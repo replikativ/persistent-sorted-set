@@ -1,7 +1,7 @@
 (defproject persistent-sorted-set "0.1.4"
   :description "Fast B-tree based persistent sorted set for Clojure/Script"
   :license {:name "MIT"}
-  :url "https://github.com/tonsky/persistent-sorted-set"
+  :url "https://github.com/replikativ/persistent-sorted-set"
   
   :dependencies [
     [org.clojure/clojure       "1.10.0"   :scope "provided"]

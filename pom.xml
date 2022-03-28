@@ -6,7 +6,7 @@
   <version>0.1.4</version>
   <name>persistent-sorted-set</name>
   <description>Fast B-tree based persistent sorted set for Clojure/Script</description>
-  <url>https://github.com/tonsky/persistent-sorted-set</url>
+  <url>https://github.com/replikativ/persistent-sorted-set</url>
   <licenses>
     <license>
       <name>MIT</name>
@@ -16,7 +16,7 @@
     <url>https://github.com/replikativ/persistent-sorted-set</url>
     <connection>scm:git:git://github.com/replikativ/persistent-sorted-set.git</connection>
     <developerConnection>scm:git:ssh://git@github.com/replikativ/persistent-sorted-set.git</developerConnection>
-    <tag>922170b85179496325fbb44a337fea5287f1f416</tag>
+    <tag>a19aef7f7a898b2ef1fb7bd9672e23a0af8255f4</tag>
   </scm>
   <build>
     <sourceDirectory>src-clojure</sourceDirectory>
