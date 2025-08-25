@@ -12,59 +12,38 @@
 
 (declare Node)
 
-(defn $child
-  "Get child at index, with lazy restoration if needed.
-   When storage is provided, supports lazy restoration."
-  [node idx storage {:keys [sync?] :or {sync? true} :as opts}]
-  (async+sync sync?
-    (async
-     (when (instance? Node node)
-       ;; Initialize children array if needed
-       (when (nil? (.-children node))
-         (set! (.-children node) (arrays/make-array (arrays/alength (.-addresses node)))))
-       (if-let [child (arrays/aget (.-children node) idx)]
-         child
-         ;; Lazy restoration from storage
-         (when-let [addresses (.-addresses node)]
-           (when-let [addr (arrays/aget addresses idx)]
-             (let [child (await (impl/restore storage addr opts))]
-               (arrays/aset (.-children node) idx child)
-               child))))))))
-
 (defn ensure-children [node]
   (when (nil? (.-children node))
     (set! (.-children node) (make-array (alength (.-keys node)))))
   (.-children node))
 
-
-
-(defn child [node idx]
-   (arrays/aget (.-children node) idx))
-
-
-
-(defn- $$child-storage
+(defn $child
   [^Node node storage idx {:keys [sync?] :or {sync? true} :as opts}]
-  (assert (and (<= 0 idx)
-               (< idx (alength (.-keys node)))))
+  (assert (and (some? idx)
+               (number? idx)))
   (assert (or (and (some? (.-children node))
                    (some? (aget (.-children node) idx)))
               (and (some? (.-addresses node))
                    (some? (aget (.-addresses node) idx)))))
   (async+sync sync?
     (async
-      (if-let [child (and (some? (.-children node))
-                          (aget (.-children node) idx))]
-        (do
-          (when-some [addr (and (some? (.-addresses node))
-                                (aget (.-addresses node) idx))]
-            (impl/accessed storage addr))
-          child)
-        (let [addr (aget (.-addresses node) idx)
-              _(assert (some? addr) "expected address to restore child")
-              child (await (impl/restore storage addr opts))]
-          (aset (ensure-children node) idx child)
-          child)))))
+      (let [*child (atom nil)]
+        (when (some? (.-children node))
+          (reset! *child (aget (.-children node) idx)))
+        (if (nil? @*child)
+          (let [address (aget (.-addresses node) idx)
+                _ (assert (some? address) "expected address to restore child")
+                _ (assert (some? storage) "expected storage")
+                child (await (impl/restore storage address opts))]
+            (reset! *child child)
+            (aset (ensure-children node) idx child))
+          (when (and (some? (.-addresses node)) (some? (aget (.-addresses node) idx)))
+            (assert (some? storage) "expected storage")
+            (impl/accessed storage (aget (.-addresses node) idx))))
+        @*child))))
+
+(defn child [node idx]
+   (arrays/aget (.-children node) idx))
 
 (defn- $count
   [^Node node storage {:keys [sync?] :or {sync? true} :as opts}]
@@ -72,7 +51,7 @@
     (async
       (let [*cnt (atom 0)]
         (dotimes [i (alength (.-keys node))]
-          (let [child (await ($$child-storage node storage i opts))]
+          (let [child (await ($child node storage i opts))]
             (swap! *cnt + (await (impl/node-count child storage opts)))))
         @*cnt))))
 
@@ -88,7 +67,7 @@
               false
               (do
                 (assert (and (<= 0 ins) (< ins (alength (.-keys node)))))
-                (let [child (await ($$child-storage node storage ins opts))]
+                (let [child (await ($child node storage ins opts))]
                   (await (impl/node-contains? child storage key cmp opts)))))))))))
 
 (defn- lookup-range [cmp arr key]
@@ -137,7 +116,7 @@
           idx   (binary-search-l cmp keys (- (arrays/alength keys) 2) key)]
       (async+sync sync?
         (async
-          (let [child-node (await ($child this idx storage opts))]
+          (let [child-node (await ($child this storage idx opts))]
             (when-let [nodes (await (impl/node-conj child-node cmp key storage opts))]
               (let [new-keys     (check-n-splice cmp keys     idx (inc idx) (arrays/amap impl/node-lim-key nodes))
                     new-children (splice             children idx (inc idx) nodes)]
@@ -156,8 +135,8 @@
         (async
           (when-not (== -1 idx) ;; short-circuit, key not here
             (let [child       (await ($child this idx storage opts))
-                  left-child  (when (>= (dec idx) 0) (await ($child this (dec idx) storage opts)))
-                  right-child (when (< (inc idx) (arrays/alength children)) (await ($child this (inc idx) storage opts)))
+                  left-child  (when (>= (dec idx) 0) (await ($child this storage (dec idx) opts)))
+                  right-child (when (< (inc idx) (arrays/alength children)) (await ($child this storage (inc idx) opts)))
                   disjoined   (await (impl/node-disj child cmp key false left-child right-child storage opts))]
               (when disjoined     ;; short-circuit, key not here
                 (let [left-idx     (if left-child  (dec idx) idx)

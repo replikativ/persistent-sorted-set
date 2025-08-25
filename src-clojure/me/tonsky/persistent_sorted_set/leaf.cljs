@@ -49,34 +49,31 @@
                    (async result))))
 
   (node-conj [_ cmp key storage opts]
-             (let [{:keys [sync?] :or {sync? true}} opts
-                   idx    (binary-search-l cmp keys (dec (arrays/alength keys)) key)
-                   keys-l (arrays/alength keys)
-                   result (cond
-                            ;; element already here
-                            (and (< idx keys-l)
-                                 (== 0 (cmp key (arrays/aget keys idx))))
-                            nil
+    (let [{:keys [sync?] :or {sync? true}} opts
+          idx    (binary-search-l cmp keys (dec (arrays/alength keys)) key)
+          keys-l (arrays/alength keys)
+          result (cond
+                   ;; element already here
+                  (and (< idx keys-l) (== 0 (cmp key (arrays/aget keys idx))))
+                  nil
 
-                            ;; splitting
-                            (== keys-l max-len)
-                            (let [middle (arrays/half (inc keys-l))]
-                              (if (> idx middle)
-                                ;; new key spes to the second half
-                                (arrays/array
-                                 (Leaf. (.slice keys 0 middle) nil)
-                                 (Leaf. (cut-n-splice keys middle keys-l idx idx (arrays/array key)) nil))
-                                ;; new key spes to the first half
-                                (arrays/array
-                                 (Leaf. (cut-n-splice keys 0 middle idx idx (arrays/array key)) nil)
-                                 (Leaf. (.slice keys middle keys-l) nil))))
+                  (== keys-l max-len)
+                  (let [middle (arrays/half (inc keys-l))] ;; splitting
+                    (if (> idx middle)
+                      ;; new key spes to the second half
+                      (arrays/array
+                       (Leaf. (.slice keys 0 middle) nil)
+                       (Leaf. (cut-n-splice keys middle keys-l idx idx (arrays/array key)) nil))
+                      ;; new key spes to the first half
+                      (arrays/array
+                       (Leaf. (cut-n-splice keys 0 middle idx idx (arrays/array key)) nil)
+                       (Leaf. (.slice keys middle keys-l) nil))))
 
-                            ;; ok as is
-                            :else
-                            (arrays/array (Leaf. (splice keys idx idx (arrays/array key)) nil)))]
-               (if sync?
-                 result
-                 (async result))))
+                  :else
+                  (arrays/array (Leaf. (splice keys idx idx (arrays/array key)) nil)))]
+     (if sync?
+       result
+       (async result))))
   (node-disj [_ cmp key root? left right storage {:keys [sync?] :or {sync? true} :as opts}]
              (let [idx (lookup-exact cmp keys key)]
                (async+sync sync?

@@ -76,6 +76,7 @@
        (and
         (is (= 0 (:writes @*stats)))
         (is (= 0 (:reads @*stats)))
+        (is (contains? original 0))
         (is (instance? Leaf (.-root original)))
         (is (nil? (.-address original)))
         (let [storage (storage)
@@ -88,9 +89,9 @@
            (testing "restoring one item"
              (let [restored (set/restore address storage {})]
                (and
-                (is (set? original))
-                (is (set? restored))
-                (is (= 1 (count original)) "original has 1 item")
+                (is (= 0 (:reads @*stats)) "nothing should have happened yet")
+                (is (contains? restored 0))
+                (is (= 1 (:reads @*stats)))
                 (is (= 1 (count restored)) "restored has 1 item")
                 (is (= restored original)  "restored is equiv")
                 (is (instance? Leaf (.-root restored)))
@@ -155,6 +156,8 @@
         (is (= 0 (:writes @*stats)))
         (is (= 0 (:reads @*stats)))
         (is (contains? original 0))
+        (is (= 0 (:writes @*stats)))
+        (is (= 0 (:reads @*stats)))
         (is (contains? original 1023))
         (is (instance? Node (.-root original)))
         (let [cs (children (.-root original))
@@ -187,8 +190,6 @@
                     (is (= 3 (count root-keys)))
                     (is (every? node? cs))
                     (is (= [255 511 1023] root-keys)))))))))))))))
-
-
 
 ;;; uses ensure-root
 ;; slice

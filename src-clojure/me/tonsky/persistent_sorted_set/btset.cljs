@@ -98,7 +98,8 @@
   [^BTSet set key cmp {:keys [sync?] :or {sync? true} :as opts}]
   (async+sync sync?
     (async
-     (let [roots (await (impl/node-conj (.-root set) cmp key (.-storage set) opts))]
+     (let [root (await ($$ensure-root set opts))
+           roots (await (impl/node-conj root cmp key (.-storage set) opts))]
        (cond
          ;; tree not changed
          (nil? roots)
@@ -292,7 +293,7 @@
      (let [idx (path-get path level)]
        (if (pos? level)
          (let [child-node (if (.-storage set)
-                            (await (node/$child node idx (.-storage set) opts))
+                            (await (node/$child node (.-storage set) idx opts))
                             (node/child node idx))
                sub-path (await ($$_next-path set child-node path (dec level) opts))]
            (if (nil? sub-path)
@@ -342,7 +343,7 @@
 
           :else
           (let [child-node (if (.-storage set)
-                             (await (node/$child node idx (.-storage set) opts))
+                             (await (node/$child node (.-storage set) idx opts))
                              (node/child node idx))
                 path' (await ($$_prev-path set child-node path (dec level) opts))]
             (cond
@@ -355,7 +356,7 @@
               ;; nested overflow, advance current idx, reset subsequent indexes
               :else
               (let [child-node (if (.-storage set)
-                                  (await (node/$child node (dec idx) (.-storage set) opts))
+                                  (await (node/$child node (.-storage set) (dec idx) opts))
                                   (node/child node (dec idx)))
                     path' (if (.-storage set)
                             (await (-rpath child-node path (dec level) (.-storage set) opts))
@@ -407,7 +408,7 @@
          (recur
            (dec level)
            (if (.-storage set)
-             (await (node/$child node (path-get path level) (.-storage set) opts))
+             (await (node/$child node (.-storage set) (path-get path level) opts))
              (node/child node (path-get path level))))
          (.-keys node))))))
 
@@ -661,7 +662,7 @@
                 (if (pos? level)
                   ;; inner node
                   (let [last-idx (dec (impl/node-len node))
-                        child-node (await (node/$child node last-idx storage opts))]
+                        child-node (await (node/$child node storage last-idx opts))]
                     (await (-rpath child-node
                                    (path-set path level last-idx)
                                    (dec level)
@@ -681,7 +682,7 @@
       ;; inner node
       (if (== idx-l idx-r)
         (-distance set (if (.-storage set)
-                          (node/$child node idx-l (.-storage set) {:sync? true})
+                          (node/$child node (.-storage set) idx-l {:sync? true})
                           (node/child node idx-l))
                    left
                    right
@@ -737,7 +738,7 @@
                  (let [keys (.-keys node)
                        idx  (binary-search-l comparator keys (- keys-l 2) key)
                        child-node (if (.-storage set)
-                                    (await (node/$child node idx (.-storage set) opts))
+                                    (await (node/$child node (.-storage set) idx opts))
                                     (node/child node idx))]
                    (recur
                     child-node
@@ -771,7 +772,7 @@
                      idx        (binary-search-r comparator keys (- keys-l 2) key)
                      res        (path-set path level idx)
                      child-node (if (.-storage set)
-                                  (await (node/$child node idx (.-storage set) opts))
+                                  (await (node/$child node (.-storage set) idx opts))
                                   (node/child node idx))]
                  (recur
                    child-node
