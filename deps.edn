@@ -1,6 +1,8 @@
 {:paths ["src-clojure" "target/classes"]
  :deps
- {org.clojure/clojure {:mvn/version "1.11.1"}}
+ {org.clojure/clojure {:mvn/version "1.11.1"}
+  missionary/missionary {:mvn/version "b.46"}
+  await-cps/await-cps {:mvn/version "0.1.14"}}
  :aliases
  {:dev
   {:extra-deps
@@ -23,6 +25,14 @@
    :exec-fn     cognitect.test-runner.api/test
    :exec-args   {:dirs ["test-clojure"]
                  :patterns ["me\\.tonsky\\.persistent-sorted-set\\.test.*"]}}
+  
+  :async-test
+  {:extra-paths ["test-clojure"]
+   :extra-deps
+   {org.clojure/clojure {:mvn/version "1.11.1"}
+    org.clojure/clojurescript {:mvn/version "1.11.60"}
+    org.clojure/core.async {:mvn/version "1.8.741"}}
+   :main-opts ["-m" "cognitect.test-runner"]}
   
   :bench
   {:extra-paths ["test-clojure" "bench-clojure"]

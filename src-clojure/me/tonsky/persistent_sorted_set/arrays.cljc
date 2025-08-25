@@ -12,7 +12,7 @@
 
 #?(:cljs
    (defn ^array make-array [size] (js/Array. size))
-   :clj 
+   :clj
    (defn make-array ^{:tag "[[Ljava.lang.Object;"} [size]
      (clojure.core/make-array java.lang.Object size)))
 
@@ -90,7 +90,7 @@
    (defn amap [f arr]
      (.map arr f))
    :clj
-   (defn amap 
+   (defn amap
      ([f arr]
       (amap f Object arr))
      ([f type arr] ;; TODO check if faster in Java
