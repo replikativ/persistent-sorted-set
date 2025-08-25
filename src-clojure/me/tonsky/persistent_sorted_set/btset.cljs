@@ -12,7 +12,7 @@
              :refer [rotate lookup-exact splice cut-n-splice
                      binary-search-l binary-search-r
                      return-array merge-n-split check-n-splice]]
-            [await-cps :refer [await] :refer-macros [async]]))
+            [is.simm.lean-cps.async :refer [await] :refer-macros [async]]))
 
 (declare iter riter -seek* -rseek* -rpath BTSet)
 

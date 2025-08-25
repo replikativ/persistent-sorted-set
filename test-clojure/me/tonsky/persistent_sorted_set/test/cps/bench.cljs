@@ -1,14 +1,15 @@
-(ns me.tonsky.persistent-sorted-set.test.await-cps-bench
+(ns me.tonsky.persistent-sorted-set.test.cps.bench
   "Benchmarks comparing synchronous vs asynchronous performance"
   (:require
    [cljs.test :refer-macros [deftest testing is] :as test]
-   [await-cps :refer [await run-async] :refer-macros [async]]
    [clojure.string :as string]
+   [is.simm.lean-cps.async :refer [await] :refer-macros [async]]
+   [is.simm.lean-cps.runtime :refer [run]]
    [me.tonsky.persistent-sorted-set :as set]
    [me.tonsky.persistent-sorted-set.btset :as btset]
    [me.tonsky.persistent-sorted-set.leaf :as leaf]
    [me.tonsky.persistent-sorted-set.node :as node]
-   [me.tonsky.persistent-sorted-set.test.async-utils :as utils]))
+   [me.tonsky.persistent-sorted-set.test.cps.utils :as utils]))
 
 (defn- now [] (js/performance.now))
 
@@ -165,7 +166,7 @@
 
 (deftest bench-single-operations
   (test/async done
-    (run-async (do-single-ops-bench)
+    (run (do-single-ops-bench)
       (fn [ok]
         (js/console.info "bench-single-operations success" ok)
         (done))
@@ -202,7 +203,7 @@
 
 (deftest bench-bulk-operations
   (test/async done
-    (run-async (do-single-ops-bench)
+    (run (do-single-ops-bench)
       (fn [ok]
         (js/console.info "bench-bulk-operations success" ok)
         (done))
@@ -266,7 +267,7 @@
 
 (deftest bench-iteration
   (test/async done
-    (run-async (do-iteration-bench)
+    (run (do-iteration-bench)
       (fn [ok]
         (js/console.info "bench-iteration success" ok)
         (done))
@@ -276,10 +277,11 @@
         (js/console.warn err)
         (done)))))
 
-;;; NOTE store & restore do nothing but set storage & address respectively
+;;; NOTE restore do nothing but set address respectively
 ;;; this bench does not actually measure anything
 ;;; FIX --> all store ops happen lazily on reads, both sync & async
-;;; (sync restored enumeration & async restored enumeration) x (ordered-acces vs random-access)
+;;;  + (sync store & async store)
+;;;  + (sync restored enumeration & async restored enumeration) x (ordered-acces vs random-access)
 
 ; (defn do-bench-storage-delays []
 ;   (async
@@ -361,7 +363,7 @@
 
 (deftest bench-lazy-loading
   (test/async done
-    (run-async (do-bench-lazy-loading)
+    (run (do-bench-lazy-loading)
       (fn [ok]
         (js/console.info "bench-lazy-loading success" ok)
         (done))

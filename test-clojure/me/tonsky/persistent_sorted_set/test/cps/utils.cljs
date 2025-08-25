@@ -1,7 +1,7 @@
-(ns me.tonsky.persistent-sorted-set.test.async-utils
+(ns me.tonsky.persistent-sorted-set.test.cps.utils
   "Simple utilities for async testing"
-  (:require [await-cps :refer [await smart-trampoline]
-                       :refer-macros [async]]
+  (:require [is.simm.lean-cps.async :refer [await] :refer-macros [async]]
+            [is.simm.lean-cps.runtime :refer [smart-trampoline]]
             [me.tonsky.persistent-sorted-set :as set]
             [me.tonsky.persistent-sorted-set.btset :as btset]
             [me.tonsky.persistent-sorted-set.leaf :as leaf]

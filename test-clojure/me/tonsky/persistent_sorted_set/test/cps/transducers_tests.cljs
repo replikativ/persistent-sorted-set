@@ -1,9 +1,10 @@
-(ns me.tonsky.persistent-sorted-set.test.await-cps-transducers-tests
+(ns me.tonsky.persistent-sorted-set.test.cps.transducers-tests
   (:require [cljs.test :as test :refer [deftest is testing]]
-            [await-cps :refer [await run-async] :refer-macros [async]]
+            [is.simm.lean-cps.async :refer [await] :refer-macros [async]]
+            [is.simm.lean-cps.runtime :refer [run]]
             [me.tonsky.persistent-sorted-set :as set]
             [me.tonsky.persistent-sorted-set.async-transducers :as at]
-            [me.tonsky.persistent-sorted-set.test.async-utils :as utils]))
+            [me.tonsky.persistent-sorted-set.test.cps.utils :as utils]))
 
 (defn async-transduce
   "Reduce an AsyncSeq with a transducer. Returns CPS fn yielding the reduced value."
@@ -70,7 +71,7 @@
 
 (deftest transducer-sequence-test
   (test/async done
-    (run-async (do-tests)
+    (run (do-tests)
       (fn [_] (done))
       (fn [err]
         (js/console.warn "transducer-sequence-test failure")

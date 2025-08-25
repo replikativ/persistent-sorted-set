@@ -1,9 +1,10 @@
-(ns me.tonsky.persistent-sorted-set.test.await-cps-sequence-tests
+(ns me.tonsky.persistent-sorted-set.test.cps.sequence-tests
   (:require [cljs.test :as test :refer [deftest is testing]]
-            [await-cps :refer [await run-async] :refer-macros [async]]
+            [is.simm.lean-cps.async :refer [await] :refer-macros [async]]
+            [is.simm.lean-cps.runtime :refer [run]]
             [me.tonsky.persistent-sorted-set :as set]
             [me.tonsky.persistent-sorted-set.async-transducers :as at]
-            [me.tonsky.persistent-sorted-set.test.async-utils :as utils]))
+            [me.tonsky.persistent-sorted-set.test.cps.utils :as utils]))
 
 (defn consume-async-seq
   "Helper to consume an entire AsyncSeq into a vector"
@@ -85,7 +86,7 @@
 
 (deftest sequence-test
   (test/async done
-    (run-async (do-sequence-test)
+    (run (do-sequence-test)
       (fn [ok] (done))
       (fn [err]
         (js/console.warn "sequence-test failure")

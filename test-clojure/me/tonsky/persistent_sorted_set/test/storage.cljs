@@ -1,5 +1,4 @@
 (ns me.tonsky.persistent-sorted-set.test.storage
-  (:require-macros [me.tonsky.persistent-sorted-set.test.storage :refer [with-stats dobatches]])
   (:require
    [cljs.test :as t :refer [is are deftest testing]]
    [clojure.edn :as edn]
