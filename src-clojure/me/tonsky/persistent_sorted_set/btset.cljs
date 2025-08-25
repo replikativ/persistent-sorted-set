@@ -1,7 +1,9 @@
 (ns me.tonsky.persistent-sorted-set.btset
   (:refer-clojure :exclude [iter sorted-set-by])
   (:require-macros [me.tonsky.persistent-sorted-set.macros :refer [async+sync]])
-  (:require [me.tonsky.persistent-sorted-set.arrays :as arrays]
+  (:require [await-cps :refer [await] :refer-macros [async]]
+            ; [is.simm.lean-cps.async :refer [await] :refer-macros [async]]
+            [me.tonsky.persistent-sorted-set.arrays :as arrays]
             [me.tonsky.persistent-sorted-set.constants
              :refer [min-len avg-len  max-len uninitialized-hash empty-path
                      bits-per-level max-safe-path max-safe-level bit-mask]]
@@ -11,8 +13,7 @@
             [me.tonsky.persistent-sorted-set.util
              :refer [rotate lookup-exact splice cut-n-splice
                      binary-search-l binary-search-r
-                     return-array merge-n-split check-n-splice]]
-            [is.simm.lean-cps.async :refer [await] :refer-macros [async]]))
+                     return-array merge-n-split check-n-splice]]))
 
 (declare iter riter -seek* -rseek* -rpath BTSet)
 
@@ -258,8 +259,7 @@
 (defn- path-eq ^boolean [^number path1 ^number path2]
   (== path1 path2))
 
-(def factors
-  (arrays/into-array (map #(js/Math.pow 2 %) (range 0 52 bits-per-level))))
+(def factors (into-array (map #(js/Math.pow 2 %) (range 0 52 bits-per-level))))
 
 (defn- path-get ^number [^number path ^number level]
   (if (< level max-safe-level)

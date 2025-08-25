@@ -3,8 +3,8 @@
   (:require
    [cljs.test :refer-macros [deftest testing is] :as test]
    [clojure.string :as string]
-   [is.simm.lean-cps.async :refer [await] :refer-macros [async]]
-   [is.simm.lean-cps.runtime :refer [run]]
+   [await-cps :refer [await run-async] :refer-macros [async] :rename {run-async run}]
+   ; [is.simm.lean-cps.async :refer [await run] :refer-macros [async]]
    [me.tonsky.persistent-sorted-set :as set]
    [me.tonsky.persistent-sorted-set.btset :as btset]
    [me.tonsky.persistent-sorted-set.leaf :as leaf]

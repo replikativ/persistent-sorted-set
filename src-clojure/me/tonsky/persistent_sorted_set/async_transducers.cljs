@@ -1,5 +1,6 @@
 (ns me.tonsky.persistent-sorted-set.async-transducers
-  (:require [is.simm.lean-cps.async :refer [await] :refer-macros [async]]
+  (:require ;[is.simm.lean-cps.async :refer [await] :refer-macros [async]]
+            [await-cps :refer [await] :refer-macros [async]]
             [me.tonsky.persistent-sorted-set :as set]
             [me.tonsky.persistent-sorted-set.protocols :refer [IAsyncSeq]]))
 

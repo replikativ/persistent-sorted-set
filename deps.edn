@@ -1,8 +1,10 @@
 {:paths ["src-clojure" "target/classes"]
  :deps
  {org.clojure/clojure {:mvn/version "1.12.0"}
-  simm-is/lean-cps {:git/url "https://github.com/simm-is/lean-cps.git"
-                    :git/sha "fa34438aa69681be9c5d05043fc7c5dbac1a3b1d"}}
+  ; simm-is/lean-cps {:git/url "https://github.com/simm-is/lean-cps.git"
+  ;                   :git/sha "fa34438aa69681be9c5d05043fc7c5dbac1a3b1d"}
+  whilo/await-cps   {:git/url "https://github.com/whilo/await-cps.git"
+                     :git/sha "fc495e1d6b944024a739a17757aaea057461aac0"}}
  :aliases
  {:dev
   {:extra-deps

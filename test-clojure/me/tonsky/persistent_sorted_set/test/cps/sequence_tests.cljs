@@ -1,7 +1,7 @@
 (ns me.tonsky.persistent-sorted-set.test.cps.sequence-tests
   (:require [cljs.test :as test :refer [deftest is testing]]
-            [is.simm.lean-cps.async :refer [await] :refer-macros [async]]
-            [is.simm.lean-cps.runtime :refer [run]]
+            [await-cps :refer [await run-async] :refer-macros [async] :rename {run-async run}]
+            ; [is.simm.lean-cps.async :refer [await run] :refer-macros [async]]
             [me.tonsky.persistent-sorted-set :as set]
             [me.tonsky.persistent-sorted-set.async-transducers :as at]
             [me.tonsky.persistent-sorted-set.test.cps.utils :as utils]))
