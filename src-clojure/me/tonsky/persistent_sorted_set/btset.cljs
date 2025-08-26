@@ -4,16 +4,13 @@
   (:require [await-cps :refer [await] :refer-macros [async]]
             ; [is.simm.lean-cps.async :refer [await] :refer-macros [async]]
             [me.tonsky.persistent-sorted-set.arrays :as arrays]
-            [me.tonsky.persistent-sorted-set.constants
-             :refer [min-len avg-len  max-len uninitialized-hash empty-path
-                     bits-per-level max-safe-path max-safe-level bit-mask]]
+            ;;TODO capitalize and emit w/ macro
+            ; [me.tonsky.persistent-sorted-set.async-transducers :as at]
+            [me.tonsky.persistent-sorted-set.constants :refer [min-len avg-len max-len uninitialized-hash empty-path bits-per-level max-safe-path max-safe-level bit-mask]]
             [me.tonsky.persistent-sorted-set.leaf :as leaf :refer [Leaf]]
             [me.tonsky.persistent-sorted-set.node :as node :refer [Node]]
             [me.tonsky.persistent-sorted-set.protocols :refer [IAsyncSeq INode IStorage] :as impl]
-            [me.tonsky.persistent-sorted-set.util
-             :refer [rotate lookup-exact splice cut-n-splice
-                     binary-search-l binary-search-r
-                     return-array merge-n-split check-n-splice]]))
+            [me.tonsky.persistent-sorted-set.util :refer [rotate lookup-exact splice cut-n-splice binary-search-l binary-search-r return-array merge-n-split check-n-splice]]))
 
 (declare iter riter -seek* -rseek* -rpath BTSet)
 
@@ -60,11 +57,12 @@
 (defn $count
   [^BTSet set {:keys [sync?] :or {sync? true} :as opts}]
   (async+sync sync?
-    (do
-      (when (neg? (.-cnt set))
-        (let [root (await ($$ensure-root set opts))]
-          (set! (.-cnt set) (await (impl/node-count root (.-storage set) opts)))))
-      (.-cnt set))))
+    (async
+     (do
+       (when (neg? (.-cnt set))
+         (let [root (await ($$ensure-root set opts))]
+           (set! (.-cnt set) (await (impl/node-count root (.-storage set) opts)))))
+       (.-cnt set)))))
 
 (defn $contains?
   [^BTSet set key {:keys [sync?] :or {sync? true} :as opts}]
@@ -73,6 +71,8 @@
       (let [root (await ($$ensure-root set opts))]
         (await (impl/node-contains? root (.-storage set) key (.-comparator set) opts))))))
 
+(declare async-iter afirst arest)
+
 (defn $equivalent?
   [^BTSet set other {:keys [sync?] :or {sync? true} :as opts}]
   (if sync?
@@ -80,47 +80,60 @@
       false
       (and (= (count set) (count other))
            (every? #($contains? set % opts) other)))
-    (if-not (set? other)
-      (async false)
-      (if (instance? BTSet other)
-        (throw (js/Error. "unimplemented btset to btset equivalent?"))
-        (and (= (await ($count set opts))
-                (count other))
-             (loop [items (seq other)]
-               (let [item (first items)]
-                 (if (nil? item)
-                   true
-                   (if-not (await ($contains? set item opts))
-                     false
-                     (recur (rest items)))))))))))
+    (async
+     (if-not (set? other)
+       false
+       (if (instance? BTSet other)
+         ;; NOTE we are assuming both have async-storage (if any)!!
+         (and (= (await ($count set opts)) (await ($count other opts)))
+              (loop [items (await (async-iter other))]
+                (let [item (and items (await (afirst items)))]
+                  (if (nil? item)
+                    true
+                    (if-not (await ($contains? set item opts))
+                      false
+                      (recur (await (arest items))))))))
+         (and (= (await ($count set opts)) (count other))
+              (loop [items (seq other)]
+                (let [item (first items)]
+                  (if (nil? item)
+                    true
+                    (if-not (await ($contains? set item opts))
+                      false
+                      (recur (rest items))))))))))))
 
 (defn $conjoin
-  [^BTSet set key cmp {:keys [sync?] :or {sync? true} :as opts}]
-  (async+sync sync?
+  ([^BTSet set key arg]
+   (if (fn? arg)
+     ($conjoin set key arg {:sync? true})
+     ($conjoin set key (.-comparator set) arg)))
+  ([^BTSet set key cmp {:keys [sync?] :or {sync? true} :as opts}]
+   (async+sync sync?
     (async
-     (let [root (await ($$ensure-root set opts))
-           roots (await (impl/node-conj root cmp key (.-storage set) opts))]
-       (cond
-         ;; tree not changed
-         (nil? roots)
-         set
+      (let [root (await ($$ensure-root set opts))
+            roots (await (impl/node-conj root cmp key (.-storage set) opts))]
+        (cond
+          (nil? roots) set
 
-         ;; keeping single root
-         (== (arrays/alength roots) 1)
-         (alter set
-                (arrays/aget roots 0)
-                (.-shift set)
-                (inc (.-cnt set)))
+          (== (arrays/alength roots) 1)
+          (alter set
+                 (arrays/aget roots 0)
+                 (.-shift set)
+                 (inc (.-cnt set)))
 
-         :else ;; introducing new root
-         (alter set
-                (Node. (arrays/amap impl/node-lim-key roots) roots nil nil)
-                (inc (.-shift set))
-                (inc (.-cnt set))))))))
+          :else
+          (alter set
+                 (Node. (arrays/amap impl/node-lim-key roots) roots nil nil)
+                 (inc (.-shift set))
+                 (inc (.-cnt set)))))))))
 
 (defn $disjoin
-  [^BTSet set key cmp {:keys [sync?] :or {sync? true} :as opts}]
-  (async+sync sync?
+  ([^BTSet set key arg]
+   (if (fn? arg)
+     ($disjoin set key arg {:sync? true})
+     ($disjoin set key (.-comparator set) arg)))
+  ([^BTSet set key cmp {:keys [sync?] :or {sync? true} :as opts}]
+   (async+sync sync?
     (async
      (let [new-roots (await (impl/node-disj (.-root set) cmp key true nil nil (.-storage set) opts))]
        (if (nil? new-roots) ;; nothing changed, key wasn't in the set
@@ -139,7 +152,7 @@
              (alter set
                     new-root
                     (.-shift set)
-                    (dec (.-cnt set))))))))))
+                    (dec (.-cnt set)))))))))))
 
 (defn $store
   ([^BTSet set arg]
@@ -165,6 +178,58 @@
      (if (await ($contains? set key opts))
        key
        not-found))))
+
+(declare AsyncSeq)
+
+(defn async-reduce
+  [arf set from]
+  (assert (instance? BTSet set))
+  ;; from can be (normal-seq | BTSet | AsyncSeq)
+  (if (instance? BTSet from)
+    (throw (ex-info "from BTSet unimplemented" {}))
+    (if (instance? AsyncSeq from)
+      (throw (ex-info "from AsyncSeq unimplemented" {}))
+      (async
+       (loop [acc set
+              items from]
+         (if (seq items)
+           (let [v (first items)]
+             (if (some? v)
+               (let [acc' (await (arf acc v))]
+                 (if (reduced? acc')
+                   (await (arf (unreduced acc')))
+                   (recur acc' (rest items))))
+               (await (arf acc))))
+           (await (arf acc))))))))
+
+(defn async-transduce
+  [xform arf set from]
+  (throw (ex-info "async-transduce unimplemented" {})))
+
+(defn async-into
+  ([] (async nil))
+  ([set] (async set))
+  ([set from]
+   (assert (instance? BTSet set))
+   (async-reduce
+    (fn
+      ([acc]
+       (async acc))
+      ([acc item]
+       ($conjoin acc item (.-comparator acc) {:sync? false})))
+    set
+    from))
+  ([set xform from]
+   (assert (instance? BTSet set))
+   (async-transduce
+    xform
+    (fn
+      ([acc]
+       (async acc))
+      ([acc item]
+       ($conjoin acc item (.-comparator acc) {:sync? false})))
+    set
+    from)))
 
 #!------------------------------------------------------------------------------
 
@@ -865,6 +930,11 @@
   (-pr-writer [this writer opts]
     (-write writer (str this))))
 
+(extend-type nil
+  IAsyncSeq
+  (-afirst [_] (async))
+  (-arest [_] (async)))
+
 (defn async-seq
   [set path till-path]
   (when (and path (path-lt path till-path))
@@ -873,6 +943,15 @@
 (defn afirst [s] (impl/-afirst s))
 
 (defn arest [s] (impl/-arest s))
+
+(defn async-iter [^BTSet set]
+  (async
+    (let [root (await ($$ensure-root set {:sync? false}))]
+      (when (pos? (impl/node-len root))
+        (let [left  empty-path
+              rpath (await (-rpath root empty-path (.-shift set) (.-storage set) {:sync? false}))
+              right (await ($$next-path set rpath {:sync? false}))]
+          (async-seq set left right))))))
 
 (defn async-slice
   "Async version of slice that returns an AsyncSeq."

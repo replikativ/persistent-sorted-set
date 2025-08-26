@@ -51,16 +51,18 @@
 (defn conj
   "Analogue to [[clojure.core/conj]] but with comparator that overrides the one stored in set.
    Accepts optional opts map with {:sync? true/false} (defaults to true)."
-  ([^BTSet set key] (btset/$conjoin set key (.-comparator set) {:sync? true}))
-  ([^BTSet set key cmp] (btset/$conjoin set key cmp {:sync? true}))
+  ([^BTSet set key]          (btset/$conjoin set key (.-comparator set) {:sync? true}))
+  ([^BTSet set key arg]      (btset/$conjoin set key arg))
   ([^BTSet set key cmp opts] (btset/$conjoin set key cmp opts)))
 
 (defn disj
   "Analogue to [[clojure.core/disj]] with comparator that overrides the one stored in set.
    Accepts optional opts map with {:sync? true/false} (defaults to true)."
   ([^BTSet set key] (btset/$disjoin set key (.-comparator set) {:sync? true}))
-  ([^BTSet set key cmp] (btset/$disjoin set key cmp {:sync? true}))
+  ([^BTSet set key arg] (btset/$disjoin set key arg))
   ([^BTSet set key cmp opts] (btset/$disjoin set key cmp opts)))
+
+#!------------------------------------------------------------------------------
 
 (defn slice
   "An iterator for part of the set with provided boundaries.
@@ -101,31 +103,27 @@
 
 #!------------------------------------------------------------------------------
 
-
-(defn lookup-async ;;-----------------------------------------------------------TODO kill me
+(defn lookup-async
   ([^BTSet set key]
    (btset/$lookup set key nil {:sync? false}))
   ([^BTSet set key not-found]
-   (btset/$lookup set key not-found {:sync? false}))
-  ([^BTSet set key not-found opts]
-   (btset/$lookup set key not-found (assoc opts :sync? false))))
+   (btset/$lookup set key not-found {:sync? false})))
 
-(defn async-seq
+(defn async-seq ;;-------------------------------------------------------------- TODO
   "Create an async sequence from a BTSet and path range"
-  [set path till-path];;-------------------------------------------------------- TODO fix these param names
+  [set path till-path]
   (btset/async-seq set path till-path))
 
-(defn afirst
-  [set]
-  (btset/afirst set));;--------------------------------------------------------- TODO this is AsyncSeq only
+(defn async-iter
+  "Async full-order iteration over `set` without pre-known bounds.
+   returns cont(IAsyncSeq | nil)"
+  [set] (btset/async-iter set))
 
-(defn arest
-  [set]
-  (btset/arest set));;---------------------------------------------------------- TODO this is AsyncSeq only
+(defn afirst [set](btset/afirst set));;-----------------------------------------TODO
 
-#!------------------------------------------------------------------------------
+(defn arest [set] (btset/arest set));;------------------------------------------TODO
 
-;; me.tonsky.persistent-sorted-set.async-transducers
+(def async-into btset/async-into)
 
 ; (defn asequence [])
 ; (defn atransduce [])

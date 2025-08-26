@@ -325,7 +325,7 @@
            (is (= 67 (:writes @*stats)))
            (is (= 0 (:reads @*stats)))
            (is (empty? (deref (:*memory storage))))
-           (let [restored ^PersistentSortedSet (set/restore address storage {:branching-factor 32})]            
+           (let [restored ^PersistentSortedSet (set/restore address storage {:branching-factor 32})]
              (and
               (is (empty? (deref (:*memory storage))))
               (is (= 0 (:reads @*stats)))
@@ -338,7 +338,47 @@
                  (is (= 3 (count children)))
                  (is (= 3 (count root-keys)))
                  (is (every? #(instance? Branch %) children))
-                 (is (= [255 511 1023] root-keys)))))))))))))
+                 (is (= [255 511 1023] root-keys)))))))))))
+   (testing "32^4"
+     (reset! *stats {:reads 0 :writes 0 :accessed 0})
+     (let [expected-root-keys [65535 131071 196607 262143 327679 393215 458751 524287 589823 655359 720895 786431 851967 917503 1048575]
+           original ^PersistentSortedSet
+           (into (set/sorted-set* {:branching-factor 32}) (range 0 (Math/pow 32 4)))]
+       (and
+        (is (= 0 (:writes @*stats)))
+        (is (= 0 (:reads @*stats)))
+        (is (instance? Branch (unwrap (.-_root original))))
+        (let [children (children (.-_root original))
+              root-keys (ks (.-_root original))]
+          (and
+           (is (= 15 (count children)))
+           (is (= 15 (count root-keys)))
+           (is (every? #(instance? Branch %) children))
+           (is (= expected-root-keys root-keys))))
+        (is (nil? (.-_address original)))
+        (let [storage  (storage)
+              address (set/store original storage)]
+          (and
+           (is (uuid? address))
+           (is (= address (.-_address ^PersistentSortedSet original)))
+           (is (= 69901 (:writes @*stats)))
+           (is (= 0 (:reads @*stats)))
+           (is (empty? (deref (:*memory storage))))
+           (let [restored ^PersistentSortedSet (set/restore address storage {:branching-factor 32})]
+             (and
+              (is (empty? (deref (:*memory storage))))
+              (is (= 0 (:reads @*stats)))
+              (is (= restored original))
+              (is (= (int (Math/pow 32 4)) (count restored)))
+              (is (= 69901 (count (deref (:*memory storage)))))
+              (is (= 69901 (:reads @*stats)))
+              (let [children (children (.-_root restored))
+                    root-keys (ks (.-_root original))]
+                (and
+                 (is (= 15 (count children)))
+                 (is (= 15 (count root-keys)))
+                 (is (every? #(instance? Branch %) children))
+                 (is (= expected-root-keys root-keys)))))))))))))
 
 (deftest test-lazyness
   (let [size       100000

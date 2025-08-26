@@ -8,7 +8,7 @@
             [me.tonsky.persistent-sorted-set.protocols :refer [INode]]
             [me.tonsky.persistent-sorted-set.util
              :refer [rotate lookup-exact splice cut-n-splice binary-search-l
-                     return-array merge-n-split]]))
+                     return-array merge-n-split lookup-exact]]))
 
 (deftype Leaf [keys ^:mutable _hash]
   Object
@@ -26,12 +26,8 @@
                         (return-array (Leaf. (arrays/aget ks 0) nil)
                                       (Leaf. (arrays/aget ks 1) nil))))
 
-  (node-contains? [this _ key cmp opts]
-    (let [{:keys [sync?] :or {sync? true}} opts]
-      (let [res (<= 0 ^number (garr/binarySearch keys key cmp))]
-        (if sync?
-          res
-          (async res)))))
+  (node-contains? [this _storage key cmp {:keys [sync?] :or {sync? true} :as opts}]
+    (async+sync sync? (async (<= 0 ^number (garr/binarySearch keys key cmp)))))
 
   (node-count [_ _storage opts]
     (let [{:keys [sync?] :or {sync? true}} opts]

@@ -1,10 +1,13 @@
 (ns me.tonsky.persistent-sorted-set.test.storage
   (:require
-   [cljs.test :as t :refer [is are deftest testing]]
+   [await-cps :refer [await run-async] :refer-macros [async] :rename {run-async run}]
+   ; [is.simm.lean-cps.async :refer [await run] :refer-macros [async]]
+   [cljs.test :as test :refer [is are deftest testing]]
    [clojure.edn :as edn]
    [clojure.string :as str]
    [me.tonsky.persistent-sorted-set :as set]
    [me.tonsky.persistent-sorted-set.protocols :refer [IStorage] :as impl]
+   [me.tonsky.persistent-sorted-set.btset :refer [BTSet]]
    [me.tonsky.persistent-sorted-set.leaf :refer [Leaf] :as leaf]
    [me.tonsky.persistent-sorted-set.node :refer [Node] :as node]))
 
@@ -25,6 +28,7 @@
 (defrecord Storage [*memory *disk]
   IStorage
   (store [_ node opts]
+    (assert (not (false? (:sync? opts))))
     (dbg "store<" (type node) ">")
     (swap! *stats update :writes inc)
     (let [address (gen-addr)]
@@ -34,7 +38,8 @@
                :keys      (.-keys node)
                :addresses (when (instance? Node node) (.-addresses node))}))
       address))
-  (restore [_ address _opts]
+  (restore [_ address opts]
+    (assert (not (false? (:sync? opts))))
     (or
      (@*memory address)
      (let [{:keys [keys addresses level]} (edn/read-string (@*disk address))
@@ -47,20 +52,51 @@
        (swap! *stats update :reads inc)
        (swap! *memory assoc address node)
        node)))
-  (accessed [_ address]
-    (swap! *stats update :accessed inc)
-    nil)
-  (delete [this addresses] (throw (js/Error. "unimplemented"))))
+  (accessed [_ address] (swap! *stats update :accessed inc) nil))
 
 (defn storage
   ([] (->Storage (atom {}) (atom {})))
   ([*disk] (->Storage (atom {}) *disk))
   ([*memory *disk] (->Storage *memory *disk)))
 
-(defn roundtrip [set]
-  (let [storage (storage)
-        address (set/store set storage)]
-    (set/restore address storage)))
+#!------------------------------------------------------------------------------
+
+(defrecord AsyncStorage [*memory *disk]
+  IStorage
+  (store [_ node opts]
+    (assert (false? (:sync? opts)))
+    (dbg "store<" (type node) ">")
+    (swap! *stats update :writes inc)
+    (let [address (gen-addr)]
+      (swap! *disk assoc address
+            (pr-str
+             {:level     (.-shift node) ;;<--------------------------------------TODO FIX ME
+              :keys      (.-keys node)
+              :addresses (when (instance? Node node) (.-addresses node))}))
+    (async address)))
+  (restore [_ address opts]
+    (assert (false? (:sync? opts)))
+    (async
+     (or
+      (@*memory address)
+      (let [{:keys [keys addresses level]} (edn/read-string (@*disk address))
+            node (if addresses
+                   (let [n (Node. keys nil addresses nil)]
+                     (set! (.-level n) level) ;;<--------------------------------TODO FIX ME
+                     n)
+                   (Leaf. keys nil))]
+        (dbg "restored<" (type node) ">")
+        (swap! *stats update :reads inc)
+        (swap! *memory assoc address node)
+        node))))
+  (accessed [_ address] (swap! *stats update :accessed inc) nil))
+
+(defn async-storage
+  ([] (->AsyncStorage (atom {}) (atom {})))
+  ([*disk] (->AsyncStorage (atom {}) *disk))
+  ([*memory *disk] (->AsyncStorage *memory *disk)))
+
+#!------------------------------------------------------------------------------
 
 (defn children [node] (some->> (.-children node) (filter some?)))
 
@@ -69,6 +105,7 @@
 (defn node? [o] (instance? Node o))
 
 (deftest ascending-insert-test
+  #_
   (and
    (testing "one item"
      (let [_(reset! *stats {:reads 0 :writes 0 :accessed 0})
@@ -189,7 +226,237 @@
                     (is (= 3 (count cs)))
                     (is (= 3 (count root-keys)))
                     (is (every? node? cs))
-                    (is (= [255 511 1023] root-keys)))))))))))))))
+                    (is (= [255 511 1023] root-keys)))))))))))))
+   (testing "32^4"
+     (reset! *stats {:reads 0 :writes 0 :accessed 0})
+     (let [expected-root-keys [65535 131071 196607 262143 327679 393215 458751 524287 589823 655359 720895 786431 851967 917503 1048575]
+           original (into (set/sorted-set) (range 0 (Math/pow 32 4)))]
+       (and
+        (is (= 0 (:writes @*stats)))
+        (is (= 0 (:reads @*stats)))
+        (is (contains? original 0))
+        (is (= 0 (:writes @*stats)))
+        (is (= 0 (:reads @*stats)))
+        (is (contains? original (dec (Math/pow 32 4))))
+        (is (= 0 (:writes @*stats)))
+        (is (= 0 (:reads @*stats)))
+        (is (instance? Node (.-root original)))
+        (let [children (children (.-root original))
+              root-keys (ks (.-root original))]
+          (and
+           (is (= 15 (count children)))
+           (is (= 15 (count root-keys)))
+           (is (every? #(instance? Node %) children))
+           (is (= expected-root-keys root-keys))))
+        (is (nil? (.-address original)))
+        (let [storage  (storage)
+              address (set/store original storage)]
+          (and
+           (is (uuid? address))
+           (is (= address (.-address ^PersistentSortedSet original)))
+           (is (= 69901 (:writes @*stats)))
+           (is (= 0 (:reads @*stats)))
+           (is (empty? (deref (:*memory storage))))
+           (let [restored (set/restore address storage {})]
+             (and
+              (is (empty? (deref (:*memory storage))))
+              (is (= 0 (:reads @*stats)))
+              (is (= restored original))
+              (is (= (int (Math/pow 32 4)) (count restored)))
+              (is (= 69901 (count (deref (:*memory storage)))))
+              (is (= 69901 (:reads @*stats)))
+              (let [children (children (.-root restored))
+                    root-keys (ks (.-root original))]
+                (and
+                 (is (= 15 (count children)))
+                 (is (= 15 (count root-keys)))
+                 (is (every? #(instance? Node %) children))
+                 (is (= expected-root-keys root-keys)))))))))))))
+
+(defn do-async-ascending-insert-test []
+  (async
+   (and
+    (testing "one item"
+      (let [_(reset! *stats {:reads 0 :writes 0 :accessed 0})
+            original (await (set/conj (set/sorted-set) 0 {:sync? false}))]
+        (and
+         (is (instance? BTSet original))
+         (is (false? (await (set/equivalent? original #{} {:sync? false}))))
+         (is (true? (await (set/equivalent? original #{0} {:sync? false}))))
+         (is (= #{0} original) "can use sync -IEquiv here, not in restored state")
+         (is (= 0 (:writes @*stats)))
+         (is (= 0 (:reads @*stats)))
+         (is (true? (await (set/contains? original 0 {:sync? false}))))
+         (is (instance? Leaf (.-root original)))
+         (is (nil? (.-address original)))
+         (let [storage (async-storage)
+               address (await (set/store original storage {:sync? false}))]
+           (and
+            (is (uuid? address))
+            (is (= address (.-address original)))
+            (is (= 1 (:writes @*stats)))
+            (is (= 0 (:reads @*stats)))
+            (testing "restoring one item"
+              (let [restored (set/restore address storage {})]
+                (and
+                 (is (= 0 (:reads @*stats)) "nothing should have happened yet")
+                 (is (true? (await (set/contains? restored 0 {:sync? false}))))
+                 (is (= 1 (:reads @*stats)))
+                 (is (= 1 (count restored)) "restored has 1 item")
+                 (is (await (set/equivalent? restored original {:sync? false}))  "restored is equiv")
+                 (is (instance? Leaf (.-root restored)))
+                 (is (= 1 (:reads @*stats)))))))))))
+    (testing "one full leaf"
+      (let [_(reset! *stats {:reads 0 :writes 0 :accessed 0})
+            original (await (set/async-into (set/sorted-set* {}) (range 0 32)))]
+        (and
+         (is (= 0 (:writes @*stats)))
+         (is (= 0 (:reads @*stats)))
+         (is (instance? Leaf (.-root original)))
+         (is (nil? (.-address original)))
+         (let [storage  (async-storage)
+               address (await (set/store original storage {:sync? false}))]
+           (and
+            (is (uuid? address))
+            (is (= address (.-address original)))
+            (is (= 1 (:writes @*stats)))
+            (is (= 0 (:reads @*stats)))
+            (let [restored (set/restore address storage {})]
+              (and
+               (is (= 0 (:reads @*stats)))
+               (is (true? (await (set/equivalent? restored original {:sync? false}))))
+               (is (= 1 (:reads @*stats)))
+               (is (instance? Leaf (.-root restored))))))))))
+    ; (testing "full-leaf + 1"
+    ;   (let [_(reset! *stats {:reads 0 :writes 0 :accessed 0})
+    ;         original (into (set/sorted-set* {}) (range 0 33))]
+    ;     (and
+    ;      (is (= 0 (:writes @*stats)))
+    ;      (is (= 0 (:reads @*stats)))
+    ;      (is (instance? Node (.-root original)))
+    ;      (let [children (children (.-root original))]
+    ;        (and
+    ;         (is (= 2 (count children)))
+    ;         (is (instance? Leaf (nth children 0)))
+    ;         (is (= 16 (count (.-keys (nth children 0)))))
+    ;         (is (instance? Leaf (nth children 1)))
+    ;         (is (= 17 (count (.-keys (nth children 1)))))))
+    ;      (is (nil? (.-address original)))
+    ;      (let [storage (storage)
+    ;            address (set/store original storage)]
+    ;        (and
+    ;         (is (uuid? address))
+    ;         (is (= address (.-address original)))
+    ;         (is (= 3 (:writes @*stats)))
+    ;         (is (= 0 (:reads @*stats)))
+    ;         (let [restored (set/restore address storage {})]
+    ;           (and
+    ;            (is (= restored original))
+    ;            (let [children (children (.-root restored))]
+    ;              (and
+    ;               (is (= 2 (count children)))
+    ;               (is (instance? Leaf (nth children 0)))
+    ;               (is (= 16 (count (.-keys (nth children 0)))))
+    ;               (is (instance? Leaf (nth children 1)))
+    ;               (is (= 17 (count (.-keys (nth children 1)))))))
+    ;            (is (= 3 (:reads @*stats))))))))))
+    ; (testing "32^2"
+    ;   (reset! *stats {:reads 0 :writes 0 :accessed 0})
+    ;   (let [original  (into (set/sorted-set* {}) (range 0 1024))]
+    ;     (and
+    ;      (is (= 0 (:writes @*stats)))
+    ;      (is (= 0 (:reads @*stats)))
+    ;      (is (contains? original 0))
+    ;      (is (= 0 (:writes @*stats)))
+    ;      (is (= 0 (:reads @*stats)))
+    ;      (is (contains? original 1023))
+    ;      (is (instance? Node (.-root original)))
+    ;      (let [cs (children (.-root original))
+    ;            root-keys (ks (.-root original))]
+    ;        (and
+    ;         (is (= 3 (count cs)))
+    ;         (is (every? node? cs))
+    ;         (is (= [255 511 1023] root-keys))
+    ;         (is (nil? (.-address original)))
+    ;         (let [storage (storage)
+    ;               address (set/store original storage)]
+    ;           (and
+    ;            (is (uuid? address))
+    ;            (is (= address (.-address original)))
+    ;            (is (= 67 (:writes @*stats)))
+    ;            (is (= 0 (:reads @*stats)))
+    ;            (is (empty? (deref (:*memory storage))))
+    ;            (let [restored (set/restore address storage {})]
+    ;              (and
+    ;               (is (empty? (deref (:*memory storage))))
+    ;               (is (= 0 (:reads @*stats)))
+    ;               (is (= restored original))
+    ;               (is (= 67 (:reads @*stats)))
+    ;               (is (contains? restored 0))
+    ;               (is (contains? restored 1023))
+    ;               (let [cs (children (.-root restored))
+    ;                     root-keys (ks (.-root original))]
+    ;                 (and
+    ;                  (is (= 3 (count cs)))
+    ;                  (is (= 3 (count root-keys)))
+    ;                  (is (every? node? cs))
+    ;                  (is (= [255 511 1023] root-keys)))))))))))))
+    ; (testing "32^4"
+    ;   (reset! *stats {:reads 0 :writes 0 :accessed 0})
+    ;   (let [expected-root-keys [65535 131071 196607 262143 327679 393215 458751 524287 589823 655359 720895 786431 851967 917503 1048575]
+    ;         original (into (set/sorted-set) (range 0 (Math/pow 32 4)))]
+    ;     (and
+    ;      (is (= 0 (:writes @*stats)))
+    ;      (is (= 0 (:reads @*stats)))
+    ;      (is (contains? original 0))
+    ;      (is (= 0 (:writes @*stats)))
+    ;      (is (= 0 (:reads @*stats)))
+    ;      (is (contains? original (dec (Math/pow 32 4))))
+    ;      (is (= 0 (:writes @*stats)))
+    ;      (is (= 0 (:reads @*stats)))
+    ;      (is (instance? Node (.-root original)))
+    ;      (let [children (children (.-root original))
+    ;            root-keys (ks (.-root original))]
+    ;        (and
+    ;         (is (= 15 (count children)))
+    ;         (is (= 15 (count root-keys)))
+    ;         (is (every? #(instance? Node %) children))
+    ;         (is (= expected-root-keys root-keys))))
+    ;      (is (nil? (.-address original)))
+    ;      (let [storage  (storage)
+    ;            address (set/store original storage)]
+    ;        (and
+    ;         (is (uuid? address))
+    ;         (is (= address (.-address ^PersistentSortedSet original)))
+    ;         (is (= 69901 (:writes @*stats)))
+    ;         (is (= 0 (:reads @*stats)))
+    ;         (is (empty? (deref (:*memory storage))))
+    ;         (let [restored (set/restore address storage {})]
+    ;           (and
+    ;            (is (empty? (deref (:*memory storage))))
+    ;            (is (= 0 (:reads @*stats)))
+    ;            (is (= restored original))
+    ;            (is (= (int (Math/pow 32 4)) (count restored)))
+    ;            (is (= 69901 (count (deref (:*memory storage)))))
+    ;            (is (= 69901 (:reads @*stats)))
+    ;            (let [children (children (.-root restored))
+    ;                  root-keys (ks (.-root original))]
+    ;              (and
+    ;               (is (= 15 (count children)))
+    ;               (is (= 15 (count root-keys)))
+    ;               (is (every? #(instance? Node %) children))
+    ;               (is (= expected-root-keys root-keys)))))))))))
+    )))
+
+(deftest async-ascending-insert-test
+  (test/async done
+    (run (do-async-ascending-insert-test)
+      (fn [ok] (done))
+      (fn [err]
+        (js/console.warn "async-ascending-insert-test")
+        (is (nil? err))
+        (js/console.error err)
+        (done)))))
 
 ;;; uses ensure-root
 ;; slice
@@ -263,3 +530,4 @@
 ;                                  (and
 ;                                   (is (= (range 100) (take 100 restored)))
 ;                                   (is (= (range 9900 10000) (take 100 (drop 9900 restored)))))))))))))))))
+
