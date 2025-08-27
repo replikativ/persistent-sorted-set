@@ -7,17 +7,17 @@
             [me.tonsky.persistent-sorted-set.btset :as btset]
             [me.tonsky.persistent-sorted-set.branch :as branch]
             [me.tonsky.persistent-sorted-set.leaf :as leaf]
-            [me.tonsky.persistent-sorted-set.protocols :refer [IStorage]]))
+            [me.tonsky.persistent-sorted-set.impl.storage :refer [IStorage]]))
 
 (defn make-branch-from-storage
   "Create a Branch with addresses for lazy restoration"
   [keys addresses]
-  (branch/Branch. keys nil (into-array addresses) nil))
+  (branch/Branch. keys nil (into-array addresses)))
 
 (defn make-leaf-from-storage
   "Create a Leaf from stored data"
   [keys]
-  (leaf/Leaf. keys nil))
+  (leaf/Leaf. keys))
 
 (defrecord TestSyncStorage [*store]
   IStorage
@@ -49,7 +49,6 @@
   (restore [this address opts]
     (fn [resolve raise]
       (if (zero? delay-ms)
-        ;; Fast path: no delay = immediate callback
         (try
           (if-let [{:keys [type keys addresses]} (get @*store address)]
             (let [node (case type
@@ -78,7 +77,6 @@
   (store [_ node opts]
     (fn [resolve raise]
       (if (zero? delay-ms)
-        ;; Fast path: no delay = immediate callback
         (try
           (let [addr (random-uuid)
                 data (cond
@@ -95,10 +93,8 @@
             (resolve addr))
           (catch :default e
             (raise e)))
-        ;; Slow path: delay = async callback
         (js/setTimeout
          (fn []
-           ;; Wrap callback execution in smart-trampoline to restart await-cps context
            (smart-trampoline
             (fn []
               (try

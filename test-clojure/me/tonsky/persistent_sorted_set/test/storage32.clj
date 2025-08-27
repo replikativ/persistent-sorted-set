@@ -224,251 +224,297 @@
 (defn ks [node]
   (some->> (.-_keys ^ANode (unwrap node)) (filterv some?)))
 
-(deftest ascending-insert-control
-  (and
-   (testing "one item"
-     (reset! *stats {:reads 0 :writes 0 :accessed 0})
-     (let [original ^PersistentSortedSet (conj (set/sorted-set* {:branching-factor 32}) 0)]
-       (and
-        (is (= 0 (:writes @*stats)))
-        (is (= 0 (:reads @*stats)))
-        (is (instance? Leaf (unwrap (.-_root original))))
-        (is (nil? (.-_address original)))
-        (let [storage  (storage)
-              address (set/store original storage)]
-          (and
-           (is (uuid? address))
-           (is (= address (.-_address ^PersistentSortedSet original)))
-           (is (= 1 (:writes @*stats)))
-           (is (= 0 (:reads @*stats)))
-           (let [restored ^PersistentSortedSet (set/restore address storage {:branching-factor 32})]
-             (and
-              (is (= restored original))
-              (is (instance? Leaf (unwrap (.-_root restored))))
-              (is (= 1 (:reads @*stats))))))))))
-   (testing "saturated root leaf"
-     (reset! *stats {:reads 0 :writes 0 :accessed 0})
-     (let [original ^PersistentSortedSet (into (set/sorted-set* {:branching-factor 32}) (range 0 32))
-           root ^Leaf (unwrap (.-_root original))]
-       (and
-        (is (= 0 (:writes @*stats)))
-        (is (= 0 (:reads @*stats)))
-        (is (instance? Leaf root))
-        (is (= 32 (count (.-_keys root))))
-        (is (nil? (.-_address original)))
-        (let [storage  (storage)
-              address (set/store original storage)]
-          (and
-           (is (uuid? address))
-           (is (= address (.-_address ^PersistentSortedSet original)))
-           (is (= 1 (:writes @*stats)))
-           (is (= 0 (:reads @*stats)))
-           (let [restored ^PersistentSortedSet (set/restore address storage {:branching-factor 32})]
-             (and
-              (is (= restored original))
-              (is (instance? Leaf (unwrap (.-_root restored))))
-              (is (= 1 (:reads @*stats))))))))))
-   (testing "saturated root leaf + 1"
-     (reset! *stats {:reads 0 :writes 0 :accessed 0})
-     (let [original ^PersistentSortedSet (into (set/sorted-set* {:branching-factor 32}) (range 0 33))]
-       (and
-        (is (= 0 (:writes @*stats)))
-        (is (= 0 (:reads @*stats)))
-        (is (instance? Branch (unwrap (.-_root original))))
-        (let [children (children (.-_root original))]
-          (and
-           (is (= 2 (count children)))
-           (is (instance? Leaf (nth children 0)))
-           (is (= 16 (.-_len ^Leaf (nth children 0))))
-           (is (instance? Leaf (nth children 1)))
-           (is (= 17 (.-_len ^Leaf (nth children 1))))))
-        (is (nil? (.-_address original)))
-        (let [storage  (storage)
-              address (set/store original storage)]
-          (and
-           (is (uuid? address))
-           (is (= address (.-_address ^PersistentSortedSet original)))
-           (is (= 3 (:writes @*stats)))
-           (is (= 0 (:reads @*stats)))
-           (let [restored ^PersistentSortedSet (set/restore address storage {:branching-factor 32})]
-             (and
-              (is (= restored original))
-              (is (= 3 (:reads @*stats)))
-              (let [children (children (.-_root restored))]
-                (and
-                 (is (= 2 (count children)))
-                 (is (instance? Leaf (nth children 0)))
-                 (is (= 16 (.-_len ^Leaf (nth children 0))))
-                 (is (instance? Leaf (nth children 1)))
-                 (is (= 17 (.-_len ^Leaf (nth children 1)))))))))))))
-   (testing "32^2"
-     (reset! *stats {:reads 0 :writes 0 :accessed 0})
-     (let [original ^PersistentSortedSet
-           (into (set/sorted-set* {:branching-factor 32}) (range 0 1024))]
-       (and
-        (is (= 0 (:writes @*stats)))
-        (is (= 0 (:reads @*stats)))
-        (is (instance? Branch (unwrap (.-_root original))))
-        (let [children (children (.-_root original))
-              root-keys (ks (.-_root original))]
-          (and
-           (is (= 3 (count children)))
-           (is (= 3 (count root-keys)))
-           (is (every? #(instance? Branch %) children))
-           (is (= [255 511 1023] root-keys))))
-        (is (nil? (.-_address original)))
-        (let [storage  (storage)
-              address (set/store original storage)]
-          (and
-           (is (uuid? address))
-           (is (= address (.-_address ^PersistentSortedSet original)))
-           (is (= 67 (:writes @*stats)))
-           (is (= 0 (:reads @*stats)))
-           (is (empty? (deref (:*memory storage))))
-           (let [restored ^PersistentSortedSet (set/restore address storage {:branching-factor 32})]
-             (and
-              (is (empty? (deref (:*memory storage))))
-              (is (= 0 (:reads @*stats)))
-              (is (= restored original))
-              (is (= 67 (count (deref (:*memory storage)))))
-              (is (= 67 (:reads @*stats)))
-              (let [children (children (.-_root restored))
-                    root-keys (ks (.-_root original))]
-                (and
-                 (is (= 3 (count children)))
-                 (is (= 3 (count root-keys)))
-                 (is (every? #(instance? Branch %) children))
-                 (is (= [255 511 1023] root-keys)))))))))))
-   (testing "32^4"
-     (reset! *stats {:reads 0 :writes 0 :accessed 0})
-     (let [expected-root-keys [65535 131071 196607 262143 327679 393215 458751 524287 589823 655359 720895 786431 851967 917503 1048575]
-           original ^PersistentSortedSet
-           (into (set/sorted-set* {:branching-factor 32}) (range 0 (Math/pow 32 4)))]
-       (and
-        (is (= 0 (:writes @*stats)))
-        (is (= 0 (:reads @*stats)))
-        (is (instance? Branch (unwrap (.-_root original))))
-        (let [children (children (.-_root original))
-              root-keys (ks (.-_root original))]
-          (and
-           (is (= 15 (count children)))
-           (is (= 15 (count root-keys)))
-           (is (every? #(instance? Branch %) children))
-           (is (= expected-root-keys root-keys))))
-        (is (nil? (.-_address original)))
-        (let [storage  (storage)
-              address (set/store original storage)]
-          (and
-           (is (uuid? address))
-           (is (= address (.-_address ^PersistentSortedSet original)))
-           (is (= 69901 (:writes @*stats)))
-           (is (= 0 (:reads @*stats)))
-           (is (empty? (deref (:*memory storage))))
-           (let [restored ^PersistentSortedSet (set/restore address storage {:branching-factor 32})]
-             (and
-              (is (empty? (deref (:*memory storage))))
-              (is (= 0 (:reads @*stats)))
-              (is (= restored original))
-              (is (= (int (Math/pow 32 4)) (count restored)))
-              (is (= 69901 (count (deref (:*memory storage)))))
-              (is (= 69901 (:reads @*stats)))
-              (let [children (children (.-_root restored))
-                    root-keys (ks (.-_root original))]
-                (and
-                 (is (= 15 (count children)))
-                 (is (= 15 (count root-keys)))
-                 (is (every? #(instance? Branch %) children))
-                 (is (= expected-root-keys root-keys)))))))))))))
+(defn branch? [node] (instance? Branch (unwrap node)))
+(defn leaf? [node] (instance? Leaf (unwrap node)))
 
-(deftest test-lazyness
-  (let [size       100000
-        xs         (shuffle (range size))
-        rm         (vec (repeatedly (quot size 5) #(rand-nth xs)))
-        original   (-> (reduce disj (into (set/sorted-set* {:branching-factor 32}) xs) rm)
-                     (disj (quot size 4) (quot size 2)))
-        storage    (storage)
-        _          (is (= 0 (:writes @*stats)))
-        address    (with-stats (set/store original storage))
-        _          (is (< 4000 (:writes @*stats) 4096))
-        _          (is (= 0 (:reads @*stats)))
-        loaded     (set/restore address storage {:branching-factor 32})
-        _          (is (= 0 (:reads @*stats)))
-        _          (is (= 0.0 (loaded-ratio loaded)))
-        _          (is (= 1.0 (durable-ratio loaded)))
+(deftest branch-steps-control
+  (testing "32 steps"
+    (let [og ^PersistentSortedSet (into (set/sorted-set* {:branching-factor 32}) (range 0 32))]
+      (and
+       ;; full leaf at root
+       (is (= 32 (count og)))
+       (is (leaf? (.-_root og)))
+       (is (= 32 (count (ks (.-_root og)))))
+       (is (= (range 0 32) (ks (.-_root og))))
+       (let [og' ^PersistentSortedSet (conj og 32)]
+         ;; split first leaf
+         (and
+          (is (= 33 (count og')))
+          (is (branch? (.-_root og')))
+          (is (= 2 (count (ks (.-_root og')))))
+          (is (= [15 32] (ks (.-_root og'))))
+          (is (= 2 (count (children (.-_root og')))))
+          (is (= 16 (count (ks (nth (children (.-_root og')) 0)))))
+          (is (= (range 0 16) (ks (nth (children (.-_root og')) 0))))
+          (is (= 17 (count (ks (nth (children (.-_root og')) 1)))))
+          (is (= (range 16 33) (ks (nth (children (.-_root og')) 1))))
+          (let [og'' ^PersistentSortedSet (conj og' 33)]
+            ;; first add after split
+            (and
+             (is (= 34 (count og'')))
+             (is (branch? (.-_root og'')))
+             (is (= 2 (count (ks (.-_root og'')))))
+             (is (= [15 33] (ks (.-_root og''))))
+             (is (= 2 (count (children (.-_root og'')))))
+             (is (= 16 (count (ks (nth (children (.-_root og'')) 0)))))
+             (is (= (range 0 16) (ks (nth (children (.-_root og'')) 0))))
+             (is (= 18 (count (ks (nth (children (.-_root og'')) 1)))))
+             (is (= (range 16 34) (ks (nth (children (.-_root og'')) 1))))
+             (let [og''- ^PersistentSortedSet (disj og'' 33)]
+               (and
+                (is (= 33 (count og''-)))
+                (is (branch? (.-_root og''-)))
+                (is (= [15 32] (ks (.-_root og''-))))
+                (is (= 16 (count (ks (nth (children (.-_root og''-)) 0)))))
+                (is (= (range 0 16) (ks (nth (children (.-_root og''-)) 0))))
+                (is (= 17 (count (ks (nth (children (.-_root og''-)) 1)))))
+                (is (= (range 16 33) (ks (nth (children (.-_root og''-)) 1))))
+                (let [og''-- ^PersistentSortedSet (disj og''- 32)]
+                  (and
+                   (is (branch? (.-_root og''-)))
+                   (is (= 32 (count og''--)))
+                   (is (= (range 0 16) (ks (nth (children (.-_root og''--)) 0))))
+                   (is (= (range 16 32) (ks (nth (children (.-_root og''--)) 1))))))))))))))))
 
-        ; touch first 100
-        _       (is (= (take 100 loaded) (take 100 original)))
-        _       (is (<= 5 (:reads @*stats) 10))
-        l100    (loaded-ratio loaded)
-        _       (is (< 0 l100 1.0))
+ (deftest ascending-insert-control
+   (and
+    (testing "one item"
+      (reset! *stats {:reads 0 :writes 0 :accessed 0})
+      (let [original ^PersistentSortedSet (conj (set/sorted-set* {:branching-factor 32}) 0)]
+        (and
+         (is (= 0 (:writes @*stats)))
+         (is (= 0 (:reads @*stats)))
+         (is (instance? Leaf (unwrap (.-_root original))))
+         (is (nil? (.-_address original)))
+         (let [storage  (storage)
+               address (set/store original storage)]
+           (and
+            (is (uuid? address))
+            (is (= address (.-_address ^PersistentSortedSet original)))
+            (is (= 1 (:writes @*stats)))
+            (is (= 0 (:reads @*stats)))
+            (let [restored ^PersistentSortedSet (set/restore address storage {:branching-factor 32})]
+              (and
+               (is (= restored original))
+               (is (instance? Leaf (unwrap (.-_root restored))))
+               (is (= 1 (:reads @*stats))))))))))
+    (testing "saturated root leaf"
+      (reset! *stats {:reads 0 :writes 0 :accessed 0})
+      (let [original ^PersistentSortedSet (into (set/sorted-set* {:branching-factor 32}) (range 0 32))
+            root ^Leaf (unwrap (.-_root original))]
+        (and
+         (is (= 0 (:writes @*stats)))
+         (is (= 0 (:reads @*stats)))
+         (is (instance? Leaf root))
+         (is (= 32 (count (.-_keys root))))
+         (is (nil? (.-_address original)))
+         (let [storage  (storage)
+               address (set/store original storage)]
+           (and
+            (is (uuid? address))
+            (is (= address (.-_address ^PersistentSortedSet original)))
+            (is (= 1 (:writes @*stats)))
+            (is (= 0 (:reads @*stats)))
+            (let [restored ^PersistentSortedSet (set/restore address storage {:branching-factor 32})]
+              (and
+               (is (= restored original))
+               (is (leaf? (unwrap (.-_root restored))))
+               (is (= 1 (:reads @*stats))))))))))
+    (testing "saturated root leaf + 1"
+      (reset! *stats {:reads 0 :writes 0 :accessed 0})
+      (let [original ^PersistentSortedSet (into (set/sorted-set* {:branching-factor 32}) (range 0 33))]
+        (and
+         (is (= 0 (:writes @*stats)))
+         (is (= 0 (:reads @*stats)))
+         (is (instance? Branch (unwrap (.-_root original))))
+         (is (= 2 (count (children (.-_root original)))))
+         (is (= 2 (count (ks (.-_root original)))))
+         (is (every? leaf? (children (.-_root original))))
+         (is (= [15 32] (ks (.-_root original))))
+         (is (nil? (.-_address original)))
+         (let [storage  (storage)
+               address (set/store original storage)]
+           (and
+            (is (uuid? address))
+            (is (= address (.-_address ^PersistentSortedSet original)))
+            (is (= 3 (:writes @*stats)))
+            (is (= 0 (:reads @*stats)))
+            (let [restored ^PersistentSortedSet (set/restore address storage {:branching-factor 32})]
+              (and
+               (is (= restored original))
+               (is (= 3 (:reads @*stats)))
+               (is (= 2 (count (children (.-_root restored)))))
+               (is (= 2 (count (ks (.-_root restored)))))
+               (is (every? leaf? (children (.-_root restored))))
+               (is (= [15 32] (ks (.-_root restored)))))))))))
+    (testing "32^2"
+      (reset! *stats {:reads 0 :writes 0 :accessed 0})
+      (let [original ^PersistentSortedSet
+            (into (set/sorted-set* {:branching-factor 32}) (range 0 1024))]
+        (and
+         (is (= 0 (:writes @*stats)))
+         (is (= 0 (:reads @*stats)))
+         (is (instance? Branch (unwrap (.-_root original))))
+         (let [children (children (.-_root original))
+               root-keys (ks (.-_root original))]
+           (and
+            (is (= 3 (count children)))
+            (is (= 3 (count root-keys)))
+            (is (every? #(instance? Branch %) children))
+            (is (= [255 511 1023] root-keys))))
+         (is (nil? (.-_address original)))
+         (let [storage  (storage)
+               address (set/store original storage)]
+           (and
+            (is (uuid? address))
+            (is (= address (.-_address ^PersistentSortedSet original)))
+            (is (= 67 (:writes @*stats)))
+            (is (= 0 (:reads @*stats)))
+            (is (empty? (deref (:*memory storage))))
+            (let [restored ^PersistentSortedSet (set/restore address storage {:branching-factor 32})]
+              (and
+               (is (empty? (deref (:*memory storage))))
+               (is (= 0 (:reads @*stats)))
+               (is (= restored original))
+               (is (= 67 (count (deref (:*memory storage)))))
+               (is (= 67 (:reads @*stats)))
+               (let [children (children (.-_root restored))
+                     root-keys (ks (.-_root original))]
+                 (and
+                  (is (= 3 (count children)))
+                  (is (= 3 (count root-keys)))
+                  (is (every? #(instance? Branch %) children))
+                  (is (= [255 511 1023] root-keys)))))))))))
+    (testing "32^4"
+      (reset! *stats {:reads 0 :writes 0 :accessed 0})
+      (let [expected-root-keys [65535 131071 196607 262143 327679 393215 458751 524287 589823 655359 720895 786431 851967 917503 1048575]
+            original ^PersistentSortedSet
+            (into (set/sorted-set* {:branching-factor 32}) (range 0 (Math/pow 32 4)))]
+        (and
+         (is (= 0 (:writes @*stats)))
+         (is (= 0 (:reads @*stats)))
+         (is (instance? Branch (unwrap (.-_root original))))
+         (let [children (children (.-_root original))
+               root-keys (ks (.-_root original))]
+           (and
+            (is (= 15 (count children)))
+            (is (= 15 (count root-keys)))
+            (is (every? #(instance? Branch %) children))
+            (is (= expected-root-keys root-keys))))
+         (is (nil? (.-_address original)))
+         (let [storage  (storage)
+               address (set/store original storage)]
+           (and
+            (is (uuid? address))
+            (is (= address (.-_address ^PersistentSortedSet original)))
+            (is (= 69901 (:writes @*stats)))
+            (is (= 0 (:reads @*stats)))
+            (is (empty? (deref (:*memory storage))))
+            (let [restored ^PersistentSortedSet (set/restore address storage {:branching-factor 32})]
+              (and
+               (is (empty? (deref (:*memory storage))))
+               (is (= 0 (:reads @*stats)))
+               (is (= restored original))
+               (is (= (int (Math/pow 32 4)) (count restored)))
+               (is (= 69901 (count (deref (:*memory storage)))))
+               (is (= 69901 (:reads @*stats)))
+               (let [children (children (.-_root restored))
+                     root-keys (ks (.-_root original))]
+                 (and
+                  (is (= 15 (count children)))
+                  (is (= 15 (count root-keys)))
+                  (is (every? #(instance? Branch %) children))
+                  (is (= expected-root-keys root-keys)))))))))))))
 
-        ; touch first 5000
-        _       (is (= (take 5000 loaded) (take 5000 original)))
-        l5000   (loaded-ratio loaded)
-        _       (is (< l100 l5000 1.0))
+ (deftest test-lazyness
+   (let [size       100000
+         xs         (shuffle (range size))
+         rm         (vec (repeatedly (quot size 5) #(rand-nth xs)))
+         original   (-> (reduce disj (into (set/sorted-set* {:branching-factor 32}) xs) rm)
+                      (disj (quot size 4) (quot size 2)))
+         storage    (storage)
+         _          (is (= 0 (:writes @*stats)))
+         address    (with-stats (set/store original storage))
+         _          (is (< 4000 (:writes @*stats) 4096))
+         _          (is (= 0 (:reads @*stats)))
+         loaded     (set/restore address storage {:branching-factor 32})
+         _          (is (= 0 (:reads @*stats)))
+         _          (is (= 0.0 (loaded-ratio loaded)))
+         _          (is (= 1.0 (durable-ratio loaded)))
 
-        ; touch middle
-        from    (- (quot size 2) (quot size 200))
-        to      (+ (quot size 2) (quot size 200))
-        _       (is (= (vec (set/slice loaded from to))
-                      (vec (set/slice loaded from to))))
-        lmiddle (loaded-ratio loaded)
-        _       (is (< l5000 lmiddle 1.0))
+         ; touch first 100
+         _       (is (= (take 100 loaded) (take 100 original)))
+         _       (is (<= 5 (:reads @*stats) 10))
+         l100    (loaded-ratio loaded)
+         _       (is (< 0 l100 1.0))
 
-        ; touch 100 last
-        _       (is (= (take 100 (rseq loaded)) (take 100 (rseq original))))
-        lrseq   (loaded-ratio loaded)
-        _       (is (< lmiddle lrseq 1.0))
+         ; touch first 5000
+         _       (is (= (take 5000 loaded) (take 5000 original)))
+         l5000   (loaded-ratio loaded)
+         _       (is (< l100 l5000 1.0))
 
-        ; touch 10000 last
-        from    (- size (quot size 100))
-        to      size
-        _       (is (= (vec (set/slice loaded from to))
-                      (vec (set/slice loaded from 100000))))
-        ltail   (loaded-ratio loaded)
-        _       (is (< lrseq ltail 1.0))
+         ; touch middle
+         from    (- (quot size 2) (quot size 200))
+         to      (+ (quot size 2) (quot size 200))
+         _       (is (= (vec (set/slice loaded from to))
+                       (vec (set/slice loaded from to))))
+         lmiddle (loaded-ratio loaded)
+         _       (is (< l5000 lmiddle 1.0))
 
-        ; conj to beginning
-        loaded' (conj loaded -1)
-        _       (is (= ltail (loaded-ratio loaded')))
-        _       (is (< (durable-ratio loaded') 1.0))
+         ; touch 100 last
+         _       (is (= (take 100 (rseq loaded)) (take 100 (rseq original))))
+         lrseq   (loaded-ratio loaded)
+         _       (is (< lmiddle lrseq 1.0))
 
-        ; conj to middle
-        loaded' (conj loaded (quot size 2))
-        _       (is (= ltail (loaded-ratio loaded')))
-        _       (is (< (durable-ratio loaded') 1.0))
+         ; touch 10000 last
+         from    (- size (quot size 100))
+         to      size
+         _       (is (= (vec (set/slice loaded from to))
+                       (vec (set/slice loaded from 100000))))
+         ltail   (loaded-ratio loaded)
+         _       (is (< lrseq ltail 1.0))
 
-        ; conj to end
-        loaded' (conj loaded Long/MAX_VALUE)
-        _       (is (= ltail (loaded-ratio loaded')))
-        _       (is (< (durable-ratio loaded') 1.0))
+         ; conj to beginning
+         loaded' (conj loaded -1)
+         _       (is (= ltail (loaded-ratio loaded')))
+         _       (is (< (durable-ratio loaded') 1.0))
 
-        ; conj to untouched area
-        loaded' (conj loaded (quot size 4))
-        _       (is (< ltail (loaded-ratio loaded') 1.0))
-        _       (is (< ltail (loaded-ratio loaded) 1.0))
-        _       (is (< (durable-ratio loaded') 1.0))
+         ; conj to middle
+         loaded' (conj loaded (quot size 2))
+         _       (is (= ltail (loaded-ratio loaded')))
+         _       (is (< (durable-ratio loaded') 1.0))
 
-        ; transients conj
-        xs      (range -1000 0)
-        loaded' (into loaded xs)
-        _       (is (every? loaded' xs))
-        _       (is (< ltail (loaded-ratio loaded')))
-        _       (is (< (durable-ratio loaded') 1.0))
+         ; conj to end
+         loaded' (conj loaded Long/MAX_VALUE)
+         _       (is (= ltail (loaded-ratio loaded')))
+         _       (is (< (durable-ratio loaded') 1.0))
 
-        ; incremental persist
-        _       (with-stats
-                  (set/store loaded' storage))
-        _       (is (< (:writes @*stats) 80)) ;; ~ 1000 / 32 + 1000 / 32 / 32 + 1
-        _       (is (= 1.0 (durable-ratio loaded')))
+         ; conj to untouched area
+         loaded' (conj loaded (quot size 4))
+         _       (is (< ltail (loaded-ratio loaded') 1.0))
+         _       (is (< ltail (loaded-ratio loaded) 1.0))
+         _       (is (< (durable-ratio loaded') 1.0))
 
-        ; transient disj
-        xs      (take 100 loaded)
-        loaded' (reduce disj loaded xs)
-        _       (is (every? #(not (loaded' %)) xs))
-        _       (is (< (durable-ratio loaded') 1.0))
+         ; transients conj
+         xs      (range -1000 0)
+         loaded' (into loaded xs)
+         _       (is (every? loaded' xs))
+         _       (is (< ltail (loaded-ratio loaded')))
+         _       (is (< (durable-ratio loaded') 1.0))
 
-        ; count fetches everything
-        _       (is (= (count loaded) (count original)))
-        l0      (loaded-ratio loaded)
-        _       (is (= 1.0 l0))]))
+         ; incremental persist
+         _       (with-stats
+                   (set/store loaded' storage))
+         _       (is (< (:writes @*stats) 80)) ;; ~ 1000 / 32 + 1000 / 32 / 32 + 1
+         _       (is (= 1.0 (durable-ratio loaded')))
+
+         ; transient disj
+         xs      (take 100 loaded)
+         loaded' (reduce disj loaded xs)
+         _       (is (every? #(not (loaded' %)) xs))
+         _       (is (< (durable-ratio loaded') 1.0))
+
+         ; count fetches everything
+         _       (is (= (count loaded) (count original)))
+         l0      (loaded-ratio loaded)
+         _       (is (= 1.0 l0))]))

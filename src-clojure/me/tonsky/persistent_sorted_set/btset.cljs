@@ -4,22 +4,20 @@
   (:require [await-cps :refer [await] :refer-macros [async]]
             ; [is.simm.lean-cps.async :refer [await] :refer-macros [async]]
             [me.tonsky.persistent-sorted-set.arrays :as arrays]
-            ;;TODO capitalize and emit w/ macro
-            ; [me.tonsky.persistent-sorted-set.async-transducers :as at]
-            [me.tonsky.persistent-sorted-set.constants :refer [min-len avg-len max-len uninitialized-hash empty-path bits-per-level max-safe-path max-safe-level bit-mask]]
-            [me.tonsky.persistent-sorted-set.leaf :as leaf :refer [Leaf]]
             [me.tonsky.persistent-sorted-set.branch :as branch :refer [Branch]]
+            [me.tonsky.persistent-sorted-set.constants :refer [MIN_LEN AVG_LEN MAX_LEN UNINITIALIZED_HASH EMPTY_PATH BITS_PER_LEVEL MAX_SAFE_PATH MAX_SAFE_LEVEL BIT_MASK]]
+            [me.tonsky.persistent-sorted-set.leaf :as leaf :refer [Leaf]]
             [me.tonsky.persistent-sorted-set.impl.node :as node]
-            [me.tonsky.persistent-sorted-set.protocols :refer [IAsyncSeq INode IStorage] :as impl]
+            [me.tonsky.persistent-sorted-set.impl.storage :as storage]
             [me.tonsky.persistent-sorted-set.util :refer [rotate lookup-exact splice cut-n-splice binary-search-l binary-search-r return-array merge-n-split check-n-splice]]))
 
 (declare iter riter -seek* -rseek* -rpath BTSet)
 
 (defn alter
   ([^BTSet set root shift cnt]
-   (BTSet. root shift cnt (.-comparator set) (.-meta set) uninitialized-hash (.-storage set) (.-address set)))
+   (BTSet. root shift cnt (.-comparator set) (.-meta set) UNINITIALIZED_HASH (.-storage set) (.-address set)))
   ([^BTSet set root shift cnt cmp]
-   (BTSet. root shift cnt cmp (.-meta set) uninitialized-hash (.-storage set) (.-address set))))
+   (BTSet. root shift cnt cmp (.-meta set) UNINITIALIZED_HASH (.-storage set) (.-address set))))
 
 (defn- $$ensure-root
   [^BTSet set {:keys [sync?] :or {sync? true} :as opts}]
@@ -28,7 +26,8 @@
     (async
      (do
        (when (and (nil? (.-root set)) (some? (.-address set)))
-         (set! (.-root set) (await (impl/restore (.-storage set) (.-address set) opts)))))
+         (assert (implements? storage/IStorage (.-storage set)))
+         (set! (.-root set) (await (storage/restore (.-storage set) (.-address set) opts)))))
      (.-root set))))
 
 (defn- store-node
@@ -36,7 +35,7 @@
   (async+sync sync?
     (cond
       (instance? Leaf node)
-      (impl/store storage node opts)
+      (storage/store storage node opts)
 
       (instance? Branch node)
       (async
@@ -46,8 +45,8 @@
            (let [child (arrays/aget children i)
                  addr (await (store-node child storage opts))]
              (arrays/aset addresses i addr)))
-         (let [node-with-addresses (Branch. (.-keys node) nil addresses nil)
-               final-addr (await (impl/store storage node-with-addresses opts))]
+         (let [node-with-addresses (Branch. (.-keys node) nil addresses)
+               final-addr (await (storage/store storage node-with-addresses opts))]
            final-addr)))
 
       :else
@@ -124,7 +123,7 @@
 
           :else
           (alter set
-                 (Branch. (arrays/amap impl/node-lim-key roots) roots nil nil)
+                 (Branch. (arrays/amap node/max-key roots) roots nil)
                  (inc (.-shift set))
                  (inc (.-cnt set)))))))))
 
@@ -152,14 +151,14 @@
 
 (defn $store
   ([^BTSet set arg]
-   (if (implements? IStorage arg)
+   (if (implements? storage/IStorage arg)
      (do
        (set! (.-storage set) arg)
        ($store set arg {:sync? true}))
      ($store set (.-storage set) arg)))
   ([^BTSet set storage {:keys [sync?] :or {sync? true} :as opts}]
    (assert (instance? BTSet set))
-   (assert (implements? IStorage storage))
+   (assert (implements? storage/IStorage storage))
    (async+sync sync?
      (async
       (do
@@ -244,7 +243,7 @@
         cmp          (if (map? root-address-or-info)
                        (or (:comparator root-address-or-info) compare)
                        (or (:comparator opts) compare))]
-    (BTSet. nil shift -1 cmp meta uninitialized-hash storage address)))
+    (BTSet. nil shift -1 cmp meta UNINITIALIZED_HASH storage address)))
 
 #!------------------------------------------------------------------------------
 
@@ -252,7 +251,7 @@
   "Splits `arr` into arrays of size between min-len and max-len,
    trying to stick to (min+max)/2"
   [min-len max-len arr]
-  (let [chunk-len avg-len
+  (let [chunk-len AVG_LEN
         len       (arrays/alength arr)
         acc       (transient [])]
     (when (pos? len)
@@ -321,26 +320,26 @@
 (defn- path-eq ^boolean [^number path1 ^number path2]
   (== path1 path2))
 
-(def factors (into-array (map #(js/Math.pow 2 %) (range 0 52 bits-per-level))))
+(def factors (into-array (map #(js/Math.pow 2 %) (range 0 52 BITS_PER_LEVEL))))
 
 (defn- path-get ^number [^number path ^number level]
-  (if (< level max-safe-level)
+  (if (< level MAX_SAFE_LEVEL)
     (-> path
-      (unsigned-bit-shift-right (* level bits-per-level))
-      (bit-and bit-mask))
+      (unsigned-bit-shift-right (* level BITS_PER_LEVEL))
+      (bit-and BIT_MASK))
     (-> path
       (/ (arrays/aget factors level))
       (js/Math.floor)
-      (bit-and bit-mask))))
+      (bit-and BIT_MASK))))
 
 (defn- path-set ^number [^number path ^number level ^number idx]
-  (let [smol? (and (< path max-safe-path) (< level max-safe-level))
+  (let [smol? (and (< path MAX_SAFE_PATH) (< level MAX_SAFE_LEVEL))
         old   (path-get path level)
         minus (if smol?
-                (bit-shift-left old (* level bits-per-level))
+                (bit-shift-left old (* level BITS_PER_LEVEL))
                 (* old (arrays/aget factors level)))
         plus  (if smol?
-                (bit-shift-left idx (* level bits-per-level))
+                (bit-shift-left idx (* level BITS_PER_LEVEL))
                 (* idx (arrays/aget factors level)))]
     (-> path
       (- minus)
@@ -348,7 +347,7 @@
 
 (defn- $$_next-path
   [set node ^number path ^number level {:keys [sync?] :or {sync? true} :as opts}]
-  (assert (and (some? node) (implements? impl/INode node)))
+  (assert (and (some? node) (implements? node/INode node)))
   (async+sync sync?
     (async
      (let [idx (path-get path level)]
@@ -361,13 +360,13 @@
              ;; nested node overflow
              (if (< (inc idx) (arrays/alength (.-children node)))
                ;; advance current node idx, reset subsequent indexes
-               (path-set empty-path level (inc idx))
+               (path-set EMPTY_PATH level (inc idx))
                nil) ;; current node overflow
              ;; keep current idx
              (path-set sub-path level idx)))
          ;; leaf
          (if (< (inc idx) (arrays/alength (.-keys node)))
-           (path-set empty-path 0 (inc idx)) ;; advance leaf idx
+           (path-set EMPTY_PATH 0 (inc idx)) ;; advance leaf idx
            nil)))))) ;; leaf overflow
 
 (defn- $$next-path
@@ -377,16 +376,16 @@
   (async+sync sync?
     (async
      (if (neg? path)
-       empty-path
+       EMPTY_PATH
        (or
         (await ($$_next-path set (.-root set) path (.-shift set) opts))
         (path-inc (if (.-storage set)
-                    (await (-rpath (.-root set) empty-path (.-shift set) (.-storage set) {:sync? false}))
-                    (-rpath (.-root set) empty-path (.-shift set)))))))))
+                    (await (-rpath (.-root set) EMPTY_PATH (.-shift set) (.-storage set) {:sync? false}))
+                    (-rpath (.-root set) EMPTY_PATH (.-shift set)))))))))
 
 (defn- $$_prev-path
   [set node ^number path ^number level {:keys [sync?] :or {sync? true} :as opts}]
-  (assert (and (some? node) (implements? impl/INode node)))
+  (assert (and (some? node) (implements? node/INode node)))
   (async+sync sync?
     (async
       (let [idx (path-get path level)]
@@ -395,7 +394,7 @@
           nil ;; leaf overflow
 
           (== 0 level) ;; leaf
-          (path-set empty-path 0 (dec idx))
+          (path-set EMPTY_PATH 0 (dec idx))
 
           (>= idx (node/len node)) ;; branch that was overflow before
           (if (.-storage set)
@@ -436,24 +435,24 @@
          (-rpath (.-root set) path (.-shift set)))
        (or
         (await ($$_prev-path set (.-root set) path (.-shift set) opts))
-        (path-dec empty-path))))))
+        (path-dec EMPTY_PATH))))))
 
 (defn- path-same-leaf ^boolean [^number path1 ^number path2]
   (if (and
-       (< path1 max-safe-path)
-       (< path2 max-safe-path))
+       (< path1 MAX_SAFE_PATH)
+       (< path2 MAX_SAFE_PATH))
     (==
-     (unsigned-bit-shift-right path1 bits-per-level)
-     (unsigned-bit-shift-right path2 bits-per-level))
+     (unsigned-bit-shift-right path1 BITS_PER_LEVEL)
+     (unsigned-bit-shift-right path2 BITS_PER_LEVEL))
     (==
-     (Math/floor (/ path1 max-len))
-     (Math/floor (/ path2 max-len)))))
+     (Math/floor (/ path1 MAX_LEN))
+     (Math/floor (/ path2 MAX_LEN)))))
 
 (defn- path-str [^number path]
   (loop [res ()
            path path]
       (if (not= path 0)
-        (recur (cljs.core/conj res (mod path max-len)) (Math/floor (/ path max-len)))
+        (recur (cljs.core/conj res (mod path MAX_LEN)) (Math/floor (/ path MAX_LEN)))
         (vec res))))
 
 (defn- $$keys-for
@@ -626,10 +625,10 @@
 (defn iter ;;;------------------------------------------------------------------XXX should this be async?
   ([set]
    (when (pos? (node/len (.-root set)))
-     (let [left  empty-path
+     (let [left  EMPTY_PATH
            rpath (if (.-storage set)
-                   (-rpath (.-root set) empty-path (.-shift set) (.-storage set))
-                   (-rpath (.-root set) empty-path (.-shift set)))
+                   (-rpath (.-root set) EMPTY_PATH (.-shift set) (.-storage set))
+                   (-rpath (.-root set) EMPTY_PATH (.-shift set)))
            right ($$next-path set rpath {:sync? true})]
        (Iter. set left right ($$keys-for set left {:sync? true}) (path-get left 0)))))
   ([set left right]
@@ -745,24 +744,24 @@
    (let [{:keys [sync?] :or {sync? true}} opts]
      (async+sync sync?
        (async
-         (if (nil? key)
-           empty-path
-           (loop [node  (.-root set)
-                  path  empty-path
-                  level (.-shift set)]
-             (let [keys-l (node/len node)]
-               (if (== 0 level)
-                 (let [keys (.-keys node)
-                       idx  (binary-search-l comparator keys (dec keys-l) key)]
-                   (if (== keys-l idx)
-                     nil
-                     (path-set path 0 idx)))
-                 (let [keys (.-keys node)
-                       idx  (binary-search-l comparator keys (- keys-l 2) key)
-                       child-node (if (.-storage set)
-                                    (await (branch/$child node (.-storage set) idx opts))
-                                    (branch/child node idx))]
-                   (recur
+        (if (nil? key)
+          EMPTY_PATH
+          (loop [node  (.-root set)
+                 path  EMPTY_PATH
+                 level (.-shift set)]
+            (let [keys-l (node/len node)]
+              (if (== 0 level)
+                (let [keys (.-keys node)
+                      idx  (binary-search-l comparator keys (dec keys-l) key)]
+                  (if (== keys-l idx)
+                    nil
+                    (path-set path 0 idx)))
+                (let [keys (.-keys node)
+                      idx  (binary-search-l comparator keys (- keys-l 2) key)
+                      child-node (if (.-storage set)
+                                   (await (branch/$child node (.-storage set) idx opts))
+                                   (branch/child node idx))]
+                  (recur
                     child-node
                     (path-set path level idx)
                     (dec level))))))))))))
@@ -777,29 +776,29 @@
   ([^BTSet set key comparator {:keys [sync?] :or {sync? true} :as opts}]
    (async+sync sync?
      (async
-       (if (nil? key)
-         (path-inc (if (.-storage set)
-                     (await (-rpath (.-root set) empty-path (.-shift set) (.-storage set) opts))
-                     (-rpath (.-root set) empty-path (.-shift set))))
-         (loop [node  (.-root set)
-                path  empty-path
-                level (.-shift set)]
-           (let [keys-l (node/len node)]
-             (if (== 0 level)
-               (let [keys (.-keys node)
-                     idx  (binary-search-r comparator keys (dec keys-l) key)
-                     res  (path-set path 0 idx)]
-                 res)
-               (let [keys       (.-keys node)
-                     idx        (binary-search-r comparator keys (- keys-l 2) key)
-                     res        (path-set path level idx)
-                     child-node (if (.-storage set)
-                                  (await (branch/$child node (.-storage set) idx opts))
-                                  (branch/child node idx))]
-                 (recur
-                   child-node
-                   res
-                   (dec level)))))))))))
+      (if (nil? key)
+        (path-inc (if (.-storage set)
+                    (await (-rpath (.-root set) EMPTY_PATH (.-shift set) (.-storage set) opts))
+                    (-rpath (.-root set) EMPTY_PATH (.-shift set))))
+        (loop [node  (.-root set)
+               path  EMPTY_PATH
+               level (.-shift set)]
+          (let [keys-l (node/len node)]
+            (if (== 0 level)
+              (let [keys (.-keys node)
+                    idx  (binary-search-r comparator keys (dec keys-l) key)
+                    res  (path-set path 0 idx)]
+                res)
+              (let [keys       (.-keys node)
+                    idx        (binary-search-r comparator keys (- keys-l 2) key)
+                    res        (path-set path level idx)
+                    child-node (if (.-storage set)
+                                 (await (branch/$child node (.-storage set) idx opts))
+                                 (branch/child node idx))]
+                (recur
+                  child-node
+                  res
+                  (dec level)))))))))))
 
 (defn- slice-path-requires-storage?
   "Check if any nodes in the slice path need storage access.
@@ -848,6 +847,10 @@
 
 ;;------------------------------------------------------------------------------
 
+(defprotocol IAsyncSeq
+  (-afirst [this] "Returns async expression yielding first element")
+  (-arest [this] "Returns async expression yielding rest of sequence"))
+
 (deftype AsyncSeq [^BTSet set path till-path ^:mutable keys ^:mutable idx]
   IAsyncSeq
   (-afirst [this]
@@ -890,17 +893,17 @@
   (when (and path (path-lt path till-path))
     (AsyncSeq. set path till-path nil nil)))
 
-(defn afirst [s] (impl/-afirst s))
+(defn afirst [s] (-afirst s))
 
-(defn arest [s] (impl/-arest s))
+(defn arest [s] (-arest s))
 
 (defn async-iter ;;------------------------------------------------------------- TODO support comparator?
   ([^BTSet set]
    (async
     (let [root (await ($$ensure-root set {:sync? false}))]
       (when (pos? (node/len root))
-        (let [left  empty-path
-              rpath (await (-rpath root empty-path (.-shift set) (.-storage set) {:sync? false}))
+        (let [left  EMPTY_PATH
+              rpath (await (-rpath root EMPTY_PATH (.-shift set) (.-storage set) {:sync? false}))
               right (await ($$next-path set rpath {:sync? false}))]
           (async-seq set left right))))))
   ([^BTSet set from]
@@ -910,7 +913,7 @@
          (let [cmp  (.-comparator set)
                path (await (-seek* set from cmp {:sync? false}))]
            (when path
-             (let [rpath (await (-rpath root empty-path (.-shift set) (.-storage set) {:sync? false}))
+             (let [rpath (await (-rpath root EMPTY_PATH (.-shift set) (.-storage set) {:sync? false}))
                    right (await ($$next-path set rpath {:sync? false}))]
                (async-seq set path right))))))))
   ([^BTSet set from to]
@@ -947,7 +950,7 @@
   (-meta [_] meta)
 
   IEmptyableCollection
-  (-empty [_] (BTSet. (Leaf. (arrays/array) nil) 0 0 comparator meta uninitialized-hash storage address))
+  (-empty [_] (BTSet. (Leaf. (arrays/array)) 0 0 comparator meta UNINITIALIZED_HASH storage address))
 
   IEquiv
   (-equiv [this other] ($equivalent? this other {:sync? true}))
@@ -1016,18 +1019,18 @@
 (defn ^BTSet from-sorted-array
   [cmp arr _len opts]
   (let [leaves (->> arr
-                 (arr-partition-approx min-len max-len)
-                 (arr-map-inplace #(Leaf. % nil)))
+                 (arr-partition-approx MIN_LEN MAX_LEN)
+                 (arr-map-inplace #(Leaf. %)))
         storage (:storage opts)]
     (loop [current-level leaves
            shift 0]
       (case (count current-level)
-        0 (BTSet. (Leaf. (arrays/array) nil) 0 0 cmp nil uninitialized-hash storage nil)
-        1 (BTSet. (first current-level) shift (arrays/alength arr) cmp nil uninitialized-hash storage nil)
+        0 (BTSet. (Leaf. (arrays/array)) 0 0 cmp nil UNINITIALIZED_HASH storage nil)
+        1 (BTSet. (first current-level) shift (arrays/alength arr) cmp nil UNINITIALIZED_HASH storage nil)
         (recur
           (->> current-level
-            (arr-partition-approx min-len max-len)
-            (arr-map-inplace #(Branch. (arrays/amap impl/node-lim-key %) % nil nil)))
+            (arr-partition-approx MIN_LEN MAX_LEN)
+            (arr-map-inplace #(Branch. (arrays/amap node/max-key %) % nil)))
           (inc shift))))))
 
 (defn ^BTSet from-sequential [cmp seq]
@@ -1036,7 +1039,7 @@
 
 (defn ^BTSet sorted-set-by
   ([cmp]
-   (BTSet. (Leaf. (arrays/array) nil) 0 0 cmp nil uninitialized-hash nil nil))
+   (BTSet. (Leaf. (arrays/array)) 0 0 cmp nil UNINITIALIZED_HASH nil nil))
   ([cmp & keys]
    (from-sequential cmp keys)))
 
@@ -1046,5 +1049,5 @@
    - :comparator  Custom comparator (defaults to compare)
    - :meta     Metadata"
   [opts]
-  (BTSet. (Leaf. (arrays/array) nil) 0 0 (or (:comparator opts) compare)
-          (:meta opts) uninitialized-hash (:storage opts) nil))
+  (BTSet. (Leaf. (arrays/array)) 0 0 (or (:comparator opts) compare)
+          (:meta opts) UNINITIALIZED_HASH (:storage opts) nil))

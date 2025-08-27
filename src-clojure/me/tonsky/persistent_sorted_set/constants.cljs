@@ -1,29 +1,26 @@
 (ns me.tonsky.persistent-sorted-set.constants
   (:require [me.tonsky.persistent-sorted-set.arrays :as arrays]))
 
-(def ^:const max-safe-path
+(def ^:const MAX_SAFE_PATH
   "js limitation for bit ops"
   (js/Math.pow 2 31))
 
-(def ^:const bits-per-level
+(def ^:const BITS_PER_LEVEL
   "tunable param"
   5)
 
-(def ^:const max-len
-  (js/Math.pow 2 bits-per-level)) ;; 32
+(def ^:const MAX_LEN (js/Math.pow 2 BITS_PER_LEVEL)) ;; 32
 
-(def ^:const min-len
-  (/ max-len 2)) ;; 16
+(def ^:const MIN_LEN (/ MAX_LEN 2)) ;; 16
 
-(def ^:private ^:const avg-len
-  (arrays/half (+ max-len min-len))) ;; 24
+(def ^:private ^:const AVG_LEN
+  (arrays/half (+ MAX_LEN MIN_LEN))) ;; 24
 
-(def ^:const max-safe-level
-  (js/Math.floor (/ 31 bits-per-level))) ;; 6
+(def ^:const MAX_SAFE_LEVEL
+  (js/Math.floor (/ 31 BITS_PER_LEVEL))) ;; 6
 
-(def ^:const bit-mask
-  (- max-len 1)) ;; 0b011111 = 5 bit
+(def ^:const BIT_MASK (- MAX_LEN 1)) ;; 0b011111 = 5 bit
 
-(def ^:const uninitialized-hash nil)
+(def ^:const UNINITIALIZED_HASH nil)
 
-(def ^:const empty-path 0)
+(def ^:const EMPTY_PATH 0)
