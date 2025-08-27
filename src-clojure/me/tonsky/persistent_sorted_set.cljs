@@ -123,7 +123,10 @@
 
 (defn arest [set] (btset/arest set));;------------------------------------------TODO
 
+(def async-reduce btset/async-reduce)
+
 (def async-into btset/async-into)
+
 
 ; (defn asequence [])
 ; (defn atransduce [])

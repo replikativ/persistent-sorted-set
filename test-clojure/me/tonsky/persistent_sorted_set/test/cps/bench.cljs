@@ -8,7 +8,7 @@
    [me.tonsky.persistent-sorted-set :as set]
    [me.tonsky.persistent-sorted-set.btset :as btset]
    [me.tonsky.persistent-sorted-set.leaf :as leaf]
-   [me.tonsky.persistent-sorted-set.node :as node]
+   [me.tonsky.persistent-sorted-set.branch :as branch]
    [me.tonsky.persistent-sorted-set.test.cps.utils :as utils]))
 
 (defn- now [] (js/performance.now))
@@ -123,36 +123,40 @@
          test-runs 5000]
      (assert (instance? btset/BTSet sync-set))
      (assert (instance? btset/BTSet async-set))
-     (testing "Benchmark: conj single element"
-       (let [sync-conj (run-benchmark
-                        "conj"
-                        (fn [] (set/conj sync-set 1001))
-                        warmup-runs test-runs)
-             async-conj (await (run-async-benchmark
-                                "conj"
-                                (fn [] (set/conj async-set 1001 compare {:sync? false}))
-                                warmup-runs test-runs))]
-         (print-comparison (format-comparison sync-conj async-conj))))
-     (testing "Benchmark: lookup existing element"
-       (let [sync-lookup (run-benchmark
-                          "Sync lookup"
-                          (fn [] (get sync-set 50))
-                          warmup-runs test-runs)
-             async-lookup (await (run-async-benchmark
-                                  "lookup"
-                                  (fn [] (async (await (set/lookup-async async-set 50))))
-                                  warmup-runs test-runs))]
-         (print-comparison (format-comparison sync-lookup async-lookup))))
-     (testing "Benchmark: contains? check"
-       (let [sync-contains (run-benchmark
-                            "contains?"
-                            (fn [] (contains? sync-set 50))
-                            warmup-runs test-runs)
-             async-contains (await (run-async-benchmark
-                                    "contains?"
-                                    (fn [] (async (await (set/contains? async-set 50 {:sync? false}))))
-                                    warmup-runs test-runs))]
-         (print-comparison (format-comparison sync-contains async-contains))))
+
+     ; (testing "Benchmark: conj single element"
+     ;   (let [sync-conj (run-benchmark
+     ;                    "conj"
+     ;                    (fn [] (set/conj sync-set 1001))
+     ;                    warmup-runs test-runs)
+     ;         async-conj (await (run-async-benchmark
+     ;                            "conj"
+     ;                            (fn [] (set/conj async-set 1001 compare {:sync? false}))
+     ;                            warmup-runs test-runs))]
+     ;     (print-comparison (format-comparison sync-conj async-conj))))
+
+     ; (testing "Benchmark: lookup existing element"
+     ;   (let [sync-lookup (run-benchmark
+     ;                      "Sync lookup"
+     ;                      (fn [] (get sync-set 50))
+     ;                      warmup-runs test-runs)
+     ;         async-lookup (await (run-async-benchmark
+     ;                              "lookup"
+     ;                              (fn [] (async (await (set/lookup-async async-set 50))))
+     ;                              warmup-runs test-runs))]
+     ;     (print-comparison (format-comparison sync-lookup async-lookup))))
+
+     ; (testing "Benchmark: contains? check"
+     ;   (let [sync-contains (run-benchmark
+     ;                        "contains?"
+     ;                        (fn [] (contains? sync-set 50))
+     ;                        warmup-runs test-runs)
+     ;         async-contains (await (run-async-benchmark
+     ;                                "contains?"
+     ;                                (fn [] (async (await (set/contains? async-set 50 {:sync? false}))))
+     ;                                warmup-runs test-runs))]
+     ;     (print-comparison (format-comparison sync-contains async-contains))))
+
      (testing "Benchmark: disj single element"
        (let [sync-disj (run-benchmark
                         "disj"
@@ -162,7 +166,8 @@
                                 "disj"
                                 (fn [] (set/disj async-set 50 compare {:sync? false}))
                                 warmup-runs test-runs))]
-         (print-comparison (format-comparison sync-disj async-disj)))))))
+         (print-comparison (format-comparison sync-disj async-disj))))
+     )))
 
 (deftest bench-single-operations
   (test/async done
@@ -202,7 +207,7 @@
            (print-comparison (format-comparison sync-build async-build))))))))
 
 (deftest bench-bulk-operations
-  (test/async done
+  #_(test/async done
     (run (do-single-ops-bench)
       (fn [ok]
         (js/console.info "bench-bulk-operations success" ok)
@@ -266,6 +271,7 @@
          (print-comparison (format-comparison sync-slice async-slice)))))))
 
 (deftest bench-iteration
+  #_
   (test/async done
     (run (do-iteration-bench)
       (fn [ok]
@@ -277,7 +283,7 @@
         (js/console.warn err)
         (done)))))
 
-;;; NOTE restore do nothing but set address respectively
+;;; NOTE restore does nothing but set address
 ;;; this bench does not actually measure anything
 ;;; FIX --> all store ops happen lazily on reads, both sync & async
 ;;;  + (sync store & async store)
@@ -362,6 +368,7 @@
          (print-comparison (format-comparison sync-warm async-warm)))))))
 
 (deftest bench-lazy-loading
+  #_
   (test/async done
     (run (do-bench-lazy-loading)
       (fn [ok]

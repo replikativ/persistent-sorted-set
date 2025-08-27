@@ -2,14 +2,8 @@
 
 (defprotocol INode
   (node-lim-key       [_])
-  (node-len           [_])
   (node-merge         [_ next])
-  (node-merge-n-split [_ next])
-  (node-count         [_ storage opts])
-  (node-contains?     [_ storage key cmp opts])
-  (node-lookup        [_ cmp key storage opts])
-  (node-conj          [_ cmp key storage opts])
-  (node-disj          [_ cmp key root? left right storage opts]))
+  (node-merge-n-split [_ next]))
 
 (defprotocol IAsyncSeq
   (-afirst [this] "Returns async expression yielding first element")

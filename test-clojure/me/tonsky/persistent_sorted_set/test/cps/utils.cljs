@@ -5,14 +5,14 @@
             [await-cps :refer [await smart-trampoline] :refer-macros [async]]
             [me.tonsky.persistent-sorted-set :as set]
             [me.tonsky.persistent-sorted-set.btset :as btset]
+            [me.tonsky.persistent-sorted-set.branch :as branch]
             [me.tonsky.persistent-sorted-set.leaf :as leaf]
-            [me.tonsky.persistent-sorted-set.node :as node]
             [me.tonsky.persistent-sorted-set.protocols :refer [IStorage]]))
 
-(defn make-node-from-storage
-  "Create a Node with addresses for lazy restoration"
+(defn make-branch-from-storage
+  "Create a Branch with addresses for lazy restoration"
   [keys addresses]
-  (node/Node. keys nil (into-array addresses) nil))
+  (branch/Branch. keys nil (into-array addresses) nil))
 
 (defn make-leaf-from-storage
   "Create a Leaf from stored data"
@@ -24,14 +24,14 @@
   (restore [this address opts]
     (if-let [{:keys [type keys addresses]} (get @*store address)]
       (case type
-        :node (make-node-from-storage keys (vec addresses))
+        :branch (make-branch-from-storage keys (vec addresses))
         :leaf (make-leaf-from-storage keys))
       (throw (ex-info "Node not found" {:address address}))))
   (store [_ node opts]
     (let [addr (random-uuid)
           data (cond
-                 (= (type node) node/Node)
-                 {:type :node
+                 (= (type node) branch/Branch)
+                 {:type :branch
                   :keys (.-keys node)
                   :addresses (when (.-addresses node) (vec (.-addresses node)))}
                  (= (type node) leaf/Leaf)
@@ -53,7 +53,7 @@
         (try
           (if-let [{:keys [type keys addresses]} (get @*store address)]
             (let [node (case type
-                         :node (make-node-from-storage keys (vec addresses))
+                         :branch (make-branch-from-storage keys (vec addresses))
                          :leaf (make-leaf-from-storage keys))]
               (resolve node))
             (raise (ex-info "Node not found" {:address address})))
@@ -66,8 +66,7 @@
               (try
                 (if-let [{:keys [type keys addresses]} (get @*store address)]
                   (let [node (case type
-                               :node
-                               (make-node-from-storage keys (vec addresses))
+                               :branch (make-branch-from-storage keys (vec addresses))
                                :leaf
                                (make-leaf-from-storage keys))]
                     (resolve node))
@@ -83,8 +82,8 @@
         (try
           (let [addr (random-uuid)
                 data (cond
-                       (= (type node) node/Node)
-                       {:type :node
+                       (= (type node) branch/Branch)
+                       {:type :branch
                         :keys (.-keys node)
                         :addresses (when (.-addresses node) (vec (.-addresses node)))}
                        (= (type node) leaf/Leaf)
@@ -105,8 +104,8 @@
               (try
                 (let [addr (random-uuid)
                       data (cond
-                             (= (type node) node/Node)
-                             {:type :node
+                             (= (type node) branch/Branch)
+                             {:type :branch
                               :keys (.-keys node)
                               :addresses (when (.-addresses node) (vec (.-addresses node)))}
                              (= (type node) leaf/Leaf)
@@ -139,3 +138,15 @@
                    (await (set/conj s n compare {:sync? false})))))
               s0
               (range n))))))
+
+(defn group [label f]
+  (fn [resolve err]
+    (js/console.group label)
+    (f
+     (fn [ok]
+       (js/console.groupEnd label)
+       (resolve ok))
+     (fn [error]
+       (js/console.groupEnd label)
+       (err err)))))
+

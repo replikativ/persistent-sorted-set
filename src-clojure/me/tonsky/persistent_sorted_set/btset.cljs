@@ -8,7 +8,8 @@
             ; [me.tonsky.persistent-sorted-set.async-transducers :as at]
             [me.tonsky.persistent-sorted-set.constants :refer [min-len avg-len max-len uninitialized-hash empty-path bits-per-level max-safe-path max-safe-level bit-mask]]
             [me.tonsky.persistent-sorted-set.leaf :as leaf :refer [Leaf]]
-            [me.tonsky.persistent-sorted-set.node :as node :refer [Node]]
+            [me.tonsky.persistent-sorted-set.branch :as branch :refer [Branch]]
+            [me.tonsky.persistent-sorted-set.impl.node :as node]
             [me.tonsky.persistent-sorted-set.protocols :refer [IAsyncSeq INode IStorage] :as impl]
             [me.tonsky.persistent-sorted-set.util :refer [rotate lookup-exact splice cut-n-splice binary-search-l binary-search-r return-array merge-n-split check-n-splice]]))
 
@@ -37,7 +38,7 @@
       (instance? Leaf node)
       (impl/store storage node opts)
 
-      (instance? Node node)
+      (instance? Branch node)
       (async
        (let [children (.-children node)
              addresses (arrays/make-array (arrays/alength children))]
@@ -45,7 +46,7 @@
            (let [child (arrays/aget children i)
                  addr (await (store-node child storage opts))]
              (arrays/aset addresses i addr)))
-         (let [node-with-addresses (Node. (.-keys node) nil addresses nil)
+         (let [node-with-addresses (Branch. (.-keys node) nil addresses nil)
                final-addr (await (impl/store storage node-with-addresses opts))]
            final-addr)))
 
@@ -61,7 +62,7 @@
      (do
        (when (neg? (.-cnt set))
          (let [root (await ($$ensure-root set opts))]
-           (set! (.-cnt set) (await (impl/node-count root (.-storage set) opts)))))
+           (set! (.-cnt set) (await (node/$count root (.-storage set) opts)))))
        (.-cnt set)))))
 
 (defn $contains?
@@ -69,7 +70,7 @@
   (async+sync sync?
     (async
       (let [root (await ($$ensure-root set opts))]
-        (await (impl/node-contains? root (.-storage set) key (.-comparator set) opts))))))
+        (await (node/$contains? root (.-storage set) key (.-comparator set) opts))))))
 
 (declare async-iter afirst arest)
 
@@ -111,7 +112,7 @@
    (async+sync sync?
     (async
       (let [root (await ($$ensure-root set opts))
-            roots (await (impl/node-conj root cmp key (.-storage set) opts))]
+            roots (await (node/$add root (.-storage set) key cmp opts))]
         (cond
           (nil? roots) set
 
@@ -123,7 +124,7 @@
 
           :else
           (alter set
-                 (Node. (arrays/amap impl/node-lim-key roots) roots nil nil)
+                 (Branch. (arrays/amap impl/node-lim-key roots) roots nil nil)
                  (inc (.-shift set))
                  (inc (.-cnt set)))))))))
 
@@ -135,24 +136,19 @@
   ([^BTSet set key cmp {:keys [sync?] :or {sync? true} :as opts}]
    (async+sync sync?
     (async
-     (let [new-roots (await (impl/node-disj (.-root set) cmp key true nil nil (.-storage set) opts))]
+     (let [root (await ($$ensure-root set opts))
+           new-roots (await (node/$remove root (.-storage set) key nil nil cmp opts))]
        (if (nil? new-roots) ;; nothing changed, key wasn't in the set
          set
-         (let [new-root (arrays/aget new-roots 0)]
-           (if (and (instance? Node new-root)
-                    (== 1 (arrays/alength (.-children new-root))))
-
-             ;; root has one child, make him new root
-             (alter set
-                    (arrays/aget (.-children new-root) 0)
-                    (dec (.-shift set))
-                    (dec (.-cnt set)))
-
-             ;; keeping root level
-             (alter set
-                    new-root
-                    (.-shift set)
-                    (dec (.-cnt set)))))))))))
+         (let [new-root (arrays/aget new-roots 0)
+               new-root  (if (and (instance? Branch new-root)
+                                  (== 1 (arrays/alength (.-children new-root))))
+                           (await (branch/$child new-root (.-storage set) 0 opts))
+                           new-root)]
+           (alter set
+                  new-root
+                  (.-shift set)
+                  (dec (.-cnt set))))))))))
 
 (defn $store
   ([^BTSet set arg]
@@ -358,8 +354,8 @@
      (let [idx (path-get path level)]
        (if (pos? level)
          (let [child-node (if (.-storage set)
-                            (await (node/$child node (.-storage set) idx opts))
-                            (node/child node idx))
+                            (await (branch/$child node (.-storage set) idx opts))
+                            (branch/child node idx))
                sub-path (await ($$_next-path set child-node path (dec level) opts))]
            (if (nil? sub-path)
              ;; nested node overflow
@@ -401,15 +397,15 @@
           (== 0 level) ;; leaf
           (path-set empty-path 0 (dec idx))
 
-          (>= idx (impl/node-len node)) ;; branch that was overflow before
+          (>= idx (node/len node)) ;; branch that was overflow before
           (if (.-storage set)
             (await (-rpath node path level (.-storage set) opts))
             (-rpath node path level))
 
           :else
           (let [child-node (if (.-storage set)
-                             (await (node/$child node (.-storage set) idx opts))
-                             (node/child node idx))
+                             (await (branch/$child node (.-storage set) idx opts))
+                             (branch/child node idx))
                 path' (await ($$_prev-path set child-node path (dec level) opts))]
             (cond
               (some? path') ;; no sub-overflow, keep current idx
@@ -421,8 +417,8 @@
               ;; nested overflow, advance current idx, reset subsequent indexes
               :else
               (let [child-node (if (.-storage set)
-                                  (await (node/$child node (.-storage set) (dec idx) opts))
-                                  (node/child node (dec idx)))
+                                  (await (branch/$child node (.-storage set) (dec idx) opts))
+                                  (branch/child node (dec idx)))
                     path' (if (.-storage set)
                             (await (-rpath child-node path (dec level) (.-storage set) opts))
                             (-rpath child-node path (dec level)))]
@@ -460,8 +456,6 @@
         (recur (cljs.core/conj res (mod path max-len)) (Math/floor (/ path max-len)))
         (vec res))))
 
-;;;-----------------------------------------------------------------------------
-
 (defn- $$keys-for
   "Returns keys array for the leaf node at the given path."
   [set path {:keys [sync?] :or {sync? true} :as opts}]
@@ -473,8 +467,8 @@
          (recur
            (dec level)
            (if (.-storage set)
-             (await (node/$child node (.-storage set) (path-get path level) opts))
-             (node/child node (path-get path level))))
+             (await (branch/$child node (.-storage set) (path-get path level) opts))
+             (branch/child node (path-get path level))))
          (.-keys node))))))
 
 ;;;-----------------------------------------------------------------------------
@@ -631,7 +625,7 @@
 
 (defn iter ;;;------------------------------------------------------------------XXX should this be async?
   ([set]
-   (when (pos? (impl/node-len (.-root set)))
+   (when (pos? (node/len (.-root set)))
      (let [left  empty-path
            rpath (if (.-storage set)
                    (-rpath (.-root set) empty-path (.-shift set) (.-storage set))
@@ -726,8 +720,8 @@
                (async
                 (if (pos? level)
                   ;; inner node
-                  (let [last-idx (dec (impl/node-len node))
-                        child-node (await (node/$child node storage last-idx opts))]
+                  (let [last-idx (dec (node/len node))
+                        child-node (await (branch/$child node storage last-idx opts))]
                     (await (-rpath child-node
                                    (path-set path level last-idx)
                                    (dec level)
@@ -735,43 +729,6 @@
                                    opts)))
                   ;; leaf
                   (path-set path 0 (dec (arrays/alength (.-keys node)))))))))
-
-
-
-#!------------------------------------------------------------------------------
-
-(defn- -distance [^BTSet set ^Node node left right level];;---------------------BUG should be async+sync
-  (let [idx-l (path-get left level)
-        idx-r (path-get right level)]
-    (if (pos? level)
-      ;; inner node
-      (if (== idx-l idx-r)
-        (-distance set (if (.-storage set)
-                          (node/$child node (.-storage set) idx-l {:sync? true})
-                          (node/child node idx-l))
-                   left
-                   right
-                   (dec level))
-        (loop [level level
-               res   (- idx-r idx-l)]
-          (if (== 0 level)
-            res
-            (recur (dec level) (* res avg-len)))))
-      (- idx-r idx-l))))
-
-(defn- distance [^BTSet set path-l path-r];;------------------------------------BUG should be async+sync
-  (cond
-    (path-eq path-l path-r)
-    0
-
-    (path-eq (path-inc path-l) path-r)
-    1
-
-    (path-eq ($$next-path set path-l {:sync? true}) path-r)
-    1
-
-    :else
-    (-distance set (.-root set) path-l path-r (.-shift set))))
 
 #!------------------------------------------------------------------------------
 
@@ -793,7 +750,7 @@
            (loop [node  (.-root set)
                   path  empty-path
                   level (.-shift set)]
-             (let [keys-l (impl/node-len node)]
+             (let [keys-l (node/len node)]
                (if (== 0 level)
                  (let [keys (.-keys node)
                        idx  (binary-search-l comparator keys (dec keys-l) key)]
@@ -803,8 +760,8 @@
                  (let [keys (.-keys node)
                        idx  (binary-search-l comparator keys (- keys-l 2) key)
                        child-node (if (.-storage set)
-                                    (await (node/$child node (.-storage set) idx opts))
-                                    (node/child node idx))]
+                                    (await (branch/$child node (.-storage set) idx opts))
+                                    (branch/child node idx))]
                    (recur
                     child-node
                     (path-set path level idx)
@@ -827,7 +784,7 @@
          (loop [node  (.-root set)
                 path  empty-path
                 level (.-shift set)]
-           (let [keys-l (impl/node-len node)]
+           (let [keys-l (node/len node)]
              (if (== 0 level)
                (let [keys (.-keys node)
                      idx  (binary-search-r comparator keys (dec keys-l) key)
@@ -837,19 +794,12 @@
                      idx        (binary-search-r comparator keys (- keys-l 2) key)
                      res        (path-set path level idx)
                      child-node (if (.-storage set)
-                                  (await (node/$child node (.-storage set) idx opts))
-                                  (node/child node idx))]
+                                  (await (branch/$child node (.-storage set) idx opts))
+                                  (branch/child node idx))]
                  (recur
                    child-node
                    res
                    (dec level)))))))))))
-
-(defn- node-requires-storage?
-  "Check if a node itself needs to be loaded from storage"
-  [node]
-  (and (instance? Node node)
-       (.-addresses node)           ; Has storage addresses
-       (nil? (.-children node))))   ; But children not loaded yet
 
 (defn- slice-path-requires-storage?
   "Check if any nodes in the slice path need storage access.
@@ -858,7 +808,7 @@
   [^BTSet set node key-from key-to level]
   (let [cmp (.-comparator set)
         keys (.-keys node)]
-    (when (instance? Node node)
+    (when (instance? Branch node)
       (let [keys-l (arrays/alength keys)
             ;; Find which children the slice bounds span
             from-idx (if key-from
@@ -944,14 +894,34 @@
 
 (defn arest [s] (impl/-arest s))
 
-(defn async-iter [^BTSet set]
-  (async
+(defn async-iter ;;------------------------------------------------------------- TODO support comparator?
+  ([^BTSet set]
+   (async
     (let [root (await ($$ensure-root set {:sync? false}))]
-      (when (pos? (impl/node-len root))
+      (when (pos? (node/len root))
         (let [left  empty-path
               rpath (await (-rpath root empty-path (.-shift set) (.-storage set) {:sync? false}))
               right (await ($$next-path set rpath {:sync? false}))]
           (async-seq set left right))))))
+  ([^BTSet set from]
+   (async
+     (let [root (await ($$ensure-root set {:sync? false}))]
+       (when (pos? (node/len root))
+         (let [cmp  (.-comparator set)
+               path (await (-seek* set from cmp {:sync? false}))]
+           (when path
+             (let [rpath (await (-rpath root empty-path (.-shift set) (.-storage set) {:sync? false}))
+                   right (await ($$next-path set rpath {:sync? false}))]
+               (async-seq set path right))))))))
+  ([^BTSet set from to]
+   (async
+     (let [root (await ($$ensure-root set {:sync? false}))]
+       (when (pos? (node/len root))
+         (let [cmp  (.-comparator set)
+               path (await (-seek*  set from cmp {:sync? false}))
+               till (await (-rseek* set to   cmp {:sync? false}))]
+           (when (and path (path-lt path till))
+             (async-seq set path till))))))))
 
 (defn async-slice
   "Async version of slice that returns an AsyncSeq."
@@ -1057,7 +1027,7 @@
         (recur
           (->> current-level
             (arr-partition-approx min-len max-len)
-            (arr-map-inplace #(Node. (arrays/amap impl/node-lim-key %) % nil nil)))
+            (arr-map-inplace #(Branch. (arrays/amap impl/node-lim-key %) % nil nil)))
           (inc shift))))))
 
 (defn ^BTSet from-sequential [cmp seq]
