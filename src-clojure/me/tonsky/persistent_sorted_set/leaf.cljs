@@ -6,12 +6,14 @@
             [me.tonsky.persistent-sorted-set.arrays :as arrays]
             [me.tonsky.persistent-sorted-set.constants :refer [MAX_LEN]]
             [me.tonsky.persistent-sorted-set.impl.node :as node :refer [INode]]
+            [me.tonsky.persistent-sorted-set.impl.storage :as storage]
             [me.tonsky.persistent-sorted-set.util :as util]))
 
 (deftype Leaf [keys]
   Object
   (toString [_] (pr-str* (vec keys)))
   INode
+  (level [_] 0)
   (max-key [_] (arrays/alast keys))
   (len [_] (arrays/alength keys))
   (merge [_ next] (Leaf. (arrays/aconcat keys (.-keys next))))
@@ -55,4 +57,10 @@
        (async
         (when-not (== -1 idx)
           (let [new-keys (util/splice keys idx (inc idx) (arrays/array))]
-            (util/rotate (Leaf. new-keys) root? left right))))))))
+            (util/rotate (Leaf. new-keys) root? left right)))))))
+  ($store [this storage {:keys [sync?] :or {sync? true} :as opts}]
+    (async+sync sync?
+     (async
+      (await (storage/store storage this opts)))))
+  ($walk-addresses [this storage on-address {:keys [sync?] :or {sync? true}}]
+    (when-not sync? (async))))

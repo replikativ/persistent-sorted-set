@@ -133,6 +133,14 @@
 
 #!------------------------------------------------------------------------------
 
+(defn walk-addresses
+  "Visit each address used by this set. Usable for cleaning up
+   garbage left in storage from previous versions of the set"
+  ([^BTSet set consume-fn]
+   (btset/$walk-addresses set consume-fn {:sync? true}))
+  ([^BTSet set consume-fn opts]
+   (btset/$walk-addresses set consume-fn opts)))
+
 (defn store
   "Accepts optional opts map with {:sync? true/false} (defaults to true).
    returns address specified by storage"

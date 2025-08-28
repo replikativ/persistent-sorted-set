@@ -196,28 +196,36 @@
           (invariant set'))))))
 
 (deftest test-walk
-  (let [size    1000000
-        xs      (shuffle (range size))
+  (let [size    1000
+        xs      (range size)
         set     (into (set/sorted-set* {:branching-factor 32}) xs)
+        *pre-store (atom 0)
         *stored (atom 0)]
-    (set/walk-addresses set
-      (fn [addr]
-        (is (nil? addr))))
-    (set/store set (storage))
-    (set/walk-addresses set
-      (fn [addr]
-        (is (some? addr))
-        (swap! *stored inc)))
-    (let [set'     (conj set (* 2 size))
-          *stored' (atom 0)]
-      (set/walk-addresses set'
-        (fn [addr]
-          (if (some? addr)
-            (swap! *stored' inc))))
-      (is (= (- @*stored 5) @*stored')))))
+    (and
+     (is (nil? (set/walk-addresses set (fn [addr] (swap! *pre-store inc)))))
+     (is (zero? @*pre-store))
+     (is (uuid? (set/store set (storage))))
+     (is (nil? (set/walk-addresses set (fn [addr] (swap! *stored inc)))))
+     (is (= 66 @*stored))
+     (let [set'     (conj set (* 2 size))
+           *stored' (atom 0)]
+       (and
+        (is (nil? (set/walk-addresses set' (fn [addr] (if (some? addr) (swap! *stored' inc))))))
+        (is (= 63 @*stored'))))
+     (let [set'     (disj set (dec size))
+           *stored' (atom 0)]
+       (and
+        (is (nil? (set/walk-addresses set' (fn [addr] (if (some? addr) (swap! *stored' inc))))))
+        (is (= 63 @*stored')))))))
 
 (defn unwrap [^Object node]
   (if (instance? Reference node) (.get ^Reference node) node))
+
+(defn ^ANode root [^PersistentSortedSet set]
+  (unwrap (.-_root set)))
+
+(defn addresses [node]
+  (some->> (.-_addresses ^Branch (unwrap node)) (mapv unwrap) (filter some?)))
 
 (defn children [node]
   (some->> (.-_children ^Branch (unwrap node)) (mapv unwrap) (filter some?)))
@@ -285,7 +293,7 @@
         (and
          (is (= 0 (:writes @*stats)))
          (is (= 0 (:reads @*stats)))
-         (is (leaf? (unwrap (.-_root original))))
+         (is (leaf? (root original)))
          (is (nil? (.-_address original)))
          (let [storage  (storage)
                address (set/store original storage)]
@@ -332,6 +340,7 @@
          (is (= 2 (count (ks (.-_root original)))))
          (is (every? leaf? (children (.-_root original))))
          (is (= [15 32] (ks (.-_root original))))
+         (is (nil? (addresses (root original))) "we have not called store() yet")
          (is (nil? (.-_address original)))
          (let [storage  (storage)
                address (set/store original storage)]
@@ -340,10 +349,12 @@
             (is (= address (.-_address ^PersistentSortedSet original)))
             (is (= 3 (:writes @*stats)))
             (is (= 0 (:reads @*stats)))
+            (is (= 2 (count (addresses (root original)))) "root branch stored 2 leafs at 2 address")
             (let [restored ^PersistentSortedSet (set/restore address storage {:branching-factor 32})]
               (and
                (is (= restored original))
                (is (= 3 (:reads @*stats)))
+               (is (= 2 (count (addresses (root restored)))) "restored root branch has those address it just read from")
                (is (= 2 (count (children (.-_root restored)))))
                (is (= 2 (count (ks (.-_root restored)))))
                (is (every? leaf? (children (.-_root restored))))
@@ -388,42 +399,47 @@
     (testing "32^4"
       (reset! *stats {:reads 0 :writes 0 :accessed 0})
       (let [expected-root-keys [65535 131071 196607 262143 327679 393215 458751 524287 589823 655359 720895 786431 851967 917503 1048575]
-            original ^PersistentSortedSet
-            (into (set/sorted-set* {:branching-factor 32}) (range 0 (Math/pow 32 4)))]
+            original ^PersistentSortedSet (into (set/sorted-set* {:branching-factor 32}) (range 0 (Math/pow 32 4)))
+            *original (atom 0)]
         (and
          (is (= 0 (:writes @*stats)))
          (is (= 0 (:reads @*stats)))
-         (let [children (children (.-_root original))
-               root-keys (ks (.-_root original))]
-           (and
-            (is (= 15 (count children)))
-            (is (= 15 (count root-keys)))
-            (is (every? branch? children))
-            (is (= expected-root-keys root-keys))))
+         (is (= 15 (count (children (.-_root original)))))
+         (is (= 15 (count (ks (.-_root original)))))
+         (is (every? branch? (children (.-_root original))))
+         (is (= expected-root-keys (ks (.-_root original))))
+         (is (nil? (addresses (root original))) "we have not called store() yet")
          (is (nil? (.-_address original)))
+         (is (nil? (set/walk-addresses original (fn [_] (swap! *original inc)))))
+         (is (zero? @*original))
          (let [storage  (storage)
-               address (set/store original storage)]
+               address (set/store original storage)
+               *stored (atom 0)]
            (and
             (is (uuid? address))
             (is (= address (.-_address ^PersistentSortedSet original)))
             (is (= 69901 (:writes @*stats)))
+            (is (= 15 (count (addresses (root original)))) "the original holds the addresses it just wrote to")
             (is (= 0 (:reads @*stats)))
             (is (empty? (deref (:*memory storage))))
-            (let [restored ^PersistentSortedSet (set/restore address storage {:branching-factor 32})]
+            (is (nil? (set/walk-addresses original (fn [_] (swap! *stored inc)))))
+            (is (= 69901 @*stored))
+            (let [restored ^PersistentSortedSet (set/restore address storage {:branching-factor 32})
+                  *restored (atom 0)]
               (and
                (is (empty? (deref (:*memory storage))))
                (is (= 0 (:reads @*stats)))
                (is (= restored original))
+               (is (nil? (set/walk-addresses restored (fn [_] (swap! *restored inc)))))
+               (is (= 69901 @*restored))
                (is (= (int (Math/pow 32 4)) (count restored)))
                (is (= 69901 (count (deref (:*memory storage)))))
                (is (= 69901 (:reads @*stats)))
-               (let [children (children (.-_root restored))
-                     root-keys (ks (.-_root original))]
-                 (and
-                  (is (= 15 (count children)))
-                  (is (= 15 (count root-keys)))
-                  (is (every? branch? children))
-                  (is (= expected-root-keys root-keys)))))))))))))
+               (is (= 15 (count (addresses (root restored)))) "restored root branch has those address it just read from")
+               (is (= 15 (count (children (.-_root restored)))))
+               (is (= 15 (count (ks (.-_root original)))))
+               (is (every? branch? (children (.-_root restored))))
+               (is (= expected-root-keys (ks (.-_root original)))))))))))))
 
 (defn seeded-shuffle [coll ^Random rnd]
   (let [al (ArrayList. ^List coll)]
