@@ -7,8 +7,9 @@
   (:import
     [clojure.lang RT]
     [java.lang.ref Reference]
-    [java.util Comparator Arrays]
-    [me.tonsky.persistent_sorted_set ANode ArrayUtil Branch IStorage Leaf PersistentSortedSet Settings]))
+    [java.util ArrayList Collections Comparator Arrays List Random]
+    (java.util.random RandomGenerator)
+    (me.tonsky.persistent_sorted_set ANode Branch Leaf PersistentSortedSet IStorage Settings)))
 
 (set! *warn-on-reflection* true)
 
@@ -271,7 +272,7 @@
                 (is (= (range 16 33) (ks (nth (children (.-_root og''-)) 1))))
                 (let [og''-- ^PersistentSortedSet (disj og''- 32)]
                   (and
-                   (is (branch? (.-_root og''-)))
+                   (is (branch? (.-_root og''--)))
                    (is (= 32 (count og''--)))
                    (is (= (range 0 16) (ks (nth (children (.-_root og''--)) 0))))
                    (is (= (range 16 32) (ks (nth (children (.-_root og''--)) 1))))))))))))))))
@@ -284,7 +285,7 @@
         (and
          (is (= 0 (:writes @*stats)))
          (is (= 0 (:reads @*stats)))
-         (is (instance? Leaf (unwrap (.-_root original))))
+         (is (leaf? (unwrap (.-_root original))))
          (is (nil? (.-_address original)))
          (let [storage  (storage)
                address (set/store original storage)]
@@ -296,7 +297,7 @@
             (let [restored ^PersistentSortedSet (set/restore address storage {:branching-factor 32})]
               (and
                (is (= restored original))
-               (is (instance? Leaf (unwrap (.-_root restored))))
+               (is (leaf? (unwrap (.-_root restored))))
                (is (= 1 (:reads @*stats))))))))))
     (testing "saturated root leaf"
       (reset! *stats {:reads 0 :writes 0 :accessed 0})
@@ -305,7 +306,7 @@
         (and
          (is (= 0 (:writes @*stats)))
          (is (= 0 (:reads @*stats)))
-         (is (instance? Leaf root))
+         (is (leaf? root))
          (is (= 32 (count (.-_keys root))))
          (is (nil? (.-_address original)))
          (let [storage  (storage)
@@ -326,7 +327,7 @@
         (and
          (is (= 0 (:writes @*stats)))
          (is (= 0 (:reads @*stats)))
-         (is (instance? Branch (unwrap (.-_root original))))
+         (is (branch? (.-_root original)))
          (is (= 2 (count (children (.-_root original)))))
          (is (= 2 (count (ks (.-_root original)))))
          (is (every? leaf? (children (.-_root original))))
@@ -354,7 +355,6 @@
         (and
          (is (= 0 (:writes @*stats)))
          (is (= 0 (:reads @*stats)))
-         (is (instance? Branch (unwrap (.-_root original))))
          (let [children (children (.-_root original))
                root-keys (ks (.-_root original))]
            (and
@@ -383,7 +383,7 @@
                  (and
                   (is (= 3 (count children)))
                   (is (= 3 (count root-keys)))
-                  (is (every? #(instance? Branch %) children))
+                  (is (every? branch? children))
                   (is (= [255 511 1023] root-keys)))))))))))
     (testing "32^4"
       (reset! *stats {:reads 0 :writes 0 :accessed 0})
@@ -393,13 +393,12 @@
         (and
          (is (= 0 (:writes @*stats)))
          (is (= 0 (:reads @*stats)))
-         (is (instance? Branch (unwrap (.-_root original))))
          (let [children (children (.-_root original))
                root-keys (ks (.-_root original))]
            (and
             (is (= 15 (count children)))
             (is (= 15 (count root-keys)))
-            (is (every? #(instance? Branch %) children))
+            (is (every? branch? children))
             (is (= expected-root-keys root-keys))))
          (is (nil? (.-_address original)))
          (let [storage  (storage)
@@ -423,98 +422,122 @@
                  (and
                   (is (= 15 (count children)))
                   (is (= 15 (count root-keys)))
-                  (is (every? #(instance? Branch %) children))
+                  (is (every? branch? children))
                   (is (= expected-root-keys root-keys)))))))))))))
 
- (deftest test-lazyness
-   (let [size       100000
-         xs         (shuffle (range size))
-         rm         (vec (repeatedly (quot size 5) #(rand-nth xs)))
-         original   (-> (reduce disj (into (set/sorted-set* {:branching-factor 32}) xs) rm)
-                      (disj (quot size 4) (quot size 2)))
-         storage    (storage)
-         _          (is (= 0 (:writes @*stats)))
-         address    (with-stats (set/store original storage))
-         _          (is (< 4000 (:writes @*stats) 4096))
-         _          (is (= 0 (:reads @*stats)))
-         loaded     (set/restore address storage {:branching-factor 32})
-         _          (is (= 0 (:reads @*stats)))
-         _          (is (= 0.0 (loaded-ratio loaded)))
-         _          (is (= 1.0 (durable-ratio loaded)))
+(defn seeded-shuffle [coll ^Random rnd]
+  (let [al (ArrayList. ^List coll)]
+    (^[List RandomGenerator] Collections/shuffle al rnd)
+    (vec al)))
 
-         ; touch first 100
-         _       (is (= (take 100 loaded) (take 100 original)))
-         _       (is (<= 5 (:reads @*stats) 10))
-         l100    (loaded-ratio loaded)
-         _       (is (< 0 l100 1.0))
+(defn rand-nth-seeded [coll ^Random rnd]
+  (nth coll (.nextInt rnd (count coll))))
 
-         ; touch first 5000
-         _       (is (= (take 5000 loaded) (take 5000 original)))
-         l5000   (loaded-ratio loaded)
-         _       (is (< l100 l5000 1.0))
+(defn test-lazyness-impl [seed]
+  (reset! *stats {:reads 0 :writes 0 :accessed 0})
+  (let [rnd      (Random. seed)
+        size     100000
+        xs       (seeded-shuffle (range size) rnd)
+        rm       (vec (repeatedly (quot size 5) #(rand-nth-seeded xs rnd)))
+        original (-> (reduce disj (into (set/sorted-set* {:branching-factor 32}) xs) rm)
+                     (disj (quot size 4) (quot size 2)))
+        storage  (storage)
+        _        (is (= 0 (:writes @*stats)))
+        address  (with-stats (set/store original storage))
+        _        (is (< 4000 (:writes @*stats) 4096))
+        _        (is (= 0 (:reads @*stats)))
+        loaded   (set/restore address storage {:branching-factor 32})
+        _        (is (= 0 (:reads @*stats)))
+        _        (is (= 0.0 (loaded-ratio loaded)))
+        _        (is (= 1.0 (durable-ratio loaded)))
 
-         ; touch middle
-         from    (- (quot size 2) (quot size 200))
-         to      (+ (quot size 2) (quot size 200))
-         _       (is (= (vec (set/slice loaded from to))
+        ; touch first 100
+        _       (is (= (take 100 loaded) (take 100 original)))
+        _       (is (<= 5 (:reads @*stats) 10))
+        l100    (loaded-ratio loaded)
+        _       (is (< 0 l100 1.0))
+
+        ; touch first 5000
+        _       (is (= (take 5000 loaded) (take 5000 original)))
+        l5000   (loaded-ratio loaded)
+        _       (is (< l100 l5000 1.0))
+
+        ; touch middle
+        from    (- (quot size 2) (quot size 200))
+        to      (+ (quot size 2) (quot size 200))
+        _       (is (= (vec (set/slice loaded from to))
                        (vec (set/slice loaded from to))))
-         lmiddle (loaded-ratio loaded)
-         _       (is (< l5000 lmiddle 1.0))
+        lmiddle (loaded-ratio loaded)
+        _       (is (< l5000 lmiddle 1.0))
 
-         ; touch 100 last
-         _       (is (= (take 100 (rseq loaded)) (take 100 (rseq original))))
-         lrseq   (loaded-ratio loaded)
-         _       (is (< lmiddle lrseq 1.0))
+        ; touch 100 last
+        _       (is (= (take 100 (rseq loaded)) (take 100 (rseq original))))
+        lrseq   (loaded-ratio loaded)
+        _       (is (< lmiddle lrseq 1.0))
 
-         ; touch 10000 last
-         from    (- size (quot size 100))
-         to      size
-         _       (is (= (vec (set/slice loaded from to))
+        ; touch 10000 last
+        from    (- size (quot size 100))
+        to      size
+        _       (is (= (vec (set/slice loaded from to))
                        (vec (set/slice loaded from 100000))))
-         ltail   (loaded-ratio loaded)
-         _       (is (< lrseq ltail 1.0))
+        ltail   (loaded-ratio loaded)
+        _       (is (< lrseq ltail 1.0))
 
-         ; conj to beginning
-         loaded' (conj loaded -1)
-         _       (is (= ltail (loaded-ratio loaded')))
-         _       (is (< (durable-ratio loaded') 1.0))
+        ; conj to beginning
+        loaded' (conj loaded -1)
+        _       (is (= ltail (loaded-ratio loaded')))
+        _       (is (< (durable-ratio loaded') 1.0))
 
-         ; conj to middle
-         loaded' (conj loaded (quot size 2))
-         _       (is (= ltail (loaded-ratio loaded')))
-         _       (is (< (durable-ratio loaded') 1.0))
+        ; conj to middle
+        loaded' (conj loaded (quot size 2))
+        _       (is (= ltail (loaded-ratio loaded')))
+        _       (is (< (durable-ratio loaded') 1.0))
 
-         ; conj to end
-         loaded' (conj loaded Long/MAX_VALUE)
-         _       (is (= ltail (loaded-ratio loaded')))
-         _       (is (< (durable-ratio loaded') 1.0))
+        ; conj to end
+        loaded' (conj loaded Long/MAX_VALUE)
+        _       (is (= ltail (loaded-ratio loaded')))
+        _       (is (< (durable-ratio loaded') 1.0))
 
-         ; conj to untouched area
-         loaded' (conj loaded (quot size 4))
-         _       (is (< ltail (loaded-ratio loaded') 1.0))
-         _       (is (< ltail (loaded-ratio loaded) 1.0))
-         _       (is (< (durable-ratio loaded') 1.0))
+        ; conj to untouched area
+        loaded' (conj loaded (quot size 4))
+        _       (is (< ltail (loaded-ratio loaded') 1.0))
+        _       (is (< ltail (loaded-ratio loaded) 1.0))
+        _       (is (< (durable-ratio loaded') 1.0))
 
-         ; transients conj
-         xs      (range -1000 0)
-         loaded' (into loaded xs)
-         _       (is (every? loaded' xs))
-         _       (is (< ltail (loaded-ratio loaded')))
-         _       (is (< (durable-ratio loaded') 1.0))
+        ; transients conj
+        xs      (range -1000 0)
+        loaded' (into loaded xs)
+        _       (is (every? loaded' xs))
+        _       (is (< ltail (loaded-ratio loaded')))
+        _       (is (< (durable-ratio loaded') 1.0))
 
-         ; incremental persist
-         _       (with-stats
-                   (set/store loaded' storage))
-         _       (is (< (:writes @*stats) 80)) ;; ~ 1000 / 32 + 1000 / 32 / 32 + 1
-         _       (is (= 1.0 (durable-ratio loaded')))
+        ; incremental persist
+        _       (with-stats
+                  (set/store loaded' storage))
+        _       (is (< (:writes @*stats) 80)) ;; ~ 1000 / 32 + 1000 / 32 / 32 + 1
+        _       (is (= 1.0 (durable-ratio loaded')))
 
-         ; transient disj
-         xs      (take 100 loaded)
-         loaded' (reduce disj loaded xs)
-         _       (is (every? #(not (loaded' %)) xs))
-         _       (is (< (durable-ratio loaded') 1.0))
+        ; transient disj
+        xs      (take 100 loaded)
+        loaded' (reduce disj loaded xs)
+        _       (is (every? #(not (loaded' %)) xs))
+        _       (is (< (durable-ratio loaded') 1.0))
 
-         ; count fetches everything
-         _       (is (= (count loaded) (count original)))
-         l0      (loaded-ratio loaded)
-         _       (is (= 1.0 l0))]))
+        ; count fetches everything
+        _       (is (= (count loaded) (count original)))
+        l0      (loaded-ratio loaded)
+        _       (is (= 1.0 l0))]))
+
+(deftest test-lazyness
+  (let [seed (System/currentTimeMillis)]
+    (println (str "Running test-lazyness with seed: " seed))
+    (try
+      (reset! *stats {:reads 0 :writes 0 :accessed 0})
+      (test-lazyness-impl seed)
+      (catch Exception e
+        (println (str "FAIL: test-lazyness failed with seed: " seed))
+        (throw e)))))
+
+(comment
+  (dotimes [_ 20] (test-lazyness))
+  )
