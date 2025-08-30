@@ -257,7 +257,7 @@
             (let [restored (set/restore address storage {})]
               (and
                (is (= 0 (:reads @*stats)))
-               (is (true? (await (set/equivalent? restored original {:sync? false}))))
+               (is (true? (await (set/equiv? restored original {:sync? false}))))
                (is (= 1 (:reads @*stats)))
                (is (leaf? (.-root restored))))))))))
     (testing "full-leaf + 1"
@@ -285,7 +285,7 @@
             (let [restored (set/restore address storage {})]
               (and
                (is (= 0 (:reads @*stats)))
-               (is (true? (await (set/equivalent? restored original {:sync? false}))))
+               (is (true? (await (set/equiv? restored original {:sync? false}))))
                (is (= 3 (:reads @*stats)))
                (is (= 2 (count (children (.-root restored)))))
                (is (every? leaf? (children (.-root restored))))
@@ -329,7 +329,7 @@
               (and
                (is (empty? (deref (:*memory storage))))
                (is (= 0 (:reads @*stats)))
-               (is (true? (await (set/equivalent? restored original {:sync? false}))))
+               (is (true? (await (set/equiv? restored original {:sync? false}))))
                (is (= 69901 (:reads @*stats)))
                (is (nil? (await (set/walk-addresses restored (fn [_] (swap! *restored inc)) {:sync? false}))))
                (is (= 69901 @*restored))

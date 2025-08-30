@@ -463,16 +463,20 @@
   (-copy [_ l r] (Iter. set l r ($$keys-for set l {:sync? true}) (path-get l 0)))
 
   IEquiv
-  (-equiv [this other] (equiv-sequential this other))
+  (-equiv [this other]
+    (equiv-sequential this other))
 
   ISequential
   ISeqable
-  (-seq [this] (when keys this))
+  (-seq [this]
+    (when keys this))
 
   ISeq
-  (-first [_] (when keys (arrays/aget keys idx)))
+  (-first [_]
+    (when keys (arrays/aget keys idx)))
 
-  (-rest [this] (or (-next this) ()))
+  (-rest [this]
+    (or (-next this) ()))
 
   INext
   (-next [this]
@@ -544,7 +548,8 @@
       (riter set ($$prev-path set left {:sync? true}) ($$prev-path set right {:sync? true}))))
 
   ISeek
-  (-seek [this key] (-seek this key (.-comparator set)))
+  (-seek [this key]
+    (-seek this key (.-comparator set)))
 
   (-seek [this key cmp]
     (cond
@@ -912,6 +917,35 @@
                       false
                       (recur (rest items))))))))))))
 
+(defn $equivalent-sequential?
+  [^BTSet set other {:keys [sync?] :or {sync? true} :as opts}]
+  (assert (instance? BTSet set))
+  (if sync?
+    (cljs.core/equiv-sequential set other)
+    (async
+      (if (instance? BTSet other)
+        (throw (ex-info "BTSet $equivalent-sequential? unimplemented" {:other other}))
+        (if (implements? IAsyncSeq other)
+          (throw (ex-info "IAsyncSeq $equivalent-sequential? unimplemented" {:other other}))
+          (if (not (sequential? other))
+            false
+            (let [cnt-x (await ($count set opts))
+                  cnt-y (count other)]
+              (if (not= cnt-x cnt-y)
+                false
+                (loop [xs (await ($$iter set opts))
+                       ys (seq other)]
+                  (if (nil? xs)
+                    (nil? ys)
+                    (if (nil? ys)
+                      false
+                      (let [x (await (afirst xs))]
+                        (if (nil? x)
+                          (nil? ys)
+                          (if (= x (first ys))
+                            (recur (await (arest xs)) (next ys))
+                            false))))))))))))))
+
 #!------------------------------------------------------------------------------
 
 (deftype BTSet [root cnt comparator meta ^:mutable _hash storage address]
@@ -931,7 +965,8 @@
   (-empty [_] (BTSet. (Leaf. (arrays/array)) 0 comparator meta UNINITIALIZED_HASH storage address))
 
   IEquiv
-  (-equiv [this other] ($equivalent? this other {:sync? true}))
+  (-equiv [this other]
+    ($equivalent? this other {:sync? true}))
 
   IHash
   (-hash [this] (caching-hash this hash-unordered-coll _hash))
@@ -947,7 +982,8 @@
   (-lookup [this k not-found] ($lookup this k not-found {:sync? true}))
 
   ISeqable
-  (-seq [this] ($$iter this {:sync? true}))
+  (-seq [this]
+    ($$iter this {:sync? true}))
 
   IReduce
   (-reduce [this f] (if-let [i ($$iter this {:sync? true})] (-reduce i f) (f)))

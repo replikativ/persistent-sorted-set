@@ -44,9 +44,13 @@
   ([^BTSet set key] (btset/$contains? set key {:sync? true}))
   ([^BTSet set key opts] (btset/$contains? set key opts)))
 
-(defn equivalent?
+(defn equiv?
   ([set other] (btset/$equivalent? set other {:sync? true}))
   ([set other opts] (btset/$equivalent? set other opts)))
+
+(defn equiv-sequential?
+  ([set other] (btset/$equivalent-sequential? set other {:sync? true}))
+  ([set other opts] (btset/$equivalent-sequential? set other opts)))
 
 (defn conj
   "Analogue to [[clojure.core/conj]] but with comparator that overrides the one stored in set.
