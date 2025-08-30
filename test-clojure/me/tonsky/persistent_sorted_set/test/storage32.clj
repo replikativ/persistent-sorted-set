@@ -236,6 +236,8 @@
 (defn branch? [node] (instance? Branch (unwrap node)))
 (defn leaf? [node] (instance? Leaf (unwrap node)))
 
+(defn level [^ANode node] (.level node))
+
 (deftest branch-steps-control
   (testing "32 steps"
     (let [og ^PersistentSortedSet (into (set/sorted-set* {:branching-factor 32}) (range 0 32))]
@@ -407,6 +409,7 @@
          (is (= 15 (count (children (.-_root original)))))
          (is (= 15 (count (ks (.-_root original)))))
          (is (every? branch? (children (.-_root original))))
+         (is (= [3 3 3 3 3 3 3 3 3 3 3 3 3 3 3] (mapv level (children (.-_root original)))))
          (is (= expected-root-keys (ks (.-_root original))))
          (is (nil? (addresses (root original))) "we have not called store() yet")
          (is (nil? (.-_address original)))
@@ -435,6 +438,7 @@
                (is (= (int (Math/pow 32 4)) (count restored)))
                (is (= 69901 (count (deref (:*memory storage)))))
                (is (= 69901 (:reads @*stats)))
+               (is (= [3 3 3 3 3 3 3 3 3 3 3 3 3 3 3] (mapv level (children (.-_root restored)))))
                (is (= 15 (count (addresses (root restored)))) "restored root branch has those address it just read from")
                (is (= 15 (count (children (.-_root restored)))))
                (is (= 15 (count (ks (.-_root original)))))

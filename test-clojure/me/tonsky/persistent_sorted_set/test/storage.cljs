@@ -1,4 +1,5 @@
 (ns me.tonsky.persistent-sorted-set.test.storage
+  (:require-macros [me.tonsky.persistent-sorted-set.test.macros :refer [testing-group]])
   (:require
    [await-cps :refer [await run-async] :refer-macros [async] :rename {run-async run}]
    ; [is.simm.lean-cps.async :refer [await run] :refer-macros [async]]
@@ -9,97 +10,9 @@
    [me.tonsky.persistent-sorted-set.impl.storage :refer [IStorage]]
    [me.tonsky.persistent-sorted-set.btset :refer [BTSet]]
    [me.tonsky.persistent-sorted-set.leaf :refer [Leaf] :as leaf]
-   [me.tonsky.persistent-sorted-set.branch :refer [Branch] :as branch]))
-
-(def ^:dynamic *debug* false)
-
-(defn dbg [& args]
-  (when *debug*
-    (apply println args)))
-
-(defn gen-addr [] (random-uuid))
-
-(def *stats
-  (atom
-    {:reads 0
-     :writes 0
-     :accessed 0}))
-
-(defn branch? [node] (instance? Branch node))
-(defn leaf? [node] (instance? Leaf node))
-
-(defrecord Storage [*memory *disk]
-  IStorage
-  (store [_ node opts]
-    (assert (not (false? (:sync? opts))))
-    (dbg "store<" (type node) ">")
-    (swap! *stats update :writes inc)
-    (let [address (gen-addr)]
-      (swap! *disk assoc address
-             (pr-str
-              {:level     (.-shift node) ;;<------------------------------------TODO FIX ME
-               :keys      (.-keys node)
-               :addresses (when (branch? node) (.-addresses node))}))
-      address))
-  (restore [_ address opts]
-    (assert (not (false? (:sync? opts))))
-    (or
-     (@*memory address)
-     (let [{:keys [keys addresses level]} (edn/read-string (@*disk address))
-           node (if addresses
-                  (let [n (Branch. keys nil addresses)]
-                    (set! (.-level n) level) ;;<--------------------------------TODO FIX ME
-                    n)
-                  (Leaf. keys))]
-       (dbg "restored<" (type node) ">")
-       (swap! *stats update :reads inc)
-       (swap! *memory assoc address node)
-       node)))
-  (accessed [_ address] (swap! *stats update :accessed inc) nil))
-
-(defn storage
-  ([] (->Storage (atom {}) (atom {})))
-  ([*disk] (->Storage (atom {}) *disk))
-  ([*memory *disk] (->Storage *memory *disk)))
-
-#!------------------------------------------------------------------------------
-
-(defrecord AsyncStorage [*memory *disk]
-  IStorage
-  (store [_ node opts]
-    (assert (false? (:sync? opts)))
-    (dbg "store<" (type node) ">")
-    (swap! *stats update :writes inc)
-    (let [address (gen-addr)]
-      (swap! *disk assoc address
-            (pr-str
-             {:level     (.-shift node) ;;<--------------------------------------TODO FIX ME
-              :keys      (.-keys node)
-              :addresses (when (branch? node) (.-addresses node))}))
-    (async address)))
-  (restore [_ address opts]
-    (assert (false? (:sync? opts)))
-    (async
-     (or
-      (@*memory address)
-      (let [{:keys [keys addresses level]} (edn/read-string (@*disk address))
-            node (if addresses
-                   (let [n (Branch. keys nil addresses)]
-                     (set! (.-level n) level) ;;<--------------------------------TODO FIX ME
-                     n)
-                   (Leaf. keys))]
-        (dbg "restored<" (type node) ">")
-        (swap! *stats update :reads inc)
-        (swap! *memory assoc address node)
-        node))))
-  (accessed [_ address] (swap! *stats update :accessed inc) nil))
-
-(defn async-storage
-  ([] (->AsyncStorage (atom {}) (atom {})))
-  ([*disk] (->AsyncStorage (atom {}) *disk))
-  ([*memory *disk] (->AsyncStorage *memory *disk)))
-
-#!------------------------------------------------------------------------------
+   [me.tonsky.persistent-sorted-set.branch :refer [Branch] :as branch]
+   [me.tonsky.persistent-sorted-set.test.storage.util
+    :refer [storage async-storage branch? leaf?]]))
 
 (defn children [node] (some->> (.-children node) (filter some?)))
 
@@ -130,17 +43,87 @@
         (is (nil? (set/walk-addresses set' (fn [addr] (if (some? addr) (swap! *stored' inc))))))
         (is (= 63 @*stored')))))))
 
+(deftest test-small-sync-restoration
+  (and
+   (testing "seq"
+     (let [storage (storage)
+           stored (into (set/sorted-set) (range 10 20))
+           address (set/store stored storage)]
+       (and
+        (testing-group "control"
+         (is (= (range 10 20) (seq (into (set/sorted-set) (range 10 20)))) "control"))
+        (testing-group "flushed"
+         (is (= (range 10 20) (seq stored)) "seq works on set that just flushed"))
+        (testing-group "restored"
+         (is (= (range 10 20) (seq (set/restore address storage))) "seq works on unrealized lazy state")))))
+   (testing "slice"
+     (let [storage (storage)
+           stored  (into (set/sorted-set) (range 0 40))
+           address (set/store stored storage)]
+       (and
+        (testing-group "control"
+         (is (= (range 10 20) (set/slice (into (set/sorted-set) (range 0 40)) 10 19)) "control"))
+        (testing-group "flushed"
+         (is (= (range 10 20) (set/slice stored 10 19)) "slice works on set that just flushed"))
+        (testing-group "restored"
+         (is (= (range 10 20) (set/slice (set/restore address storage) 10 19)) "slice works on unrealized lazy state")))))
+   (testing "slice reversed order"
+     (let [storage (storage)
+           stored  (into (set/sorted-set) (reverse (range 0 100)))
+           address (set/store stored storage)]
+       (and
+        (testing-group "control"
+          (is (= (range 10 20)
+                 (set/slice (into (set/sorted-set) (reverse (range 0 100))) 10 19))
+              "control"))
+        (testing-group "flushed"
+          (is (= (range 10 20) (set/slice stored 10 19))
+              "slice works on set that just flushed"))
+        (testing-group "restored"
+          (is (= (range 10 20)
+                 (set/slice (set/restore address storage) 10 19))
+              "slice works on unrealized lazy state")))))
+   (testing "rseq"
+     (let [storage (storage)
+           stored  (into (set/sorted-set) (range 10 20))
+           address (set/store stored storage)]
+       (and
+        (testing-group "control"
+          (is (= (range 19 9 -1) (rseq (into (set/sorted-set) (range 10 20)))) "control"))
+        (testing-group "flushed"
+          (is (= (range 19 9 -1) (rseq stored)) "rseq works on set that just flushed"))
+        (testing-group "restored"
+          (is (= (range 19 9 -1) (rseq (set/restore address storage))) "rseq works on unrealized lazy state")))))
+   (testing "rslice"
+     (let [storage (storage)
+           stored  (into (set/sorted-set) (range 0 40))
+           address (set/store stored storage)]
+       (and
+        (testing-group "control"
+          (is (= (range 19 9 -1)
+                 (set/rslice (into (set/sorted-set) (range 0 40)) 19 10))
+              "control"))
+        (testing-group "flushed"
+          (is (= (range 19 9 -1) (set/rslice stored 19 10))
+              "rslice works on set that just flushed"))
+        (testing-group "restored"
+          (is (= (range 19 9 -1) (set/rslice (set/restore address storage) 19 10))
+              "rslice works on unrealized lazy state")))))
+   (testing "reversing rseq is original sort"
+     (let [storage (storage)
+           stored  (into (set/sorted-set) (shuffle (range 0 5001)))
+           address (set/store stored storage)]
+       (and
+        (testing-group "control"
+         (let [x (set/rslice (into (set/sorted-set) (shuffle (range 0 5001))) 5000 nil)]
+           (is (= x (some-> x rseq reverse)) "control")))
+        (testing-group "flushed"
+         (let [x (set/rslice stored 5000 nil)]
+           (is (= x (some-> x rseq reverse)) "rseq reversibility on flushed set")))
+        (testing-group "restored"
+         (let [x (set/rslice (set/restore address storage) 5000 nil)]
+           (is (= x (some-> x rseq reverse)) "rseq reversibility on restored set"))))))))
 
-
-;;; TODO (sync vs async), (realized vs lazy)
-;; iter, async iter
-;; slice
-;; rslice
-;; contains
-;; conj
-;; disj
-;; count
-;; walk-addresses
 
 
 ; (deftest sync-storage-test

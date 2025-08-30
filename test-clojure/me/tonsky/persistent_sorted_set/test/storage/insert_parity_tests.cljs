@@ -4,99 +4,14 @@
    ; [is.simm.lean-cps.async :refer [await run] :refer-macros [async]]
    [cljs.test :as test :refer [is are deftest testing]]
    [clojure.edn :as edn]
-   [clojure.string :as str]
    [me.tonsky.persistent-sorted-set :as set]
    [me.tonsky.persistent-sorted-set.impl.storage :refer [IStorage]]
    [me.tonsky.persistent-sorted-set.btset :refer [BTSet]]
    [me.tonsky.persistent-sorted-set.leaf :refer [Leaf] :as leaf]
-   [me.tonsky.persistent-sorted-set.branch :refer [Branch] :as branch]))
+   [me.tonsky.persistent-sorted-set.branch :refer [Branch] :as branch]
+   [me.tonsky.persistent-sorted-set.test.storage.util
+    :refer [async-storage storage level branch? leaf? *stats]]))
 
-(def ^:dynamic *debug* false)
-
-(defn dbg [& args]
-  (when *debug*
-    (apply println args)))
-
-(defn gen-addr [] (random-uuid))
-
-(def *stats
-  (atom
-    {:reads 0
-     :writes 0
-     :accessed 0}))
-
-(defn branch? [node] (instance? Branch node))
-(defn leaf? [node] (instance? Leaf node))
-
-(defrecord Storage [*memory *disk]
-  IStorage
-  (store [_ node opts]
-    (assert (not (false? (:sync? opts))))
-    (dbg "store<" (type node) ">")
-    (swap! *stats update :writes inc)
-    (let [address (gen-addr)]
-      (swap! *disk assoc address
-             (pr-str
-              {:level     (.-shift node) ;;<------------------------------------TODO FIX ME
-               :keys      (.-keys node)
-               :addresses (when (branch? node) (.-addresses node))}))
-      address))
-  (restore [_ address opts]
-    (assert (not (false? (:sync? opts))))
-    (or
-     (@*memory address)
-     (let [{:keys [keys addresses level]} (edn/read-string (@*disk address))
-           node (if addresses
-                  (let [n (Branch. keys nil addresses)]
-                    (set! (.-level n) level) ;;<--------------------------------TODO FIX ME
-                    n)
-                  (Leaf. keys))]
-       (dbg "restored<" (type node) ">")
-       (swap! *stats update :reads inc)
-       (swap! *memory assoc address node)
-       node)))
-  (accessed [_ address] (swap! *stats update :accessed inc) nil))
-
-(defn storage
-  ([] (->Storage (atom {}) (atom {})))
-  ([*disk] (->Storage (atom {}) *disk))
-  ([*memory *disk] (->Storage *memory *disk)))
-
-#!------------------------------------------------------------------------------
-
-(defrecord AsyncStorage [*memory *disk]
-  IStorage
-  (store [_ node opts]
-    (assert (false? (:sync? opts)))
-    (dbg "store<" (type node) ">")
-    (swap! *stats update :writes inc)
-    (let [address (gen-addr)]
-      (swap! *disk assoc address
-            (pr-str
-             {:keys      (.-keys node)
-              :addresses (when (branch? node) (.-addresses node))}))
-    (async address)))
-  (restore [_ address opts]
-    (assert (false? (:sync? opts)))
-    (async
-     (or
-      (@*memory address)
-      (let [{:keys [keys addresses level]} (edn/read-string (@*disk address))
-            node (if addresses
-                   (Branch. keys nil addresses)
-                   (Leaf. keys))]
-        (dbg "restored<" (type node) ">")
-        (swap! *stats update :reads inc)
-        (swap! *memory assoc address node)
-        node))))
-  (accessed [_ address] (swap! *stats update :accessed inc) nil))
-
-(defn async-storage
-  ([] (->AsyncStorage (atom {}) (atom {})))
-  ([*disk] (->AsyncStorage (atom {}) *disk))
-  ([*memory *disk] (->AsyncStorage *memory *disk)))
-
-#!------------------------------------------------------------------------------
 
 (defn root [set] (.-root set))
 
@@ -396,6 +311,7 @@
          (is (= 15 (count (ks (.-root original)))))
          (is (= expected-root-keys (ks (.-root original))))
          (is (= 15 (count (children (.-root original)))))
+         (is (= [3 3 3 3 3 3 3 3 3 3 3 3 3 3 3] (mapv level (children (.-root original)))))
          (is (every? branch? (children (.-root original))))
          (let [storage (async-storage)
                address (await (set/store original storage {:sync? false}))
@@ -420,6 +336,7 @@
                (is (= (int (Math/pow 32 4)) (count restored)) "can call sync when fully realized")
                (is (= 69901 (count (deref (:*memory storage)))))
                (is (= 69901 (:reads @*stats)))
+               (is (= [3 3 3 3 3 3 3 3 3 3 3 3 3 3 3] (mapv level (children (.-root restored)))))
                (is (= 15 (count (children (.-root restored)))))
                (is (= 15 (count (ks (.-root original)))))
                (is (every? branch? (children (.-root restored))))

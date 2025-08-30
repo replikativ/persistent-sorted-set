@@ -27,8 +27,6 @@
     (is (= (range 19 9 -1)
           (set/rslice (into (set/sorted-set) (range 0 40)) 19 10)))
 
-
-
     (let [s (into (set/sorted-set) (shuffle (range 0 5001)))]
       (is (= (set/rslice s 5000 nil)
             (some-> (set/rslice s 5000 nil) rseq reverse))))

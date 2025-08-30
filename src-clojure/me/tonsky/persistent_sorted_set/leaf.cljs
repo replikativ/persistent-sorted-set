@@ -13,9 +13,9 @@
   Object
   (toString [_] (pr-str* (vec keys)))
   INode
+  (len [_] (arrays/alength keys))
   (level [_] 0)
   (max-key [_] (arrays/alast keys))
-  (len [_] (arrays/alength keys))
   (merge [_ next] (Leaf. (arrays/aconcat keys (.-keys next))))
   (merge-split [_ next]
     (let [ks (util/merge-n-split keys (.-keys next))]

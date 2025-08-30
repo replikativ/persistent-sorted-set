@@ -109,16 +109,6 @@
   ([^BTSet set key not-found]
    (btset/$lookup set key not-found {:sync? false})))
 
-(defn async-seq ;;-------------------------------------------------------------- TODO
-  "Create an async sequence from a BTSet and path range"
-  [set path till-path]
-  (btset/async-seq set path till-path))
-
-(defn async-iter
-  "Async full-order iteration over `set` without pre-known bounds.
-   returns cont(IAsyncSeq | nil)"
-  [set] (btset/async-iter set))
-
 (defn afirst [set](btset/afirst set));;-----------------------------------------TODO
 
 (defn arest [set] (btset/arest set));;------------------------------------------TODO
