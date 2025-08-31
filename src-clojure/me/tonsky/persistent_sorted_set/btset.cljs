@@ -106,7 +106,7 @@
      ($store set (.-storage set) arg)))
   ([^BTSet set storage {:keys [sync?] :or {sync? true} :as opts}]
    (assert (instance? BTSet set))
-   (assert (implements? storage/IStorage storage))
+   (assert (implements? storage/IStorage storage) "BTSet/$store requires IStorage in second argument")
    (async+sync sync?
     (async
      (do
@@ -641,11 +641,7 @@
 
 ;;;-----------------------------------------------------------------------------
 
-(defn slice [^BTSet set key-from key-to comparator]
-  (when-some [path ($$seek set key-from comparator {:sync? true})]
-    (let [till-path ($$rseek set key-to comparator {:sync? true})]
-      (when (path-lt path till-path)
-        (Iter. set path till-path ($$keys-for set path {:sync? true}) (path-get path 0))))))
+
 
 ;;------------------------------------------------------------------------------
 
@@ -699,13 +695,7 @@
 
 (defn arest [s] (-arest s))
 
-(defn async-slice
-  "Async version of slice that returns an AsyncSeq."
-  [^BTSet set key-from key-to comparator]
-  (async
-   (when-some [path (await ($$seek set key-from comparator {:sync? false}))]
-     (let [till-path (await ($$rseek set key-to comparator {:sync? false}))]
-       (async-seq set path till-path)))))
+
 
 (defn async-reduce
   [arf set from]
@@ -734,25 +724,25 @@
 
 (defn async-into
   ([] (async nil))
-  ([set] (async set))
-  ([set from]
+  ([^BTSet set] (async set))
+  ([^BTSet set from]
    (assert (instance? BTSet set))
    (async-reduce
     (fn
-      ([acc]
+      ([^BTSet acc]
        (async acc))
-      ([acc item]
+      ([^BTSet acc item]
        ($conjoin acc item (.-comparator acc) {:sync? false})))
     set
     from))
-  ([set xform from]
+  ([^BTSet set xform from]
    (assert (instance? BTSet set))
    (async-transduce
     xform
     (fn
-      ([acc]
+      ([^BTSet acc]
        (async acc))
-      ([acc item]
+      ([^BTSet acc item]
        ($conjoin acc item (.-comparator acc) {:sync? false})))
     set
     from)))
@@ -862,10 +852,34 @@
           (when (and path (path-lt path till))
             (async-seq set path till))))))))
 
+(defn $slice
+  ([^BTSet set key-from key-to]
+   ($slice set key-from key-to (.-comparator set) {:sync? true}))
+  ([^BTSet set key-from key-to arg]
+   (if (fn? arg)
+     ($slice set key-from key-to arg {:sync? true})
+     ($slice set key-from key-to (.-comparator set) arg)))
+  ([^BTSet set key-from key-to cmp {:keys [sync?] :or {sync? true} :as opts}]
+   (async+sync sync?
+    (async
+     (js/console.group "$slice")
+
+     ; set key-from key-to opts
+     (let [res
+           (when-some [from-path (await ($$seek set key-from cmp opts))]
+             (js/console.log "from-path:" from-path)
+             (let [to-path (await ($$rseek set key-to cmp opts))]
+               (js/console.log "to-path:" from-path)
+               (when (path-lt from-path to-path)
+                 (let [ks (await ($$keys-for set from-path opts))]
+                   (js/console.log "ks:" ks)
+                   (if sync?
+                     (Iter. set from-path to-path ks (path-get from-path 0))
+                     (AsyncSeq. set from-path to-path ks (path-get from-path 0)))))))]
+       (js/console.groupEnd "$slice")
+       res)))))
+
 (defn $$iter
-  "Unified iterator with async+sync semantics.
-   sync?: returns (Iter ...)
-   async?: returns (AsyncSeq ...)"
   ([^BTSet set {:keys [sync?] :or {sync? true} :as opts}]
    (async+sync sync?
      (async
@@ -918,33 +932,39 @@
                       (recur (rest items))))))))))))
 
 (defn $equivalent-sequential?
-  [^BTSet set other {:keys [sync?] :or {sync? true} :as opts}]
-  (assert (instance? BTSet set))
+  [set other {:keys [sync?] :or {sync? true} :as opts}]
   (if sync?
     (cljs.core/equiv-sequential set other)
     (async
       (if (instance? BTSet other)
-        (throw (ex-info "BTSet $equivalent-sequential? unimplemented" {:other other}))
+        (throw (ex-info "BTSet other $equivalent-sequential? unimplemented" {:other other}))
         (if (implements? IAsyncSeq other)
-          (throw (ex-info "IAsyncSeq $equivalent-sequential? unimplemented" {:other other}))
+          (throw (ex-info "IAsyncSeq other $equivalent-sequential? unimplemented" {:other other}))
           (if (not (sequential? other))
             false
-            (let [cnt-x (await ($count set opts))
-                  cnt-y (count other)]
-              (if (not= cnt-x cnt-y)
-                false
-                (loop [xs (await ($$iter set opts))
-                       ys (seq other)]
-                  (if (nil? xs)
+            (if (implements? IAsyncSeq set) ;; this is typically an async slice.
+              (loop [xs set
+                     ys (seq other)]
+                (let [x (await (afirst xs))]
+                  (if (nil? x)
                     (nil? ys)
-                    (if (nil? ys)
-                      false
-                      (let [x (await (afirst xs))]
-                        (if (nil? x)
-                          (nil? ys)
-                          (if (= x (first ys))
-                            (recur (await (arest xs)) (next ys))
-                            false))))))))))))))
+                    (if (= x (first ys))
+                      (recur (await (arest xs)) (next ys))
+                      false))))
+              ;; count here is potentially very expensive in restored state
+              ;; will realize all nodes to sum keys. otherwise its cached
+              (let [cnt-x (await ($count set opts))
+                    cnt-y (count other)]
+                (if (not= cnt-x cnt-y)
+                  false
+                  (loop [xs (await ($$iter set opts))
+                         ys (seq other)]
+                    (let [x (await (afirst xs))]
+                      (if (nil? x)
+                        (nil? ys)
+                        (if (= x (first ys))
+                          (recur (await (arest xs)) (next ys))
+                          false)))))))))))))
 
 #!------------------------------------------------------------------------------
 

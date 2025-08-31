@@ -4,7 +4,7 @@
   me.tonsky.persistent-sorted-set
   (:refer-clojure :exclude [conj count disj sorted-set sorted-set-by contains?])
   (:require [me.tonsky.persistent-sorted-set.arrays :as arrays]
-            [me.tonsky.persistent-sorted-set.btset :as btset]))
+            [me.tonsky.persistent-sorted-set.btset :as btset :refer [BTSet]]))
 
 ; B+ tree
 ; -------
@@ -37,6 +37,7 @@
 ; Keys and idx are cached for fast iteration inside a leaf"
 
 (defn count
+  "O(n) when restoring root address, otherwise O(1)"
   ([set] (btset/$count set {:sync? true}))
   ([set opts] (btset/$count set opts)))
 
@@ -66,35 +67,29 @@
   ([^BTSet set key arg] (btset/$disjoin set key arg))
   ([^BTSet set key cmp opts] (btset/$disjoin set key cmp opts)))
 
-#!------------------------------------------------------------------------------
-
 (defn slice
   "An iterator for part of the set with provided boundaries.
    `(slice set from to)` returns iterator for all Xs where from <= X <= to.
    Optionally pass in comparator that will override the one that set uses. Supports efficient [[clojure.core/rseq]]."
   ([^BTSet set key-from key-to]
-   (btset/slice set key-from key-to (.-comparator set)))
-  ([^BTSet set key-from key-to comparator]
-   (btset/slice set key-from key-to comparator)))
+   (btset/$slice set key-from key-to))
+  ([^BTSet set key-from key-to arg]
+   (btset/$slice set key-from key-to arg))
+  ([^BTSet set key-from key-to comparator opts]
+   (btset/$slice set key-from key-to comparator opts)))
 
-(defn async-slice
-  "Async version of slice that returns a Promise resolving to a vector of elements.
-   Returns a Promise that resolves to a vector containing all elements in the range [key-from, key-to)."
-  ([^BTSet set key-from key-to]
-   (btset/async-slice set key-from key-to (.-comparator set)))
-  ([^BTSet set key-from key-to comparator]
-   (btset/async-slice set key-from key-to comparator)))
+#!------------------------------------------------------------------------------
 
 (defn rslice
   "A reverse iterator for part of the set with provided boundaries.
    `(rslice set from to)` returns backwards iterator for all Xs where from <= X <= to.
    Optionally pass in comparator that will override the one that set uses. Supports efficient [[clojure.core/rseq]]."
   ([^BTSet set key]
-   (some-> (btset/slice set key key (.-comparator set)) rseq))
+   (some-> (btset/$slice set key key (.-comparator set)) rseq))
   ([^BTSet set key-from key-to]
-   (some-> (btset/slice set key-to key-from (.-comparator set)) rseq))
+   (some-> (btset/$slice set key-to key-from (.-comparator set)) rseq))
   ([^BTSet set key-from key-to comparator]
-   (some-> (btset/slice set key-to key-from comparator) rseq)))
+   (some-> (btset/$slice set key-to key-from comparator) rseq)))
 
 (defn seek
   "An efficient way to seek to a specific key in a seq (either returned by [[clojure.core.seq]] or a slice.)
