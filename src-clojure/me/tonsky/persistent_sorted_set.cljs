@@ -2,7 +2,8 @@
       "A B-tree based persistent sorted set. Supports transients, custom comparators, fast iteration, efficient slices (iterator over a part of the set) and reverse slices. Almost a drop-in replacement for [[clojure.core/sorted-set]], the only difference being this one can't store nil."
       :author "Nikita Prokopov"}
   me.tonsky.persistent-sorted-set
-  (:refer-clojure :exclude [conj count disj sorted-set sorted-set-by contains?])
+  (:refer-clojure :exclude [conj count disj sorted-set sorted-set-by contains?
+                            seq rseq])
   (:require [me.tonsky.persistent-sorted-set.arrays :as arrays]
             [me.tonsky.persistent-sorted-set.btset :as btset :refer [BTSet]]))
 
@@ -37,34 +38,56 @@
 ; Keys and idx are cached for fast iteration inside a leaf"
 
 (defn count
-  "O(n) when restoring root address, otherwise O(1)"
+  "O(n) when restoring root address, otherwise O(1)
+   returns number by default
+   returns continuation yeilding number when {:sync? false}"
   ([set] (btset/$count set {:sync? true}))
   ([set opts] (btset/$count set opts)))
 
 (defn contains?
+  "returns boolean by default
+   returns continuation yeilding boolean when {:sync? false}"
   ([^BTSet set key] (btset/$contains? set key {:sync? true}))
   ([^BTSet set key opts] (btset/$contains? set key opts)))
 
 (defn equiv?
-  "is the other a set with the same items?"
+  "Is _other_ a set with the same items?
+   returns boolean by default
+   returns continuation yeilding boolean when {:sync? false}"
   ([set other] (btset/$equivalent? set other {:sync? true}))
   ([set other opts] (btset/$equivalent? set other opts)))
 
+(defn seq
+  "returns btset/Iter by default
+   returns continuation yielding btset/AsyncSeq when {:sync? false}"
+  ([set] (btset/$seq set))
+  ([set opts] (btset/$seq set opts)))
+
+(defn rseq
+  "returns btset/ReverseIter by default
+   returns continuation yielding btset/AsyncRSeq when {:sync? false}"
+  ([set] (btset/$rseq set))
+  ([set opts] (btset/$rseq set opts)))
+
 (defn equiv-sequential?
-  "tests items in sequential order."
+  "Test items in sequential order.
+   returns boolean by default
+   returns continuation yeilding boolean when {:sync? false}"
   ([set other] (btset/$equivalent-sequential? set other {:sync? true}))
   ([set other opts] (btset/$equivalent-sequential? set other opts)))
 
 (defn conj
   "Analogue to [[clojure.core/conj]] but with comparator that overrides the one stored in set.
-   Accepts optional opts map with {:sync? true/false} (defaults to true)."
+   returns BTSet by default
+   returns continuation yeilding BTSet when {:sync? false}"
   ([^BTSet set key]          (btset/$conjoin set key))
   ([^BTSet set key arg]      (btset/$conjoin set key arg))
   ([^BTSet set key cmp opts] (btset/$conjoin set key cmp opts)))
 
 (defn disj
   "Analogue to [[clojure.core/disj]] with comparator that overrides the one stored in set.
-   Accepts optional opts map with {:sync? true/false} (defaults to true)."
+   returns BTSet by default
+   returns continuation yeilding BTSet when {:sync? false}"
   ([^BTSet set key]          (btset/$disjoin set key))
   ([^BTSet set key arg]      (btset/$disjoin set key arg))
   ([^BTSet set key cmp opts] (btset/$disjoin set key cmp opts)))
@@ -80,18 +103,20 @@
   ([^BTSet set key-from key-to comparator opts]
    (btset/$slice set key-from key-to comparator opts)))
 
-#!------------------------------------------------------------------------------
-
 (defn rslice
   "A reverse iterator for part of the set with provided boundaries.
    `(rslice set from to)` returns backwards iterator for all Xs where from <= X <= to.
    Optionally pass in comparator that will override the one that set uses. Supports efficient [[clojure.core/rseq]]."
   ([^BTSet set key]
-   (some-> (btset/$slice set key key (.-comparator set)) rseq))
+   (btset/$rslice set key key (.-comparator set) {:sync? true}))
   ([^BTSet set key-from key-to]
-   (some-> (btset/$slice set key-to key-from (.-comparator set)) rseq))
-  ([^BTSet set key-from key-to comparator]
-   (some-> (btset/$slice set key-to key-from comparator) rseq)))
+   (btset/$rslice set key-from key-to (.-comparator set) {:sync? true}))
+  ([^BTSet set key-from key-to arg]
+   (btset/$rslice set key-from key-to arg))
+  ([^BTSet set key-from key-to cmp opts]
+   (btset/$rslice set key-from key-to cmp opts)))
+
+#!------------------------------------------------------------------------------
 
 (defn seek
   "An efficient way to seek to a specific key in a seq (either returned by [[clojure.core.seq]] or a slice.)
@@ -126,15 +151,21 @@
 
 (defn walk-addresses
   "Visit each address used by this set. Usable for cleaning up
-   garbage left in storage from previous versions of the set"
+   garbage left in storage from previous versions of the set.
+
+   returns nil when the walk completes
+   returns a continuation yielding nil when {:sync? false}"
   ([^BTSet set consume-fn]
    (btset/$walk-addresses set consume-fn {:sync? true}))
   ([^BTSet set consume-fn opts]
    (btset/$walk-addresses set consume-fn opts)))
 
 (defn store
-  "Accepts optional opts map with {:sync? true/false} (defaults to true).
-   returns address specified by storage"
+  "Flush set to storage. sync calls must be used with sync storage
+   and async calls must be used with async storage.
+
+   returns address by default
+   returns continuation yeilding address when {:sync? false}"
   ([^BTSet set] (btset/$store set {:sync? true}))
   ([^BTSet set arg] (btset/$store set arg))
   ([^BTSet set storage opts] (btset/$store set storage opts)))
@@ -144,7 +175,9 @@
    This operation is always synchronous and does not initiate io.
    + First arg can be either:
      - A root address (UUID) - requires opts with :shift and :count
-     - A map from store-set with :root-address :comparator"
+     - A map from store-set with :root-address :comparator
+
+   returns BTSet, **always synchronously**"
   ([root-address-or-info storage]
    (btset/restore root-address-or-info storage {}))
   ([root-address-or-info storage opts]

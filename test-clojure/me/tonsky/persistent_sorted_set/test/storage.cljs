@@ -50,36 +50,36 @@
            stored (into (set/sorted-set) (range 10 20))
            address (set/store stored storage)]
        (and
-        (testing-group "control"
+        (testing "control"
          (is (= (range 10 20) (seq (into (set/sorted-set) (range 10 20)))) "control"))
-        (testing-group "flushed"
+        (testing "flushed"
          (is (= (range 10 20) (seq stored)) "seq works on set that just flushed"))
-        (testing-group "restored"
+        (testing "restored"
          (is (= (range 10 20) (seq (set/restore address storage))) "seq works on unrealized lazy state")))))
    (testing "slice"
      (let [storage (storage)
            stored  (into (set/sorted-set) (range 0 40))
            address (set/store stored storage)]
        (and
-        (testing-group "control"
+        (testing "control"
          (is (= (range 10 20) (set/slice (into (set/sorted-set) (range 0 40)) 10 19)) "control"))
-        (testing-group "flushed"
+        (testing "flushed"
          (is (= (range 10 20) (set/slice stored 10 19)) "slice works on set that just flushed"))
-        (testing-group "restored"
+        (testing "restored"
          (is (= (range 10 20) (set/slice (set/restore address storage) 10 19)) "slice works on unrealized lazy state")))))
    (testing "slice reversed order"
      (let [storage (storage)
            stored  (into (set/sorted-set) (reverse (range 0 100)))
            address (set/store stored storage)]
        (and
-        (testing-group "control"
+        (testing "control"
           (is (= (range 10 20)
                  (set/slice (into (set/sorted-set) (reverse (range 0 100))) 10 19))
               "control"))
-        (testing-group "flushed"
+        (testing "flushed"
           (is (= (range 10 20) (set/slice stored 10 19))
               "slice works on set that just flushed"))
-        (testing-group "restored"
+        (testing "restored"
           (is (= (range 10 20)
                  (set/slice (set/restore address storage) 10 19))
               "slice works on unrealized lazy state")))))
@@ -88,25 +88,25 @@
            stored  (into (set/sorted-set) (range 10 20))
            address (set/store stored storage)]
        (and
-        (testing-group "control"
+        (testing "control"
           (is (= (range 19 9 -1) (rseq (into (set/sorted-set) (range 10 20)))) "control"))
-        (testing-group "flushed"
+        (testing "flushed"
           (is (= (range 19 9 -1) (rseq stored)) "rseq works on set that just flushed"))
-        (testing-group "restored"
+        (testing "restored"
           (is (= (range 19 9 -1) (rseq (set/restore address storage))) "rseq works on unrealized lazy state")))))
    (testing "rslice"
      (let [storage (storage)
            stored  (into (set/sorted-set) (range 0 40))
            address (set/store stored storage)]
        (and
-        (testing-group "control"
+        (testing "control"
           (is (= (range 19 9 -1)
                  (set/rslice (into (set/sorted-set) (range 0 40)) 19 10))
               "control"))
-        (testing-group "flushed"
+        (testing "flushed"
           (is (= (range 19 9 -1) (set/rslice stored 19 10))
               "rslice works on set that just flushed"))
-        (testing-group "restored"
+        (testing "restored"
           (is (= (range 19 9 -1) (set/rslice (set/restore address storage) 19 10))
               "rslice works on unrealized lazy state")))))
    (testing "reversing rseq is original sort"
@@ -114,13 +114,13 @@
            stored  (into (set/sorted-set) (shuffle (range 0 5001)))
            address (set/store stored storage)]
        (and
-        (testing-group "control"
+        (testing "control"
          (let [x (set/rslice (into (set/sorted-set) (shuffle (range 0 5001))) 5000 nil)]
            (is (= x (some-> x rseq reverse)) "control")))
-        (testing-group "flushed"
+        (testing "flushed"
          (let [x (set/rslice stored 5000 nil)]
            (is (= x (some-> x rseq reverse)) "rseq reversibility on flushed set")))
-        (testing-group "restored"
+        (testing "restored"
          (let [x (set/rslice (set/restore address storage) 5000 nil)]
            (is (= x (some-> x rseq reverse)) "rseq reversibility on restored set"))))))))
 
@@ -128,7 +128,7 @@
 (defn do-test-small-async-restoration []
   (async
    (and
-    (testing "async seq equivalent"
+    (testing "async (equiv-sequential? btset, seq)"
       (let [storage (async-storage)
             stored (into (set/sorted-set) (range 10 20))
             address (await (set/store stored storage {:sync? false}))]
@@ -172,17 +172,69 @@
            (let [s (await (set/slice (set/restore address storage) 10 19 {:sync? false}))
                  b (await (set/equiv-sequential? s (range 10 20) {:sync? false}))]
              (is (true? b) "slice works on unrealized lazy state"))))))
-    ; (testing "rseq"
-    ;   (let [storage (storage)
-    ;         stored  (into (set/sorted-set) (range 10 20))
-    ;         address (set/store stored storage)]
-    ;     (and
-    ;      (testing-group "control"
-    ;        (is (= (range 19 9 -1) (rseq (into (set/sorted-set) (range 10 20)))) "control"))
-    ;      (testing-group "flushed"
-    ;        (is (= (range 19 9 -1) (rseq stored)) "rseq works on set that just flushed"))
-    ;      (testing-group "restored"
-    ;        (is (= (range 19 9 -1) (rseq (set/restore address storage))) "rseq works on unrealized lazy state")))))
+    (testing "very small rseq"
+      (let [storage (async-storage)
+            stored  (into (set/sorted-set) (range 0 5))
+            address (await (set/store stored storage {:sync? false}))]
+        (and
+         (testing "sync control"
+           (let [s (into (set/sorted-set) (range 0 5))]
+             (is (= (range 4 -1 -1) (set/rseq s)) "control")))
+         (testing "async control"
+           (let [s (into (set/sorted-set) (range 0 5))
+                 rs (await (set/rseq s {:sync? false}))
+                 b  (await (set/equiv-sequential? rs (range 4 -1 -1) {:sync? false}))]
+             (is (true? b))))
+         (testing "flushed"
+           (let [rs (await (set/rseq stored {:sync? false}))
+                 b  (await (set/equiv-sequential? rs (range 4 -1 -1) {:sync? false}))]
+             (is (true? b) "rseq works on set that just flushed")))
+         (testing "restored"
+           (let [rs (await (set/rseq (set/restore address storage) {:sync? false}))
+                 b  (await (set/equiv-sequential? rs (range 4 -1 -1) {:sync? false}))]
+             (is (true? b) "rseq works on unrealized lazy state"))))))
+    (testing "small rseq"
+      (let [storage (async-storage)
+            stored  (into (set/sorted-set) (range 10 20))
+            address (await (set/store stored storage {:sync? false}))]
+        (and
+         (testing "sync control"
+           (let [s (into (set/sorted-set) (range 10 20))]
+             (is (= (range 19 9 -1) (set/rseq s)) "control")))
+         (testing "async control"
+           (let [s (into (set/sorted-set) (range 10 20))
+                 rs (await (set/rseq s {:sync? false}))
+                 b  (await (set/equiv-sequential? rs (range 19 9 -1) {:sync? false}))]
+             (is (true? b))))
+         (testing "flushed"
+           (let [rs (await (set/rseq stored {:sync? false}))
+                 b  (await (set/equiv-sequential? rs (range 19 9 -1) {:sync? false}))]
+             (is (true? b) "rseq works on set that just flushed")))
+         (testing "restored"
+           (let [rs (await (set/rseq (set/restore address storage) {:sync? false}))
+                 b  (await (set/equiv-sequential? rs (range 19 9 -1) {:sync? false}))]
+             (is (true? b) "rseq works on unrealized lazy state"))))))
+    (testing "medium rseq"
+      (let [storage (async-storage)
+            stored  (into (set/sorted-set) (range 48 512))
+            address (await (set/store stored storage {:sync? false}))]
+        (and
+         (testing "sync control"
+           (let [s (into (set/sorted-set) (range 48 512))]
+             (is (= (range 511 47 -1) (set/rseq s)) "control")))
+         (testing "async control"
+           (let [s (into (set/sorted-set) (range 48 512))
+                 rs (await (set/rseq s {:sync? false}))
+                 b  (await (set/equiv-sequential? rs (range 511 47 -1) {:sync? false}))]
+             (is (true? b))))
+         (testing "flushed"
+           (let [rs (await (set/rseq stored {:sync? false}))
+                 b  (await (set/equiv-sequential? rs (range 511 47 -1) {:sync? false}))]
+             (is (true? b) "rseq works on set that just flushed")))
+         (testing "restored"
+           (let [rs (await (set/rseq (set/restore address storage) {:sync? false}))
+                 b  (await (set/equiv-sequential? rs (range 511 47 -1) {:sync? false}))]
+             (is (true? b) "rseq works on unrealized lazy state"))))))
     ; (testing "rslice"
     ;   (let [storage (storage)
     ;         stored  (into (set/sorted-set) (range 0 40))
@@ -293,9 +345,9 @@
              (is (true?  (await (set/equiv? (await (set/disj (set/restore async-address async-storage) 512 {:sync? false}))
                                             (disj (into (set/sorted-set) (range 1024)) 512)
                                             {:sync? false})))))))))
-     (testing
+     (testing "equiv-sequential"
        (and
-        (testing-group "equiv-sequential? on naive sets"
+        (testing "equiv-sequential? on naive sets"
          (and
           (is (true? (set/equiv-sequential? (set/sorted-set) ())))
           (is (true? (await (set/equiv-sequential? (set/sorted-set) () {:sync? false}))))
@@ -319,7 +371,7 @@
           (is (false? (await (set/equiv-sequential? (into (set/sorted-set) (range 0 512))
                                                     (into #{} (shuffle (range 0 512)))
                                                     {:sync? false}))))))
-        (testing-group "equiv-sequential? on restored sets"
+        (testing "equiv-sequential? on restored sets"
           (and
            (testing "empty seq"
              (let [async-storage (async-storage)
@@ -363,40 +415,4 @@
         (is (nil? err))
         (js/console.error err)
         (done)))))
-
-; (comment
-;  (testing "Restore from storage"
-;    (let [restored (set/restore store-info storage {:sync? true})]
-;      (and
-;       (is (= n (count restored)))
-;       (is (= 0 (first restored)))
-;       (is (= 9999 (last restored)))
-;       (testing "Check a sample of elements using contains?"
-;         (loop [indices (range 0 10000 1000)]
-;           (let [i (first indices)]
-;             (if (nil? i)
-;               true
-;               (if-not (is (contains? restored i) (str "Missing element: " i))
-;                 false
-;                 (recur (rest indices)))))))
-;       (testing "Verify slices on restored set"
-;         (and
-;          (is (= (range 100) (vec (set/slice restored 0 99))))
-;          (is (= (range 5000 5100) (vec (set/slice restored 5000 5099))))
-;          (is (= (range 9900 10000) (vec (set/slice restored 9900 9999))))))
-;       (testing "conj on restored set"
-;         (let [restored-with-new (set/conj restored 10000)]
-;           (and
-;            (is (= (inc n) (count restored-with-new)))
-;            (is (contains? restored-with-new 10000)))))
-;       (testing "disj on restored set"
-;         (let [restored-without (set/disj restored 5000)]
-;           (and
-;            (is (= (dec n) (count restored-without)))
-;            (is (not (contains? restored-without 5000))))))
-;       (testing "iteration over restored set"
-;         (and
-;          (is (= (range 100) (take 100 restored)))
-;          (is (= (range 9900 10000) (take 100 (drop 9900 restored)))))))))
-;  )
 
