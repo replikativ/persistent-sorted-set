@@ -46,25 +46,27 @@
   ([^BTSet set key opts] (btset/$contains? set key opts)))
 
 (defn equiv?
+  "is the other a set with the same items?"
   ([set other] (btset/$equivalent? set other {:sync? true}))
   ([set other opts] (btset/$equivalent? set other opts)))
 
 (defn equiv-sequential?
+  "tests items in sequential order."
   ([set other] (btset/$equivalent-sequential? set other {:sync? true}))
   ([set other opts] (btset/$equivalent-sequential? set other opts)))
 
 (defn conj
   "Analogue to [[clojure.core/conj]] but with comparator that overrides the one stored in set.
    Accepts optional opts map with {:sync? true/false} (defaults to true)."
-  ([^BTSet set key]          (btset/$conjoin set key (.-comparator set) {:sync? true}))
+  ([^BTSet set key]          (btset/$conjoin set key))
   ([^BTSet set key arg]      (btset/$conjoin set key arg))
   ([^BTSet set key cmp opts] (btset/$conjoin set key cmp opts)))
 
 (defn disj
   "Analogue to [[clojure.core/disj]] with comparator that overrides the one stored in set.
    Accepts optional opts map with {:sync? true/false} (defaults to true)."
-  ([^BTSet set key] (btset/$disjoin set key (.-comparator set) {:sync? true}))
-  ([^BTSet set key arg] (btset/$disjoin set key arg))
+  ([^BTSet set key]          (btset/$disjoin set key))
+  ([^BTSet set key arg]      (btset/$disjoin set key arg))
   ([^BTSet set key cmp opts] (btset/$disjoin set key cmp opts)))
 
 (defn slice
@@ -139,11 +141,10 @@
 
 (defn restore
   "Restore a set from storage given root-address-or-info and storage.
+   This operation is always synchronous and does not initiate io.
    + First arg can be either:
      - A root address (UUID) - requires opts with :shift and :count
-     - A map from store-set with :root-address, :shift, :count, :comparator
-   + Storage operations will use the provided opts for sync/async mode.
-   + This operation is always synchronous and does not initiate io."
+     - A map from store-set with :root-address :comparator"
   ([root-address-or-info storage]
    (btset/restore root-address-or-info storage {}))
   ([root-address-or-info storage opts]

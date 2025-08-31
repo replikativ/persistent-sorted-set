@@ -42,6 +42,8 @@
         (await (node/$contains? root (.-storage set) key (.-comparator set) opts))))))
 
 (defn $conjoin
+  ([^BTSet set key]
+   ($conjoin set key (.-comparator set) {:sync? true}))
   ([^BTSet set key arg]
    (if (fn? arg)
      ($conjoin set key arg {:sync? true})
@@ -75,6 +77,8 @@
                     nil))))))))
 
 (defn $disjoin
+  ([^BTSet set key]
+   ($disjoin set key (.-comparator set) {:sync? true}))
   ([^BTSet set key arg]
    (if (fn? arg)
      ($disjoin set key arg {:sync? true})
@@ -371,10 +375,10 @@
 
 (defn- path-str [^number path]
   (loop [res ()
-           path path]
-      (if (not= path 0)
-        (recur (cljs.core/conj res (mod path MAX_LEN)) (Math/floor (/ path MAX_LEN)))
-        (vec res))))
+         path path]
+    (if (not= path 0)
+      (recur (conj res (mod path MAX_LEN)) (Math/floor (/ path MAX_LEN)))
+      (vec res))))
 
 (defn- $$keys-for
   "Returns keys array for the leaf node at the given path."
@@ -602,47 +606,6 @@
                   res
                   (dec level)))))))))))
 
-(defn- slice-path-requires-storage?
-  "Check if any nodes in the slice path need storage access.
-   This is the critical optimization - only check nodes that
-   the slice operation will actually traverse."
-  [^BTSet set node key-from key-to level]
-  (let [cmp (.-comparator set)
-        keys (.-keys node)]
-    (when (instance? Branch node)
-      (let [keys-l (arrays/alength keys)
-            ;; Find which children the slice bounds span
-            from-idx (if key-from
-                       (binary-search-l cmp keys (- keys-l 2) key-from)
-                       0)
-            to-idx   (if key-to
-                       (binary-search-r cmp keys (- keys-l 2) key-to)
-                       (dec (arrays/alength (.-addresses node))))]
-
-        ;; Only check nodes that are actually in the slice path
-        (loop [idx from-idx]
-          (when (<= idx to-idx)
-            (let [;; Check if this child needs loading
-                  child-addr (when (.-addresses node)
-                               (arrays/aget (.-addresses node) idx))
-                  child-loaded? (when (.-children node)
-                                  (arrays/aget (.-children node) idx))]
-              (if (and child-addr (not child-loaded?))
-                ;; Found unloaded node in slice path
-                true
-                ;; This child is loaded, recurse if needed
-                (if (and child-loaded? (> level 1))
-                  ;; Recursively check this child's path requirements
-                  (or (slice-path-requires-storage? set child-loaded? key-from key-to (dec level))
-                      ;; Move to next child in slice range
-                      (recur (inc idx)))
-                  ;; Move to next child in slice range
-                  (recur (inc idx)))))))))))
-
-;;;-----------------------------------------------------------------------------
-
-
-
 ;;------------------------------------------------------------------------------
 
 (defprotocol IAsyncSeq
@@ -694,8 +657,6 @@
 (defn afirst [s] (-afirst s))
 
 (defn arest [s] (-arest s))
-
-
 
 (defn async-reduce
   [arf set from]
@@ -819,38 +780,6 @@
   (ReverseIter. set left right ($$keys-for set right {:sync? true}) (path-get right 0)))
 
 #!------------------------------------------------------------------------------
-#!------------------------------------------------------------------------------
-
-(defn _async-iter ;;------------------------------------------------------------- TODO support comparator?
-  ([^BTSet set]
-   (async
-    (let [root (await ($$root set {:sync? false}))
-          lvl  (node/level root)]
-      (when (pos? (node/len root))
-        (let [left  EMPTY_PATH
-              rpath (await ($$rpath root EMPTY_PATH lvl (.-storage set) {:sync? false}))
-              right (await ($$next-path set rpath {:sync? false}))]
-          (async-seq set left right))))))
-  ([^BTSet set from]
-   (async
-    (let [root (await ($$root set {:sync? false}))
-          lvl  (node/level root)]
-      (when (pos? (node/len root))
-        (let [cmp  (.-comparator set)
-              path (await ($$seek set from cmp {:sync? false}))]
-          (when path
-            (let [rpath (await ($$rpath root EMPTY_PATH lvl (.-storage set) {:sync? false}))
-                  right (await ($$next-path set rpath {:sync? false}))]
-              (async-seq set path right))))))))
-  ([^BTSet set from to]
-   (async
-    (let [root (await ($$root set {:sync? false}))]
-      (when (pos? (node/len root))
-        (let [cmp  (.-comparator set)
-              path (await ($$seek  set from cmp {:sync? false}))
-              till (await ($$rseek set to   cmp {:sync? false}))]
-          (when (and path (path-lt path till))
-            (async-seq set path till))))))))
 
 (defn $slice
   ([^BTSet set key-from key-to]
@@ -862,22 +791,13 @@
   ([^BTSet set key-from key-to cmp {:keys [sync?] :or {sync? true} :as opts}]
    (async+sync sync?
     (async
-     (js/console.group "$slice")
-
-     ; set key-from key-to opts
-     (let [res
-           (when-some [from-path (await ($$seek set key-from cmp opts))]
-             (js/console.log "from-path:" from-path)
-             (let [to-path (await ($$rseek set key-to cmp opts))]
-               (js/console.log "to-path:" from-path)
-               (when (path-lt from-path to-path)
-                 (let [ks (await ($$keys-for set from-path opts))]
-                   (js/console.log "ks:" ks)
-                   (if sync?
-                     (Iter. set from-path to-path ks (path-get from-path 0))
-                     (AsyncSeq. set from-path to-path ks (path-get from-path 0)))))))]
-       (js/console.groupEnd "$slice")
-       res)))))
+     (when-some [from-path (await ($$seek set key-from cmp opts))]
+       (let [to-path (await ($$rseek set key-to cmp opts))]
+         (when (path-lt from-path to-path)
+           (let [ks (await ($$keys-for set from-path opts))]
+             (if sync?
+               (Iter. set from-path to-path ks (path-get from-path 0))
+               (AsyncSeq. set from-path to-path ks (path-get from-path 0)))))))))))
 
 (defn $$iter
   ([^BTSet set {:keys [sync?] :or {sync? true} :as opts}]
@@ -898,9 +818,14 @@
   ([^BTSet set left right {:keys [sync?] :or {sync? true} :as opts}]
    (if sync?
      (Iter. set left right ($$keys-for set left {:sync? true}) (path-get left 0))
-     (_async-iter set left right))))
-
-#!------------------------------------------------------------------------------
+     (async
+      (let [root (await ($$root set {:sync? false}))]
+        (when (pos? (node/len root))
+          (let [cmp  (.-comparator set)
+                path (await ($$seek  set left cmp {:sync? false}))
+                till (await ($$rseek set right   cmp {:sync? false}))]
+            (when (and path (path-lt path till))
+              (async-seq set path till)))))))))
 
 (defn $equivalent?
   [^BTSet set other {:keys [sync?] :or {sync? true} :as opts}]
