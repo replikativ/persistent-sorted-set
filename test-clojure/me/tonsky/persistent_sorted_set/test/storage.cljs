@@ -8,12 +8,6 @@
    [me.tonsky.persistent-sorted-set.test.storage.util
     :refer [storage async-storage]]))
 
-(defn children [node] (some->> (.-children node) (filter some?)))
-
-(defn ks [node] (some->> (.-keys node) (filterv some?)))
-
-#!------------------------------------------------------------------------------
-
 (deftest test-walk-addresses
   (let [size       1000
         xs         (range size)
@@ -37,385 +31,54 @@
         (is (nil? (set/walk-addresses set' (fn [addr] (if (some? addr) (swap! *stored' inc))))))
         (is (= 63 @*stored')))))))
 
-(deftest test-small-sync-restoration
-  (and
-   (testing "seq"
-     (let [storage (storage)
-           stored (into (set/sorted-set) (range 10 20))
-           address (set/store stored storage)]
-       (and
-        (testing "control"
-         (is (= (range 10 20) (seq (into (set/sorted-set) (range 10 20)))) "control"))
-        (testing "flushed"
-         (is (= (range 10 20) (seq stored)) "seq works on set that just flushed"))
-        (testing "restored"
-         (is (= (range 10 20) (seq (set/restore address storage))) "seq works on unrealized lazy state")))))
-   (testing "slice"
-     (let [storage (storage)
-           stored  (into (set/sorted-set) (range 0 40))
-           address (set/store stored storage)]
-       (and
-        (testing "control"
-         (is (= (range 10 20) (set/slice (into (set/sorted-set) (range 0 40)) 10 19)) "control"))
-        (testing "flushed"
-         (is (= (range 10 20) (set/slice stored 10 19)) "slice works on set that just flushed"))
-        (testing "restored"
-         (is (= (range 10 20) (set/slice (set/restore address storage) 10 19)) "slice works on unrealized lazy state")))))
-   (testing "slice reversed order"
-     (let [storage (storage)
-           stored  (into (set/sorted-set) (reverse (range 0 100)))
-           address (set/store stored storage)]
-       (and
-        (testing "control"
-          (is (= (range 10 20)
-                 (set/slice (into (set/sorted-set) (reverse (range 0 100))) 10 19))
-              "control"))
-        (testing "flushed"
-          (is (= (range 10 20) (set/slice stored 10 19))
-              "slice works on set that just flushed"))
-        (testing "restored"
-          (is (= (range 10 20)
-                 (set/slice (set/restore address storage) 10 19))
-              "slice works on unrealized lazy state")))))
-   (testing "rseq"
-     (let [storage (storage)
-           stored  (into (set/sorted-set) (range 10 20))
-           address (set/store stored storage)]
-       (and
-        (testing "control"
-          (is (= (range 19 9 -1) (rseq (into (set/sorted-set) (range 10 20)))) "control"))
-        (testing "flushed"
-          (is (= (range 19 9 -1) (rseq stored)) "rseq works on set that just flushed"))
-        (testing "restored"
-          (is (= (range 19 9 -1) (rseq (set/restore address storage))) "rseq works on unrealized lazy state")))))
-   (testing "rslice"
-     (let [storage (storage)
-           stored  (into (set/sorted-set) (range 0 40))
-           address (set/store stored storage)]
-       (and
-        (testing "control"
-          (is (= (range 19 9 -1)
-                 (set/rslice (into (set/sorted-set) (range 0 40)) 19 10))
-              "control"))
-        (testing "flushed"
-          (is (= (range 19 9 -1) (set/rslice stored 19 10))
-              "rslice works on set that just flushed"))
-        (testing "restored"
-          (is (= (range 19 9 -1) (set/rslice (set/restore address storage) 19 10))
-              "rslice works on unrealized lazy state")))))
-   (testing "reversing rseq is original sort"
-     (let [storage (storage)
-           stored  (into (set/sorted-set) (shuffle (range 0 5001)))
-           address (set/store stored storage)]
-       (and
-        (testing "control"
-         (let [x (set/rslice (into (set/sorted-set) (shuffle (range 0 5001))) 5000 nil)]
-           (is (= x (some-> x rseq reverse)) "control")))
-        (testing "flushed"
-         (let [x (set/rslice stored 5000 nil)]
-           (is (= x (some-> x rseq reverse)) "rseq reversibility on flushed set")))
-        (testing "restored"
-         (let [x (set/rslice (set/restore address storage) 5000 nil)]
-           (is (= x (some-> x rseq reverse)) "rseq reversibility on restored set"))))))))
-
-(defn do-test-small-async-restoration []
+(defn do-seek-async-tests []
   (async
-   (and
-    (testing "async (equiv-sequential? btset, seq)"
-      (let [storage (async-storage)
-            stored (into (set/sorted-set) (range 10 20))
-            address (await (set/store stored storage {:sync? false}))]
-        (and
-         (testing "async-control"
-           (is (true? (await (set/equiv-sequential? (await (set/async-into (set/sorted-set) (range 10 20))) (range 10 20) {:sync? false})))))
-         (testing "flushed"
-           (is (true? (await (set/equiv-sequential? stored (range 10 20) {:sync? false})))))
-         (testing "restored"
-           (is (true? (await (set/equiv-sequential? (set/restore address storage) (range 10 20) {:sync? false}))))))))
-    (testing "async slice"
-      (let [storage (async-storage)
-            stored  (into (set/sorted-set) (range 0 40))
-            address (await (set/store stored storage {:sync? false}))]
-        (and
-         (testing "async-control"
-           (let [s (await (set/slice (into (set/sorted-set) (range 0 40)) 10 19 {:sync? false}))]
-             (is (true? (await (set/equiv-sequential? s (range 10 20) {:sync? false}))))))
-         (testing "flushed"
-           (let [s (await (set/slice stored 10 19 {:sync? false}))
-                 b (await (set/equiv-sequential? s (range 10 20) {:sync? false}))]
-             (is (true? b) "slice works on set that just flushed")))
-         (testing "restored"
-           (let [s (await (set/slice (set/restore address storage) 10 19 {:sync? false}))
-                 b (await (set/equiv-sequential? s (range 10 20) {:sync? false}))]
-             (is (true? b) "slice works on unrealized lazy state"))))))
-    (testing "async slice reversed order"
-      (let [storage (async-storage)
-            stored  (into (set/sorted-set) (reverse (range 0 100)))
-            address (await (set/store stored storage {:sync? false}))]
-        (and
-         (testing "async control"
-           (let [s (await (set/slice (into (set/sorted-set) (reverse (range 0 100))) 10 19 {:sync? false}))
-                 b (await (set/equiv-sequential? s (range 10 20) {:sync? false}))]
-             (is (true? b))))
-         (testing "flushed"
-           (let [s (await (set/slice stored 10 19 {:sync? false}))
-                 b (await (set/equiv-sequential? s (range 10 20) {:sync? false}))]
-             (is (true? b) "slice works on set that just flushed")))
-         (testing "restored"
-           (let [s (await (set/slice (set/restore address storage) 10 19 {:sync? false}))
-                 b (await (set/equiv-sequential? s (range 10 20) {:sync? false}))]
-             (is (true? b) "slice works on unrealized lazy state"))))))
-    (testing "very small rseq"
-      (let [storage (async-storage)
-            stored  (into (set/sorted-set) (range 0 5))
-            address (await (set/store stored storage {:sync? false}))]
-        (and
-         (testing "sync control"
-           (let [s (into (set/sorted-set) (range 0 5))]
-             (is (= (range 4 -1 -1) (set/rseq s)) "control")))
-         (testing "async control"
-           (let [s (into (set/sorted-set) (range 0 5))
-                 rs (await (set/rseq s {:sync? false}))
-                 b  (await (set/equiv-sequential? rs (range 4 -1 -1) {:sync? false}))]
-             (is (true? b))))
-         (testing "flushed"
-           (let [rs (await (set/rseq stored {:sync? false}))
-                 b  (await (set/equiv-sequential? rs (range 4 -1 -1) {:sync? false}))]
-             (is (true? b) "rseq works on set that just flushed")))
-         (testing "restored"
-           (let [rs (await (set/rseq (set/restore address storage) {:sync? false}))
-                 b  (await (set/equiv-sequential? rs (range 4 -1 -1) {:sync? false}))]
-             (is (true? b) "rseq works on unrealized lazy state"))))))
-    (testing "small rseq"
-      (let [storage (async-storage)
-            stored  (into (set/sorted-set) (range 10 20))
-            address (await (set/store stored storage {:sync? false}))]
-        (and
-         (testing "sync control"
-           (let [s (into (set/sorted-set) (range 10 20))]
-             (is (= (range 19 9 -1) (set/rseq s)) "control")))
-         (testing "async control"
-           (let [s (into (set/sorted-set) (range 10 20))
-                 rs (await (set/rseq s {:sync? false}))
-                 b  (await (set/equiv-sequential? rs (range 19 9 -1) {:sync? false}))]
-             (is (true? b))))
-         (testing "flushed"
-           (let [rs (await (set/rseq stored {:sync? false}))
-                 b  (await (set/equiv-sequential? rs (range 19 9 -1) {:sync? false}))]
-             (is (true? b) "rseq works on set that just flushed")))
-         (testing "restored"
-           (let [rs (await (set/rseq (set/restore address storage) {:sync? false}))
-                 b  (await (set/equiv-sequential? rs (range 19 9 -1) {:sync? false}))]
-             (is (true? b) "rseq works on unrealized lazy state"))))))
-    (testing "medium rseq"
-      (let [storage (async-storage)
-            stored  (into (set/sorted-set) (range 48 512))
-            address (await (set/store stored storage {:sync? false}))]
-        (and
-         (testing "sync control"
-           (let [s (into (set/sorted-set) (range 48 512))]
-             (is (= (range 511 47 -1) (set/rseq s)) "control")))
-         (testing "async control"
-           (let [s (into (set/sorted-set) (range 48 512))
-                 rs (await (set/rseq s {:sync? false}))
-                 b  (await (set/equiv-sequential? rs (range 511 47 -1) {:sync? false}))]
-             (is (true? b))))
-         (testing "flushed"
-           (let [rs (await (set/rseq stored {:sync? false}))
-                 b  (await (set/equiv-sequential? rs (range 511 47 -1) {:sync? false}))]
-             (is (true? b) "rseq works on set that just flushed")))
-         (testing "restored"
-           (let [rs (await (set/rseq (set/restore address storage) {:sync? false}))
-                 b  (await (set/equiv-sequential? rs (range 511 47 -1) {:sync? false}))]
-             (is (true? b) "rseq works on unrealized lazy state"))))))
-    (testing "rslice"
-      (let [storage (async-storage)
-            stored  (into (set/sorted-set) (range 0 40))
-            address (await (set/store stored storage {:sync? false}))]
-        (and
-         (testing "sync-control"
-           (is (= (range 19 9 -1)
-                  (set/rslice (into (set/sorted-set) (range 0 40)) 19 10))))
-         (testing "async-control"
-           (let [s  (into (set/sorted-set) (range 0 40))
-                 rs (await (set/rslice s 19 10 compare {:sync? false}))
-                 b  (await (set/equiv-sequential? rs (range 19 9 -1) {:sync? false}))]
-             (is (true? b))))
-         (testing "flushed"
-           (let [rs (await (set/rslice stored 19 10 compare {:sync? false}))
-                 b  (await (set/equiv-sequential? rs (range 19 9 -1) {:sync? false}))]
-             (is (true? b) "rslice works on set that just flushed")))
-         (testing "restored"
-           (let [rs (await (set/rslice (set/restore address storage) 19 10 compare {:sync? false}))
-                 b  (await (set/equiv-sequential? rs (range 19 9 -1) {:sync? false}))]
-             (is (true? b) "rslice works on unrealized lazy state"))))))
-    (testing "reversing rslice is original sort"
-      (let [storage (async-storage)
-            stored  (into (set/sorted-set) (shuffle (range 0 5001)))
-            address (await (set/store stored storage {:sync? false}))
-            asc     (range 0 5001)]
-        (and
-         (testing "sync control"
-           (is (= asc (reverse (set/rslice (into (set/sorted-set) (shuffle (range 0 5001))) 5000 nil)))))
-         (testing "async control"
-           (let [s (into (set/sorted-set) (shuffle (range 0 5001)))
-                 rs (await (set/rslice s 5000 nil compare {:sync? false}))
-                 b  (await (set/equiv-sequential? rs (reverse asc) {:sync? false}))]
-             (is (true? b))))
-         (testing "flushed (async)"
-           (let [rs (await (set/rslice stored 5000 nil compare {:sync? false}))
-                 b  (await (set/equiv-sequential? rs (reverse asc) {:sync? false}))]
-             (is (true? b) "rseq reversibility on flushed set")))
-         (testing "restored (async)"
-           (let [rs (await (set/rslice (set/restore address storage) 5000 nil compare {:sync? false}))
-                 b  (await (set/equiv-sequential? rs (reverse asc) {:sync? false}))]
-             (is (true? b) "rseq reversibility on restored set")))))))))
+   #_
+    (let [size 1000
+          s    (apply set/sorted-set (range size))
+          aseq (await (set/slice s nil nil {:sync? false}))]
+      (and
+       ; (testing "simple async seek on forward async seq"
+       ;   (loop [i 0]
+       ;     (if (>= i 10)
+       ;       true
+       ;       (let [seek-loc (* 100 i)
+       ;             after    (await (set/seek aseq seek-loc compare {:sync? false}))
+       ;             ok       (await (set/equiv-sequential? after (range seek-loc size) {:sync? false}))]
+       ;         (if (true? ok)
+       ;           (do
+       ;             (is (true? ok))
+       ;             (recur (inc i)))
+       ;           (is (true? ok) (str "i:" i ", seek-loc:" seek-loc)))))))
 
-(deftest test-small-async-restoration
+       ; (testing "multiple async seek chaining"
+       ;   (let [s1 (await (set/seek aseq 250 compare {:sync? false}))
+       ;         s2 (await (set/seek s1   500 compare {:sync? false}))
+       ;         ok (await (set/equiv-sequential? s2 (range 500 size) {:sync? false}))]
+       ;     (is (true? ok))))
+
+       ; (testing "async seq behaviour after seek"
+       ;   (let [tail (await (set/seek aseq 500 compare {:sync? false}))
+       ;         ok   (await (set/equiv-sequential? tail (range 500 size) {:sync? false}))]
+       ;     (is (true? ok))))
+
+       ; (testing "async slicing together with seek"
+       ;   (let [slc (await (set/slice (apply set/sorted-set (range 10000)) 2500 7500 {:sync? false}))
+       ;         a1  (await (set/seek slc 5000 compare {:sync? false}))
+       ;         a2  (await (set/seek a1  7500 compare {:sync? false}))
+       ;         ok1 (await (set/equiv-sequential? a1 (range 5000 7501) {:sync? false}))
+       ;         ok2 (await (set/equiv-sequential? a2 (list 7500)       {:sync? false}))]
+       ;     (and (is (true? ok1))
+       ;          (is (true? ok2)))))
+       ))
+    ))
+
+(deftest seek-for-async-seq-test
   (test/async done
-    (run (do-test-small-async-restoration)
-      (fn [ok] (done))
+    (run (do-seek-async-tests)
+      (fn [_] (done))
       (fn [err]
-        (js/console.warn "test-small-async-restoration failed")
+        (js/console.warn "seek-for-async-seq-test failed")
         (is (nil? err))
         (js/console.error err)
         (done)))))
-
-(defn do-equivalence-tests []
-  (async
-    (and
-     (testing "equiv? on naive sets"
-       (and
-        (testing "empty set"
-          (and
-           (is (true? (set/equiv? (set/sorted-set) #{} {:sync? true})))
-           (is (true? (await (set/equiv? (set/sorted-set) #{} {:sync? false}))))
-           (is (true? (set/equiv? (set/sorted-set) (set/sorted-set) {:sync? true})))
-           (is (true? (await (set/equiv? (set/sorted-set) (set/sorted-set) {:sync? false}))))))
-        (testing "32^2"
-          (is (true? (set/equiv? (into (set/sorted-set) (range 1024)) (into #{} (range 1024)) {:sync? true})))
-          (is (true? (await (set/equiv? (into (set/sorted-set) (range 1024)) (into #{} (range 1024)) {:sync? false}))))
-          (is (true? (set/equiv? (into (set/sorted-set) (range 1024))
-                                 (into (set/sorted-set) (range 1024)) {:sync? true})))
-          (is (true? (await (set/equiv? (into (set/sorted-set) (range 1024))
-                                        (into (set/sorted-set) (range 1024)) {:sync? false})))))
-        (testing "32^2 mutation sanity check"
-          (is (false? (await (set/equiv? (disj (into (set/sorted-set) (range 1024)) 512)
-                                         (into (set/sorted-set) (range 1024)) {:sync? false}))))
-          (is (true? (await (set/equiv? (disj (into (set/sorted-set) (range 1024)) 512)
-                                        (disj (into (set/sorted-set) (range 1024)) 512) {:sync? false})))))))
-     (testing "equiv? on restored sets"
-       (and
-        (testing "restored empty set"
-          (let [async-storage (async-storage)
-                sync-storage  (storage)
-                sync-set      (set/sorted-set* {:storage sync-storage})
-                async-set     (set/sorted-set* {:storage async-storage})
-                sync-address  (set/store sync-set)
-                async-address (await (set/store async-set {:sync? false}))]
-           (assert (uuid? sync-address))
-           (assert (uuid? async-address))
-           (and
-            (is (true? (set/equiv? (set/restore sync-address sync-storage) #{} {:sync? true})))
-            (is (true? (set/equiv? (set/restore sync-address sync-storage) (set/sorted-set) {:sync? true})))
-            (is (true? (await (set/equiv? (set/restore async-address async-storage) #{} {:sync? false}))))
-            (is (true? (await (set/equiv? (set/restore async-address async-storage) (sorted-set) {:sync? false})))))))
-        (testing "restored 32^2"
-          (let [async-storage (async-storage)
-                sync-storage  (storage)
-                sync-set      (into (set/sorted-set* {:storage sync-storage}) (range 1024))
-                async-set     (into (set/sorted-set* {:storage async-storage}) (range 1024))
-                sync-address  (set/store sync-set)
-                async-address (await (set/store async-set {:sync? false}))]
-            (assert (uuid? sync-address))
-            (assert (uuid? async-address))
-            (and
-             (is (true? (set/equiv? (set/restore sync-address sync-storage)
-                                    (into #{} (range 1024)) {:sync? true})))
-             (is (true? (set/equiv? (set/restore sync-address sync-storage)
-                                    (into (set/sorted-set) (range 1024)) {:sync? true})))
-             (is (true? (await (set/equiv? (set/restore async-address async-storage)
-                                           (into #{} (range 1024)) {:sync? false}))))
-             (is (true? (await (set/equiv? (set/restore async-address async-storage)
-                                           (into (set/sorted-set) (range 1024)) {:sync? false})))))))
-        (testing "mutations on restored 32^2"
-          (let [async-storage (async-storage)
-                async-set     (into (set/sorted-set* {:storage async-storage}) (range 1024))
-                async-address (await (set/store async-set {:sync? false}))]
-            (assert (uuid? async-address))
-            (and
-             (is (false? (await (set/equiv? (await (set/disj (set/restore async-address async-storage) 512 {:sync? false}))
-                                            (into (set/sorted-set) (range 1024))
-                                            {:sync? false}))))
-             (is (true?  (await (set/equiv? (await (set/disj (set/restore async-address async-storage) 512 {:sync? false}))
-                                            (disj (into (set/sorted-set) (range 1024)) 512)
-                                            {:sync? false})))))))))
-     (testing "equiv-sequential"
-       (and
-        (testing "equiv-sequential? on naive sets"
-         (and
-          (is (true? (set/equiv-sequential? (set/sorted-set) ())))
-          (is (true? (await (set/equiv-sequential? (set/sorted-set) () {:sync? false}))))
-          (is (true? (set/equiv-sequential? (into (set/sorted-set) (range 0 32))
-                                            (range 0 32))))
-          (is (true? (await (set/equiv-sequential? (into (set/sorted-set) (range 0 32))
-                                                   (range 0 32)
-                                                   {:sync? false}))))
-          (is (false? (set/equiv-sequential? (into (set/sorted-set) (range 0 32))
-                                             (shuffle (range 0 32)))))
-          (is (false? (await (set/equiv-sequential? (into (set/sorted-set) (range 0 32))
-                                                    (shuffle (range 0 32))
-                                                    {:sync? false}))))
-          (is (true?  (set/equiv-sequential? (into (set/sorted-set) (range 0 32))
-                                             (seq (into (sorted-set) (range 0 32))))))
-          (is (true?  (await (set/equiv-sequential? (into (set/sorted-set) (range 0 32))
-                                                    (seq (into (sorted-set) (range 0 32)))
-                                                    {:sync? false}))))
-          (is (false? (set/equiv-sequential? (into (set/sorted-set) (range 0 512))
-                                             (into #{} (shuffle (range 0 512))))))
-          (is (false? (await (set/equiv-sequential? (into (set/sorted-set) (range 0 512))
-                                                    (into #{} (shuffle (range 0 512)))
-                                                    {:sync? false}))))))
-        (testing "equiv-sequential? on restored sets"
-          (and
-           (testing "empty seq"
-             (let [async-storage (async-storage)
-                   sync-storage  (storage)
-                   sync-set      (set/sorted-set* {:storage sync-storage})
-                   async-set     (set/sorted-set* {:storage async-storage})
-                   sync-address  (set/store sync-set)
-                   async-address (await (set/store async-set {:sync? false}))]
-               (and
-                (is (true? (set/equiv-sequential? (set/restore sync-address sync-storage) ())))
-                (is (true? (await (set/equiv-sequential? (set/restore async-address async-storage) () {:sync? false})))))))
-           (testing "(range 32)"
-             (let [async-storage (async-storage)
-                   sync-storage  (storage)
-                   sync-set      (into (set/sorted-set* {:storage sync-storage}) (range 32))
-                   async-set     (into (set/sorted-set* {:storage async-storage}) (range 32))
-                   sync-address  (set/store sync-set)
-                   async-address (await (set/store async-set {:sync? false}))]
-               (and
-                (is (true? (set/equiv-sequential? (set/restore sync-address sync-storage) (range 32))))
-                (is (true? (await (set/equiv-sequential? (set/restore async-address async-storage) (range 32) {:sync? false})))))))
-           (testing "(range 512)"
-             (let [async-storage (async-storage)
-                   sync-storage  (storage)
-                   sync-set      (into (set/sorted-set* {:storage sync-storage}) (range 512))
-                   async-set     (into (set/sorted-set* {:storage async-storage}) (range 512))
-                   sync-address  (set/store sync-set)
-                   async-address (await (set/store async-set {:sync? false}))]
-               (and
-                (is (true? (set/equiv-sequential? (set/restore sync-address sync-storage) (range 512))))
-                (is (true? (await (set/equiv-sequential? (set/restore async-address async-storage) (range 512) {:sync? false}))))))))))))))
-
-(deftest equivalence-tests
-  (test/async done
-    (run (do-equivalence-tests)
-      (fn [ok] (done))
-      (fn [err]
-        (js/console.warn "equivalence-tests failed")
-        (is (nil? err))
-        (js/console.error err)
-        (done)))))
-

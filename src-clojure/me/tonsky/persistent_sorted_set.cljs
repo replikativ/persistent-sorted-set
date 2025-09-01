@@ -86,6 +86,13 @@
   ([^BTSet set key] (btset/$contains? set key {:sync? true}))
   ([^BTSet set key opts] (btset/$contains? set key opts)))
 
+(defn lookup
+  "key if present, else (or not-found nil)"
+  ([^BTSet set key]
+   (btset/$lookup set key nil {:sync? false}))
+  ([^BTSet set key not-found]
+   (btset/$lookup set key not-found {:sync? false})))
+
 (defn equiv?
   "Is _other_ a set with the same items?
    returns boolean by default
@@ -154,19 +161,14 @@
 
 (defn seek
   "An efficient way to seek to a specific key in a seq (either returned by [[clojure.core.seq]] or a slice.)
-  `(seek (seq set) to)` returns iterator for all Xs where to <= X.
-  Optionally pass in comparator that will override the one that set uses."
+   `(seek (seq set) to)` returns iterator for all Xs where to <= X.
+   Optionally pass in comparator that will override the one that set uses."
   ([seq to]
-   (btset/-seek seq to))
-  ([seq to cmp]
-   (btset/-seek seq to cmp)))
-
-(defn lookup-async
-  "key if present, else (or not-found nil)"
-  ([^BTSet set key]
-   (btset/$lookup set key nil {:sync? false}))
-  ([^BTSet set key not-found]
-   (btset/$lookup set key not-found {:sync? false})))
+   (btset/$seek seq to))
+  ([seq to arg]
+   (btset/$seek seq to arg))
+  ([seq to cmp opts]
+   (btset/$seek seq to cmp opts)))
 
 (defn walk-addresses
   "Visit each address used by this set. Usable for cleaning up
@@ -204,16 +206,23 @@
 
 #!------------------------------------------------------------------------------
 
-(defn afirst [set](btset/afirst set));;-----------------------------------------TODO
+(defn afirst [set](btset/afirst set))
 
-(defn arest [set] (btset/arest set));;------------------------------------------TODO
+(defn arest [set] (btset/arest set))
 
-(def async-reduce btset/async-reduce)
+(defn async-reduce
+  "reducing function is fn<acc,item> and _must_ return a continuation"
+  [arf set from]
+  (btset/async-reduce arf set from))
 
-(def async-into btset/async-into)
+(defn async-into
+  "xforms must be synchronous"
+  ([] (btset/async-into))
+  ([set] (btset/async-into set))
+  ([set from] (btset/async-into set from))
+  ([set xf from] (btset/async-into set xf from)))
 
-
-; (defn asequence [])
-; (defn atransduce [])
+; (defn async-sequence [])
+; (defn async-transduce [])
 
 

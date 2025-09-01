@@ -394,7 +394,7 @@
                 (path-set path level idx)
                 (dec level))))))))))
 
-(declare riter)
+(declare ReverseIter $seek)
 
 (deftype Iter [^BTSet set left right keys idx]
   IIter
@@ -483,7 +483,11 @@
   IReversible
   (-rseq [this]
     (when keys
-      (riter set ($$prev-path set left {:sync? true}) ($$prev-path set right {:sync? true}))))
+      (let [left' ($$prev-path set left {:sync? true})
+            right' ($$prev-path set right {:sync? true})]
+        (ReverseIter. set left' right'
+                      ($$keys-for set right' {:sync? true})
+                      (path-get right' 0)))))
 
   ISeek
   (-seek [this key]
@@ -577,11 +581,6 @@
   IAsyncSeq
   (-afirst [_] (async))
   (-arest [_] (async)))
-
-(defn async-seq
-  [set path till-path]
-  (when (and path (path-lt path till-path))
-    (AsyncSeq. set path till-path nil nil)))
 
 (defn afirst [s] (-afirst s))
 
@@ -759,10 +758,11 @@
       (let [root (await ($$root set {:sync? false}))]
         (when (pos? (node/len root))
           (let [cmp  (.-comparator set)
-                path (await ($$seek  set left cmp {:sync? false}))
-                till (await ($$rseek set right   cmp {:sync? false}))]
-            (when (and path (path-lt path till))
-              (async-seq set path till)))))))))
+                left' (await ($$seek set left cmp {:sync? false}))
+                right' (await ($$rseek set right cmp {:sync? false}))]
+            (when (and left' (path-lt left' right'))
+              (let [ks (await ($$keys-for set left' {:sync? true}))]
+                (AsyncSeq. set left' right' ks (path-get left' 0)))))))))))
 
 (defn $slice
   ([^BTSet set key-from key-to]
@@ -889,6 +889,34 @@
                 ks (await ($$keys-for set r' opts))
                 idx (path-get r' 0)]
             (AsyncReverseSeq. set l' r' ks idx))))))))
+
+(defn $seek
+  ([seq to]
+   ($seek seq to {:sync? true}))
+  ([seq to arg]
+   (if (fn? arg)
+     ($seek seq to arg {:sync? true})
+     ($seek seq to (.-comparator (.-set seq)) arg)))
+  ([seq key cmp {:keys [sync?] :or {sync? true} :as opts}]
+   (if sync?
+     (-seek seq key cmp)
+     (if (instance? AsyncSeq seq)
+       (if (nat-int? (cmp (arrays/aget (.-keys seq) (.-idx seq)) key))
+         (async seq)
+         (async
+          (when-some [left' (await ($$seek (.-set seq) key cmp opts))]
+            (let [ks ($$keys-for (.-set seq) left' opts)]
+              (AsyncSeq. set left' (.-right seq) ks (path-get left' 0))))))
+       (if (instance? AsyncReverseSeq seq)
+         (if (nat-int? (cmp key (arrays/aget (.-keys seq) (.-idx seq))))
+           (async seq)
+           (let [right' (await ($$prev-path set ($$rseek set key cmp opts) opts))]
+             (when (and
+                    (nat-int? right')
+                    (path-lte (.-left seq) right')
+                    (path-lt  right' (.-right seq)))
+               (AsyncReverseSeq. set (.-left seq) right' ($$keys-for set right' opts) (path-get right' 0)))))
+         (throw (js/Error. (str "unsupported type: '" (type seq) "'"))))))))
 
 #!------------------------------------------------------------------------------
 
