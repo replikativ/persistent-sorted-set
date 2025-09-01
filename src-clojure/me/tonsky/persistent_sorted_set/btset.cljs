@@ -774,34 +774,34 @@
   ([^BTSet set key-from key-to cmp {:keys [sync?] :or {sync? true} :as opts}]
    (async+sync sync?
     (async
-     (when-some [from-path (await ($$seek set key-from cmp opts))]
-       (let [to-path (await ($$rseek set key-to cmp opts))]
-         (when (path-lt from-path to-path)
-           (let [ks (await ($$keys-for set from-path opts))]
+     (when-some [left (await ($$seek set key-from cmp opts))]
+       (let [right (await ($$rseek set key-to cmp opts))]
+         (when (path-lt left right)
+           (let [ks (await ($$keys-for set left opts))]
              (if sync?
-               (Iter. set from-path to-path ks (path-get from-path 0))
-               (AsyncSeq. set from-path to-path ks (path-get from-path 0)))))))))))
+               (Iter.     set left right ks (path-get left 0))
+               (AsyncSeq. set left right ks (path-get left 0)))))))))))
 
 (defn $rslice
   ([^BTSet set key-from key-to]
    ($rslice set key-from key-to (.-comparator set) {:sync? true}))
   ([^BTSet set key-from key-to arg]
    (if (fn? arg)
-     ($rslice set key-from key-to (.-comparator set) arg)
-     ($rslice set key-from key-to arg {:sync? true})))
+     ($rslice set key-from key-to arg {:sync? true})
+     ($rslice set key-from key-to (.-comparator set) arg)))
   ([^BTSet set key-from key-to cmp {:keys [sync?] :or {sync? true} :as opts}]
    (if sync?
      (when-some [iter ($slice set key-to key-from cmp opts)]
        (rseq iter))
      (async
-       (when-some [from-path (await ($$seek set key-to cmp opts))]
-         (let [to-path    (await ($$rseek set key-from cmp opts))]
-           (when (path-lt from-path to-path)
-             (let [left-bound (await ($$prev-path set from-path opts))
-                   start-path (await ($$prev-path set to-path   opts))
-                   ks         (await ($$keys-for set start-path opts))
-                   idx        (path-get start-path 0)]
-               (AsyncReverseSeq. set left-bound start-path ks idx)))))))))
+      (when-some [from-path (await ($$seek set key-to cmp opts))]
+        (let [to-path (await ($$rseek set key-from cmp opts))]
+          (when (path-lt from-path to-path)
+            (let [left-bound (await ($$prev-path set from-path opts))
+                  start-path (await ($$prev-path set to-path   opts))
+                  ks         (await ($$keys-for set start-path opts))
+                  idx        (path-get start-path 0)]
+              (AsyncReverseSeq. set left-bound start-path ks idx)))))))))
 
 (defn $equivalent?
   [^BTSet set other {:keys [sync?] :or {sync? true} :as opts}]
@@ -891,32 +891,39 @@
             (AsyncReverseSeq. set l' r' ks idx))))))))
 
 (defn $seek
-  ([seq to]
-   ($seek seq to {:sync? true}))
-  ([seq to arg]
+  ([seq key]
+   ($seek seq key {:sync? true}))
+  ([seq key arg]
+   (assert (some? seq))
    (if (fn? arg)
-     ($seek seq to arg {:sync? true})
-     ($seek seq to (.-comparator (.-set seq)) arg)))
+     ($seek seq key arg {:sync? true})
+     ($seek seq key (.-comparator (.-set seq)) arg)))
   ([seq key cmp {:keys [sync?] :or {sync? true} :as opts}]
+   (assert (some? seq))
+   (assert (fn? cmp))
    (if sync?
      (-seek seq key cmp)
-     (if (instance? AsyncSeq seq)
-       (if (nat-int? (cmp (arrays/aget (.-keys seq) (.-idx seq)) key))
-         (async seq)
-         (async
-          (when-some [left' (await ($$seek (.-set seq) key cmp opts))]
-            (let [ks ($$keys-for (.-set seq) left' opts)]
-              (AsyncSeq. set left' (.-right seq) ks (path-get left' 0))))))
-       (if (instance? AsyncReverseSeq seq)
-         (if (nat-int? (cmp key (arrays/aget (.-keys seq) (.-idx seq))))
+     (let [set (.-set seq)]
+       (assert (instance? BTSet set))
+       (if (instance? AsyncSeq seq)
+         (if (nat-int? (cmp (arrays/aget (.-keys seq) (.-idx seq)) key))
            (async seq)
-           (let [right' (await ($$prev-path set ($$rseek set key cmp opts) opts))]
-             (when (and
-                    (nat-int? right')
-                    (path-lte (.-left seq) right')
-                    (path-lt  right' (.-right seq)))
-               (AsyncReverseSeq. set (.-left seq) right' ($$keys-for set right' opts) (path-get right' 0)))))
-         (throw (js/Error. (str "unsupported type: '" (type seq) "'"))))))))
+           (async
+            (when-some [left' (await ($$seek set key cmp opts))]
+              (let [ks ($$keys-for set left' opts)]
+                (AsyncSeq. set left' (.-right seq) ks (path-get left' 0))))))
+         (if (instance? AsyncReverseSeq seq)
+           (if (nat-int? (cmp key (arrays/aget (.-keys seq) (.-idx seq))))
+             (async seq)
+             (async
+              (let [k (await ($$rseek set key cmp opts))
+                    right' (await ($$prev-path set k opts))]
+                (when (and
+                       (nat-int? right')
+                       (path-lte (.-left seq) right')
+                       (path-lt  right' (.-right seq)))
+                  (AsyncReverseSeq. set (.-left seq) right' ($$keys-for set right' opts) (path-get right' 0))))))
+           (throw (js/Error. (str "unsupported type: '" (type seq) "'")))))))))
 
 #!------------------------------------------------------------------------------
 
