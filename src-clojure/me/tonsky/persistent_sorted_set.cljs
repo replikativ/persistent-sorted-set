@@ -37,6 +37,42 @@
 ;           idx       :: Cached idx in keys array
 ; Keys and idx are cached for fast iteration inside a leaf"
 
+#!------------------------------------------------------------------------------
+
+(defn from-sorted-array
+  "Fast path to create a set if you already have a sorted array of elements on your hands."
+  ([cmp arr]
+   (from-sorted-array cmp arr (arrays/alength arr)))
+  ([cmp arr _len]
+   (from-sorted-array cmp arr _len {}))
+  ([cmp arr _len opts]
+   (btset/from-sorted-array cmp arr _len opts)))
+
+(defn from-sequential
+  "Create a set with custom comparator and a collection of keys. Useful when you don't want to call [[clojure.core/apply]] on [[sorted-set-by]]."
+  [cmp seq]
+  (btset/from-sequential cmp seq))
+
+(defn sorted-set-by
+  ([cmp]
+   (btset/sorted-set-by cmp))
+  ([cmp & keys]
+   (apply btset/sorted-set-by cmp keys)))
+
+(defn sorted-set
+  ([] (btset/sorted-set-by compare))
+  ([& keys] (btset/from-sequential compare keys)))
+
+(defn sorted-set*
+  "Create a set with options map containing:
+   - :storage  Storage implementation
+   - :comparator  Custom comparator (defaults to compare)
+   - :meta     Metadata"
+  [opts]
+  (btset/from-opts opts))
+
+#!------------------------------------------------------------------------------
+
 (defn count
   "O(n) when restoring root address, otherwise O(1)
    returns number by default
@@ -116,8 +152,6 @@
   ([^BTSet set key-from key-to cmp opts]
    (btset/$rslice set key-from key-to cmp opts)))
 
-#!------------------------------------------------------------------------------
-
 (defn seek
   "An efficient way to seek to a specific key in a seq (either returned by [[clojure.core.seq]] or a slice.)
   `(seek (seq set) to)` returns iterator for all Xs where to <= X.
@@ -127,27 +161,12 @@
   ([seq to cmp]
    (btset/-seek seq to cmp)))
 
-#!------------------------------------------------------------------------------
-
 (defn lookup-async
+  "key if present, else (or not-found nil)"
   ([^BTSet set key]
    (btset/$lookup set key nil {:sync? false}))
   ([^BTSet set key not-found]
    (btset/$lookup set key not-found {:sync? false})))
-
-(defn afirst [set](btset/afirst set));;-----------------------------------------TODO
-
-(defn arest [set] (btset/arest set));;------------------------------------------TODO
-
-(def async-reduce btset/async-reduce)
-
-(def async-into btset/async-into)
-
-
-; (defn asequence [])
-; (defn atransduce [])
-
-#!------------------------------------------------------------------------------
 
 (defn walk-addresses
   "Visit each address used by this set. Usable for cleaning up
@@ -185,32 +204,16 @@
 
 #!------------------------------------------------------------------------------
 
-(defn from-sorted-array
-  "Fast path to create a set if you already have a sorted array of elements on your hands."
-  ([cmp arr]
-   (from-sorted-array cmp arr (arrays/alength arr)))
-  ([cmp arr _len]
-   (from-sorted-array cmp arr _len {}))
-  ([cmp arr _len opts]
-   (btset/from-sorted-array cmp arr _len opts)))
+(defn afirst [set](btset/afirst set));;-----------------------------------------TODO
 
-(defn from-sequential
-  "Create a set with custom comparator and a collection of keys. Useful when you don't want to call [[clojure.core/apply]] on [[sorted-set-by]]."
-  [cmp seq]
-  (let [arr (-> (into-array seq) (arrays/asort cmp) (btset/sorted-arr-distinct cmp))]
-    (from-sorted-array cmp arr)))
+(defn arest [set] (btset/arest set));;------------------------------------------TODO
 
-(def sorted-set-by btset/sorted-set-by)
+(def async-reduce btset/async-reduce)
 
-(defn sorted-set
-  ([] (btset/sorted-set-by compare))
-  ([& keys] (btset/from-sequential compare keys)))
+(def async-into btset/async-into)
 
-(defn sorted-set*
-  "Create a set with options map containing:
-   - :storage  Storage implementation
-   - :comparator  Custom comparator (defaults to compare)
-   - :meta     Metadata"
-  [opts]
-  (btset/from-opts opts))
+
+; (defn asequence [])
+; (defn atransduce [])
+
 

@@ -11,7 +11,7 @@
             [me.tonsky.persistent-sorted-set.impl.storage :as storage]
             [me.tonsky.persistent-sorted-set.util :refer [rotate lookup-exact splice cut-n-splice binary-search-l binary-search-r return-array merge-n-split check-n-splice]]))
 
-(declare BTSet $$iter riter)
+(declare BTSet)
 
 (defn- $$root
   [^BTSet set {:keys [sync?] :or {sync? true} :as opts}]
@@ -152,61 +152,6 @@
                   (or (:comparator root-address-or-info) compare)
                   (or (:comparator opts) compare))]
     (BTSet. nil -1 cmp meta UNINITIALIZED_HASH storage address)))
-
-#!------------------------------------------------------------------------------
-
-(defn- arr-partition-approx
-  "Splits `arr` into arrays of size between min-len and max-len,
-   trying to stick to (min+max)/2"
-  [min-len max-len arr]
-  (let [chunk-len AVG_LEN
-        len       (arrays/alength arr)
-        acc       (transient [])]
-    (when (pos? len)
-      (loop [pos 0]
-        (let [rest (- len pos)]
-          (cond
-            (<= rest max-len)
-            (conj! acc (.slice arr pos))
-            (>= rest (+ chunk-len min-len))
-            (do
-              (conj! acc (.slice arr pos (+ pos chunk-len)))
-              (recur (+ pos chunk-len)))
-            :else
-            (let [piece-len (arrays/half rest)]
-              (conj! acc (.slice arr pos (+ pos piece-len)))
-              (recur (+ pos piece-len)))))))
-    (to-array (persistent! acc))))
-
-(defn- sorted-arr-distinct? [arr cmp]
-  (let [al (arrays/alength arr)]
-    (if (<= al 1)
-      true
-      (loop [i 1
-             p (arrays/aget arr 0)]
-        (if (>= i al)
-          true
-          (let [e (arrays/aget arr i)]
-            (if (== 0 (cmp e p))
-              false
-              (recur (inc i) e))))))))
-
-(defn sorted-arr-distinct
-  "Filter out repetitive values in a sorted array.
-   Optimized for no-duplicates case"
-  [arr cmp]
-  (if (sorted-arr-distinct? arr cmp)
-    arr
-    (let [al (arrays/alength arr)]
-      (loop [acc (transient [(arrays/aget arr 0)])
-             i   1
-             p   (arrays/aget arr 0)]
-        (if (>= i al)
-          (into-array (persistent! acc))
-          (let [e (arrays/aget arr i)]
-            (if (== 0 (cmp e p))
-              (recur acc (inc i) e)
-              (recur (conj! acc e) (inc i) e))))))))
 
 #!------------------------------------------------------------------------------
 
@@ -448,6 +393,8 @@
                 child-node
                 (path-set path level idx)
                 (dec level))))))))))
+
+(declare riter)
 
 (deftype Iter [^BTSet set left right keys idx]
   IIter
@@ -692,6 +639,8 @@
 
 #!------------------------------------------------------------------------------
 
+(declare $$iter)
+
 (deftype ReverseIter [^BTSet set left right keys idx]
   IIter
   (-copy [_ l r] (ReverseIter. set l r ($$keys-for set r {:sync? true}) (path-get r 0)))
@@ -757,8 +706,6 @@
   (-pr-writer [this writer opts]
     (pr-sequential-writer writer pr-writer "(" " " ")" opts (seq this))))
 
-(defn riter [^BTSet set left right]
-  (ReverseIter. set left right ($$keys-for set right {:sync? true}) (path-get right 0)))
 
 #!------------------------------------------------------------------------------
 
@@ -928,14 +875,6 @@
   ([set opts]
    ($$iter set opts)))
 
-; (defn riter [^BTSet set left right]
-;   (ReverseIter. set left right ($$keys-for set right {:sync? true}) (path-get right 0)))
-
-;; Iter
-; (-rseq [this]
-;   (when keys
-;     (riter set ($$prev-path set left {:sync? true}) ($$prev-path set right {:sync? true}))))
-
 (defn $rseq
   ([set]
    ($rseq set {:sync? true}))
@@ -1026,6 +965,59 @@
 
 #!------------------------------------------------------------------------------
 #! Constructors
+
+(defn- arr-partition-approx
+  "Splits `arr` into arrays of size between min-len and max-len,
+   trying to stick to (min+max)/2"
+  [min-len max-len arr]
+  (let [chunk-len AVG_LEN
+        len       (arrays/alength arr)
+        acc       (transient [])]
+    (when (pos? len)
+      (loop [pos 0]
+        (let [rest (- len pos)]
+          (cond
+            (<= rest max-len)
+            (conj! acc (.slice arr pos))
+            (>= rest (+ chunk-len min-len))
+            (do
+              (conj! acc (.slice arr pos (+ pos chunk-len)))
+              (recur (+ pos chunk-len)))
+            :else
+            (let [piece-len (arrays/half rest)]
+              (conj! acc (.slice arr pos (+ pos piece-len)))
+              (recur (+ pos piece-len)))))))
+    (to-array (persistent! acc))))
+
+(defn- sorted-arr-distinct? [arr cmp]
+  (let [al (arrays/alength arr)]
+    (if (<= al 1)
+      true
+      (loop [i 1
+             p (arrays/aget arr 0)]
+        (if (>= i al)
+          true
+          (let [e (arrays/aget arr i)]
+            (if (== 0 (cmp e p))
+              false
+              (recur (inc i) e))))))))
+
+(defn- sorted-arr-distinct
+  "Filter out repetitive values in a sorted array.
+   Optimized for no-duplicates case"
+  [arr cmp]
+  (if (sorted-arr-distinct? arr cmp)
+    arr
+    (let [al (arrays/alength arr)]
+      (loop [acc (transient [(arrays/aget arr 0)])
+             i   1
+             p   (arrays/aget arr 0)]
+        (if (>= i al)
+          (into-array (persistent! acc))
+          (let [e (arrays/aget arr i)]
+            (if (== 0 (cmp e p))
+              (recur acc (inc i) e)
+              (recur (conj! acc e) (inc i) e))))))))
 
 (defn- arr-map-inplace [f arr]
   (let [len (arrays/alength arr)]

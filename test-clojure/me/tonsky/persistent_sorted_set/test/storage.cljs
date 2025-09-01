@@ -4,15 +4,9 @@
    [await-cps :refer [await run-async] :refer-macros [async] :rename {run-async run}]
    ; [is.simm.lean-cps.async :refer [await run] :refer-macros [async]]
    [cljs.test :as test :refer [is are deftest testing]]
-   [clojure.edn :as edn]
-   [clojure.string :as str]
    [me.tonsky.persistent-sorted-set :as set]
-   [me.tonsky.persistent-sorted-set.impl.storage :refer [IStorage]]
-   [me.tonsky.persistent-sorted-set.btset :refer [BTSet AsyncSeq]]
-   [me.tonsky.persistent-sorted-set.leaf :refer [Leaf] :as leaf]
-   [me.tonsky.persistent-sorted-set.branch :refer [Branch] :as branch]
    [me.tonsky.persistent-sorted-set.test.storage.util
-    :refer [storage async-storage branch? leaf?]]))
+    :refer [storage async-storage]]))
 
 (defn children [node] (some->> (.-children node) (filter some?)))
 
@@ -124,7 +118,6 @@
          (let [x (set/rslice (set/restore address storage) 5000 nil)]
            (is (= x (some-> x rseq reverse)) "rseq reversibility on restored set"))))))))
 
-
 (defn do-test-small-async-restoration []
   (async
    (and
@@ -235,36 +228,48 @@
            (let [rs (await (set/rseq (set/restore address storage) {:sync? false}))
                  b  (await (set/equiv-sequential? rs (range 511 47 -1) {:sync? false}))]
              (is (true? b) "rseq works on unrealized lazy state"))))))
-    ; (testing "rslice"
-    ;   (let [storage (storage)
-    ;         stored  (into (set/sorted-set) (range 0 40))
-    ;         address (set/store stored storage)]
-    ;     (and
-    ;      (testing-group "control"
-    ;        (is (= (range 19 9 -1)
-    ;               (set/rslice (into (set/sorted-set) (range 0 40)) 19 10))
-    ;            "control"))
-    ;      (testing-group "flushed"
-    ;        (is (= (range 19 9 -1) (set/rslice stored 19 10))
-    ;            "rslice works on set that just flushed"))
-    ;      (testing-group "restored"
-    ;        (is (= (range 19 9 -1) (set/rslice (set/restore address storage) 19 10))
-    ;            "rslice works on unrealized lazy state")))))
-    ; (testing "reversing rseq is original sort"
-    ;   (let [storage (storage)
-    ;         stored  (into (set/sorted-set) (shuffle (range 0 5001)))
-    ;         address (set/store stored storage)]
-    ;     (and
-    ;      (testing-group "control"
-    ;                     (let [x (set/rslice (into (set/sorted-set) (shuffle (range 0 5001))) 5000 nil)]
-    ;                       (is (= x (some-> x rseq reverse)) "control")))
-    ;      (testing-group "flushed"
-    ;                     (let [x (set/rslice stored 5000 nil)]
-    ;                       (is (= x (some-> x rseq reverse)) "rseq reversibility on flushed set")))
-    ;      (testing-group "restored"
-    ;                     (let [x (set/rslice (set/restore address storage) 5000 nil)]
-    ;                       (is (= x (some-> x rseq reverse)) "rseq reversibility on restored set"))))))
-    )))
+    (testing "rslice"
+      (let [storage (async-storage)
+            stored  (into (set/sorted-set) (range 0 40))
+            address (await (set/store stored storage {:sync? false}))]
+        (and
+         (testing "sync-control"
+           (is (= (range 19 9 -1)
+                  (set/rslice (into (set/sorted-set) (range 0 40)) 19 10))))
+         (testing "async-control"
+           (let [s  (into (set/sorted-set) (range 0 40))
+                 rs (await (set/rslice s 19 10 compare {:sync? false}))
+                 b  (await (set/equiv-sequential? rs (range 19 9 -1) {:sync? false}))]
+             (is (true? b))))
+         (testing "flushed"
+           (let [rs (await (set/rslice stored 19 10 compare {:sync? false}))
+                 b  (await (set/equiv-sequential? rs (range 19 9 -1) {:sync? false}))]
+             (is (true? b) "rslice works on set that just flushed")))
+         (testing "restored"
+           (let [rs (await (set/rslice (set/restore address storage) 19 10 compare {:sync? false}))
+                 b  (await (set/equiv-sequential? rs (range 19 9 -1) {:sync? false}))]
+             (is (true? b) "rslice works on unrealized lazy state"))))))
+    (testing "reversing rslice is original sort"
+      (let [storage (async-storage)
+            stored  (into (set/sorted-set) (shuffle (range 0 5001)))
+            address (await (set/store stored storage {:sync? false}))
+            asc     (range 0 5001)]
+        (and
+         (testing "sync control"
+           (is (= asc (reverse (set/rslice (into (set/sorted-set) (shuffle (range 0 5001))) 5000 nil)))))
+         (testing "async control"
+           (let [s (into (set/sorted-set) (shuffle (range 0 5001)))
+                 rs (await (set/rslice s 5000 nil compare {:sync? false}))
+                 b  (await (set/equiv-sequential? rs (reverse asc) {:sync? false}))]
+             (is (true? b))))
+         (testing "flushed (async)"
+           (let [rs (await (set/rslice stored 5000 nil compare {:sync? false}))
+                 b  (await (set/equiv-sequential? rs (reverse asc) {:sync? false}))]
+             (is (true? b) "rseq reversibility on flushed set")))
+         (testing "restored (async)"
+           (let [rs (await (set/rslice (set/restore address storage) 5000 nil compare {:sync? false}))
+                 b  (await (set/equiv-sequential? rs (reverse asc) {:sync? false}))]
+             (is (true? b) "rseq reversibility on restored set")))))))))
 
 (deftest test-small-async-restoration
   (test/async done
@@ -393,7 +398,6 @@
                (and
                 (is (true? (set/equiv-sequential? (set/restore sync-address sync-storage) (range 32))))
                 (is (true? (await (set/equiv-sequential? (set/restore async-address async-storage) (range 32) {:sync? false})))))))
-           ;; TODO rseq, slicing
            (testing "(range 512)"
              (let [async-storage (async-storage)
                    sync-storage  (storage)
@@ -404,7 +408,6 @@
                (and
                 (is (true? (set/equiv-sequential? (set/restore sync-address sync-storage) (range 512))))
                 (is (true? (await (set/equiv-sequential? (set/restore async-address async-storage) (range 512) {:sync? false}))))))))))))))
-
 
 (deftest equivalence-tests
   (test/async done
