@@ -1,17 +1,15 @@
 (ns me.tonsky.persistent-sorted-set.test.storage.util
   (:require-macros [me.tonsky.persistent-sorted-set.test.macros :refer [testing-group]])
-  (:require
-   [await-cps :refer [await run-async] :refer-macros [async] :rename {run-async run}]
-   ; [is.simm.lean-cps.async :refer [await run] :refer-macros [async]]
-   [cljs.test :as test :refer [is are deftest testing]]
-   [clojure.edn :as edn]
-   [clojure.string :as str]
-   [me.tonsky.persistent-sorted-set :as set]
-   [me.tonsky.persistent-sorted-set.impl.storage :refer [IStorage]]
-   [me.tonsky.persistent-sorted-set.impl.node :as node]
-   [me.tonsky.persistent-sorted-set.btset :refer [BTSet]]
-   [me.tonsky.persistent-sorted-set.leaf :refer [Leaf] :as leaf]
-   [me.tonsky.persistent-sorted-set.branch :refer [Branch] :as branch]))
+  (:require [cljs.test :as test :refer [is are deftest testing]]
+            [clojure.edn :as edn]
+            [clojure.string :as str]
+            [is.simm.lean-cps.async :refer [await run] :refer-macros [async]]
+            [me.tonsky.persistent-sorted-set :as set]
+            [me.tonsky.persistent-sorted-set.impl.storage :refer [IStorage]]
+            [me.tonsky.persistent-sorted-set.impl.node :as node]
+            [me.tonsky.persistent-sorted-set.btset :refer [BTSet]]
+            [me.tonsky.persistent-sorted-set.leaf :refer [Leaf] :as leaf]
+            [me.tonsky.persistent-sorted-set.branch :refer [Branch] :as branch]))
 
 (def ^:dynamic *debug* false)
 

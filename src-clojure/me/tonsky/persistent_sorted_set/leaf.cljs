@@ -1,7 +1,6 @@
 (ns me.tonsky.persistent-sorted-set.leaf
   (:require-macros [me.tonsky.persistent-sorted-set.macros :refer [async+sync]])
-  (:require [await-cps :refer [await] :refer-macros [async]]
-            ; [is.simm.lean-cps.async :refer [await] :refer-macros [async]]
+  (:require [is.simm.lean-cps.async :refer [await] :refer-macros [async]]
             [goog.array :as garr]
             [me.tonsky.persistent-sorted-set.arrays :as arrays]
             [me.tonsky.persistent-sorted-set.constants :refer [MAX_LEN]]
