@@ -6,7 +6,68 @@
    [cljs.test :as test :refer [is are deftest testing]]
    [me.tonsky.persistent-sorted-set :as set]
    [me.tonsky.persistent-sorted-set.test.storage.util
-    :refer [storage async-storage]]))
+    :refer [storage async-storage branch? leaf?]]))
+
+(defn root [set] (.-root set))
+
+(defn addresses [node] (some->> (.-addresses node) (filter some?)))
+
+(defn children [node] (some->> (.-children node) (filter some?)))
+
+(defn ks [node] (some->> (.-keys node) (filterv some?)))
+
+(deftest branch-steps-test
+  "steps from full leaf to branch and back down"
+  (let [og ^PersistentSortedSet (into (set/sorted-set* {}) (range 0 32))]
+    (and
+     (is (= 32 (count og)))
+     (is (leaf? (.-root og))) ;; full leaf at root
+     (is (= 32 (count (ks (.-root og)))))
+     (is (= (range 0 32) (ks (.-root og))))
+     (let [og' (conj og 32)] ;; split first leaf
+       (and
+        (is (= 33 (count og')))
+        (is (branch? (.-root og')))
+        (is (= 2 (count (ks (.-root og')))))
+        (is (= [15 32] (ks (.-root og'))))
+        (is (= 2 (count (children (.-root og')))))
+        (is (= 16 (count (ks (nth (children (.-root og')) 0)))))
+        (is (= (range 0 16) (ks (nth (children (.-root og')) 0))))
+        (is (= 17 (count (ks (nth (children (.-root og')) 1)))))
+        (is (= (range 16 33) (ks (nth (children (.-root og')) 1))))
+        (let [og'' (conj og' 33)] ;; first add after split
+          (and
+           (is (= 34 (count og'')))
+           (is (branch? (.-root og'')))
+           (is (= 2 (count (ks (.-root og'')))))
+           (is (= [15 33] (ks (.-root og''))))
+           (is (= 2 (count (children (.-root og'')))))
+           (is (= 16 (count (ks (nth (children (.-root og'')) 0)))))
+           (is (= (range 0 16) (ks (nth (children (.-root og'')) 0))))
+           (is (= 18 (count (ks (nth (children (.-root og'')) 1)))))
+           (is (= (range 16 34) (ks (nth (children (.-root og'')) 1))))
+           (let [og''- (disj og'' 33)]
+             (and
+              (is (= 33 (count og''-)))
+              (is (branch? (.-root og''-)))
+              (is (= [15 32] (ks (.-root og''-))))
+              (is (= 16 (count (ks (nth (children (.-root og''-)) 0)))))
+              (is (= (range 0 16) (ks (nth (children (.-root og''-)) 0))))
+              (is (= 17 (count (ks (nth (children (.-root og''-)) 1)))))
+              (is (= (range 16 33) (ks (nth (children (.-root og''-)) 1))))
+              (let [og''-- (disj og''- 32)]
+                (and
+                 (is (= 32 (count og''--)))
+                 ;; jvm version does not shrink here, not sure we should care
+                 #_(is (branch? (.-root og''--)))
+                 #_(is (= (range 0 16) (ks (nth (children (.-root og''--)) 0))))
+                 #_(is (= (range 16 32) (ks (nth (children (.-root og''--)) 1)))))))))))))))
+
+(deftest disj-test
+  (let [control-set (into (sorted-set) [3 5 6])
+        test-set (into (set/sorted-set) [3 5 6])]
+    (is (= (disj (disj control-set 6) 6)
+           (disj (disj test-set 6) 6)))))
 
 (deftest test-walk-addresses
   (let [size       1000
@@ -31,132 +92,4 @@
         (is (nil? (set/walk-addresses set' (fn [addr] (if (some? addr) (swap! *stored' inc))))))
         (is (= 63 @*stored')))))))
 
-(defn do-seek-slice-test []
-  (async
-   (and
-    (testing "slicing together with seek"
-      (testing "A"
-        (and
-         (testing "sync-control"
-           (is (= (range 5000 7501) (-> (set/slice (apply set/sorted-set (range 10000)) 2500 7500)
-                                      (set/seek 5000)))))
-         (testing "async-control"
-           (let [s  (apply set/sorted-set (range 10000))
-                 sl (await (set/slice s 2500 7500 {:sync? false}))
-                 sk (await (set/seek sl 5000 {:sync? false}))]
-             (is (set/equiv-sequential? sk (range 5000 7501) {:sync? false}))))
-         (testing "async restored"
-           (let [s        (apply set/sorted-set (range 10000))
-                 storage  (async-storage)
-                 addr     (await (set/store s storage {:sync? false}))
-                 restored (set/restore addr storage)
-                 sl       (await (set/slice restored 2500 7500 {:sync? false}))
-                 sk       (await (set/seek sl 5000 {:sync? false}))]
-             (is (set/equiv-sequential? sk (range 5000 7501) {:sync? false}))))))
-      (testing "B"
-        (and
-         (testing "sync-control"
-           (is (= (list 7500)
-                  (-> (set/slice (apply set/sorted-set (range 10000)) 2500 7500)
-                    (set/seek 5000)
-                    (set/seek 7500)))))
-         (testing "async-control"
-           (let [s   (apply set/sorted-set (range 10000))
-                 sl  (await (set/slice s 2500 7500 {:sync? false}))
-                 sk1 (await (set/seek sl 5000 {:sync? false}))
-                 sk2 (await (set/seek sk1 7500 {:sync? false}))]
-             (is (set/equiv-sequential? sk2 (list 7500) {:sync? false}))))
-         (testing "async restored"
-           (let [s        (apply set/sorted-set (range 10000))
-                 storage  (async-storage)
-                 addr     (await (set/store s storage {:sync? false}))
-                 restored (set/restore addr storage)
-                 sl       (await (set/slice restored 2500 7500 {:sync? false}))
-                 sk1      (await (set/seek sl 5000 {:sync? false}))
-                 sk2      (await (set/seek sk1 7500 {:sync? false}))]
-             (is (set/equiv-sequential? sk2 (list 7500) {:sync? false}))))))
-      (testing "C"
-        (and
-         (testing "sync-control"
-           (is (= (range 5000 2499 -1)
-                  (-> (set/rslice (apply set/sorted-set (range 10000)) 7500 2500)
-                    (set/seek 5000)))))
-         (testing "async-control"
-           (let [s   (apply set/sorted-set (range 10000))
-                 rs  (await (set/rslice s 7500 2500 {:sync? false}))
-                 sk  (await (set/seek rs 5000 {:sync? false}))]
-             (is (set/equiv-sequential? sk (range 5000 2499 -1) {:sync? false}))))
-         (testing "async restored"
-           (let [s        (apply set/sorted-set (range 10000))
-                 storage  (async-storage)
-                 addr     (await (set/store s storage {:sync? false}))
-                 restored (set/restore addr storage)
-                 rs       (await (set/rslice restored 7500 2500 {:sync? false}))
-                 sk       (await (set/seek rs 5000 {:sync? false}))]
-             (is (set/equiv-sequential? sk (range 5000 2499 -1) {:sync? false}))))))
-      (testing "D"
-        (and
-         (testing "sync-control"
-           (is (= (list 2500)
-                  (-> (set/rslice (apply set/sorted-set (range 10000)) 7500 2500)
-                    (set/seek 5000)
-                    (set/seek 2500)))))
-         (testing "async-control"
-           (let [s   (apply set/sorted-set (range 10000))
-                 rs  (await (set/rslice s 7500 2500 {:sync? false}))
-                 sk1 (await (set/seek rs 5000 {:sync? false}))
-                 _(assert (some? sk1))
-                 sk2 (await (set/seek sk1 2500 {:sync? false}))]
-             (is (set/equiv-sequential? sk2 (list 2500) {:sync? false}))))
-         (testing "async restored"
-           (let [s        (apply set/sorted-set (range 10000))
-                 storage  (async-storage)
-                 addr     (await (set/store s storage {:sync? false}))
-                 restored (set/restore addr storage)
-                 rs       (await (set/rslice restored 7500 2500 {:sync? false}))
-                 sk1      (await (set/seek rs 5000 {:sync? false}))
-                 sk2      (await (set/seek sk1 2500 {:sync? false}))]
-             (is (set/equiv-sequential? sk2 (list 2500) {:sync? false}))))))))))
 
-(deftest seek-slice-test
-  (test/async done
-    (run (do-seek-slice-test)
-      (fn [_] (done))
-      (fn [err]
-        (js/console.warn "seek-slice-test failed")
-        (is (nil? err))
-        (js/console.error err)
-        (done)))))
-
-; (testing "simple async seek on forward async seq"
-;   (loop [i 0]
-;     (if (>= i 10)
-;       true
-;       (let [seek-loc (* 100 i)
-;             after    (await (set/seek aseq seek-loc compare {:sync? false}))
-;             ok       (await (set/equiv-sequential? after (range seek-loc size) {:sync? false}))]
-;         (if (true? ok)
-;           (do
-;             (is (true? ok))
-;             (recur (inc i)))
-;           (is (true? ok) (str "i:" i ", seek-loc:" seek-loc)))))))
-
-; (testing "multiple async seek chaining"
-;   (let [s1 (await (set/seek aseq 250 compare {:sync? false}))
-;         s2 (await (set/seek s1   500 compare {:sync? false}))
-;         ok (await (set/equiv-sequential? s2 (range 500 size) {:sync? false}))]
-;     (is (true? ok))))
-
-; (testing "async seq behaviour after seek"
-;   (let [tail (await (set/seek aseq 500 compare {:sync? false}))
-;         ok   (await (set/equiv-sequential? tail (range 500 size) {:sync? false}))]
-;     (is (true? ok))))
-
-; (testing "async slicing together with seek"
-;   (let [slc (await (set/slice (apply set/sorted-set (range 10000)) 2500 7500 {:sync? false}))
-;         a1  (await (set/seek slc 5000 compare {:sync? false}))
-;         a2  (await (set/seek a1  7500 compare {:sync? false}))
-;         ok1 (await (set/equiv-sequential? a1 (range 5000 7501) {:sync? false}))
-;         ok2 (await (set/equiv-sequential? a2 (list 7500)       {:sync? false}))]
-;     (and (is (true? ok1))
-;          (is (true? ok2)))))

@@ -1,4 +1,4 @@
-(ns me.tonsky.persistent-sorted-set.test.cps.utils
+(ns me.tonsky.persistent-sorted-set.bench.cps.utils
   "Simple utilities for async testing"
   (:require ;[is.simm.lean-cps.async :refer [await] :refer-macros [async]]
             ;[is.simm.lean-cps.runtime :refer [smart-trampoline]]
@@ -145,4 +145,3 @@
      (fn [error]
        (js/console.groupEnd label)
        (err err)))))
-

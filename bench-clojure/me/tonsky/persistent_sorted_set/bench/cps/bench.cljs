@@ -1,4 +1,4 @@
-(ns me.tonsky.persistent-sorted-set.test.cps.bench
+(ns me.tonsky.persistent-sorted-set.bench.cps.cps-storage-bench
   "Benchmarks comparing synchronous vs asynchronous performance"
   (:require
    [cljs.test :refer-macros [deftest testing is] :as test]
@@ -9,7 +9,7 @@
    [me.tonsky.persistent-sorted-set.btset :as btset]
    [me.tonsky.persistent-sorted-set.leaf :as leaf]
    [me.tonsky.persistent-sorted-set.branch :as branch]
-   [me.tonsky.persistent-sorted-set.test.cps.utils :as utils]))
+   [me.tonsky.persistent-sorted-set.bench.cps.utils :as utils]))
 
 (defn- now [] (js/performance.now))
 

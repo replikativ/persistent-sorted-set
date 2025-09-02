@@ -169,13 +169,109 @@
                      restored (set/restore addr storage)]
                  (nil? (await (set/rslice restored -1 -2 {:sync? false})))))))))))
 
-
 (deftest rslice-parity-test
   (test/async done
     (run (do-rslice-parity-test)
       (fn [_] (done))
       (fn [err]
         (js/console.warn "slice-parity-test failed")
+        (is (nil? err))
+        (js/console.error err)
+        (done)))))
+
+(defn do-seek-slice-test []
+  (async
+   (and
+    (testing "slicing together with seek"
+      (testing "A"
+        (and
+         (testing "sync-control"
+           (is (= (range 5000 7501) (-> (set/slice (apply set/sorted-set (range 10000)) 2500 7500)
+                                      (set/seek 5000)))))
+         (testing "async-control"
+           (let [s  (apply set/sorted-set (range 10000))
+                 sl (await (set/slice s 2500 7500 {:sync? false}))
+                 sk (await (set/seek sl 5000 {:sync? false}))]
+             (is (set/equiv-sequential? sk (range 5000 7501) {:sync? false}))))
+         (testing "async restored"
+           (let [s        (apply set/sorted-set (range 10000))
+                 storage  (async-storage)
+                 addr     (await (set/store s storage {:sync? false}))
+                 restored (set/restore addr storage)
+                 sl       (await (set/slice restored 2500 7500 {:sync? false}))
+                 sk       (await (set/seek sl 5000 {:sync? false}))]
+             (is (set/equiv-sequential? sk (range 5000 7501) {:sync? false}))))))
+      (testing "B"
+        (and
+         (testing "sync-control"
+           (is (= (list 7500)
+                  (-> (set/slice (apply set/sorted-set (range 10000)) 2500 7500)
+                    (set/seek 5000)
+                    (set/seek 7500)))))
+         (testing "async-control"
+           (let [s   (apply set/sorted-set (range 10000))
+                 sl  (await (set/slice s 2500 7500 {:sync? false}))
+                 sk1 (await (set/seek sl 5000 {:sync? false}))
+                 sk2 (await (set/seek sk1 7500 {:sync? false}))]
+             (is (set/equiv-sequential? sk2 (list 7500) {:sync? false}))))
+         (testing "async restored"
+           (let [s        (apply set/sorted-set (range 10000))
+                 storage  (async-storage)
+                 addr     (await (set/store s storage {:sync? false}))
+                 restored (set/restore addr storage)
+                 sl       (await (set/slice restored 2500 7500 {:sync? false}))
+                 sk1      (await (set/seek sl 5000 {:sync? false}))
+                 sk2      (await (set/seek sk1 7500 {:sync? false}))]
+             (is (set/equiv-sequential? sk2 (list 7500) {:sync? false}))))))
+      (testing "C"
+        (and
+         (testing "sync-control"
+           (is (= (range 5000 2499 -1)
+                  (-> (set/rslice (apply set/sorted-set (range 10000)) 7500 2500)
+                    (set/seek 5000)))))
+         (testing "async-control"
+           (let [s   (apply set/sorted-set (range 10000))
+                 rs  (await (set/rslice s 7500 2500 {:sync? false}))
+                 sk  (await (set/seek rs 5000 {:sync? false}))]
+             (is (set/equiv-sequential? sk (range 5000 2499 -1) {:sync? false}))))
+         (testing "async restored"
+           (let [s        (apply set/sorted-set (range 10000))
+                 storage  (async-storage)
+                 addr     (await (set/store s storage {:sync? false}))
+                 restored (set/restore addr storage)
+                 rs       (await (set/rslice restored 7500 2500 {:sync? false}))
+                 sk       (await (set/seek rs 5000 {:sync? false}))]
+             (is (set/equiv-sequential? sk (range 5000 2499 -1) {:sync? false}))))))
+      (testing "D"
+        (and
+         (testing "sync-control"
+           (is (= (list 2500)
+                  (-> (set/rslice (apply set/sorted-set (range 10000)) 7500 2500)
+                    (set/seek 5000)
+                    (set/seek 2500)))))
+         (testing "async-control"
+           (let [s   (apply set/sorted-set (range 10000))
+                 rs  (await (set/rslice s 7500 2500 {:sync? false}))
+                 sk1 (await (set/seek rs 5000 {:sync? false}))
+                 _(assert (some? sk1))
+                 sk2 (await (set/seek sk1 2500 {:sync? false}))]
+             (is (set/equiv-sequential? sk2 (list 2500) {:sync? false}))))
+         (testing "async restored"
+           (let [s        (apply set/sorted-set (range 10000))
+                 storage  (async-storage)
+                 addr     (await (set/store s storage {:sync? false}))
+                 restored (set/restore addr storage)
+                 rs       (await (set/rslice restored 7500 2500 {:sync? false}))
+                 sk1      (await (set/seek rs 5000 {:sync? false}))
+                 sk2      (await (set/seek sk1 2500 {:sync? false}))]
+             (is (set/equiv-sequential? sk2 (list 2500) {:sync? false}))))))))))
+
+(deftest seek-slice-test
+  (test/async done
+    (run (do-seek-slice-test)
+      (fn [_] (done))
+      (fn [err]
+        (js/console.warn "seek-slice-test failed")
         (is (nil? err))
         (js/console.error err)
         (done)))))

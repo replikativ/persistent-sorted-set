@@ -55,7 +55,7 @@
           idx   (garr/binarySearch keys key cmp)]
      (async+sync sync?
        (async
-        (when-not (== -1 idx)
+        (when (<= 0 idx)
           (let [new-keys (util/splice keys idx (inc idx) (arrays/array))]
             (util/rotate (Leaf. new-keys) root? left right)))))))
   ($store [this storage {:keys [sync?] :or {sync? true} :as opts}]
