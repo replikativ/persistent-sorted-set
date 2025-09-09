@@ -15,6 +15,14 @@
   :cljs
   {:extra-deps {org.clojure/clojurescript {:mvn/version "1.12.42"}}}
 
+  :node-tests
+  {:extra-paths ["test-clojure"]
+   :extra-deps {thheller/shadow-cljs {:mvn/version "3.2.0"}}}
+
+  :node-stress
+  {:extra-paths ["test-clojure"]
+   :extra-deps {thheller/shadow-cljs {:mvn/version "3.2.0"}}}
+
   :build
   {:extra-deps {io.github.clojure/tools.build {:git/tag "v0.8.5" :git/sha "9c738da" #_#_:exclusions [org.slf4j/slf4j-nop]}}
    :ns-default build}
