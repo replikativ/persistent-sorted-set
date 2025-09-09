@@ -2,7 +2,7 @@
  :deps
  {org.clojure/clojure {:mvn/version "1.12.0"}
   simm-is/lean-cps {:git/url "https://github.com/simm-is/lean-cps.git"
-                    :git/sha "138bc8c6a1322a87e63e3be8860edd29bc049436"}
+                    :git/sha "b4a2bf4612f997919f9e6342a4161a5a47c7b230"}
   ;whilo/await-cps   {:git/url "https://github.com/whilo/await-cps.git"
   ;                   :git/sha "fc495e1d6b944024a739a17757aaea057461aac0"}
   }

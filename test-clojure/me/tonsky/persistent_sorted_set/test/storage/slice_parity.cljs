@@ -1,6 +1,6 @@
 (ns me.tonsky.persistent-sorted-set.test.storage.slice-parity
   (:require [cljs.test :as test :refer [is are deftest testing]]
-            [is.simm.lean-cps.async :refer [await run] :refer-macros [async]]
+            [is.simm.lean-cps.async :refer [await] :refer-macros [async]]
             [me.tonsky.persistent-sorted-set :as set]
             [me.tonsky.persistent-sorted-set.test.storage.util
              :refer [storage async-storage]]))
@@ -82,7 +82,7 @@
 
 (deftest slice-parity-test
   (test/async done
-    (run (do-slice-parity-test)
+    (do-slice-parity-test
       (fn [_] (done))
       (fn [err]
         (js/console.warn "slice-parity-test failed")
@@ -168,7 +168,7 @@
 
 (deftest rslice-parity-test
   (test/async done
-    (run (do-rslice-parity-test)
+    (do-rslice-parity-test
       (fn [_] (done))
       (fn [err]
         (js/console.warn "slice-parity-test failed")
@@ -265,7 +265,7 @@
 
 (deftest seek-slice-test
   (test/async done
-    (run (do-seek-slice-test)
+    (do-seek-slice-test
       (fn [_] (done))
       (fn [err]
         (js/console.warn "seek-slice-test failed")

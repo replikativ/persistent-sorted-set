@@ -1,6 +1,6 @@
 (ns me.tonsky.persistent-sorted-set.test.storage.equiv
   (:require [cljs.test :as test :refer [is are deftest testing]]
-            [is.simm.lean-cps.async :refer [await run] :refer-macros [async]]
+            [is.simm.lean-cps.async :refer [await] :refer-macros [async]]
             [me.tonsky.persistent-sorted-set :as set]
             [me.tonsky.persistent-sorted-set.test.storage.util
              :refer [storage async-storage]]))
@@ -74,6 +74,7 @@
              (is (true?  (await (set/equiv? (await (set/disj (set/restore async-address async-storage) 512 {:sync? false}))
                                             (disj (into (set/sorted-set) (range 1024)) 512)
                                             {:sync? false})))))))))
+
      (testing "equiv-sequential"
        (and
         (testing "equiv-sequential? on naive sets"
@@ -135,10 +136,10 @@
 
 (deftest equivalence-tests
   (test/async done
-    (run (do-equivalence-tests)
-      (fn [ok] (done))
-      (fn [err]
-        (js/console.warn "equivalence-tests failed")
-        (is (nil? err))
-        (js/console.error err)
-        (done)))))
+    (do-equivalence-tests
+     (fn [ok] (done))
+     (fn [err]
+       (js/console.warn "equivalence-tests failed")
+       (is (nil? err))
+       (js/console.error err)
+       (done)))))

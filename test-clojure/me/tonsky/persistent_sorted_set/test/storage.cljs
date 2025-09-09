@@ -1,7 +1,6 @@
 (ns me.tonsky.persistent-sorted-set.test.storage
   (:require-macros [me.tonsky.persistent-sorted-set.test.macros :refer [testing-group]])
   (:require [cljs.test :as test :refer [is are deftest testing]]
-            [is.simm.lean-cps.async :refer [await run] :refer-macros [async]]
             [me.tonsky.persistent-sorted-set :as set]
             [me.tonsky.persistent-sorted-set.test.storage.util
              :refer [storage async-storage branch? leaf?]]))

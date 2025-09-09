@@ -3,7 +3,7 @@
   (:require [cljs.test :as test :refer [is are deftest testing]]
             [clojure.edn :as edn]
             [clojure.string :as str]
-            [is.simm.lean-cps.async :refer [await run] :refer-macros [async]]
+            [is.simm.lean-cps.async :refer [await] :refer-macros [async]]
             [me.tonsky.persistent-sorted-set :as set]
             [me.tonsky.persistent-sorted-set.impl.storage :refer [IStorage]]
             [me.tonsky.persistent-sorted-set.impl.node :as node]
