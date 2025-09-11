@@ -896,7 +896,7 @@
    (assert (some? seq))
    (if (fn? arg)
      ($seek seq key arg {:sync? true})
-     ($seek seq key (.-comparator (.-set seq)) arg)))
+     ($seek seq key (.-comparator ^PersistentSortedSet (.-set seq)) arg)))
   ([seq key cmp {:keys [sync?] :or {sync? true} :as opts}]
    (assert (some? seq))
    (assert (fn? cmp))

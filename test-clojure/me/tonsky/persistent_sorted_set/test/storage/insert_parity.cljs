@@ -293,7 +293,7 @@
 
 (deftest async-ascending-insert-test
   (test/async done
-    (run (do-async-ascending-insert-test)
+    ((do-async-ascending-insert-test)
       (fn [ok] (done))
       (fn [err]
         (js/console.warn "async-ascending-insert-test failed")

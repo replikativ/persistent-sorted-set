@@ -136,7 +136,7 @@
 
 (deftest equivalence-tests
   (test/async done
-    (do-equivalence-tests
+    ((do-equivalence-tests)
      (fn [ok] (done))
      (fn [err]
        (js/console.warn "equivalence-tests failed")

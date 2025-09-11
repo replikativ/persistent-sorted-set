@@ -242,7 +242,7 @@
 
 (deftest test-small-async-restoration
   (test/async done
-    (do-test-small-async-restoration
+    ((do-test-small-async-restoration)
       (fn [ok] (done))
       (fn [err]
         (js/console.warn "test-small-async-restoration failed")
