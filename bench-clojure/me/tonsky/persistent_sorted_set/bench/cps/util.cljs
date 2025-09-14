@@ -1,7 +1,7 @@
 (ns me.tonsky.persistent-sorted-set.bench.cps.utils
   "Simple utilities for async testing"
-  (:require ;[is.simm.lean-cps.async :refer [await] :refer-macros [async]]
-            ;[is.simm.lean-cps.runtime :refer [smart-trampoline]]
+  (:require ;[is.simm.partial-cps.async :refer [await] :refer-macros [async]]
+            ;[is.simm.partial-cps.runtime :refer [smart-trampoline]]
             [await-cps :refer [await smart-trampoline] :refer-macros [async]]
             [me.tonsky.persistent-sorted-set :as set]
             [me.tonsky.persistent-sorted-set.btset :as btset]

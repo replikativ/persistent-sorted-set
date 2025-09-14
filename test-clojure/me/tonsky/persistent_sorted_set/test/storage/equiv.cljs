@@ -1,6 +1,6 @@
 (ns me.tonsky.persistent-sorted-set.test.storage.equiv
   (:require [cljs.test :as test :refer [is are deftest testing]]
-            [is.simm.lean-cps.async :refer [await] :refer-macros [async]]
+            [is.simm.partial-cps.async :refer [await] :refer-macros [async]]
             [me.tonsky.persistent-sorted-set :as set]
             [me.tonsky.persistent-sorted-set.test.storage.util
              :refer [storage async-storage]]))

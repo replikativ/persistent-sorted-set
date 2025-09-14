@@ -1,7 +1,7 @@
 (ns me.tonsky.persistent-sorted-set.btset
   (:refer-clojure :exclude [iter sorted-set-by])
   (:require-macros [me.tonsky.persistent-sorted-set.macros :refer [async+sync]])
-  (:require [is.simm.lean-cps.async :refer [await] :refer-macros [async]]
+  (:require [is.simm.partial-cps.async :refer [await] :refer-macros [async]]
             [me.tonsky.persistent-sorted-set.arrays :as arrays]
             [me.tonsky.persistent-sorted-set.branch :as branch :refer [Branch]]
             [me.tonsky.persistent-sorted-set.constants :refer [MIN_LEN AVG_LEN MAX_LEN UNINITIALIZED_HASH EMPTY_PATH BITS_PER_LEVEL MAX_SAFE_PATH MAX_SAFE_LEVEL BIT_MASK]]
