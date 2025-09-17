@@ -1,11 +1,9 @@
-{:paths ["src-clojure" "target/classes"]
+{:paths ["src-clojure" "src-java" "target/classes"]
  :deps
  {org.clojure/clojure {:mvn/version "1.12.0"}
   simm-is/partial-cps {:git/url "https://github.com/simm-is/partial-cps.git"
                        :git/sha "c6e22922ff08515957cd548fa1f505e054160795"
                        }
-  ;whilo/await-cps   {:git/url "https://github.com/whilo/await-cps.git"
-  ;                   :git/sha "fc495e1d6b944024a739a17757aaea057461aac0"}
   }
  :aliases
  {:dev
@@ -26,8 +24,15 @@
    :extra-deps {thheller/shadow-cljs {:mvn/version "3.2.0"}}}
 
   :build
-  {:extra-deps {io.github.clojure/tools.build {:git/tag "v0.8.5" :git/sha "9c738da" #_#_:exclusions [org.slf4j/slf4j-nop]}}
+  {:extra-paths ["."]
+   :extra-deps {io.github.clojure/tools.build {:git/tag "v0.8.5" :git/sha "9c738da" #_#_:exclusions [org.slf4j/slf4j-nop]}}
    :ns-default build}
+
+  :compile-java
+  {:extra-paths ["."]
+   :extra-deps {io.github.clojure/tools.build {:git/tag "v0.8.5" :git/sha "9c738da"}}
+   :ns-default build
+   :exec-fn build/java}
 
   :test
   {:extra-paths ["test-clojure"]
