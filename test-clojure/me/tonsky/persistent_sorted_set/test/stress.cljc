@@ -49,13 +49,14 @@
                        (is (= (into-via-doseq [] set0) xs-sorted)))
                      (testing "disj"
                        (and
-                        (if-not (is (= (vec set1) (vec xs-rm)))
-                          (do
-                            (set! (.-set0 js/window) set0)
-                            (set! (.-rm js/window) rm)
-                            (set! (.-xs-rm js/window) xs-rm)
-                            false)
-                          true)
+                        #?(:cljs
+                           (if-not (is (= (vec set1) (vec xs-rm)))
+                             (do
+                               (set! (.-set0 js/window) set0)
+                               (set! (.-rm js/window) rm)
+                               (set! (.-xs-rm js/window) xs-rm)
+                               false)
+                             true))
                         (is (= (count set1) (count xs-rm)))
                         (is (= set1 xs-rm))))
                      (testing "disj transient"
