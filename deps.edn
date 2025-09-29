@@ -2,7 +2,7 @@
  :deps
  {org.clojure/clojure {:mvn/version "1.12.0"}
   simm-is/partial-cps {:git/url "https://github.com/simm-is/partial-cps.git"
-                       :git/sha "c6e22922ff08515957cd548fa1f505e054160795"}}
+                       :git/sha "be1ae4924e68ea6a13285f8ac2acaa5cd79ea8ef"}}
  :aliases
  {:dev
   {:extra-deps

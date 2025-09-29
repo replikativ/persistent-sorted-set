@@ -206,10 +206,6 @@
 
 #!------------------------------------------------------------------------------
 
-(defn afirst [set](btset/afirst set))
-
-(defn arest [set] (btset/arest set))
-
 (defn async-reduce
   "reducing function is fn<acc,item> and _must_ return a continuation"
   [arf set from]

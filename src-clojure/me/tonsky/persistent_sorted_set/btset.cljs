@@ -2,6 +2,7 @@
   (:refer-clojure :exclude [iter sorted-set-by])
   (:require-macros [me.tonsky.persistent-sorted-set.macros :refer [async+sync]])
   (:require [is.simm.partial-cps.async :refer [await] :refer-macros [async]]
+            [is.simm.partial-cps.sequence :as aseq]
             [me.tonsky.persistent-sorted-set.arrays :as arrays]
             [me.tonsky.persistent-sorted-set.branch :as branch :refer [Branch]]
             [me.tonsky.persistent-sorted-set.constants :refer [MIN_LEN AVG_LEN MAX_LEN UNINITIALIZED_HASH EMPTY_PATH BITS_PER_LEVEL MAX_SAFE_PATH MAX_SAFE_LEVEL BIT_MASK]]
@@ -545,12 +546,8 @@
 
 ;;------------------------------------------------------------------------------
 
-(defprotocol IAsyncSeq
-  (-afirst [this] "Returns async expression yielding first element")
-  (-arest [this] "Returns async expression yielding rest of sequence"))
-
 (deftype AsyncSeq [^BTSet set left right ^:mutable keys ^:mutable idx]
-  IAsyncSeq
+  aseq/IAsyncSeq
   (-afirst [this]
     (async
       (when (and left (path-lt left right))
@@ -575,15 +572,6 @@
   IPrintWithWriter
   (-pr-writer [this writer opts]
     (-write writer (str this))))
-
-(extend-type nil
-  IAsyncSeq
-  (-afirst [_] (async))
-  (-arest [_] (async)))
-
-(defn afirst [s] (-afirst s))
-
-(defn arest [s] (-arest s))
 
 (defn async-reduce
   [arf set from]
@@ -708,7 +696,7 @@
 #!------------------------------------------------------------------------------
 
 (deftype AsyncReverseSeq [^BTSet set left right ^:mutable keys ^:mutable idx]
-  IAsyncSeq
+  aseq/IAsyncSeq
   (-afirst [this]
     (async
       (when (and right (path-lt left right))
@@ -816,12 +804,12 @@
          ;; NOTE we are assuming both have async-storage (if any)!!
          (and (= (await ($count set opts)) (await ($count other opts)))
               (loop [items (await ($$iter other opts))]
-                (let [item (and items (await (afirst items)))]
+                (let [item (and items (await (aseq/first items)))]
                   (if (nil? item)
                     true
                     (if-not (await ($contains? set item opts))
                       false
-                      (recur (await (arest items))))))))
+                      (recur (await (aseq/rest items))))))))
          (and (= (await ($count set opts)) (count other))
               (loop [items (seq other)]
                 (let [item (first items)]
@@ -838,18 +826,18 @@
     (async
       (if (instance? BTSet other)
         (throw (ex-info "BTSet other $equivalent-sequential? unimplemented" {:other other}))
-        (if (implements? IAsyncSeq other)
+        (if (implements? aseq/IAsyncSeq other)
           (throw (ex-info "IAsyncSeq other $equivalent-sequential? unimplemented" {:other other}))
           (if (not (sequential? other))
             false
-            (if (implements? IAsyncSeq set) ;; this is typically an async slice.
+            (if (implements? aseq/IAsyncSeq set) ;; this is typically an async slice.
               (loop [xs set
                      ys (seq other)]
-                (let [x (await (afirst xs))]
+                (let [x (await (aseq/first xs))]
                   (if (nil? x)
                     (nil? ys)
                     (if (= x (first ys))
-                      (recur (await (arest xs)) (next ys))
+                      (recur (await (aseq/rest xs)) (next ys))
                       false))))
               ;; count here is potentially very expensive in restored state
               ;; will realize all nodes to sum keys. otherwise its cached
@@ -859,11 +847,11 @@
                   false
                   (loop [xs (await ($$iter set opts))
                          ys (seq other)]
-                    (let [x (await (afirst xs))]
+                    (let [x (await (aseq/first xs))]
                       (if (nil? x)
                         (nil? ys)
                         (if (= x (first ys))
-                          (recur (await (arest xs)) (next ys))
+                          (recur (await (aseq/rest xs)) (next ys))
                           false)))))))))))))
 
 #!------------------------------------------------------------------------------
