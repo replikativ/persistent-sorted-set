@@ -1,7 +1,7 @@
 (ns me.tonsky.persistent-sorted-set.test.storage.small
   (:require-macros [me.tonsky.persistent-sorted-set.test.macros :refer [testing-group]])
-  (:require [cljs.test :as test :refer [is are deftest testing]]
-            [is.simm.lean-cps.async :refer [await] :refer-macros [async]]
+  (:require [cljs.test :as test :refer-macros [is deftest testing]]
+            [is.simm.partial-cps.async :refer [await] :refer-macros [async]]
             [me.tonsky.persistent-sorted-set :as set]
             [me.tonsky.persistent-sorted-set.test.storage.util
              :refer [storage async-storage]]))
@@ -242,7 +242,7 @@
 
 (deftest test-small-async-restoration
   (test/async done
-    (do-test-small-async-restoration
+    ((do-test-small-async-restoration)
       (fn [ok] (done))
       (fn [err]
         (js/console.warn "test-small-async-restoration failed")
