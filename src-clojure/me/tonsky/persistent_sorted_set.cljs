@@ -3,7 +3,7 @@
       :author "Nikita Prokopov"}
   me.tonsky.persistent-sorted-set
   (:refer-clojure :exclude [conj count disj sorted-set sorted-set-by contains?
-                            seq rseq])
+                            seq rseq into transduce reduce])
   (:require [me.tonsky.persistent-sorted-set.arrays :as arrays]
             [me.tonsky.persistent-sorted-set.btset :as btset :refer [BTSet]]))
 
@@ -204,21 +204,33 @@
   ([root-address-or-info storage opts]
    (btset/restore root-address-or-info storage opts)))
 
-#!------------------------------------------------------------------------------
+(defn reduce
+  "reducing function is fn<acc,item> and _must_ return a continuation
+   returns result by default
+   returns continuation yielding result when {:sync? false}"
+  ([arf set from]
+   (btset/$reduce arf set from {:sync? true}))
+  ([arf set from opts]
+   (btset/$reduce arf set from opts)))
 
-(defn async-reduce
-  "reducing function is fn<acc,item> and _must_ return a continuation"
-  [arf set from]
-  (btset/async-reduce arf set from))
+(defn transduce
+  "xforms must be synchronous
+   reducing function is fn<acc,item> and _must_ return a continuation
+   returns result by default
+   returns continuation yielding result when {:sync? false}"
+  ([xform arf set from]
+   (btset/$transduce xform arf set from {:sync? true}))
+  ([xform arf set from opts]
+   (btset/$transduce xform arf set from opts)))
 
-(defn async-into
-  "xforms must be synchronous"
-  ([] (btset/async-into))
-  ([set] (btset/async-into set))
-  ([set from] (btset/async-into set from))
-  ([set xf from] (btset/async-into set xf from)))
-
-; (defn async-sequence [])
-; (defn async-transduce [])
-
+(defn into
+  "xforms must be synchronous
+   returns collection by default
+   returns continuation yielding collection when {:sync? false}"
+  ([set arg]
+   (btset/$into set arg))
+  ([set arg0 arg1]
+   (btset/$into set arg0 arg1))
+  ([set xform from opts]
+   (btset/$into set xform from opts)))
 

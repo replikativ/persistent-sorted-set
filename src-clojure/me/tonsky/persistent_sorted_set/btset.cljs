@@ -573,56 +573,6 @@
   (-pr-writer [this writer opts]
     (-write writer (str this))))
 
-(defn async-reduce
-  [arf set from]
-  (assert (instance? BTSet set))
-  ;; from can be (normal-seq | BTSet | AsyncSeq)
-  (if (instance? BTSet from)
-    (throw (ex-info "from BTSet unimplemented" {}))
-    (if (instance? AsyncSeq from)
-      (throw (ex-info "from AsyncSeq unimplemented" {}))
-      (async
-       (loop [acc set
-              items from]
-         (if (seq items)
-           (let [v (first items)]
-             (if (some? v)
-               (let [acc' (await (arf acc v))]
-                 (if (reduced? acc')
-                   (await (arf (unreduced acc')))
-                   (recur acc' (rest items))))
-               (await (arf acc))))
-           (await (arf acc))))))))
-
-(defn async-transduce
-  [xform arf set from]
-  (throw (ex-info "async-transduce unimplemented" {})))
-
-(defn async-into
-  ([] (async nil))
-  ([^BTSet set] (async set))
-  ([^BTSet set from]
-   (assert (instance? BTSet set))
-   (async-reduce
-    (fn
-      ([^BTSet acc]
-       (async acc))
-      ([^BTSet acc item]
-       ($conjoin acc item (.-comparator acc) {:sync? false})))
-    set
-    from))
-  ([^BTSet set xform from]
-   (assert (instance? BTSet set))
-   (async-transduce
-    xform
-    (fn
-      ([^BTSet acc]
-       (async acc))
-      ([^BTSet acc item]
-       ($conjoin acc item (.-comparator acc) {:sync? false})))
-    set
-    from)))
-
 #!------------------------------------------------------------------------------
 
 (declare $$iter)
@@ -820,41 +770,279 @@
                       (recur (rest items))))))))))))
 
 (defn $equivalent-sequential?
-  [set other {:keys [sync?] :or {sync? true} :as opts}]
+  [xs ys {:keys [sync?] :or {sync? true} :as opts}]
   (if sync?
-    (cljs.core/equiv-sequential set other)
+    (cljs.core/equiv-sequential xs ys)
     (async
-      (if (instance? BTSet other)
-        (throw (ex-info "BTSet other $equivalent-sequential? unimplemented" {:other other}))
-        (if (implements? aseq/IAsyncSeq other)
-          (throw (ex-info "IAsyncSeq other $equivalent-sequential? unimplemented" {:other other}))
-          (if (not (sequential? other))
+      (cond
+        ;; BTSet X BTSet
+        (and (instance? BTSet xs) (instance? BTSet ys))
+        (let [cnt-x (await ($count xs opts))
+              cnt-y (await ($count ys opts))]
+          (if (not= cnt-x cnt-y)
             false
-            (if (implements? aseq/IAsyncSeq set) ;; this is typically an async slice.
-              (loop [xs set
-                     ys (seq other)]
-                (let [x (await (aseq/first xs))]
-                  (if (nil? x)
-                    (nil? ys)
-                    (if (= x (first ys))
-                      (recur (await (aseq/rest xs)) (next ys))
-                      false))))
-              ;; count here is potentially very expensive in restored state
-              ;; will realize all nodes to sum keys. otherwise its cached
-              (let [cnt-x (await ($count set opts))
-                    cnt-y (count other)]
-                (if (not= cnt-x cnt-y)
-                  false
-                  (loop [xs (await ($$iter set opts))
-                         ys (seq other)]
-                    (let [x (await (aseq/first xs))]
-                      (if (nil? x)
-                        (nil? ys)
-                        (if (= x (first ys))
-                          (recur (await (aseq/rest xs)) (next ys))
-                          false)))))))))))))
+            (loop [xiter (await ($$iter xs opts))
+                   yiter (await ($$iter ys opts))]
+              (let [x (await (aseq/first xiter))
+                    y (await (aseq/first yiter))]
+                (cond
+                  (nil? x) (nil? y)
+                  (not= x y) false
+                  :else (recur (await (aseq/rest xiter))
+                               (await (aseq/rest yiter))))))))
 
-#!------------------------------------------------------------------------------
+        ;; BTSet X AsyncSeq
+        (and (instance? BTSet xs) (satisfies? aseq/IAsyncSeq ys))
+        (loop [xiter (await ($$iter xs opts))
+               yiter ys]
+          (let [x (await (aseq/first xiter))
+                y (await (aseq/first yiter))]
+            (cond
+              (nil? x) (nil? y)
+              (not= x y) false
+              :else (recur (await (aseq/rest xiter))
+                           (await (aseq/rest yiter))))))
+
+        ;; AsyncSeq X BTSet
+        (and (satisfies? aseq/IAsyncSeq xs) (instance? BTSet ys))
+        (loop [xiter xs
+               yiter (await ($$iter ys opts))]
+          (let [x (await (aseq/first xiter))
+                y (await (aseq/first yiter))]
+            (cond
+              (nil? x) (nil? y)
+              (not= x y) false
+              :else (recur (await (aseq/rest xiter))
+                           (await (aseq/rest yiter))))))
+
+        ;; AsyncSeq X AsyncSeq
+        (and (satisfies? aseq/IAsyncSeq xs) (satisfies? aseq/IAsyncSeq ys))
+        (loop [xiter xs
+               yiter ys]
+          (let [x (await (aseq/first xiter))
+                y (await (aseq/first yiter))]
+            (cond
+              (nil? x) (nil? y)
+              (not= x y) false
+              :else (recur (await (aseq/rest xiter))
+                           (await (aseq/rest yiter))))))
+
+        ;; BTSet X Seqable
+        (and (instance? BTSet xs) (or (seqable? ys) (array? ys)))
+        (let [s (if (array? ys) (array-seq ys 0) (seq ys))
+              cnt-x (await ($count xs opts))
+              cnt-y (count s)]
+          (if (not= cnt-x cnt-y)
+            false
+            (loop [xiter (await ($$iter xs opts))
+                   z     s]
+              (let [x (await (aseq/first xiter))]
+                (if (nil? x)
+                  (nil? z)
+                  (if (= x (first z))
+                    (recur (await (aseq/rest xiter)) (next z))
+                    false))))))
+
+        ;; AsyncSeq X Seqable
+        (and (satisfies? aseq/IAsyncSeq xs) (or (seqable? ys) (array? ys)))
+        (let [s (if (array? ys) (array-seq ys 0) (seq ys))]
+          (loop [xiter xs
+                 z     s]
+            (let [x (await (aseq/first xiter))]
+              (cond
+                (nil? x) (nil? z)
+                (nil? z) false
+                (= x (first z)) (recur (await (aseq/rest xiter)) (next z))
+                :else false))))
+
+        :else false))))
+
+(defn async-reduce
+  [arf set from]
+  (assert (instance? BTSet set) "async-reduce expects a BTSet in second arg")
+  (if (instance? BTSet from)
+    (async
+     (loop [acc set
+            items (await ($$iter from {:sync? false}))]
+       (if-some [x (await (aseq/first items))]
+         (let [acc' (await (arf acc x))]
+           (if (reduced? acc')
+             (await (arf (unreduced acc')))
+             (recur acc' (await (aseq/rest items)))))
+         (await (arf acc)))))
+    (if (satisfies? aseq/IAsyncSeq from)
+      (async
+       (loop [acc set
+              items from]
+         (if-some [x (await (aseq/first items))]
+           (let [acc' (await (arf acc x))]
+             (if (reduced? acc')
+               (await (arf (unreduced acc')))
+               (recur acc' (await (aseq/rest items)))))
+           (await (arf acc)))))
+      (async
+       (loop [acc set
+              items from]
+         (if (seq items)
+           (let [v (first items)]
+             (if (some? v)
+               (let [acc' (await (arf acc v))]
+                 (if (reduced? acc')
+                   (await (arf (unreduced acc')))
+                   (recur acc' (rest items))))
+               (await (arf acc))))
+           (await (arf acc))))))))
+
+(defn- xf-driver
+  "Returns {:step (fn [x] {:out <vector> :done? <bool>})
+            :complete (fn [] <vector>)}.
+   Internally applies `xform` to a synchronous collecting rf, preserving
+   early-termination semantics via `reduced`."
+  [xform]
+  (let [buf  (volatile! [])
+        step (fn
+               ([] nil)
+               ([acc] acc)
+               ([acc x] (vswap! buf conj x) acc))
+        xf   (xform step)]
+    {:step
+     (fn [x]
+       (let [start (count @buf)
+             ret   (xf nil x)
+             v     @buf
+             out   (if (> (count v) start) (subvec v start (count v)) [])
+             done? (reduced? ret)]
+         (when done?
+           ;; finalize the transducer and collect any final outputs
+           (let [s2 (count @buf)
+                 _  (xf (unreduced ret))
+                 v2 @buf
+                 tail (if (> (count v2) s2) (subvec v2 s2 (count v2)) [])]
+             (vreset! buf [])
+             {:out (if (seq tail) (into out tail) out)
+              :done? true}))
+         (when-not done?
+           (vreset! buf [])
+           {:out out :done? false})))
+
+     :complete
+     (fn []
+       (let [start (count @buf)
+             _     (xf nil)
+             v     @buf
+             out   (if (> (count v) start) (subvec v start (count v)) [])]
+         (vreset! buf [])
+         out))}))
+
+(defn async-transduce
+  "xform: synchronous transducer (core map/filter/comp/etc)
+   arf:   MUST BE ASYNC reducing fn with arities ([acc] ...) and ([acc x] ...)
+   init:  initial accumulator
+   from:  BTSet | aseq/IAsyncSeq | sequential"
+  [xform arf init from]
+  (let [{:keys [step complete]} (xf-driver xform)
+        apply-outs
+        (fn [acc outs]
+          (async
+            (loop [a acc, i 0, n (count outs)]
+              (if (< i n)
+                (let [a' (await (arf a (nth outs i)))]
+                  (if (reduced? a')
+                    (reduced (unreduced a'))
+                    (recur a' (unchecked-inc i) n)))
+                a))))]
+
+    (cond
+      (instance? BTSet from)
+      (async
+        (loop [acc init
+               items (await ($$iter from {:sync? false}))]
+          (if-some [x (await (aseq/first items))]
+            (let [{:keys [out done?]} (step x)
+                  acc' (await (apply-outs acc out))]
+              (if (reduced? acc')
+                (await (arf (unreduced acc')))
+                (if done?
+                  (await (arf acc'))
+                  (recur acc' (await (aseq/rest items))))))
+            (let [tail (complete)
+                  acc' (await (apply-outs acc tail))]
+              (await (arf acc'))))))
+
+      (satisfies? aseq/IAsyncSeq from)
+      (async
+        (loop [acc init
+               items from]
+          (if-some [x (await (aseq/first items))]
+            (let [{:keys [out done?]} (step x)
+                  acc' (await (apply-outs acc out))]
+              (if (reduced? acc')
+                (await (arf (unreduced acc')))
+                (if done?
+                  (await (arf acc'))
+                  (recur acc' (await (aseq/rest items))))))
+            (let [tail (complete)
+                  acc' (await (apply-outs acc tail))]
+              (await (arf acc'))))))
+
+      (sequential? from)
+      (async
+        (loop [acc init
+               xs  (seq from)]
+          (if (seq xs)
+            (let [{:keys [out done?]} (step (first xs))
+                  acc' (await (apply-outs acc out))]
+              (if (reduced? acc')
+                (await (arf (unreduced acc')))
+                (if done?
+                  (await (arf acc'))
+                  (recur acc' (next xs)))))
+            (let [tail (complete)
+                  acc' (await (apply-outs acc tail))]
+              (await (arf acc'))))))
+
+      :else
+      (throw (js/Error. (str "async-transduce: unsupported input type " (type from)))))))
+
+
+(defn $reduce
+  ([rf init from]
+   ($reduce rf init from {:sync? true}))
+  ([rf init from {:keys [sync?] :or {sync? true}}]
+   (assert (instance? BTSet init))
+   (if sync?
+     (reduce rf init from)
+     (async-reduce rf init from))))
+
+(defn $transduce
+  ([xform arf init from]
+   ($transduce xform arf init from {:sync? true}))
+  ([xform arf init from {:keys [sync?] :or {sync? true}}]
+   (assert (instance? BTSet init))
+   (if sync?
+     (transduce xform arf init from)
+     (async-transduce xform arf init from))))
+
+(defn $into
+  ([to from]
+   ($into to (map identity) from {:sync? true}))
+  ([to arg0 arg1]
+   (if (fn? arg0)
+     ($into to arg0 arg1 {:sync? true})
+     ($into to (map identity) arg0 arg1)))
+  ([to xform from {:keys [sync?] :or {sync? true}}]
+   (assert (instance? BTSet to))
+   (if sync?
+     (into to xform from)
+     (async-transduce xform
+                      (fn
+                        ([acc] (async acc))
+                        ([acc item]
+                         (if (instance? BTSet acc)
+                           ($conjoin acc item (.-comparator acc) {:sync? false})
+                           (async (conj acc item)))))
+                      to
+                      from))))
 
 (defn $seq
   ([set]

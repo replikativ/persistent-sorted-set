@@ -190,7 +190,7 @@
    (and
     (testing "one full leaf"
       (reset! *stats {:reads 0 :writes 0 :accessed 0})
-      (let [original (await (set/async-into (set/sorted-set* {}) (range 0 32)))]
+      (let [original (await (set/into (set/sorted-set* {}) (range 0 32) {:sync? false}))]
         (and
          (is (= 0 (:writes @*stats)))
          (is (= 0 (:reads @*stats)))
@@ -211,7 +211,7 @@
                (is (leaf? (.-root restored))))))))))
     (testing "full-leaf + 1"
       (reset! *stats {:reads 0 :writes 0 :accessed 0})
-      (let [original (await (set/async-into (set/sorted-set* {}) (range 0 33)))]
+      (let [original (await (set/into (set/sorted-set* {}) (range 0 33) {:sync? false}))]
         (and
          (is (= 0 (:writes @*stats)))
          (is (= 0 (:reads @*stats)))
@@ -243,7 +243,7 @@
     (testing "32^4"
       (reset! *stats {:reads 0 :writes 0 :accessed 0})
       (let [expected-root-keys [65535 131071 196607 262143 327679 393215 458751 524287 589823 655359 720895 786431 851967 917503 1048575]
-            original (await (set/async-into (set/sorted-set* {}) (range 0 (Math/pow 32 4))))
+            original (await (set/into (set/sorted-set* {}) (range 0 (Math/pow 32 4)) {:sync? false}))
             *original (atom 0)]
         (and
          (is (= 0 (:writes @*stats)))

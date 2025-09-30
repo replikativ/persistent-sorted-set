@@ -96,7 +96,7 @@
             address (await (set/store stored storage {:sync? false}))]
         (and
          (testing "async-control"
-           (is (true? (await (set/equiv-sequential? (await (set/async-into (set/sorted-set) (range 10 20))) (range 10 20) {:sync? false})))))
+           (is (true? (await (set/equiv-sequential? (await (set/into (set/sorted-set) (range 10 20) {:sync? false})) (range 10 20) {:sync? false})))))
          (testing "flushed"
            (is (true? (await (set/equiv-sequential? stored (range 10 20) {:sync? false})))))
          (testing "restored"
