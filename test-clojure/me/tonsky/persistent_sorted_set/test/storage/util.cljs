@@ -29,7 +29,7 @@
 
 (defn level [node] (node/level node))
 
-(defrecord Storage [*memory *disk]
+(defrecord Storage [*memory *disk settings]
   IStorage
   (store [_ node opts]
     (assert (not (false? (:sync? opts))))
@@ -48,8 +48,8 @@
      (@*memory address)
      (let [{:keys [keys addresses level] :as m} (edn/read-string (@*disk address))
            node (if addresses
-                  (branch/from-map m)
-                  (Leaf. keys))]
+                  (branch/from-map (assoc m :settings settings))
+                  (Leaf. keys settings))]
        (dbg "restored<" (type node) ">")
        (swap! *stats update :reads inc)
        (swap! *memory assoc address node)
@@ -57,13 +57,15 @@
   (accessed [_ address] (swap! *stats update :accessed inc) nil))
 
 (defn storage
-  ([] (->Storage (atom {}) (atom {})))
-  ([*disk] (->Storage (atom {}) *disk))
-  ([*memory *disk] (->Storage *memory *disk)))
+  ([] (storage (atom {}) (atom {})))
+  ([*disk] (storage (atom {}) *disk))
+  ([*memory *disk] (storage *memory *disk {}))
+  ([*memory *disk opts]
+   (->Storage *memory *disk (merge {:branchingFactor 32} opts))))
 
 #!------------------------------------------------------------------------------
 
-(defrecord AsyncStorage [*memory *disk]
+(defrecord AsyncStorage [*memory *disk settings]
   IStorage
   (store [_ node opts]
     (assert (false? (:sync? opts)))
@@ -83,8 +85,8 @@
       (@*memory address)
       (let [{:keys [keys addresses level] :as m} (edn/read-string (@*disk address))
             node (if addresses
-                   (branch/from-map m)
-                   (Leaf. keys))]
+                   (branch/from-map (assoc m :settings settings))
+                   (Leaf. keys settings))]
         (dbg "restored<" (type node) ">")
         (swap! *stats update :reads inc)
         (swap! *memory assoc address node)
@@ -92,6 +94,8 @@
   (accessed [_ address] (swap! *stats update :accessed inc) nil))
 
 (defn async-storage
-  ([] (->AsyncStorage (atom {}) (atom {})))
-  ([*disk] (->AsyncStorage (atom {}) *disk))
-  ([*memory *disk] (->AsyncStorage *memory *disk)))
+  ([] (async-storage (atom {}) (atom {})))
+  ([*disk] (async-storage (atom {}) *disk))
+  ([*memory *disk] (async-storage *memory *disk {}))
+  ([*memory *disk opts]
+   (->AsyncStorage *memory *disk (merge {:branchingFactor 32} opts))))

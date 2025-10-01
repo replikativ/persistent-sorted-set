@@ -3,7 +3,6 @@
   (:require [goog.array :as garr]
             [is.simm.partial-cps.async :refer [await] :refer-macros [async]]
             [me.tonsky.persistent-sorted-set.arrays :as arrays]
-            [me.tonsky.persistent-sorted-set.constants :refer [MAX_LEN]]
             [me.tonsky.persistent-sorted-set.impl.node :as node :refer [INode]]
             [me.tonsky.persistent-sorted-set.impl.storage :as storage]
             [me.tonsky.persistent-sorted-set.util :as util]))
@@ -94,11 +93,12 @@
         (let [child-node (await ($child this storage idx opts))
               nodes      (await (node/$add child-node storage key cmp opts))]
           (when nodes
-            (let [children     (ensure-children this)
-                  new-keys     (util/check-n-splice cmp keys idx (inc idx) (arrays/amap node/max-key nodes))
-                  new-children (util/splice children idx (inc idx) nodes)
-                  nodes-len    (arrays/alength nodes)]
-              (if (<= (arrays/alength new-children) MAX_LEN)
+            (let [branching-factor (:branchingFactor (.-settings this))
+                  children         (ensure-children this)
+                  new-keys         (util/check-n-splice cmp keys idx (inc idx) (arrays/amap node/max-key nodes))
+                  new-children     (util/splice children idx (inc idx) nodes)
+                  nodes-len        (arrays/alength nodes)]
+              (if (<= (arrays/alength new-children) branching-factor)
                 (let [new-addrs
                       (when addrs
                         (if (= nodes-len 1)
@@ -111,7 +111,7 @@
                                 (aset na idx nil)
                                 na)))
                           (util/splice addrs idx (inc idx) (arrays/array nil nil))))]
-                  (arrays/array (Branch. (.-level this) new-keys new-children new-addrs)))
+                  (arrays/array (Branch. (.-level this) new-keys new-children new-addrs (.-settings this))))
                 (let [middle      (arrays/half (arrays/alength new-children))
                       tmp-addrs   (when addrs
                                     (util/splice addrs idx (inc idx) (arrays/array nil nil)))
@@ -121,11 +121,13 @@
                    (Branch. (.-level this)
                             (.slice new-keys 0 middle)
                             (.slice new-children 0 middle)
-                            left-addrs)
+                            left-addrs
+                            (.-settings this))
                    (Branch. (.-level this)
                             (.slice new-keys middle)
                             (.slice new-children middle)
-                            right-addrs)))))))))))
+                            right-addrs
+                            (.-settings this))))))))))))
 
 (defn $remove
   [^Branch this storage key left right cmp {:keys [sync?] :or {sync? true} :as opts}]
@@ -162,10 +164,11 @@
                                              (identical? (arrays/aget disjoined (dec alen)) right-child))
                                     (aset repl (dec alen) raddr))
                                   (util/splice addrs left-idx right-idx repl)))]
-                (util/rotate (Branch. (.-level this) new-keys new-kids new-addrs)
+                (util/rotate (Branch. (.-level this) new-keys new-kids new-addrs (.-settings this))
                              (and (nil? left) (nil? right))
                              left
-                             right)))))))))
+                             right
+                             (.-settings this))))))))))
 
 (defn $store
   [^Branch this storage {:keys [sync?] :or {sync? true} :as opts}]
@@ -200,10 +203,10 @@
               (recur (inc i)))))))))
 
 (defn ^Branch from-map
-  [{:keys [level keys addresses]}]
-  (Branch. level keys nil addresses))
+  [{:keys [level keys addresses settings]}]
+  (Branch. level keys nil addresses settings))
 
-(deftype Branch [^number level keys ^:mutable children ^:mutable addresses]
+(deftype Branch [^number level keys ^:mutable children ^:mutable addresses settings]
   Object
   (toString [_] (pr-str* {:level level :keys (vec keys)}))
   INode
@@ -214,13 +217,14 @@
     (Branch. level
              (arrays/aconcat keys (.-keys next))
              (arrays/aconcat children (.-children next))
-             nil))
+             nil
+             settings))
   (merge-split [this next]
     (let [ks (util/merge-n-split keys     (.-keys next))
           ps (util/merge-n-split children (.-children next))]
       (util/return-array
-       (Branch. level (arrays/aget ks 0) (arrays/aget ps 0) nil)
-       (Branch. level (arrays/aget ks 1) (arrays/aget ps 1) nil))))
+       (Branch. level (arrays/aget ks 0) (arrays/aget ps 0) nil settings)
+       (Branch. level (arrays/aget ks 1) (arrays/aget ps 1) nil settings))))
   ($add [this storage key cmp opts]
     ($add this storage key cmp opts))
   ($contains? [this storage key cmp opts]

@@ -14,3 +14,5 @@
   ($store          [this storage opts])
   ($walk-addresses [this storage on-address opts]))
 
+(defn new-len [len _settings]
+  len)

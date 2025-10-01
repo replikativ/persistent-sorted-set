@@ -39,6 +39,12 @@
 
 #!------------------------------------------------------------------------------
 
+(def ^:private default-opts
+  {:branchingFactor 32})
+
+(defn- with-defaults [opts]
+  (merge default-opts opts))
+
 (defn from-sorted-array
   "Fast path to create a set if you already have a sorted array of elements on your hands."
   ([cmp arr]
@@ -46,22 +52,24 @@
   ([cmp arr _len]
    (from-sorted-array cmp arr _len {}))
   ([cmp arr _len opts]
-   (btset/from-sorted-array cmp arr _len opts)))
+   (btset/from-sorted-array cmp arr _len (with-defaults opts))))
 
 (defn from-sequential
-  "Create a set with custom comparator and a collection of keys. Useful when you don't want to call [[clojure.core/apply]] on [[sorted-set-by]]."
-  [cmp seq]
-  (btset/from-sequential cmp seq))
+  "Create a set with custom comparator and a collection of keys. Useful when you't want to call [[clojure.core/apply]] on [[sorted-set-by]]."
+  ([cmp seq]
+   (from-sequential cmp seq {}))
+  ([cmp seq opts]
+   (btset/from-sequential cmp seq (with-defaults opts))))
 
 (defn sorted-set-by
   ([cmp]
-   (btset/sorted-set-by cmp))
+   (btset/from-opts (with-defaults {:comparator cmp})))
   ([cmp & keys]
-   (apply btset/sorted-set-by cmp keys)))
+   (from-sequential cmp keys)))
 
 (defn sorted-set
-  ([] (btset/sorted-set-by compare))
-  ([& keys] (btset/from-sequential compare keys)))
+  ([] (sorted-set-by compare))
+  ([& keys] (from-sequential compare keys)))
 
 (defn sorted-set*
   "Create a set with options map containing:
@@ -69,7 +77,7 @@
    - :comparator  Custom comparator (defaults to compare)
    - :meta     Metadata"
   [opts]
-  (btset/from-opts opts))
+  (btset/from-opts (with-defaults opts)))
 
 #!------------------------------------------------------------------------------
 
@@ -200,9 +208,9 @@
 
    returns BTSet, **always synchronously**"
   ([root-address-or-info storage]
-   (btset/restore root-address-or-info storage {}))
+   (restore root-address-or-info storage {}))
   ([root-address-or-info storage opts]
-   (btset/restore root-address-or-info storage opts)))
+   (btset/restore root-address-or-info storage (with-defaults opts))))
 
 (defn reduce
   "reducing function is fn<acc,item> and _must_ return a continuation

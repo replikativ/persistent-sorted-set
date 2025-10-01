@@ -5,13 +5,14 @@
             [is.simm.partial-cps.sequence :as aseq]
             [me.tonsky.persistent-sorted-set.arrays :as arrays]
             [me.tonsky.persistent-sorted-set.branch :as branch :refer [Branch]]
-            [me.tonsky.persistent-sorted-set.constants :refer [MIN_LEN AVG_LEN MAX_LEN UNINITIALIZED_HASH EMPTY_PATH BITS_PER_LEVEL MAX_SAFE_PATH MAX_SAFE_LEVEL BIT_MASK]]
             [me.tonsky.persistent-sorted-set.leaf :as leaf :refer [Leaf]]
             [me.tonsky.persistent-sorted-set.impl.node :as node]
             [me.tonsky.persistent-sorted-set.impl.storage :as storage]
             [me.tonsky.persistent-sorted-set.util :refer [rotate lookup-exact splice cut-n-splice binary-search-l binary-search-r return-array merge-n-split check-n-splice]]))
 
 (declare BTSet)
+
+(def ^:const UNINITIALIZED_HASH nil)
 
 (defn- $$root
   [^BTSet set {:keys [sync?] :or {sync? true} :as opts}]
@@ -62,16 +63,18 @@
                     (.-meta set)
                     UNINITIALIZED_HASH
                     (.-storage set)
-                    nil)
+                    nil
+                    (.-settings set))
             (let [child0 (arrays/aget roots 0)
                   lvl    (inc (node/level child0))]
-              (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil)
+              (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil (.-settings set))
                       (inc (.-cnt set))
                       (.-comparator set)
                       (.-meta set)
                       UNINITIALIZED_HASH
                       (.-storage set)
-                      nil)))))))))
+                      nil
+                      (.-settings set))))))))))
 
 (defn $disjoin
   ([^BTSet set key]
@@ -98,7 +101,8 @@
                    (.-meta set)
                    UNINITIALIZED_HASH
                    (.-storage set)
-                   nil))))))))
+                   nil
+                   (.-settings set)))))))))
 
 (defn $store
   ([^BTSet set arg]
@@ -150,10 +154,33 @@
                     (:meta opts))
         cmp     (if (map? root-address-or-info)
                   (or (:comparator root-address-or-info) compare)
-                  (or (:comparator opts) compare))]
-    (BTSet. nil -1 cmp meta UNINITIALIZED_HASH storage address)))
+                  (or (:comparator opts) compare))
+        settings (select-keys (merge (when (map? root-address-or-info) root-address-or-info) opts) [:branchingFactor])]
+    (BTSet. nil -1 cmp meta UNINITIALIZED_HASH storage address settings)))
 
 #!------------------------------------------------------------------------------
+
+(def ^:const MAX_SAFE_PATH
+  "js limitation for bit ops"
+  (js/Math.pow 2 31))
+
+(def ^:const BITS_PER_LEVEL
+  "tunable param"
+  5)
+
+(def ^:const MAX_LEN (js/Math.pow 2 BITS_PER_LEVEL)) ;; 32
+
+(def ^:const MIN_LEN (/ MAX_LEN 2)) ;; 16
+
+(def ^:private ^:const AVG_LEN
+  (arrays/half (+ MAX_LEN MIN_LEN))) ;; 24
+
+(def ^:const MAX_SAFE_LEVEL
+  (js/Math.floor (/ 31 BITS_PER_LEVEL))) ;; 6
+
+(def ^:const BIT_MASK (- MAX_LEN 1)) ;; 0b011111 = 5 bit
+
+(def ^:const EMPTY_PATH 0)
 
 (defn- path-inc ^number [^number path]
   (inc path))
@@ -1102,21 +1129,21 @@
 
 #!------------------------------------------------------------------------------
 
-(deftype BTSet [root cnt comparator meta ^:mutable _hash storage address]
+(deftype BTSet [root cnt comparator meta ^:mutable _hash storage address settings]
   Object
   (toString [this] (pr-str* this))
 
   ICloneable
-  (-clone [_] (BTSet. root cnt comparator meta _hash storage address))
+  (-clone [_] (BTSet. root cnt comparator meta _hash storage address settings))
 
   IWithMeta
-  (-with-meta [_ new-meta] (BTSet. root cnt comparator new-meta _hash storage address))
+  (-with-meta [_ new-meta] (BTSet. root cnt comparator new-meta _hash storage address settings))
 
   IMeta
   (-meta [_] meta)
 
   IEmptyableCollection
-  (-empty [_] (BTSet. (Leaf. (arrays/array)) 0 comparator meta UNINITIALIZED_HASH storage address))
+  (-empty [_] (BTSet. (Leaf. (arrays/array) settings) 0 comparator meta UNINITIALIZED_HASH storage address settings))
 
   IEquiv
   (-equiv [this other]
@@ -1239,33 +1266,29 @@
 
 (defn ^BTSet from-sorted-array
   [cmp arr _len opts]
-  (let [leaves (->> arr
-                 (arr-partition-approx MIN_LEN MAX_LEN)
-                 (arr-map-inplace #(Leaf. %)))
-        storage (:storage opts)]
+  (let [settings (select-keys opts [:branchingFactor])
+        leaves   (->> arr
+                   (arr-partition-approx MIN_LEN MAX_LEN)
+                   (arr-map-inplace #(Leaf. % settings)))
+        storage  (:storage opts)]
     (loop [current-level leaves
            shift 0]
       (case (count current-level)
-        0 (BTSet. (Leaf. (arrays/array)) 0 cmp nil UNINITIALIZED_HASH storage nil)
-        1 (BTSet. (first current-level) (arrays/alength arr) cmp nil UNINITIALIZED_HASH storage nil)
+        0 (BTSet. (Leaf. (arrays/array) settings) 0 cmp nil UNINITIALIZED_HASH storage nil settings)
+        1 (BTSet. (first current-level) (arrays/alength arr) cmp nil UNINITIALIZED_HASH storage nil settings)
         (recur
           (->> current-level
             (arr-partition-approx MIN_LEN MAX_LEN)
             (arr-map-inplace #(Branch. (inc shift)
                                        (arrays/amap node/max-key %)
                                        %
-                                       nil)))
+                                       nil
+                                       settings)))
           (inc shift))))))
 
-(defn ^BTSet from-sequential [cmp seq]
+(defn ^BTSet from-sequential [cmp seq opts]
   (let [arr (-> (into-array seq) (arrays/asort cmp) (sorted-arr-distinct cmp))]
-    (from-sorted-array cmp arr (alength arr) {})))
-
-(defn ^BTSet sorted-set-by
-  ([cmp]
-   (BTSet. (Leaf. (arrays/array)) 0 cmp nil UNINITIALIZED_HASH nil nil))
-  ([cmp & keys]
-   (from-sequential cmp keys)))
+    (from-sorted-array cmp arr (alength arr) opts)))
 
 (defn ^BTSet from-opts
   "Create a set with options map containing:
@@ -1273,5 +1296,13 @@
    - :comparator  Custom comparator (defaults to compare)
    - :meta     Metadata"
   [opts]
-  (BTSet. (Leaf. (arrays/array)) 0 (or (:comparator opts) compare)
-          (:meta opts) UNINITIALIZED_HASH (:storage opts) nil))
+  (let [settings (select-keys opts [:branchingFactor])]
+    (BTSet. (Leaf. (arrays/array) settings) 0 (or (:comparator opts) compare)
+            (:meta opts) UNINITIALIZED_HASH (:storage opts) nil settings)))
+
+(defn ^BTSet sorted-set-by
+  ([cmp]
+   (from-opts {:comparator cmp}))
+  ([cmp & keys]
+   (from-sequential cmp keys {})))
+

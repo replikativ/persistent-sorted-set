@@ -3,42 +3,42 @@
   (:require [is.simm.partial-cps.async :refer [await] :refer-macros [async]]
             [goog.array :as garr]
             [me.tonsky.persistent-sorted-set.arrays :as arrays]
-            [me.tonsky.persistent-sorted-set.constants :refer [MAX_LEN]]
             [me.tonsky.persistent-sorted-set.impl.node :as node :refer [INode]]
             [me.tonsky.persistent-sorted-set.impl.storage :as storage]
             [me.tonsky.persistent-sorted-set.util :as util]))
 
-(deftype Leaf [keys]
+(deftype Leaf [keys settings]
   Object
   (toString [_] (pr-str* (vec keys)))
   INode
   (len [_] (arrays/alength keys))
   (level [_] 0)
   (max-key [_] (arrays/alast keys))
-  (merge [_ next] (Leaf. (arrays/aconcat keys (.-keys next))))
+  (merge [_ next] (Leaf. (arrays/aconcat keys (.-keys next)) settings))
   (merge-split [_ next]
     (let [ks (util/merge-n-split keys (.-keys next))]
-      (util/return-array (Leaf. (arrays/aget ks 0))
-                         (Leaf. (arrays/aget ks 1)))))
+      (util/return-array (Leaf. (arrays/aget ks 0) settings)
+                         (Leaf. (arrays/aget ks 1) settings))))
   ($add [this storage key cmp {:keys [sync?] :or {sync? true}}]
-    (let [idx    (util/binary-search-l cmp keys (dec (arrays/alength keys)) key)
-          keys-l (arrays/alength keys)
-          result (cond
-                   (and (< idx keys-l) (== 0 (cmp key (arrays/aget keys idx))))
-                   nil
+    (let [branching-factor (:branchingFactor settings)
+          idx              (util/binary-search-l cmp keys (dec (arrays/alength keys)) key)
+          keys-l           (arrays/alength keys)
+          result           (cond
+                             (and (< idx keys-l) (== 0 (cmp key (arrays/aget keys idx))))
+                             nil
 
-                   (== keys-l MAX_LEN)
-                   (let [middle (arrays/half (inc keys-l))]
+                             (== keys-l branching-factor)
+                             (let [middle (arrays/half (inc keys-l))]
                      (if (> idx middle)
                        (arrays/array
-                        (Leaf. (.slice keys 0 middle))
-                        (Leaf. (util/cut-n-splice keys middle keys-l idx idx (arrays/array key))))
+                        (Leaf. (.slice keys 0 middle) settings)
+                        (Leaf. (util/cut-n-splice keys middle keys-l idx idx (arrays/array key)) settings))
                        (arrays/array
-                        (Leaf. (util/cut-n-splice keys 0 middle idx idx (arrays/array key)))
-                        (Leaf. (.slice keys middle keys-l)))))
+                        (Leaf. (util/cut-n-splice keys 0 middle idx idx (arrays/array key)) settings)
+                        (Leaf. (.slice keys middle keys-l) settings))))
 
                    :else
-                   (arrays/array (Leaf. (util/splice keys idx idx (arrays/array key)))))]
+                   (arrays/array (Leaf. (util/splice keys idx idx (arrays/array key)) settings)))]
       (if sync?
         result
         (async result))))
@@ -56,7 +56,7 @@
        (async
         (when (<= 0 idx)
           (let [new-keys (util/splice keys idx (inc idx) (arrays/array))]
-            (util/rotate (Leaf. new-keys) root? left right)))))))
+            (util/rotate (Leaf. new-keys settings) root? left right settings)))))))
   ($store [this storage {:keys [sync?] :or {sync? true} :as opts}]
     (async+sync sync?
      (async

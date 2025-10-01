@@ -1,6 +1,5 @@
 (ns me.tonsky.persistent-sorted-set.util
   (:require [me.tonsky.persistent-sorted-set.arrays :as arrays]
-            [me.tonsky.persistent-sorted-set.constants :refer [MIN_LEN]]
             [me.tonsky.persistent-sorted-set.impl.node :as node]))
 
 (defn- binary-search-l [cmp arr r k]
@@ -87,22 +86,23 @@
          (arrays/array a2))
        (arrays/array a3)))))
 
-(defn rotate [node root? left right]
-  (cond
+(defn rotate [node root? left right settings]
+  (let [min-len (/ (:branchingFactor settings 32) 2)]
+    (cond
     ;; root never merges
     root?
     (return-array node)
 
     ;; enough keys, nothing to merge
-    (> (node/len node) MIN_LEN)
+    (> (node/len node) min-len)
     (return-array left node right)
 
     ;; left and this can be merged to one
-    (and left (<= (node/len left) MIN_LEN))
+    (and left (<= (node/len left) min-len))
     (return-array (node/merge left node) right)
 
     ;; right and this can be merged to one
-    (and right (<= (node/len right) MIN_LEN))
+    (and right (<= (node/len right) min-len))
     (return-array left (node/merge node right))
 
     ;; left has fewer nodes, redestribute with it
@@ -114,7 +114,7 @@
     ;; right has fewer nodes, redestribute with it
     :else
     (let [nodes (node/merge-split node right)]
-      (return-array left (arrays/aget nodes 0) (arrays/aget nodes 1)))))
+      (return-array left (arrays/aget nodes 0) (arrays/aget nodes 1))))))
 
 (defn lookup-exact [cmp arr key]
   (let [arr-l (arrays/alength arr)
