@@ -160,184 +160,162 @@
 
 #!------------------------------------------------------------------------------
 
-(def ^:const MAX_SAFE_PATH
-  "js limitation for bit ops"
-  (js/Math.pow 2 31))
+(def ^:const EMPTY_PATH (js* "0n"))
 
-(def ^:const BITS_PER_LEVEL
-  "tunable param"
-  5)
+(defn- bits-per-level [set]
+  (let [bf (get (.-settings set) :branchingFactor 32)]
+    (Math/ceil (Math/log2 bf))))
 
-(def ^:const MAX_LEN (js/Math.pow 2 BITS_PER_LEVEL)) ;; 32
+(defn- max-len [set]
+  (get (.-settings set) :branchingFactor 32))
 
-(def ^:const MIN_LEN (/ MAX_LEN 2)) ;; 16
+(defn- min-len [set]
+  (/ (max-len set) 2))
 
-(def ^:private ^:const AVG_LEN
-  (arrays/half (+ MAX_LEN MIN_LEN))) ;; 24
+(defn- avg-len [set]
+  (arrays/half (+ (max-len set) (min-len set))))
 
-(def ^:const MAX_SAFE_LEVEL
-  (js/Math.floor (/ 31 BITS_PER_LEVEL))) ;; 6
+(defn- path-inc [path]
+  (+ path (js* "1n")))
 
-(def ^:const BIT_MASK (- MAX_LEN 1)) ;; 0b011111 = 5 bit
+(defn- path-dec [path]
+  (- path (js* "1n")))
 
-(def ^:const EMPTY_PATH 0)
-
-(defn- path-inc ^number [^number path]
-  (inc path))
-
-(defn- path-dec ^number [^number path]
-  (dec path))
-
-(defn- path-cmp ^number [^number path1 ^number path2]
+(defn- path-cmp [path1 path2]
   (- path1 path2))
 
-(defn- path-lt ^boolean [^number path1 ^number path2]
+(defn- path-lt [path1 path2]
   (< path1 path2))
 
-(defn- path-lte ^boolean [^number path1 ^number path2]
+(defn- path-lte [path1 path2]
   (<= path1 path2))
 
-(defn- path-eq ^boolean [^number path1 ^number path2]
+(defn- path-eq [path1 path2]
   (== path1 path2))
 
-(def factors (into-array (map #(js/Math.pow 2 %) (range 0 52 BITS_PER_LEVEL))))
+(defn- path-get ^number [set path ^number level]
+  (let [bpl (bits-per-level set)
+        shift (js/BigInt (* level bpl))
+        mask (js* "~{} - 1n" (bit-shift-left (js* "1n") (js/BigInt bpl)))]
+    (js/Number (bit-and (bit-shift-right path shift) mask))))
 
-(defn- path-get ^number [^number path ^number level]
-  (if (< level MAX_SAFE_LEVEL)
+(defn- path-set [set path ^number level ^number idx]
+  (let [bpl   (bits-per-level set)
+        shift (js/BigInt (* level bpl))
+        mask  (js* "~{} - 1n" (bit-shift-left (js* "1n") (js/BigInt bpl)))
+        old   (bit-and (bit-shift-right path shift) mask)]
     (-> path
-      (unsigned-bit-shift-right (* level BITS_PER_LEVEL))
-      (bit-and BIT_MASK))
-    (-> path
-      (/ (arrays/aget factors level))
-      (js/Math.floor)
-      (bit-and BIT_MASK))))
-
-(defn- path-set ^number [^number path ^number level ^number idx]
-  (let [smol? (and (< path MAX_SAFE_PATH) (< level MAX_SAFE_LEVEL))
-        old   (path-get path level)
-        minus (if smol?
-                (bit-shift-left old (* level BITS_PER_LEVEL))
-                (* old (arrays/aget factors level)))
-        plus  (if smol?
-                (bit-shift-left idx (* level BITS_PER_LEVEL))
-                (* idx (arrays/aget factors level)))]
-    (-> path
-      (- minus)
-      (+ plus))))
+      (- (bit-shift-left old shift))
+      (+ (bit-shift-left (js/BigInt idx) shift)))))
 
 (defn- rpath
-  [node ^number path ^number level]
+  [set node path ^number level]
   (if (pos? level)
     (let [last-idx (dec (arrays/alength (.-children node)))]
       (recur
+        set
         (arrays/aget (.-children node) last-idx)
-        (path-set path level last-idx)
+        (path-set set path level last-idx)
         (dec level)))
-    (path-set path 0 (dec (arrays/alength (.-keys node))))))
+    (path-set set path 0 (dec (arrays/alength (.-keys node))))))
 
 (defn- $$rpath
-  [node ^number path ^number level storage {:keys [sync?] :or {sync? true} :as opts}]
+  [set node path ^number level {:keys [sync?] :or {sync? true} :as opts}]
   (async+sync sync?
    (async
     (if (pos? level)
       (let [last-idx (dec (node/len node))
-            child-node (await (branch/$child node storage last-idx opts))]
-        (await ($$rpath child-node (path-set path level last-idx) (dec level) storage opts)))
-      (path-set path 0 (dec (arrays/alength (.-keys node))))))))
+            child-node (await (branch/$child node (.-storage set) last-idx opts))]
+        (await ($$rpath set child-node (path-set set path level last-idx) (dec level) opts)))
+      (path-set set path 0 (dec (arrays/alength (.-keys node))))))))
 
 (defn- $$_next-path
-  [set node ^number path ^number level {:keys [sync?] :or {sync? true} :as opts}]
+  [set node path ^number level {:keys [sync?] :or {sync? true} :as opts}]
   (assert (and (some? node) (implements? node/INode node)))
   (async+sync sync?
    (async
-    (let [idx (path-get path level)]
+    (let [idx (path-get set path level)]
       (if (pos? level)
         (let [child-node (await (branch/$child node (.-storage set) idx opts))
               sub-path (await ($$_next-path set child-node path (dec level) opts))]
           (if (nil? sub-path)
             (if (< (inc idx) (arrays/alength (.-children node)))
-              (path-set EMPTY_PATH level (inc idx))
+              (path-set set EMPTY_PATH level (inc idx))
               nil)
-            (path-set sub-path level idx)))
+            (path-set set sub-path level idx)))
         (if (< (inc idx) (arrays/alength (.-keys node)))
-          (path-set EMPTY_PATH 0 (inc idx)) ;; advance leaf idx
+          (path-set set EMPTY_PATH 0 (inc idx)) ;; advance leaf idx
           nil))))))
 
 (defn- $$next-path
   "Returns path representing next item after `path` in natural traversal order.
    Will overflow at leaf if at the end of the tree"
-  [set ^number path {:keys [sync?] :or {sync? true} :as opts}]
+  [set path {:keys [sync?] :or {sync? true} :as opts}]
   (async+sync sync?
     (async
-     (if (neg? path)
+     (if (< path (js* "0n"))
        EMPTY_PATH
        (let [root (await ($$root set opts))
              lvl  (node/level root)]
          (or
           (await ($$_next-path set root path lvl opts))
           (path-inc (if (.-storage set)
-                      (await ($$rpath root EMPTY_PATH lvl (.-storage set) opts))
-                      (rpath root EMPTY_PATH lvl)))))))))
+                      (await ($$rpath set root EMPTY_PATH lvl opts))
+                      (rpath set root EMPTY_PATH lvl)))))))))
 
 (defn- $$_prev-path
-  [set node ^number path ^number level {:keys [sync?] :or {sync? true} :as opts}]
+  [set node path ^number level {:keys [sync?] :or {sync? true} :as opts}]
   (assert (and (some? node) (implements? node/INode node)))
   (async+sync sync?
     (async
-     (let [idx (path-get path level)]
+     (let [idx (path-get set path level)]
        (if (and (== 0 level) (== 0 idx))
          nil ;; leaf overflow
          (if (== 0 level)
-           (path-set EMPTY_PATH 0 (dec idx)) ;; leaf
+           (path-set set EMPTY_PATH 0 (dec idx)) ;; leaf
            (if (>= idx (node/len node))
              (if (.-storage set) ;; branch that was overflow before
-               (await ($$rpath node path level (.-storage set) opts))
-               (rpath node path level))
+               (await ($$rpath set node path level opts))
+               (rpath set node path level))
              (let [child-node (await (branch/$child node (.-storage set) idx opts))
                    path' (await ($$_prev-path set child-node path (dec level) opts))]
                (if (some? path')
-                 (path-set path' level idx) ;; no sub-overflow, keep current idx
+                 (path-set set path' level idx) ;; no sub-overflow, keep current idx
                  (if (== 0 idx)
                    nil ;; nested overflow + this node overflow
                    (let [;; nested overflow, advance current idx, reset subsequent indexes
                          child-node (await (branch/$child node (.-storage set) (dec idx) opts))
                          path' (if (.-storage set)
-                                 (await ($$rpath child-node path (dec level) (.-storage set) opts))
-                                 (rpath child-node path (dec level)))]
-                     (path-set path' level (dec idx)))))))))))))
+                                 (await ($$rpath set child-node path (dec level) opts))
+                                 (rpath set child-node path (dec level)))]
+                     (path-set set path' level (dec idx)))))))))))))
 
 (defn- $$prev-path
   "Returns path representing previous item before `path` in natural traversal order.
    Will overflow at leaf if at beginning of tree"
-  [set ^number path {:keys [sync?] :or {sync? true} :as opts}]
+  [set path {:keys [sync?] :or {sync? true} :as opts}]
   (async+sync sync?
     (async
      (let [root (await ($$root set opts))
            lvl  (node/level root)]
-       (if (> (path-get path (inc lvl)) 0) ;; overflow
+       (if (> (path-get set path (inc lvl)) 0) ;; overflow
          (if (.-storage set)
-           (await ($$rpath root path lvl (.-storage set) opts))  ;;-------------XXX can we consolidate here
-           (rpath root path lvl))
+           (await ($$rpath set root path lvl opts))
+           (rpath set root path lvl))
          (or (await ($$_prev-path set root path lvl opts))
              (path-dec EMPTY_PATH)))))))
 
-(defn- path-same-leaf ^boolean [^number path1 ^number path2]
-  (if (and
-       (< path1 MAX_SAFE_PATH)
-       (< path2 MAX_SAFE_PATH))
-    (==
-     (unsigned-bit-shift-right path1 BITS_PER_LEVEL)
-     (unsigned-bit-shift-right path2 BITS_PER_LEVEL))
-    (==
-     (Math/floor (/ path1 MAX_LEN))
-     (Math/floor (/ path2 MAX_LEN)))))
+(defn- path-same-leaf ^boolean [set path1 path2]
+  (let [bpl (bits-per-level set)]
+    (== (bit-shift-right path1 (js/BigInt bpl)) (bit-shift-right path2 (js/BigInt bpl)))))
 
-(defn- path-str [^number path]
-  (loop [res ()
-         path path]
-    (if (not= path 0)
-      (recur (conj res (mod path MAX_LEN)) (Math/floor (/ path MAX_LEN)))
-      (vec res))))
+(defn- path-str [set path]
+  (let [ml (js/BigInt (max-len set))]
+    (loop [res ()
+           path path]
+      (if (not= path (js* "0n"))
+        (recur (conj res (js/Number (mod path ml))) (quot path ml))
+        (vec res)))))
 
 (defn- $$keys-for
   "Returns keys array for the leaf node at the given path."
@@ -351,8 +329,10 @@
          (if (pos? level)
            (recur
              (dec level)
-             (await (branch/$child node (.-storage set) (path-get path level) opts)))
+             (await (branch/$child node (.-storage set) (path-get set path level) opts)))
            (.-keys node)))))))
+
+;;------------------------------------------------------------------------------
 
 ;;------------------------------------------------------------------------------
 
@@ -412,20 +392,20 @@
                   idx  (binary-search-l comparator keys (dec keys-l) key)]
               (if (== keys-l idx)
                 nil
-                (path-set path 0 idx)))
+                (path-set set path 0 idx)))
             (let [keys (.-keys node)
                   idx  (binary-search-l comparator keys (- keys-l 2) key)
                   child-node (await (branch/$child node (.-storage set) idx opts))]
               (recur
                 child-node
-                (path-set path level idx)
+                (path-set set path level idx)
                 (dec level))))))))))
 
 (declare ReverseIter $seek)
 
 (deftype Iter [^BTSet set left right keys idx]
   IIter
-  (-copy [_ l r] (Iter. set l r ($$keys-for set l {:sync? true}) (path-get l 0)))
+  (-copy [_ l r] (Iter. set l r ($$keys-for set l {:sync? true}) (path-get set l 0)))
 
   IEquiv
   (-equiv [this other]
@@ -457,9 +437,9 @@
 
   IChunkedSeq
   (-chunked-first [this]
-    (let [end-idx (if (path-same-leaf left right)
+    (let [end-idx (if (path-same-leaf set left right)
                     ;; right is in the same node
-                    (path-get right 0)
+                    (path-get set right 0)
                     ;; right is in a different node
                     (arrays/alength keys))]
       (Chunk. keys idx end-idx)))
@@ -469,7 +449,7 @@
 
   IChunkedNext
   (-chunked-next [this]
-    (let [last  (path-set left 0 (dec (arrays/alength keys)))
+    (let [last  (path-set set left 0 (dec (arrays/alength keys)))
           left' ($$next-path set last {:sync? true})]
       (when (path-lt left' right)
         (-copy this left' right))))
@@ -504,7 +484,7 @@
             :else
             (let [left' ($$next-path set left {:sync? true})]
               (if (path-lt left' right)
-                (recur left' ($$keys-for set left' {:sync? true}) (path-get left' 0) new-acc)
+                (recur left' ($$keys-for set left' {:sync? true}) (path-get set left' 0) new-acc)
                 new-acc)))))))
 
   IReversible
@@ -514,7 +494,7 @@
             right' ($$prev-path set right {:sync? true})]
         (ReverseIter. set left' right'
                       ($$keys-for set right' {:sync? true})
-                      (path-get right' 0)))))
+                      (path-get set right' 0)))))
 
   ISeek
   (-seek [this key]
@@ -530,7 +510,7 @@
 
       :else
       (when-some [left' ($$seek set key cmp {:sync? true})]
-        (Iter. set left' right ($$keys-for set left' {:sync? true}) (path-get left' 0)))))
+        (Iter. set left' right ($$keys-for set left' {:sync? true}) (path-get set left' 0)))))
 
   Object
   (toString [this] (pr-str* this))
@@ -552,8 +532,8 @@
           lvl  (node/level root)]
       (if (nil? key)
         (path-inc (if (.-storage set)
-                    (await ($$rpath root EMPTY_PATH lvl (.-storage set) opts))
-                    (rpath root EMPTY_PATH lvl)))
+                    (await ($$rpath set root EMPTY_PATH lvl opts))
+                    (rpath set root EMPTY_PATH lvl)))
         (loop [node  root
                path  EMPTY_PATH
                level lvl]
@@ -561,10 +541,10 @@
             (if (== 0 level)
               (let [keys (.-keys node)
                     idx  (binary-search-r comparator keys (dec keys-l) key)]
-                (path-set path 0 idx))
+                (path-set set path 0 idx))
               (let [keys       (.-keys node)
                     idx        (binary-search-r comparator keys (- keys-l 2) key)
-                    res        (path-set path level idx)
+                    res        (path-set set path level idx)
                     child-node (await (branch/$child node (.-storage set) idx opts))]
                 (recur
                   child-node
@@ -580,14 +560,14 @@
       (when (and left (path-lt left right))
         (when (nil? keys)
           (set! keys (await ($$keys-for set left {:sync? false})))
-          (set! idx (path-get left 0)))
+          (set! idx (path-get set left 0)))
         (arrays/aget keys idx))))
   (-arest [this]
     (async
       (when (and left (path-lt left right))
         (when (nil? keys)
           (set! keys (await ($$keys-for set left {:sync? false})))
-          (set! idx (path-get left 0)))
+          (set! idx (path-get set left 0)))
         (if (< (inc idx) (arrays/alength keys))
           (AsyncSeq. set (path-inc left) right keys (inc idx))
           (let [next-path (await ($$next-path set left {:sync? false}))]
@@ -595,7 +575,7 @@
               (AsyncSeq. set next-path right nil nil)))))))
   Object
   (toString [this]
-    (str "AsyncSeq[" (path-str left) " -> " (path-str right) "]"))
+    (str "AsyncSeq[" (path-str set left) " -> " (path-str set right) "]"))
   IPrintWithWriter
   (-pr-writer [this writer opts]
     (-write writer (str this))))
@@ -606,7 +586,7 @@
 
 (deftype ReverseIter [^BTSet set left right keys idx]
   IIter
-  (-copy [_ l r] (ReverseIter. set l r ($$keys-for set r {:sync? true}) (path-get r 0)))
+  (-copy [_ l r] (ReverseIter. set l r ($$keys-for set r {:sync? true}) (path-get set r 0)))
 
   IEquiv
   (-equiv [this other] (equiv-sequential this other))
@@ -656,11 +636,10 @@
 
       :else
       (let [right' ($$prev-path set ($$rseek set key cmp {:sync? true}) {:sync? true})]
-        (when (and
-               (nat-int? right')
-               (path-lte left right')
-               (path-lt  right' right))
-          (ReverseIter. set left right' ($$keys-for set right' {:sync? true}) (path-get right' 0))))))
+        (when (and right' (>= right' (js* "0n"))
+             (path-lte left right')
+             (path-lt  right' right))
+          (ReverseIter. set left right' ($$keys-for set right' {:sync? true}) (path-get set right' 0))))))
 
   Object
   (toString [this] (pr-str* this))
@@ -679,7 +658,7 @@
       (when (and right (path-lt left right))
         (when (nil? keys)
           (set! keys (await ($$keys-for set right {:sync? false})))
-          (let [i (path-get right 0)
+          (let [i (path-get set right 0)
                 n (arrays/alength keys)]
             (set! idx (if (< i n) i (dec n)))))
         (arrays/aget keys idx))))
@@ -693,9 +672,9 @@
          (let [right' (await ($$prev-path set right {:sync? false}))]
            (when (path-lt left right')
              (let [ks (await ($$keys-for set right' {:sync? false}))]
-               (AsyncReverseSeq. set left right' ks (path-get right' 0)))))))))
+               (AsyncReverseSeq. set left right' ks (path-get set right' 0)))))))))
   Object
-  (toString [_] (str "AsyncReverseSeq[" (path-str right) " <- " (path-str left) "]"))
+  (toString [_] (str "AsyncReverseSeq[" (path-str set right) " <- " (path-str set left) "]"))
   IPrintWithWriter
   (-pr-writer [this w _] (-write w (str this))))
 
@@ -708,16 +687,16 @@
         (when (pos? (node/len root))
           (let [left  EMPTY_PATH
                 rpth  (if (.-storage set)
-                        (await ($$rpath root EMPTY_PATH lvl (.-storage set) opts))
-                        (rpath root EMPTY_PATH lvl))
+                        (await ($$rpath set root EMPTY_PATH lvl opts))
+                        (rpath set root EMPTY_PATH lvl))
                 right (await ($$next-path set rpth opts))
                 ks (await ($$keys-for set left opts))]
             (if sync?
-              (Iter.     set left right ks (path-get left 0))
-              (AsyncSeq. set left right ks (path-get left 0)))))))))
+              (Iter.     set left right ks (path-get set left 0))
+              (AsyncSeq. set left right ks (path-get set left 0)))))))))
   ([^BTSet set left right {:keys [sync?] :or {sync? true} :as opts}]
    (if sync?
-     (Iter. set left right ($$keys-for set left {:sync? true}) (path-get left 0))
+     (Iter. set left right ($$keys-for set left {:sync? true}) (path-get set left 0))
      (async
       (let [root (await ($$root set {:sync? false}))]
         (when (pos? (node/len root))
@@ -726,7 +705,7 @@
                 right' (await ($$rseek set right cmp {:sync? false}))]
             (when (and left' (path-lt left' right'))
               (let [ks (await ($$keys-for set left' {:sync? true}))]
-                (AsyncSeq. set left' right' ks (path-get left' 0)))))))))))
+                (AsyncSeq. set left' right' ks (path-get set left' 0)))))))))))
 
 (defn $slice
   ([^BTSet set key-from key-to]
@@ -743,8 +722,8 @@
          (when (path-lt left right)
            (let [ks (await ($$keys-for set left opts))]
              (if sync?
-               (Iter.     set left right ks (path-get left 0))
-               (AsyncSeq. set left right ks (path-get left 0)))))))))))
+               (Iter.     set left right ks (path-get set left 0))
+               (AsyncSeq. set left right ks (path-get set left 0)))))))))))
 
 (defn $rslice
   ([^BTSet set key-from key-to]
@@ -764,7 +743,7 @@
             (let [left-bound (await ($$prev-path set from-path opts))
                   start-path (await ($$prev-path set to-path   opts))
                   ks         (await ($$keys-for set start-path opts))
-                  idx        (path-get start-path 0)]
+                  idx        (path-get set start-path 0)]
               (AsyncReverseSeq. set left-bound start-path ks idx)))))))))
 
 (defn $equivalent?
@@ -1089,7 +1068,7 @@
           (let [l' (await ($$prev-path set (.-left i) opts))
                 r' (await ($$prev-path set (.-right i) opts))
                 ks (await ($$keys-for set r' opts))
-                idx (path-get r' 0)]
+                idx (path-get set r' 0)]
             (AsyncReverseSeq. set l' r' ks idx))))))))
 
 (defn $seek
@@ -1113,18 +1092,17 @@
            (async
             (when-some [left' (await ($$seek set key cmp opts))]
               (let [ks ($$keys-for set left' opts)]
-                (AsyncSeq. set left' (.-right seq) ks (path-get left' 0))))))
+                (AsyncSeq. set left' (.-right seq) ks (path-get set left' 0))))))
          (if (instance? AsyncReverseSeq seq)
            (if (nat-int? (cmp key (arrays/aget (.-keys seq) (.-idx seq))))
              (async seq)
              (async
               (let [k (await ($$rseek set key cmp opts))
                     right' (await ($$prev-path set k opts))]
-                (when (and
-                       (nat-int? right')
+                (when (and right' (>= right' (js* "0n"))
                        (path-lte (.-left seq) right')
                        (path-lt  right' (.-right seq)))
-                  (AsyncReverseSeq. set (.-left seq) right' ($$keys-for set right' opts) (path-get right' 0))))))
+                  (AsyncReverseSeq. set (.-left seq) right' ($$keys-for set right' opts) (path-get set right' 0))))))
            (throw (js/Error. (str "unsupported type: '" (type seq) "'")))))))))
 
 #!------------------------------------------------------------------------------
@@ -1206,8 +1184,10 @@
 (defn- arr-partition-approx
   "Splits `arr` into arrays of size between min-len and max-len,
    trying to stick to (min+max)/2"
-  [min-len max-len arr]
-  (let [chunk-len AVG_LEN
+  [set arr]
+  (let [chunk-len (avg-len set)
+        min-len   (min-len set)
+        max-len   (max-len set)
         len       (arrays/alength arr)
         acc       (transient [])]
     (when (pos? len)
@@ -1267,8 +1247,9 @@
 (defn ^BTSet from-sorted-array
   [cmp arr _len opts]
   (let [settings (select-keys opts [:branchingFactor])
+        set      (BTSet. nil 0 cmp nil nil nil nil settings)
         leaves   (->> arr
-                   (arr-partition-approx MIN_LEN MAX_LEN)
+                   (arr-partition-approx set)
                    (arr-map-inplace #(Leaf. % settings)))
         storage  (:storage opts)]
     (loop [current-level leaves
@@ -1278,7 +1259,7 @@
         1 (BTSet. (first current-level) (arrays/alength arr) cmp nil UNINITIALIZED_HASH storage nil settings)
         (recur
           (->> current-level
-            (arr-partition-approx MIN_LEN MAX_LEN)
+            (arr-partition-approx set)
             (arr-map-inplace #(Branch. (inc shift)
                                        (arrays/amap node/max-key %)
                                        %
