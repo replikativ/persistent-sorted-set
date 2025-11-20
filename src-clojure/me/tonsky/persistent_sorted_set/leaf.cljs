@@ -20,7 +20,7 @@
       (util/return-array (Leaf. (arrays/aget ks 0) settings)
                          (Leaf. (arrays/aget ks 1) settings))))
   ($add [this storage key cmp {:keys [sync?] :or {sync? true}}]
-    (let [branching-factor (:branchingFactor settings)
+    (let [branching-factor (:branching-factor settings)
           idx              (util/binary-search-l cmp keys (dec (arrays/alength keys)) key)
           keys-l           (arrays/alength keys)
           result           (cond

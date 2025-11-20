@@ -61,7 +61,7 @@
   ([*disk] (storage (atom {}) *disk))
   ([*memory *disk] (storage *memory *disk {}))
   ([*memory *disk opts]
-   (->Storage *memory *disk (merge {:branchingFactor 32} opts))))
+   (->Storage *memory *disk (merge {:branching-factor 512} opts))))
 
 #!------------------------------------------------------------------------------
 
@@ -98,4 +98,4 @@
   ([*disk] (async-storage (atom {}) *disk))
   ([*memory *disk] (async-storage *memory *disk {}))
   ([*memory *disk opts]
-   (->AsyncStorage *memory *disk (merge {:branchingFactor 32} opts))))
+   (->AsyncStorage *memory *disk (merge {:branching-factor 512} opts))))

@@ -87,7 +87,7 @@
        (arrays/array a3)))))
 
 (defn rotate [node root? left right settings]
-  (let [min-len (/ (:branchingFactor settings 32) 2)]
+  (let [min-len (/ (:branching-factor settings 32) 2)]
     (cond
     ;; root never merges
     root?

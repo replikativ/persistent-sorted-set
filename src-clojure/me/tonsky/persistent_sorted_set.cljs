@@ -8,7 +8,7 @@
             [me.tonsky.persistent-sorted-set.btset :as btset :refer [BTSet]]))
 
 (def ^:private default-opts
-  {:branchingFactor 32})
+  {:branching-factor 512})
 
 (defn- with-defaults [opts]
   (merge default-opts opts))

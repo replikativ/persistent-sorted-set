@@ -155,7 +155,7 @@
         cmp     (if (map? root-address-or-info)
                   (or (:comparator root-address-or-info) compare)
                   (or (:comparator opts) compare))
-        settings (select-keys (merge (when (map? root-address-or-info) root-address-or-info) opts) [:branchingFactor])]
+        settings (select-keys (merge (when (map? root-address-or-info) root-address-or-info) opts) [:branching-factor])]
     (BTSet. nil -1 cmp meta UNINITIALIZED_HASH storage address settings)))
 
 #!------------------------------------------------------------------------------
@@ -163,11 +163,11 @@
 (def ^:const EMPTY_PATH (js* "0n"))
 
 (defn- bits-per-level [set]
-  (let [bf (get (.-settings set) :branchingFactor 32)]
+  (let [bf (get (.-settings set) :branching-factor)]
     (Math/ceil (Math/log2 bf))))
 
 (defn- max-len [set]
-  (get (.-settings set) :branchingFactor 32))
+  (get (.-settings set) :branching-factor))
 
 (defn- min-len [set]
   (/ (max-len set) 2))
@@ -556,20 +556,15 @@
   (anext [this]
    (async
     (when (and left (path-lt left right))
-      [(do
-         (when (nil? keys)
-           (set! keys (await ($$keys-for set left {:sync? false})))
-           (set! idx (path-get set left 0)))
-         (arrays/aget keys idx))
-       (do
-         (when (nil? keys)
-           (set! keys (await ($$keys-for set left {:sync? false})))
-           (set! idx (path-get set left 0)))
-         (if (< (inc idx) (arrays/alength keys))
-           (AsyncSeq. set (path-inc left) right keys (inc idx))
-           (let [next-path (await ($$next-path set left {:sync? false}))]
-             (when (and next-path (path-lt next-path right))
-               (AsyncSeq. set next-path right nil nil)))))])))
+      (when (nil? keys)
+        (set! keys (await ($$keys-for set left {:sync? false})))
+        (set! idx (path-get set left 0)))
+      [(arrays/aget keys idx)
+       (if (< (inc idx) (arrays/alength keys))
+         (AsyncSeq. set (path-inc left) right keys (inc idx))
+         (let [next-path (await ($$next-path set left {:sync? false}))]
+           (when (and next-path (path-lt next-path right))
+             (AsyncSeq. set next-path right nil nil))))])))
   Object
   (toString [this]
     (str "AsyncSeq[" (path-str set left) " -> " (path-str set right) "]"))
@@ -1240,7 +1235,7 @@
 
 (defn ^BTSet from-sorted-array
   [cmp arr _len opts]
-  (let [settings (select-keys opts [:branchingFactor])
+  (let [settings (select-keys opts [:branching-factor])
         set      (BTSet. nil 0 cmp nil nil nil nil settings)
         leaves   (->> arr
                    (arr-partition-approx set)
@@ -1271,7 +1266,7 @@
    - :comparator  Custom comparator (defaults to compare)
    - :meta     Metadata"
   [opts]
-  (let [settings (select-keys opts [:branchingFactor])]
+  (let [settings (select-keys opts [:branching-factor])]
     (BTSet. (Leaf. (arrays/array) settings) 0 (or (:comparator opts) compare)
             (:meta opts) UNINITIALIZED_HASH (:storage opts) nil settings)))
 

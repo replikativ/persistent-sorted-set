@@ -93,7 +93,7 @@
         (let [child-node (await ($child this storage idx opts))
               nodes      (await (node/$add child-node storage key cmp opts))]
           (when nodes
-            (let [branching-factor (:branchingFactor (.-settings this))
+            (let [branching-factor (:branching-factor (.-settings this))
                   children         (ensure-children this)
                   new-keys         (util/check-n-splice cmp keys idx (inc idx) (arrays/amap node/max-key nodes))
                   new-children     (util/splice children idx (inc idx) nodes)
