@@ -5,15 +5,13 @@
             [me.tonsky.persistent-sorted-set :as set]))
 
 (deftype AsyncRange [^number current ^number end ^number step]
-  aseq/IAsyncSeq
-  (-afirst [_]
+  aseq/PAsyncSeq
+  (anext [_]
     (async
-      (when (< current end)
-        current)))
-  (-arest [_]
-    (async
+     [(when (< current end)
+        current)
       (when (< (+ current step) end)
-        (AsyncRange. (+ current step) end step)))))
+        (AsyncRange. (+ current step) end step))])))
 
 (defn async-range
   ([end] (AsyncRange. 0 end 1))

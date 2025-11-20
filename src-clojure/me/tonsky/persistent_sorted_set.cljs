@@ -7,38 +7,6 @@
   (:require [me.tonsky.persistent-sorted-set.arrays :as arrays]
             [me.tonsky.persistent-sorted-set.btset :as btset :refer [BTSet]]))
 
-; B+ tree
-; -------
-
-; Leaf:     keys[]     :: array of values
-
-; Node:     children[] :: links to children nodes
-;           keys[]     :: max value for whole subtree
-;                         node.keys[i] == max(node.children[i].keys)
-; All arrays are 16..32 elements, inclusive
-
-; BTSet:    root       :: Node or Leaf
-;           shift      :: depth - 1
-;           cnt        :: size of a set, integer, rolling
-;           comparator :: comparator used for ordering
-;           meta       :: clojure meta map
-;           _hash      :: hash code, same as for clojure collections, on-demand, cached
-
-; Path: conceptually a vector of indexes from root to leaf value, but encoded in a single number.
-;       E.g. we have path [7 30 11] representing root.children[7].children[30].keys[11].
-;       In our case level-shift is 5, meaning each index will take 5 bits:
-;       (7 << 10) | (30 << 5) | (11 << 0) = 8139
-;         00111       11110       01011
-
-; Iter:     set       :: Set this iterator belongs to
-;           left      :: Current path
-;           right     :: Right bound path (exclusive)
-;           keys      :: Cached ref for keys array for a leaf
-;           idx       :: Cached idx in keys array
-; Keys and idx are cached for fast iteration inside a leaf"
-
-#!------------------------------------------------------------------------------
-
 (def ^:private default-opts
   {:branchingFactor 32})
 

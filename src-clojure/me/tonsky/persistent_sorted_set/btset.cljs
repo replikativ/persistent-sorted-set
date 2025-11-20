@@ -334,8 +334,6 @@
 
 ;;------------------------------------------------------------------------------
 
-;;------------------------------------------------------------------------------
-
 ;; replace with cljs.core/ArrayChunk after https://dev.clojure.org/jira/browse/CLJS-2470
 (deftype Chunk [arr off end]
   ICounted
@@ -554,25 +552,24 @@
 ;;------------------------------------------------------------------------------
 
 (deftype AsyncSeq [^BTSet set left right ^:mutable keys ^:mutable idx]
-  aseq/IAsyncSeq
-  (-afirst [this]
-    (async
-      (when (and left (path-lt left right))
-        (when (nil? keys)
-          (set! keys (await ($$keys-for set left {:sync? false})))
-          (set! idx (path-get set left 0)))
-        (arrays/aget keys idx))))
-  (-arest [this]
-    (async
-      (when (and left (path-lt left right))
-        (when (nil? keys)
-          (set! keys (await ($$keys-for set left {:sync? false})))
-          (set! idx (path-get set left 0)))
-        (if (< (inc idx) (arrays/alength keys))
-          (AsyncSeq. set (path-inc left) right keys (inc idx))
-          (let [next-path (await ($$next-path set left {:sync? false}))]
-            (when (and next-path (path-lt next-path right))
-              (AsyncSeq. set next-path right nil nil)))))))
+  aseq/PAsyncSeq
+  (anext [this]
+   (async
+    (when (and left (path-lt left right))
+      [(do
+         (when (nil? keys)
+           (set! keys (await ($$keys-for set left {:sync? false})))
+           (set! idx (path-get set left 0)))
+         (arrays/aget keys idx))
+       (do
+         (when (nil? keys)
+           (set! keys (await ($$keys-for set left {:sync? false})))
+           (set! idx (path-get set left 0)))
+         (if (< (inc idx) (arrays/alength keys))
+           (AsyncSeq. set (path-inc left) right keys (inc idx))
+           (let [next-path (await ($$next-path set left {:sync? false}))]
+             (when (and next-path (path-lt next-path right))
+               (AsyncSeq. set next-path right nil nil)))))])))
   Object
   (toString [this]
     (str "AsyncSeq[" (path-str set left) " -> " (path-str set right) "]"))
@@ -648,31 +645,28 @@
   (-pr-writer [this writer opts]
     (pr-sequential-writer writer pr-writer "(" " " ")" opts (seq this))))
 
-
 #!------------------------------------------------------------------------------
 
 (deftype AsyncReverseSeq [^BTSet set left right ^:mutable keys ^:mutable idx]
-  aseq/IAsyncSeq
-  (-afirst [this]
-    (async
-      (when (and right (path-lt left right))
-        (when (nil? keys)
-          (set! keys (await ($$keys-for set right {:sync? false})))
-          (let [i (path-get set right 0)
-                n (arrays/alength keys)]
-            (set! idx (if (< i n) i (dec n)))))
-        (arrays/aget keys idx))))
-  (-arest [this]
-    (async
-     (when keys
-       (if (> idx 0)
-         (let [right' (path-dec right)]
-           (when (path-lt left right')
-             (AsyncReverseSeq. set left right' keys (dec idx))))
-         (let [right' (await ($$prev-path set right {:sync? false}))]
-           (when (path-lt left right')
-             (let [ks (await ($$keys-for set right' {:sync? false}))]
-               (AsyncReverseSeq. set left right' ks (path-get set right' 0)))))))))
+  aseq/PAsyncSeq
+  (anext [this]
+   (async
+    [(when (and right (path-lt left right))
+       (when (nil? keys)
+         (set! keys (await ($$keys-for set right {:sync? false})))
+         (let [i (path-get set right 0)
+               n (arrays/alength keys)]
+           (set! idx (if (< i n) i (dec n)))))
+       (arrays/aget keys idx))
+      (when keys
+        (if (> idx 0)
+          (let [right' (path-dec right)]
+            (when (path-lt left right')
+              (AsyncReverseSeq. set left right' keys (dec idx))))
+          (let [right' (await ($$prev-path set right {:sync? false}))]
+            (when (path-lt left right')
+              (let [ks (await ($$keys-for set right' {:sync? false}))]
+                (AsyncReverseSeq. set left right' ks (path-get set right' 0)))))))]))
   Object
   (toString [_] (str "AsyncReverseSeq[" (path-str set right) " <- " (path-str set left) "]"))
   IPrintWithWriter
@@ -798,7 +792,7 @@
                                (await (aseq/rest yiter))))))))
 
         ;; BTSet X AsyncSeq
-        (and (instance? BTSet xs) (satisfies? aseq/IAsyncSeq ys))
+        (and (instance? BTSet xs) (satisfies? aseq/PAsyncSeq ys))
         (loop [xiter (await ($$iter xs opts))
                yiter ys]
           (let [x (await (aseq/first xiter))
@@ -810,7 +804,7 @@
                            (await (aseq/rest yiter))))))
 
         ;; AsyncSeq X BTSet
-        (and (satisfies? aseq/IAsyncSeq xs) (instance? BTSet ys))
+        (and (satisfies? aseq/PAsyncSeq xs) (instance? BTSet ys))
         (loop [xiter xs
                yiter (await ($$iter ys opts))]
           (let [x (await (aseq/first xiter))
@@ -822,7 +816,7 @@
                            (await (aseq/rest yiter))))))
 
         ;; AsyncSeq X AsyncSeq
-        (and (satisfies? aseq/IAsyncSeq xs) (satisfies? aseq/IAsyncSeq ys))
+        (and (satisfies? aseq/PAsyncSeq xs) (satisfies? aseq/PAsyncSeq ys))
         (loop [xiter xs
                yiter ys]
           (let [x (await (aseq/first xiter))
@@ -850,7 +844,7 @@
                     false))))))
 
         ;; AsyncSeq X Seqable
-        (and (satisfies? aseq/IAsyncSeq xs) (or (seqable? ys) (array? ys)))
+        (and (satisfies? aseq/PAsyncSeq xs) (or (seqable? ys) (array? ys)))
         (let [s (if (array? ys) (array-seq ys 0) (seq ys))]
           (loop [xiter xs
                  z     s]
@@ -876,7 +870,7 @@
              (await (arf (unreduced acc')))
              (recur acc' (await (aseq/rest items)))))
          (await (arf acc)))))
-    (if (satisfies? aseq/IAsyncSeq from)
+    (if (satisfies? aseq/PAsyncSeq from)
       (async
        (loop [acc set
               items from]
@@ -944,7 +938,7 @@
   "xform: synchronous transducer (core map/filter/comp/etc)
    arf:   MUST BE ASYNC reducing fn with arities ([acc] ...) and ([acc x] ...)
    init:  initial accumulator
-   from:  BTSet | aseq/IAsyncSeq | sequential"
+   from:  BTSet | aseq/PAsyncSeq | sequential"
   [xform arf init from]
   (let [{:keys [step complete]} (xf-driver xform)
         apply-outs
@@ -975,7 +969,7 @@
                   acc' (await (apply-outs acc tail))]
               (await (arf acc'))))))
 
-      (satisfies? aseq/IAsyncSeq from)
+      (satisfies? aseq/PAsyncSeq from)
       (async
         (loop [acc init
                items from]
