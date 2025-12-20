@@ -1,13 +1,23 @@
-{:source-paths ["src-clojure" "test-clojure" "bench-clojure"]
+{:deps {:aliases [:node-tests :node-stress]},
+ :source-paths ["src-clojure" "test-clojure"]
  :builds
- {:bench
-  {:target           :node-script
-   :main             me.tonsky.persistent-sorted-set.bench/-main
-   :output-to        "target/bench.js"
-   :compiler-options {:infer-externs true}}
-  
-  :test
-  {:target           :node-test
-   :output-to        "target/test.js"
-   :ns-regexp        "me\\.tonsky\\.persistent-sorted-set\\.test\\..*$"
-   :compiler-options {:infer-externs true}}}}
+ {:node-tests
+  {:target    :node-test  ;shadow-cljs release node-tests && node target/pss/tests.min.js
+   :output-to "target/pss/tests.min.js"
+   :ns-regexp "^(?!me.tonsky.persistent-sorted-set.test.stress)"
+   :compiler-options {:infer-externs true
+                      :parallel-build true
+                      :static-fns true
+                      :fn-invoke-direct true
+                      :elide-asserts true
+                      :optimizations :advanced}}
+  :node-stress ;shadow-cljs release node-stress && node target/pss/stress.min.js
+  {:target    :node-test
+   :output-to "target/pss/stress.min.js"
+   :ns-regexp "^me.tonsky.persistent-sorted-set.test.stress"
+   :compiler-options {:infer-externs true
+                      :parallel-build true
+                      :static-fns true
+                      :fn-invoke-direct true
+                      :elide-asserts true
+                      :optimizations :advanced}}}}

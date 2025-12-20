@@ -30,15 +30,16 @@
   (let [e0 (set/sorted-set-by cmp-s)
         ds [[:a :b] [:b :x] [:b :q] [:a :d]]
         e1 (reduce conj e0 ds)]
-    (is (= (count ds)        (count (seq e1))))
-    (is (= (vec (seq e1))    (vec (set/slice e1 [nil nil] [nil nil])))) ; * *
-    (is (= [[:a :b] [:a :d]] (vec (set/slice e1 [:a nil]  [:a nil] )))) ; :a *
-    (is (= [[:b :q]]         (vec (set/slice e1 [:b :q]   [:b :q]  )))) ; :b :q (specific)
-    (is (= [[:a :d] [:b :q]] (vec (set/slice e1 [:a :d]   [:b :q]  )))) ; matching subrange
-    (is (= [[:a :d] [:b :q]] (vec (set/slice e1 [:a :c]   [:b :r]  )))) ; non-matching subrange
-    (is (= [[:b :x]]         (vec (set/slice e1 [:b :r]   [:c nil] )))) ; non-matching -> out of range
-    (is (= []                (vec (set/slice e1 [:c nil]  [:c nil] )))) ; totally out of range
-    ))
+    (and
+     (is (= (count ds)        (count (seq e1))))
+     (is (= (vec (seq e1))    (vec (set/slice e1 [nil nil] [nil nil])))) ; * *
+     (is (= [[:a :b] [:a :d]] (vec (set/slice e1 [:a nil]  [:a nil] )))) ; :a *
+     (is (= [[:b :q]]         (vec (set/slice e1 [:b :q]   [:b :q]  )))) ; :b :q (specific)
+     (is (= [[:a :d] [:b :q]] (vec (set/slice e1 [:a :d]   [:b :q]  )))) ; matching subrange
+     (is (= [[:a :d] [:b :q]] (vec (set/slice e1 [:a :c]   [:b :r]  )))) ; non-matching subrange
+     (is (= [[:b :x]]         (vec (set/slice e1 [:b :r]   [:c nil] )))) ; non-matching -> out of range
+     (is (= []                (vec (set/slice e1 [:c nil]  [:c nil] )))) ; totally out of range
+     )))
 
 (defn irange [from to]
   (if (< from to)
@@ -51,7 +52,7 @@
       (let [s (into (set/sorted-set) (shuffle (irange 0 5000)))]
         (are [from to expected] (= expected (set/slice s from to))
           nil    nil    (irange 0 5000)
-          
+
           -1     nil    (irange 0 5000)
           0      nil    (irange 0 5000)
           0.5    nil    (irange 1 5000)
@@ -83,7 +84,7 @@
       (let [s (into (set/sorted-set) (shuffle (irange 0 10)))]
         (are [from to expected] (= expected (set/slice s from to))
           nil  nil  (irange 0 10)
-          
+
           -1   nil  (irange 0 10)
           0    nil  (irange 0 10)
           0.5  nil  (irange 1 10)
@@ -92,7 +93,7 @@
           9.5  nil  [10]
           10   nil  [10]
           10.5 nil  nil
-          
+
           nil -1   nil
           nil 0    [0]
           nil 0.5  [0]
@@ -115,7 +116,7 @@
       (let [s (into (set/sorted-set) (shuffle (irange 0 5000)))]
         (are [from to expected] (= expected (set/rslice s from to))
           nil    nil    (irange 5000 0)
-          
+
           5001   nil    (irange 5000 0)
           5000   nil    (irange 5000 0)
           4999.5 nil    (irange 4999 0)
@@ -124,7 +125,7 @@
           0.5    nil    [0]
           0      nil    [0]
           -1     nil    nil
-          
+
           nil    5001   nil
           nil    5000   [5000]
           nil    4999.5 [5000]
@@ -147,7 +148,7 @@
       (let [s (into (set/sorted-set) (shuffle (irange 0 10)))]
         (are [from to expected] (= expected (set/rslice s from to))
           nil nil (irange 10 0)
-          
+
           11  nil (irange 10 0)
           10  nil (irange 10 0)
           9.5 nil (irange 9 0)
@@ -156,7 +157,7 @@
           0.5 nil [0]
           0   nil [0]
           -1  nil nil
-          
+
           nil 11  nil
           nil 10  [10]
           nil 9.5 [10]
@@ -183,18 +184,18 @@
           2500   nil
           5000   nil
           5001   nil
-          
+
           nil    -1
-          nil    0     
-          nil    1     
+          nil    0
+          nil    1
           nil    2500
           nil    5000
-          nil    5001  
-          
+          nil    5001
+
           nil    nil
- 
+
           -1     5001
-          0      5000  
+          0      5000
           1      4999
           2500   2500
           2500.1 2500.9)))
@@ -207,47 +208,47 @@
           2500   nil
           5000   nil
           5001   nil
-          
+
           nil    -1
-          nil    0     
-          nil    1     
+          nil    0
+          nil    1
           nil    2500
           nil    5000
-          nil    5001  
-          
+          nil    5001
+
           nil    nil
 
-          5001   -1    
-          5000   0       
-          4999   1     
-          2500   2500  
-          2500.9 2500.1)))
+          5001   -1
+          5000   0
+          4999   1
+          2500   2500
+          2500.9 2500.1)))))
 
+(deftest test-slice-2
+  (dotimes [i  iters]
     (testing "Slice with equal elements"
       (let [cmp10 (fn [a b] (compare (quot a 10) (quot b 10)))
             s10   (reduce #(set/conj %1 %2 compare) (set/sorted-set-by cmp10) (shuffle (irange 0 5000)))]
         (are [from to expected] (= expected (set/slice s10 from to))
-          30 30      (irange 30 39)
-          130 4970   (irange 130 4979)
-          -100 6000  (irange 0 5000))
+             30 30      (irange 30 39)
+             130 4970   (irange 130 4979)
+             -100 6000  (irange 0 5000))
         (are [from to expected] (= expected (set/rslice s10 from to))
-          30 30      (irange 39 30)
-          4970 130   (irange 4979 130)
-          6000 -100  (irange 5000 0)))
-
+             30 30      (irange 39 30)
+             4970 130   (irange 4979 130)
+             6000 -100  (irange 5000 0)))
       (let [cmp100 (fn [a b] (compare (quot a 100) (quot b 100)))
             s100   (reduce #(set/conj %1 %2 compare) (set/sorted-set-by cmp100) (shuffle (irange 0 5000)))]
         (are [from to expected] (= expected (set/slice s100 from to))
-          30  30     (irange 0 99)
-          2550 2550  (irange 2500 2599)
-          130 4850   (irange 100 4899)
-          -100 6000  (irange 0 5000))
+             30  30     (irange 0 99)
+             2550 2550  (irange 2500 2599)
+             130 4850   (irange 100 4899)
+             -100 6000  (irange 0 5000))
         (are [from to expected] (= expected (set/rslice s100 from to))
-          30 30      (irange 99 0)
-          2550 2550  (irange 2599 2500)
-          4850 130   (irange 4899 100)
-          6000 -100  (irange 5000 0))))
-    ))
+             30 30      (irange 99 0)
+             2550 2550  (irange 2599 2500)
+             4850 130   (irange 4899 100)
+             6000 -100  (irange 5000 0))))))
 
 (defn ireduce
   ([f coll] (#?(:clj .reduce :cljs -reduce) ^IReduce coll f))
