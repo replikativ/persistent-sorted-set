@@ -220,6 +220,31 @@ public class Leaf<Key, Address> extends ANode<Key, Address> {
   }
 
   @Override
+  public ANode[] replace(IStorage storage, Key oldKey, Key newKey, Comparator<Key> cmp, Settings settings) {
+    int idx = search(oldKey, cmp);
+    if (idx < 0) // not in set
+      return PersistentSortedSet.UNCHANGED;
+
+    // Transient: can modify in place
+    if (editable()) {
+      _keys[idx] = newKey;
+      // If we replaced the last element, maxKey changed
+      if (idx == _len - 1) {
+        return new ANode[]{this}; // signal maxKey update needed
+      }
+      return PersistentSortedSet.EARLY_EXIT;
+    }
+
+    // Persistent: create new leaf with replaced key
+    Leaf n = new Leaf(_len, settings);
+    ArrayUtil.copy(_keys, 0, _len, n._keys, 0);
+    n._keys[idx] = newKey;
+
+    // Always return the new node - parent needs to update its child reference
+    return new ANode[]{n};
+  }
+
+  @Override
   public void walkAddresses(IStorage storage, IFn onAddress) {
     // noop
   }

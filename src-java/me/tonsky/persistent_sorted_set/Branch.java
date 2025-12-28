@@ -596,6 +596,62 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
   }
 
   @Override
+  public ANode[] replace(IStorage storage, Key oldKey, Key newKey, Comparator<Key> cmp, Settings settings) {
+    // Find which child contains the key
+    int idx = search(oldKey, cmp);
+    if (idx < 0) idx = -idx - 1;
+    if (idx == _len) idx = _len - 1; // key might be in last child
+    assert 0 <= idx && idx < _len;
+
+    // Recursively replace in child
+    ANode[] nodes = child(storage, idx).replace(storage, oldKey, newKey, cmp, settings);
+
+    if (PersistentSortedSet.UNCHANGED == nodes) // key not found
+      return PersistentSortedSet.UNCHANGED;
+
+    if (PersistentSortedSet.EARLY_EXIT == nodes) // replaced in transient child, no updates needed
+      return PersistentSortedSet.EARLY_EXIT;
+
+    // Child was replaced (nodes.length == 1)
+    ANode<Key, Address> newChild = nodes[0];
+    Key newMaxKey = newChild.maxKey();
+    boolean maxKeyChanged = (idx == _len - 1) && (0 != cmp.compare(newMaxKey, _keys[idx]));
+
+    // Transient: can modify in place
+    if (editable()) {
+      _keys[idx] = newMaxKey;
+      child(idx, newChild);
+      if (_addresses != null) {
+        _addresses[idx] = null; // clear stored address since child changed
+      }
+      if (maxKeyChanged)
+        return new ANode[]{this};
+      else
+        return PersistentSortedSet.EARLY_EXIT;
+    }
+
+    // Persistent: create new branch with updated child
+    Key[] newKeys;
+    if (0 == cmp.compare(newMaxKey, _keys[idx])) {
+      newKeys = _keys; // reuse array if maxKey unchanged
+    } else {
+      newKeys = Arrays.copyOfRange(_keys, 0, _len);
+      newKeys[idx] = newMaxKey;
+    }
+
+    Address[] newAddresses = null;
+    if (_addresses != null) {
+      newAddresses = Arrays.copyOfRange(_addresses, 0, _len);
+      newAddresses[idx] = null; // child changed, address invalid
+    }
+
+    Object[] newChildren = _children == null ? new Object[_keys.length] : Arrays.copyOfRange(_children, 0, _len);
+    newChildren[idx] = newChild;
+
+    return new ANode[]{new Branch(_level, _len, newKeys, newAddresses, newChildren, settings)};
+  }
+
+  @Override
   public void walkAddresses(IStorage storage, IFn onAddress) {
     for (int i = 0; i < _len; ++i) {
       Address address = address(i);

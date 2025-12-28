@@ -311,8 +311,91 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     return new PersistentSortedSet(_meta, _cmp, null, _storage, newRoot, alterCount(-1), _settings, _version + 1);
   }
 
+  /**
+   * Replace an existing key with a new key at the same logical position.
+   * The comparator must return 0 for both oldKey and newKey.
+   * This is a single-traversal update - much faster than disjoin + cons.
+   *
+   * @param oldKey The key to find and replace
+   * @param newKey The replacement key (must compare equal to oldKey)
+   * @return Updated set, or this if oldKey not found
+   */
+  public PersistentSortedSet replace(Object oldKey, Object newKey) {
+    return replace(oldKey, newKey, _cmp);
+  }
+
+  public PersistentSortedSet replace(Object oldKey, Object newKey, Comparator cmp) {
+    ANode[] nodes = root().replace(_storage, (Key) oldKey, (Key) newKey, cmp, _settings);
+
+    // Not in set
+    if (UNCHANGED == nodes) return this;
+
+    // In-place update (transient)
+    if (EARLY_EXIT == nodes) {
+      _address = null;
+      _version += 1;
+      return this;
+    }
+
+    // New root node (persistent case or maxKey changed in transient)
+    ANode newRoot = nodes[0];
+    if (editable()) {
+      _address = null;
+      _root = newRoot;
+      _version += 1;
+      return this;
+    }
+
+    return new PersistentSortedSet(_meta, _cmp, null, _storage, newRoot, _count, _settings, _version + 1);
+  }
+
   public boolean contains(Object key) {
     return root().contains(_storage, (Key) key, _cmp);
+  }
+
+  /**
+   * Look up a key and return the actual stored element.
+   * Unlike get/valAt which return the search key, this returns the
+   * stored element - useful when using custom comparators that only
+   * compare part of the key (e.g., [id value] tuples compared by id).
+   *
+   * O(log n) traversal with no allocations (unlike slice).
+   *
+   * @param key The key to search for
+   * @return The stored element, or null if not found
+   */
+  public Key lookup(Object key) {
+    return lookup(key, _cmp);
+  }
+
+  /**
+   * Look up a key with custom comparator and return the actual stored element.
+   */
+  public Key lookup(Object key, Comparator<Key> cmp) {
+    ANode<Key, Address> node = root();
+
+    if (node.len() == 0) {
+      return null;
+    }
+
+    while (true) {
+      int idx = node.searchFirst((Key) key, cmp);
+      if (idx >= node._len) {
+        return null;
+      }
+
+      // Check if this is an exact match (comparator returns 0)
+      if (cmp.compare(node._keys[idx], (Key) key) != 0) {
+        return null;
+      }
+
+      if (node instanceof Branch) {
+        node = ((Branch<Key, Address>) node).child(_storage, idx);
+      } else {
+        // Leaf node - return the actual stored key
+        return node._keys[idx];
+      }
+    }
   }
 
   // IEditableCollection

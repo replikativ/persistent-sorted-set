@@ -116,6 +116,16 @@ public abstract class ANode<Key, Address> {
   public abstract boolean contains(IStorage storage, Key key, Comparator<Key> cmp);
   public abstract ANode[] add(IStorage storage, Key key, Comparator<Key> cmp, Settings settings);
   public abstract ANode[] remove(IStorage storage, Key key, ANode left, ANode right, Comparator<Key> cmp, Settings settings);
+
+  /**
+   * Replace an existing key with a new key at the same position.
+   * The comparator must return 0 for both oldKey and newKey (same logical position).
+   * This is a single-traversal update - much faster than remove + add.
+   *
+   * @return UNCHANGED if oldKey not found, EARLY_EXIT if replaced without maxKey change,
+   *         or array with updated node(s) if maxKey changed
+   */
+  public abstract ANode[] replace(IStorage storage, Key oldKey, Key newKey, Comparator<Key> cmp, Settings settings);
   public abstract String str(IStorage storage, int lvl);
   public abstract void walkAddresses(IStorage storage, IFn onAddress);
   public abstract Address store(IStorage<Key, Address> storage);

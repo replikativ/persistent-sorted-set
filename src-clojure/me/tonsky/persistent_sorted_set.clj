@@ -1,7 +1,7 @@
 (ns ^{:author "Nikita Prokopov"
       :doc "A B-tree based persistent sorted set. Supports transients, custom comparators, fast iteration, efficient slices (iterator over a part of the set) and reverse slices. Almost a drop-in replacement for [[clojure.core/sorted-set]], the only difference being this one can’t store nil."}
   me.tonsky.persistent-sorted-set
-  (:refer-clojure :exclude [conj disj sorted-set sorted-set-by])
+  (:refer-clojure :exclude [conj disj sorted-set sorted-set-by replace])
   (:require
     [me.tonsky.persistent-sorted-set.arrays :as arrays])
   (:import
@@ -51,6 +51,33 @@
    (.seek ^Seq seq to))
   ([seq to cmp]
    (.seek ^Seq seq to ^Comparator cmp)))
+
+(defn lookup
+  "Look up a key and return the actual stored element.
+  Unlike get/valAt which return the search key, this returns the
+  stored element - useful when using custom comparators that only
+  compare part of the key (e.g., [id value] tuples compared by id).
+
+  O(log n) traversal with no allocations (unlike slice).
+
+  Returns nil if not found."
+  ([^PersistentSortedSet set key]
+   (.lookup set key))
+  ([^PersistentSortedSet set key ^Comparator cmp]
+   (.lookup set key cmp)))
+
+(defn replace
+  "Replace an existing key with a new key at the same logical position.
+  The comparator must return 0 for both old-key and new-key.
+  This is a single-traversal update - much faster than disj + conj.
+
+  O(log n) traversal with minimal allocations.
+
+  Returns the updated set, or the original set if old-key not found."
+  ([^PersistentSortedSet set old-key new-key]
+   (.replace set old-key new-key))
+  ([^PersistentSortedSet set old-key new-key ^Comparator cmp]
+   (.replace set old-key new-key cmp)))
 
 (defn- array-from-indexed [coll type from to]
   (cond
