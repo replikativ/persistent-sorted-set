@@ -65,9 +65,9 @@
 (defn lookup
   "key if present, else (or not-found nil)"
   ([^BTSet set key]
-   (btset/$lookup set key nil {:sync? false}))
+   (btset/$lookup set key nil {:sync? true}))
   ([^BTSet set key not-found]
-   (btset/$lookup set key not-found {:sync? false})))
+   (btset/$lookup set key not-found {:sync? true})))
 
 (defn equiv?
   "Is _other_ a set with the same items?
