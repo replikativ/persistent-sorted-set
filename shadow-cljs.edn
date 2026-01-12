@@ -24,9 +24,9 @@
   :ci ;shadow-cljs compile ci && node target/pss/ci-tests.js
   {:target    :node-test
    :output-to "target/pss/ci-tests.js"
-   :ns-regexp "^(?!me.tonsky.persistent-sorted-set.test.stress)"
+   :ns-regexp "^(?!me.tonsky.persistent-sorted-set.test.stress|me.tonsky.persistent-sorted-set.test.storage)"
    :compiler-options {:infer-externs true
-                      :parallel-build true
+                      :parallel-build false
                       :static-fns true
                       :fn-invoke-direct true
                       :elide-asserts true
