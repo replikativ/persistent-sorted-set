@@ -32,7 +32,7 @@ workflows:
             - docker-deploy
           filters:
             branches:
-              only: master
+              only: main
           requires:
             - tools/unittest
             - tools/cljstest
@@ -42,6 +42,6 @@ workflows:
             - docker-deploy
           filters:
             branches:
-              only: master
+              only: main
           requires:
             - tools/deploy

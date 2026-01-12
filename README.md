@@ -104,7 +104,7 @@ This project uses CircleCI for continuous integration and deployment:
 - **Automated Testing**: Both Clojure and ClojureScript tests run on every commit
 - **Code Formatting**: Automatic formatting checks with cljfmt ensure consistent code style
 - **Versioning**: Releases follow semantic versioning `0.3.{commit-count}`, automatically calculated
-- **Deployment**: On the `master` branch, successful builds are automatically:
+- **Deployment**: On the `main` branch, successful builds are automatically:
   - Deployed to [Clojars](https://clojars.org/io.replikativ/persistent-sorted-set)
   - Released to [GitHub](https://github.com/replikativ/persistent-sorted-set/releases)
 
