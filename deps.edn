@@ -27,7 +27,7 @@
   :build
   {:extra-deps {io.github.clojure/tools.build {:git/tag "v0.8.5" :git/sha "9c738da" #_#_:exclusions [org.slf4j/slf4j-nop]}
                 slipset/deps-deploy {:mvn/version "0.2.0"}
-                io.github.borkdude/gh-release-artifact {:git/sha "b6fffdc44cf8374c381d8c4d627e9dd04e6738f2"}}
+                io.github.borkdude/gh-release-artifact {:git/tag "v0.2.1" :git/sha "4a9a74f"}}
    :ns-default build}
 
   :test
