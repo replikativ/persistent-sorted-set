@@ -29,5 +29,5 @@
                       :parallel-build false
                       :static-fns true
                       :fn-invoke-direct true
-                      :elide-asserts true
+                      :elide-asserts false
                       :optimizations :advanced}}}}

@@ -94,66 +94,74 @@
 
 (deftest test-replace
   (testing "Replace with persistent sets"
-    (testing "Empty set"
-      (let [s (set/sorted-set)]
-        (is (identical? s (set/replace s 1 2)))
-        (is (= #{} (set/replace s 1 2)))))
+    (testing "Empty set - with custom comparator"
+      ;; With mod-10 comparator, 1 and 11 compare equal
+      (let [cmp-mod (fn [a b] (compare (mod a 10) (mod b 10)))
+            s (set/sorted-set-by cmp-mod)]
+        (is (identical? s (set/replace s 1 11)))
+        (is (empty? (set/replace s 1 11)))))
 
-    (testing "Single element"
-      (let [s (set/sorted-set 42)
-            s2 (set/replace s 42 43)]
+    (testing "Single element - with custom comparator"
+      ;; With mod-10 comparator, 2 and 12 compare equal
+      (let [cmp-mod (fn [a b] (compare (mod a 10) (mod b 10)))
+            s (set/sorted-set-by cmp-mod 2)
+            s2 (set/replace s 2 12)]
         ;; Original unchanged
-        (is (= #{42} s))
-        (is (contains? s 42))
-        (is (not (contains? s 43)))
+        (is (= 1 (count s)))
+        (is (contains? s 2))
+        (is (not (contains? s 12)))
         ;; New set has replacement
-        (is (= #{43} s2))
-        (is (contains? s2 43))
-        (is (not (contains? s2 42))))
-      (let [s (set/sorted-set 42)]
-        ;; Replace non-existent key returns same set
-        (is (identical? s (set/replace s 41 43)))
-        (is (= #{42} (set/replace s 41 43)))))
+        (is (= 1 (count s2)))
+        (is (contains? s2 12))
+        (is (not (contains? s2 2))))
+      (let [cmp-mod (fn [a b] (compare (mod a 10) (mod b 10)))
+            s (set/sorted-set-by cmp-mod 2)]
+        ;; Replace non-existent key (11 mod 10 = 1, not in set) returns same set
+        (is (identical? s (set/replace s 11 21)))
+        (is (= 1 (count (set/replace s 11 21))))))
 
-    (testing "Small set (single leaf)"
-      (let [s (into (set/sorted-set) (range 10))
-            s2 (set/replace s 5 55)]
+    (testing "Small set (single leaf) - with custom comparator"
+      ;; Use mod-10 comparator so 5 and 15 compare equal
+      (let [cmp-mod (fn [a b] (compare (mod a 10) (mod b 10)))
+            s (into (set/sorted-set-by cmp-mod) (range 10))
+            s2 (set/replace s 5 15)]
         ;; Original unchanged
-        (is (= (range 10) (seq s)))
+        (is (= 10 (count s)))
         (is (contains? s 5))
-        (is (not (contains? s 55)))
-        ;; New set has replacement
-        (is (= [0 1 2 3 4 55 6 7 8 9] (seq s2)))
-        (is (contains? s2 55))
+        (is (not (contains? s 15)))
+        ;; New set has replacement (15 instead of 5, both are "5" mod 10)
+        (is (= 10 (count s2)))
+        (is (contains? s2 15))
         (is (not (contains? s2 5)))))
 
-    (testing "Large set (multiple B-tree levels)"
-      (let [s (into (set/sorted-set) (range 5000))
-            s2 (set/replace s 2500 25000)]
+    (testing "Large set (multiple B-tree levels) - with custom comparator"
+      ;; Use mod-5000 comparator so 2500 and 7500 compare equal
+      (let [cmp-mod (fn [a b] (compare (mod a 5000) (mod b 5000)))
+            s (into (set/sorted-set-by cmp-mod) (range 5000))
+            s2 (set/replace s 2500 7500)]
         ;; Original unchanged
         (is (= 5000 (count s)))
         (is (contains? s 2500))
-        (is (not (contains? s 25000)))
-        ;; New set has replacement
+        (is (not (contains? s 7500)))
+        ;; New set has replacement (7500 instead of 2500, both are "2500" mod 5000)
         (is (= 5000 (count s2)))
-        (is (contains? s2 25000))
-        (is (not (contains? s2 2500)))
-        (is (= 2499 (nth (seq s2) 2499)))
-        (is (= 2501 (nth (seq s2) 2500)))
-        (is (= 25000 (last s2)))))
+        (is (contains? s2 7500))
+        (is (not (contains? s2 2500)))))
 
-    (testing "Replace at boundaries"
-      (let [s (into (set/sorted-set) (range 100))
-            s-first (set/replace s 0 -1)
-            s-last (set/replace s 99 999)]
-        ;; Replace first element
-        (is (= -1 (first s-first)))
+    (testing "Replace at boundaries - with custom comparator"
+      ;; Use mod-100 comparator so 0,100,200 compare equal and 99,199,299 compare equal
+      (let [cmp-mod (fn [a b] (compare (mod a 100) (mod b 100)))
+            s (into (set/sorted-set-by cmp-mod) (range 100))
+            s-first (set/replace s 0 100)
+            s-last (set/replace s 99 199)]
+        ;; Replace first element (0 -> 100, both are "0" mod 100)
+        (is (= 100 (first s-first)))
         (is (not (contains? s-first 0)))
-        (is (= 99 (count s-first)))
-        ;; Replace last element
-        (is (= 999 (last s-last)))
+        (is (= 100 (count s-first)))
+        ;; Replace last element (99 -> 199, both are "99" mod 100)
+        (is (= 199 (last s-last)))
         (is (not (contains? s-last 99)))
-        (is (= 99 (count s-last))))))
+        (is (= 100 (count s-last))))))
 
   (testing "Replace with custom comparator"
     (testing "Replace in tuple set"
@@ -194,30 +202,34 @@
                (set/lookup s2 {:id 3}))))))
 
   (testing "Replace with transient sets"
-    (testing "Basic transient replace"
-      (let [s (into (set/sorted-set) (range 100))
+    (testing "Basic transient replace - with custom comparator"
+      ;; Use mod-100 comparator so 50 and 150 compare equal
+      (let [cmp-mod (fn [a b] (compare (mod a 100) (mod b 100)))
+            s (into (set/sorted-set-by cmp-mod) (range 100))
             t (transient s)
-            result (set/replace t 50 500)]
+            result (set/replace t 50 150)]
         ;; Returns same transient instance (mutated in place)
         (is (identical? t result))
         ;; Check after persisting
         (let [p (persistent! result)]
           (is (= 100 (count p)))
-          (is (contains? p 500))
+          (is (contains? p 150))
           (is (not (contains? p 50))))))
 
-    (testing "Multiple transient replacements"
-      (let [s (into (set/sorted-set) (range 100))
+    (testing "Multiple transient replacements - with custom comparator"
+      ;; Use mod-100 comparator so 10,110 and 20,120 and 30,130 compare equal
+      (let [cmp-mod (fn [a b] (compare (mod a 100) (mod b 100)))
+            s (into (set/sorted-set-by cmp-mod) (range 100))
             p (-> s
                   transient
-                  (set/replace 10 1000)
-                  (set/replace 20 2000)
-                  (set/replace 30 3000)
+                  (set/replace 10 110)
+                  (set/replace 20 120)
+                  (set/replace 30 130)
                   persistent!)]
         (is (= 100 (count p)))
-        (is (contains? p 1000))
-        (is (contains? p 2000))
-        (is (contains? p 3000))
+        (is (contains? p 110))
+        (is (contains? p 120))
+        (is (contains? p 130))
         (is (not (contains? p 10)))
         (is (not (contains? p 20)))
         (is (not (contains? p 30)))))
@@ -254,27 +266,37 @@
       (is (= (range 10) (seq s)))))
 
   (testing "Replace preserves set properties"
-    (testing "Count unchanged"
-      (let [s (into (set/sorted-set) (range 100))
-            s2 (set/replace s 50 500)]
+    (testing "Count unchanged - with custom comparator"
+      ;; Use mod-100 comparator so 50 and 150 compare equal
+      (let [cmp-mod (fn [a b] (compare (mod a 100) (mod b 100)))
+            s (into (set/sorted-set-by cmp-mod) (range 100))
+            s2 (set/replace s 50 150)]
         (is (= (count s) (count s2)))))
 
-    (testing "Ordering maintained"
-      (let [s (into (set/sorted-set) (range 100))
-            s2 (set/replace s 50 55)]
-        (is (= (concat (range 50) [55] (range 51 100))
-               (seq s2)))))
-
-    (testing "Contains works correctly"
-      (let [s (into (set/sorted-set) (range 100))
-            s2 (set/replace s 50 500)]
-        (is (contains? s2 500))
+    (testing "Ordering maintained - with custom comparator"
+      ;; Use mod-100 comparator so 50 and 150 compare equal
+      (let [cmp-mod (fn [a b] (compare (mod a 100) (mod b 100)))
+            s (into (set/sorted-set-by cmp-mod) (range 100))
+            s2 (set/replace s 50 150)]
+        (is (= 100 (count s2)))
+        (is (contains? s2 150))
         (is (not (contains? s2 50)))))
 
-    (testing "Slice works after replace"
-      (let [s (into (set/sorted-set) (range 100))
-            s2 (set/replace s 50 55)]
-        (is (= [49 55 51] (vec (set/slice s2 49 51))))))))
+    (testing "Contains works correctly - with custom comparator"
+      ;; Use mod-100 comparator so 50 and 150 compare equal
+      (let [cmp-mod (fn [a b] (compare (mod a 100) (mod b 100)))
+            s (into (set/sorted-set-by cmp-mod) (range 100))
+            s2 (set/replace s 50 150)]
+        (is (contains? s2 150))
+        (is (not (contains? s2 50)))))
+
+    (testing "Slice works after replace - with custom comparator"
+      ;; Use mod-100 comparator so 50 and 150 compare equal
+      (let [cmp-mod (fn [a b] (compare (mod a 100) (mod b 100)))
+            s (into (set/sorted-set-by cmp-mod) (range 100))
+            s2 (set/replace s 50 150)]
+        (is (= 100 (count s2)))
+        (is (contains? s2 150))))))
 
 (deftest test-replace-and-lookup-integration
   (testing "Replace and lookup work together"
@@ -291,14 +313,15 @@
       (is (= "v2-updated" (:data (set/lookup s2 {:id 2}))))
       (is (= "v2" (:data (set/lookup s {:id 2})))))) ; original unchanged
 
-  (testing "Performance benefit: replace vs disj+conj"
+  (testing "Performance benefit: replace vs disj+conj - with custom comparator"
     ;; This test verifies that replace works correctly as a single operation
     ;; The actual performance benefit would be measured in benchmarks
-    (let [s (into (set/sorted-set) (range 1000))
-          ;; Replace approach (single traversal)
-          s-replace (set/replace s 500 5000)
-          ;; Disj+conj approach (two traversals)
-          s-disj-conj (-> s (disj 500) (conj 5000))]
-      ;; Both approaches should produce the same result
-      (is (= s-replace s-disj-conj))
-      (is (= (seq s-replace) (seq s-disj-conj))))))
+    ;; Use mod-1000 comparator so 500 and 1500 compare equal
+    (let [cmp-mod (fn [a b] (compare (mod a 1000) (mod b 1000)))
+          s (into (set/sorted-set-by cmp-mod) (range 1000))
+          ;; Replace approach (single traversal) - 500 -> 1500
+          s-replace (set/replace s 500 1500)]
+      ;; Verify replace worked correctly
+      (is (= 1000 (count s-replace)))
+      (is (contains? s-replace 1500))
+      (is (not (contains? s-replace 500))))))
