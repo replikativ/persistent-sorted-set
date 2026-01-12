@@ -58,8 +58,8 @@
        (testing "async-into(async-set, xform async-seq)"
          (let [aset (await (set/into (set/sorted-set) (map inc) (async-range 0 128) {:sync? false}))]
            (is (true? (await (set/equiv-sequential? aset
-                                                   (range 1 129)
-                                                   {:sync? false}))))))))
+                                                    (range 1 129)
+                                                    {:sync? false}))))))))
     (testing "async-transduce"
       (and
        (testing "async-transduce(filter+map, async-set, sync-seq)"
@@ -83,10 +83,10 @@
 
 (deftest reducers-test
   (test/async done
-    ((do-test)
-     (fn [ok] (done))
-     (fn [err]
-       (js/console.warn "reducers-test failed")
-       (is (nil? err))
-       (js/console.error err)
-       (done)))))
+              ((do-test)
+               (fn [ok] (done))
+               (fn [err]
+                 (js/console.warn "reducers-test failed")
+                 (is (nil? err))
+                 (js/console.error err)
+                 (done)))))

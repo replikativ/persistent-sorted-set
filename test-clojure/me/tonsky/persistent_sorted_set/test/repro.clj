@@ -1,10 +1,10 @@
 (ns me.tonsky.persistent-sorted-set.test.repro
   (:require
-    [me.tonsky.persistent-sorted-set :as set]
-    [me.tonsky.persistent-sorted-set.test.storage32 :as storage32])
+   [me.tonsky.persistent-sorted-set :as set]
+   [me.tonsky.persistent-sorted-set.test.storage32 :as storage32])
   (:import
-    [java.util ArrayList Collections Random]
-    [me.tonsky.persistent_sorted_set Settings PersistentSortedSet]))
+   [java.util ArrayList Collections Random]
+   [me.tonsky.persistent_sorted_set Settings PersistentSortedSet]))
 
 (defn seeded-shuffle [coll ^java.util.Random rnd]
   (let [al (java.util.ArrayList. coll)]
@@ -36,5 +36,4 @@
   (oob! 1756343976668)
   (oob! 1756343977008)
   (oob! 1756343978053)
-  (oob! 1756343974789)
-  )
+  (oob! 1756343974789))

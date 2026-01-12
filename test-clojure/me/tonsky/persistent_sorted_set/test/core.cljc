@@ -1,9 +1,9 @@
 (ns me.tonsky.persistent-sorted-set.test.core
   (:require
-    [me.tonsky.persistent-sorted-set :as set]
-    [clojure.test :as t :refer [is are deftest testing]])
+   [me.tonsky.persistent-sorted-set :as set]
+   [clojure.test :as t :refer [is are deftest testing]])
   #?(:clj
-      (:import [clojure.lang IReduce])))
+     (:import [clojure.lang IReduce])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -33,12 +33,12 @@
     (and
      (is (= (count ds)        (count (seq e1))))
      (is (= (vec (seq e1))    (vec (set/slice e1 [nil nil] [nil nil])))) ; * *
-     (is (= [[:a :b] [:a :d]] (vec (set/slice e1 [:a nil]  [:a nil] )))) ; :a *
-     (is (= [[:b :q]]         (vec (set/slice e1 [:b :q]   [:b :q]  )))) ; :b :q (specific)
-     (is (= [[:a :d] [:b :q]] (vec (set/slice e1 [:a :d]   [:b :q]  )))) ; matching subrange
-     (is (= [[:a :d] [:b :q]] (vec (set/slice e1 [:a :c]   [:b :r]  )))) ; non-matching subrange
-     (is (= [[:b :x]]         (vec (set/slice e1 [:b :r]   [:c nil] )))) ; non-matching -> out of range
-     (is (= []                (vec (set/slice e1 [:c nil]  [:c nil] )))) ; totally out of range
+     (is (= [[:a :b] [:a :d]] (vec (set/slice e1 [:a nil]  [:a nil])))) ; :a *
+     (is (= [[:b :q]]         (vec (set/slice e1 [:b :q]   [:b :q])))) ; :b :q (specific)
+     (is (= [[:a :d] [:b :q]] (vec (set/slice e1 [:a :d]   [:b :q])))) ; matching subrange
+     (is (= [[:a :d] [:b :q]] (vec (set/slice e1 [:a :c]   [:b :r])))) ; non-matching subrange
+     (is (= [[:b :x]]         (vec (set/slice e1 [:b :r]   [:c nil])))) ; non-matching -> out of range
+     (is (= []                (vec (set/slice e1 [:c nil]  [:c nil])))) ; totally out of range
      )))
 
 (defn irange [from to]
@@ -230,25 +230,25 @@
       (let [cmp10 (fn [a b] (compare (quot a 10) (quot b 10)))
             s10   (reduce #(set/conj %1 %2 compare) (set/sorted-set-by cmp10) (shuffle (irange 0 5000)))]
         (are [from to expected] (= expected (set/slice s10 from to))
-             30 30      (irange 30 39)
-             130 4970   (irange 130 4979)
-             -100 6000  (irange 0 5000))
+          30 30      (irange 30 39)
+          130 4970   (irange 130 4979)
+          -100 6000  (irange 0 5000))
         (are [from to expected] (= expected (set/rslice s10 from to))
-             30 30      (irange 39 30)
-             4970 130   (irange 4979 130)
-             6000 -100  (irange 5000 0)))
+          30 30      (irange 39 30)
+          4970 130   (irange 4979 130)
+          6000 -100  (irange 5000 0)))
       (let [cmp100 (fn [a b] (compare (quot a 100) (quot b 100)))
             s100   (reduce #(set/conj %1 %2 compare) (set/sorted-set-by cmp100) (shuffle (irange 0 5000)))]
         (are [from to expected] (= expected (set/slice s100 from to))
-             30  30     (irange 0 99)
-             2550 2550  (irange 2500 2599)
-             130 4850   (irange 100 4899)
-             -100 6000  (irange 0 5000))
+          30  30     (irange 0 99)
+          2550 2550  (irange 2500 2599)
+          130 4850   (irange 100 4899)
+          -100 6000  (irange 0 5000))
         (are [from to expected] (= expected (set/rslice s100 from to))
-             30 30      (irange 99 0)
-             2550 2550  (irange 2599 2500)
-             4850 130   (irange 4899 100)
-             6000 -100  (irange 5000 0))))))
+          30 30      (irange 99 0)
+          2550 2550  (irange 2599 2500)
+          4850 130   (irange 4899 100)
+          6000 -100  (irange 5000 0))))))
 
 (defn ireduce
   ([f coll] (#?(:clj .reduce :cljs -reduce) ^IReduce coll f))
@@ -309,19 +309,18 @@
         (is (= 55 (reduce-chunked + 0 (rseq s))))
         (is (= 35 (reduce-chunked + 0 (set/rslice s 8 2))))))))
 
-
 #?(:clj
-    (deftest iter-over-transient
-      (let [set (transient (into (set/sorted-set) (range 100)))
-            seq (seq set)]
-        (conj! set 100)
-        (is (thrown-with-msg? Exception #"iterating and mutating" (first seq)))
-        (is (thrown-with-msg? Exception #"iterating and mutating" (next seq)))
-        (is (thrown-with-msg? Exception #"iterating and mutating" (reduce + seq)))
-        (is (thrown-with-msg? Exception #"iterating and mutating" (reduce + 0 seq)))
-        (is (thrown-with-msg? Exception #"iterating and mutating" (chunk-first seq)))
-        (is (thrown-with-msg? Exception #"iterating and mutating" (chunk-next seq)))
-        (is (thrown-with-msg? Exception #"iterating and mutating" (.iterator ^Iterable seq))))))
+   (deftest iter-over-transient
+     (let [set (transient (into (set/sorted-set) (range 100)))
+           seq (seq set)]
+       (conj! set 100)
+       (is (thrown-with-msg? Exception #"iterating and mutating" (first seq)))
+       (is (thrown-with-msg? Exception #"iterating and mutating" (next seq)))
+       (is (thrown-with-msg? Exception #"iterating and mutating" (reduce + seq)))
+       (is (thrown-with-msg? Exception #"iterating and mutating" (reduce + 0 seq)))
+       (is (thrown-with-msg? Exception #"iterating and mutating" (chunk-first seq)))
+       (is (thrown-with-msg? Exception #"iterating and mutating" (chunk-next seq)))
+       (is (thrown-with-msg? Exception #"iterating and mutating" (.iterator ^Iterable seq))))))
 
 (deftest seek-for-seq-test
   (let [size 1000

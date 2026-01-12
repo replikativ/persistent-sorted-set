@@ -90,31 +90,31 @@
   (let [min-len (/ (:branching-factor settings 32) 2)]
     (cond
     ;; root never merges
-    root?
-    (return-array node)
+      root?
+      (return-array node)
 
     ;; enough keys, nothing to merge
-    (> (node/len node) min-len)
-    (return-array left node right)
+      (> (node/len node) min-len)
+      (return-array left node right)
 
     ;; left and this can be merged to one
-    (and left (<= (node/len left) min-len))
-    (return-array (node/merge left node) right)
+      (and left (<= (node/len left) min-len))
+      (return-array (node/merge left node) right)
 
     ;; right and this can be merged to one
-    (and right (<= (node/len right) min-len))
-    (return-array left (node/merge node right))
+      (and right (<= (node/len right) min-len))
+      (return-array left (node/merge node right))
 
     ;; left has fewer nodes, redestribute with it
-    (and left (or (nil? right)
-                  (< (node/len left) (node/len right))))
-    (let [nodes (node/merge-split left node)]
-      (return-array (arrays/aget nodes 0) (arrays/aget nodes 1) right))
+      (and left (or (nil? right)
+                    (< (node/len left) (node/len right))))
+      (let [nodes (node/merge-split left node)]
+        (return-array (arrays/aget nodes 0) (arrays/aget nodes 1) right))
 
     ;; right has fewer nodes, redestribute with it
-    :else
-    (let [nodes (node/merge-split node right)]
-      (return-array left (arrays/aget nodes 0) (arrays/aget nodes 1))))))
+      :else
+      (let [nodes (node/merge-split node right)]
+        (return-array left (arrays/aget nodes 0) (arrays/aget nodes 1))))))
 
 (defn lookup-exact [cmp arr key]
   (let [arr-l (arrays/alength arr)

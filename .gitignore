@@ -4,9 +4,14 @@
 target
 .DS_Store
 .idea
-pom.xml
+/pom.xml
 bench-clojure/*.edn
 node_modules
 .shadow-cljs
 .cpcache
 .gemini/.env
+
+# IDE/tooling directories
+.calva/
+.clj-kondo/
+.lsp/

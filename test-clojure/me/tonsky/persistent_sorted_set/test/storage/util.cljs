@@ -20,9 +20,9 @@
 
 (def *stats
   (atom
-    {:reads 0
-     :writes 0
-     :accessed 0}))
+   {:reads 0
+    :writes 0
+    :accessed 0}))
 
 (defn branch? [node] (instance? Branch node))
 (defn leaf? [node] (instance? Leaf node))
@@ -73,11 +73,11 @@
     (swap! *stats update :writes inc)
     (let [address (gen-addr)]
       (swap! *disk assoc address
-            (pr-str
-             {:level     (node/level node)
-              :keys      (.-keys node)
-              :addresses (when (branch? node) (.-addresses node))}))
-    (async address)))
+             (pr-str
+              {:level     (node/level node)
+               :keys      (.-keys node)
+               :addresses (when (branch? node) (.-addresses node))}))
+      (async address)))
   (restore [_ address opts]
     (assert (false? (:sync? opts)))
     (async

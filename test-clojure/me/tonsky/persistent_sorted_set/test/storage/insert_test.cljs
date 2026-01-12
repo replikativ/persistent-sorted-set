@@ -24,7 +24,7 @@
 (deftest sync-insert-32-test
   (and
    (testing "32"
-     (let [_(reset! *stats {:reads 0 :writes 0 :accessed 0})
+     (let [_ (reset! *stats {:reads 0 :writes 0 :accessed 0})
            original (into (set/sorted-set* {:branching-factor 32}) (range 0 32))]
        (and
         (is (= 0 (:writes @*stats)))
@@ -235,18 +235,18 @@
 
 (deftest async-insert-32-test
   (test/async done
-    ((do-async-insert-32-test)
-      (fn [ok] (done))
-      (fn [err]
-        (js/console.warn "async-ascending-insert-test failed")
-        (is (nil? err))
-        (js/console.error err)
-        (done)))))
+              ((do-async-insert-32-test)
+               (fn [ok] (done))
+               (fn [err]
+                 (js/console.warn "async-ascending-insert-test failed")
+                 (is (nil? err))
+                 (js/console.error err)
+                 (done)))))
 
 (deftest sync-insert-512-test
   (and
    (testing "saturated root leaf"
-     (let [_(reset! *stats {:reads 0 :writes 0 :accessed 0})
+     (let [_ (reset! *stats {:reads 0 :writes 0 :accessed 0})
            original (into (set/sorted-set) (range 0 512))]
        (and
         (is (= 0 (:writes @*stats)))
@@ -463,10 +463,10 @@
 
 (deftest async-insert-512-test
   (test/async done
-    ((do-async-insert-512-test)
-      (fn [ok] (done))
-      (fn [err]
-        (js/console.warn "async-insert-512-test failed")
-        (is (nil? err))
-        (js/console.error err)
-        (done)))))
+              ((do-async-insert-512-test)
+               (fn [ok] (done))
+               (fn [err]
+                 (js/console.warn "async-insert-512-test failed")
+                 (is (nil? err))
+                 (js/console.error err)
+                 (done)))))

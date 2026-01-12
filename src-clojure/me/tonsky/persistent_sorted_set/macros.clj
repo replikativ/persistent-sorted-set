@@ -5,8 +5,8 @@
 
 (defmacro async+sync [sync? async-code]
   (let [sync-code      (clojure.walk/postwalk
-                         (fn [n] (async->sync n n))
-                         async-code)]
+                        (fn [n] (async->sync n n))
+                        async-code)]
     `(if ~sync?
        ~sync-code
        ~async-code)))

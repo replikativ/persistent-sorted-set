@@ -25,7 +25,9 @@
    :extra-deps {thheller/shadow-cljs {:mvn/version "3.2.0"}}}
 
   :build
-  {:extra-deps {io.github.clojure/tools.build {:git/tag "v0.8.5" :git/sha "9c738da" #_#_:exclusions [org.slf4j/slf4j-nop]}}
+  {:extra-deps {io.github.clojure/tools.build {:git/tag "v0.8.5" :git/sha "9c738da" #_#_:exclusions [org.slf4j/slf4j-nop]}
+                slipset/deps-deploy {:mvn/version "0.2.0"}
+                io.github.borkdude/gh-release-artifact {:git/sha "b6fffdc44cf8374c381d8c4d627e9dd04e6738f2"}}
    :ns-default build}
 
   :test
@@ -45,4 +47,12 @@
                  "-Duser.language=en-US"
                  "-Djdk.attach.allowAttachSelf"
                  "-XX:+UnlockDiagnosticVMOptions"
-                 "-XX:+DebugNonSafepoints"]}}}
+                 "-XX:+DebugNonSafepoints"]}
+
+  :format
+  {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
+   :main-opts ["-m" "cljfmt.main" "check" "src-clojure" "test-clojure"]}
+
+  :ffix
+  {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
+   :main-opts ["-m" "cljfmt.main" "fix" "src-clojure" "test-clojure"]}}}

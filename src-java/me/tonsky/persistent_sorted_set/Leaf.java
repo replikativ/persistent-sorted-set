@@ -221,6 +221,8 @@ public class Leaf<Key, Address> extends ANode<Key, Address> {
 
   @Override
   public ANode[] replace(IStorage storage, Key oldKey, Key newKey, Comparator<Key> cmp, Settings settings) {
+    assert 0 == cmp.compare(oldKey, newKey) : "oldKey and newKey must compare as equal (cmp.compare must return 0)";
+
     int idx = search(oldKey, cmp);
     if (idx < 0) // not in set
       return PersistentSortedSet.UNCHANGED;

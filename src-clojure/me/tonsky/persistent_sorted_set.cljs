@@ -1,7 +1,7 @@
 (ns ^{:doc
       "A B-tree based persistent sorted set. Supports transients, custom comparators, fast iteration, efficient slices (iterator over a part of the set) and reverse slices. Almost a drop-in replacement for [[clojure.core/sorted-set]], the only difference being this one can't store nil."
       :author "Nikita Prokopov"}
-  me.tonsky.persistent-sorted-set
+ me.tonsky.persistent-sorted-set
   (:refer-clojure :exclude [conj count disj sorted-set sorted-set-by contains?
                             seq rseq into transduce reduce])
   (:require [me.tonsky.persistent-sorted-set.arrays :as arrays]
@@ -110,6 +110,16 @@
   ([^BTSet set key]          (btset/$disjoin set key))
   ([^BTSet set key arg]      (btset/$disjoin set key arg))
   ([^BTSet set key cmp opts] (btset/$disjoin set key cmp opts)))
+
+(defn replace
+  "Replace an existing key with a new key at the same logical position.
+   The comparator must return 0 for both old-key and new-key.
+   This is a single-traversal update - faster than disj + conj.
+   returns BTSet by default
+   returns continuation yielding BTSet when {:sync? false}"
+  ([^BTSet set old-key new-key]          (btset/$replace set old-key new-key))
+  ([^BTSet set old-key new-key arg]      (btset/$replace set old-key new-key arg))
+  ([^BTSet set old-key new-key cmp opts] (btset/$replace set old-key new-key cmp opts)))
 
 (defn slice
   "An iterator for part of the set with provided boundaries.

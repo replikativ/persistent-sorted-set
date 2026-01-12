@@ -28,8 +28,10 @@ lein jar
 Dependency:
 
 ```clj
-[persistent-sorted-set "0.3.0"]
+[io.replikativ/persistent-sorted-set "0.3.100"]
 ```
+
+The version follows the pattern `0.3.{commit-count}` and is automatically incremented with each commit.
 
 Code:
 
@@ -61,6 +63,23 @@ Code:
 
 (set/sorted-set-by > 1 2 3)
 ;=> #{3 2 1}
+
+;; lookup returns the actual stored key
+(-> (set/sorted-set 1 2 3 4)
+    (set/lookup 3))
+;=> 3
+
+(-> (set/sorted-set 1 2 3 4)
+    (set/lookup 99 :not-found))
+;=> :not-found
+
+;; replace updates a key at the same logical position
+;; (old-key and new-key must compare equal)
+(defn cmp-by-id [[id1 _] [id2 _]] (compare id1 id2))
+
+(-> (set/sorted-set-by cmp-by-id [1 :old] [2 :old] [3 :old])
+    (set/replace [2 :old] [2 :new]))
+;=> #{[1 :old] [2 :new] [3 :old]}
 ```
 One can also efficiently seek on the iterators.
 
@@ -74,6 +93,31 @@ One can also efficiently seek on the iterators.
     (set/seek 60)
     (set/seek 30))
 ;; => (30 29 28 27 26 25)
+```
+
+## Development
+
+### CI/CD Pipeline
+
+This project uses CircleCI for continuous integration and deployment:
+
+- **Automated Testing**: Both Clojure and ClojureScript tests run on every commit
+- **Code Formatting**: Automatic formatting checks with cljfmt ensure consistent code style
+- **Versioning**: Releases follow semantic versioning `0.3.{commit-count}`, automatically calculated
+- **Deployment**: On the `master` branch, successful builds are automatically:
+  - Deployed to [Clojars](https://clojars.org/io.replikativ/persistent-sorted-set)
+  - Released to [GitHub](https://github.com/replikativ/persistent-sorted-set/releases)
+
+### Code Formatting
+
+To ensure consistent code style for easier PR review:
+
+```bash
+# Check formatting
+clj -M:format
+
+# Auto-fix formatting issues
+clj -M:ffix
 ```
 
 ## Durability
@@ -249,7 +293,8 @@ PersistentSortedSet (transient)   47..50ms
 
 ## Projects using PersistentSortedSet
 
-- [Datascript](https://github.com/tonsky/datascript), persistent in-memory database
+- [DataScript](https://github.com/tonsky/datascript), persistent in-memory database
+- [Datahike](https://github.com/replikativ/datahike), durable Datalog database with persistent storage
 
 ## License
 

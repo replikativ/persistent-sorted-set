@@ -14,22 +14,22 @@
            address (set/store stored storage)]
        (and
         (testing "control"
-         (is (= (range 10 20) (seq (into (set/sorted-set) (range 10 20)))) "control"))
+          (is (= (range 10 20) (seq (into (set/sorted-set) (range 10 20)))) "control"))
         (testing "flushed"
-         (is (= (range 10 20) (seq stored)) "seq works on set that just flushed"))
+          (is (= (range 10 20) (seq stored)) "seq works on set that just flushed"))
         (testing "restored"
-         (is (= (range 10 20) (seq (set/restore address storage))) "seq works on unrealized lazy state")))))
+          (is (= (range 10 20) (seq (set/restore address storage))) "seq works on unrealized lazy state")))))
    (testing "slice"
      (let [storage (storage)
            stored  (into (set/sorted-set) (range 0 40))
            address (set/store stored storage)]
        (and
         (testing "control"
-         (is (= (range 10 20) (set/slice (into (set/sorted-set) (range 0 40)) 10 19)) "control"))
+          (is (= (range 10 20) (set/slice (into (set/sorted-set) (range 0 40)) 10 19)) "control"))
         (testing "flushed"
-         (is (= (range 10 20) (set/slice stored 10 19)) "slice works on set that just flushed"))
+          (is (= (range 10 20) (set/slice stored 10 19)) "slice works on set that just flushed"))
         (testing "restored"
-         (is (= (range 10 20) (set/slice (set/restore address storage) 10 19)) "slice works on unrealized lazy state")))))
+          (is (= (range 10 20) (set/slice (set/restore address storage) 10 19)) "slice works on unrealized lazy state")))))
    (testing "slice reversed order"
      (let [storage (storage)
            stored  (into (set/sorted-set) (reverse (range 0 100)))
@@ -78,14 +78,14 @@
            address (set/store stored storage)]
        (and
         (testing "control"
-         (let [x (set/rslice (into (set/sorted-set) (shuffle (range 0 5001))) 5000 nil)]
-           (is (= x (some-> x rseq reverse)) "control")))
+          (let [x (set/rslice (into (set/sorted-set) (shuffle (range 0 5001))) 5000 nil)]
+            (is (= x (some-> x rseq reverse)) "control")))
         (testing "flushed"
-         (let [x (set/rslice stored 5000 nil)]
-           (is (= x (some-> x rseq reverse)) "rseq reversibility on flushed set")))
+          (let [x (set/rslice stored 5000 nil)]
+            (is (= x (some-> x rseq reverse)) "rseq reversibility on flushed set")))
         (testing "restored"
-         (let [x (set/rslice (set/restore address storage) 5000 nil)]
-           (is (= x (some-> x rseq reverse)) "rseq reversibility on restored set"))))))))
+          (let [x (set/rslice (set/restore address storage) 5000 nil)]
+            (is (= x (some-> x rseq reverse)) "rseq reversibility on restored set"))))))))
 
 (defn do-test-small-async-restoration []
   (async
@@ -242,10 +242,10 @@
 
 (deftest test-small-async-restoration
   (test/async done
-    ((do-test-small-async-restoration)
-      (fn [ok] (done))
-      (fn [err]
-        (js/console.warn "test-small-async-restoration failed")
-        (is (nil? err))
-        (js/console.error err)
-        (done)))))
+              ((do-test-small-async-restoration)
+               (fn [ok] (done))
+               (fn [err]
+                 (js/console.warn "test-small-async-restoration failed")
+                 (is (nil? err))
+                 (js/console.error err)
+                 (done)))))

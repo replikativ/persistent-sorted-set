@@ -384,15 +384,16 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
         return null;
       }
 
-      // Check if this is an exact match (comparator returns 0)
-      if (cmp.compare(node._keys[idx], (Key) key) != 0) {
-        return null;
-      }
-
       if (node instanceof Branch) {
+        // For Branch nodes: _keys[idx] is the max key of child subtree.
+        // We descend if max key >= search key (which searchFirst guarantees).
+        // Don't check for exact match here - the actual key is in a descendant.
         node = ((Branch<Key, Address>) node).child(_storage, idx);
       } else {
-        // Leaf node - return the actual stored key
+        // Leaf node - check for exact match and return
+        if (cmp.compare(node._keys[idx], (Key) key) != 0) {
+          return null;
+        }
         return node._keys[idx];
       }
     }

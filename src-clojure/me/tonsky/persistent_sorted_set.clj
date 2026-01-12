@@ -1,15 +1,15 @@
 (ns ^{:author "Nikita Prokopov"
       :doc "A B-tree based persistent sorted set. Supports transients, custom comparators, fast iteration, efficient slices (iterator over a part of the set) and reverse slices. Almost a drop-in replacement for [[clojure.core/sorted-set]], the only difference being this one can’t store nil."}
-  me.tonsky.persistent-sorted-set
+ me.tonsky.persistent-sorted-set
   (:refer-clojure :exclude [conj disj sorted-set sorted-set-by replace])
   (:require
-    [me.tonsky.persistent-sorted-set.arrays :as arrays])
+   [me.tonsky.persistent-sorted-set.arrays :as arrays])
   (:import
-    [clojure.lang RT]
-    [java.lang.ref SoftReference]
-    [java.util Comparator Arrays]
-    [java.util.function BiConsumer]
-    [me.tonsky.persistent_sorted_set ANode ArrayUtil Branch IStorage Leaf PersistentSortedSet RefType Settings Seq]))
+   [clojure.lang RT]
+   [java.lang.ref SoftReference]
+   [java.util Comparator Arrays]
+   [java.util.function BiConsumer]
+   [me.tonsky.persistent_sorted_set ANode ArrayUtil Branch IStorage Leaf PersistentSortedSet RefType Settings Seq]))
 
 (set! *warn-on-reflection* true)
 
@@ -104,17 +104,17 @@
 
        :else
        (-> res
-         (conj! (array-from-indexed coll type from (+ from (quot len 2))))
-         (conj! (array-from-indexed coll type (+ from (quot len 2)) to)))))))
+           (conj! (array-from-indexed coll type from (+ from (quot len 2))))
+           (conj! (array-from-indexed coll type (+ from (quot len 2)) to)))))))
 
 (defn- map->settings ^Settings [m]
   (Settings.
-    (int (or (:branching-factor m) 0))
-    (case (:ref-type m)
-      :strong RefType/STRONG
-      :soft   RefType/SOFT
-      :weak   RefType/WEAK
-      nil)))
+   (int (or (:branching-factor m) 0))
+   (case (:ref-type m)
+     :strong RefType/STRONG
+     :soft   RefType/SOFT
+     :weak   RefType/WEAK
+     nil)))
 
 (defn- settings->map [^Settings s]
   {:branching-factor (.branchingFactor s)
@@ -138,12 +138,12 @@
                                 (Leaf. (count keys) keys settings))
          ->Branch             (fn [level ^objects children]
                                 (Branch.
-                                  level
-                                  (count children)
-                                  ^objects (arrays/amap #(.maxKey ^ANode %) Object children)
-                                  nil
-                                  children
-                                  settings))]
+                                 level
+                                 (count children)
+                                 ^objects (arrays/amap #(.maxKey ^ANode %) Object children)
+                                 nil
+                                 children
+                                 settings))]
      (loop [level 1
             nodes (mapv ->Leaf (split keys len Object avg-branching-factor max-branching-factor))]
        (case (count nodes)
@@ -165,10 +165,10 @@
   "Create a set with custom comparator, metadata and settings"
   [opts]
   (PersistentSortedSet.
-    (:meta opts)
-    ^Comparator (or (:cmp opts) compare)
-    (:storage opts)
-    (map->settings opts)))
+   (:meta opts)
+   ^Comparator (or (:cmp opts) compare)
+   (:storage opts)
+   (map->settings opts)))
 
 (defn sorted-set-by
   "Create a set with custom comparator."
