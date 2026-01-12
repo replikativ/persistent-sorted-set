@@ -20,4 +20,14 @@
                       :static-fns true
                       :fn-invoke-direct true
                       :elide-asserts true
+                      :optimizations :advanced}}
+  :ci ;shadow-cljs compile ci && node target/pss/ci-tests.js
+  {:target    :node-test
+   :output-to "target/pss/ci-tests.js"
+   :ns-regexp "^(?!me.tonsky.persistent-sorted-set.test.stress)"
+   :compiler-options {:infer-externs true
+                      :parallel-build true
+                      :static-fns true
+                      :fn-invoke-direct true
+                      :elide-asserts true
                       :optimizations :advanced}}}}
