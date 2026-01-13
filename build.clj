@@ -22,9 +22,10 @@
   "Compiles `src/java` to `target/classes`"
   [_]
   ; (println "Compiling 'src/java' to 'target/classes'...")
-  (b/javac {:src-dirs  ["src-java"]
-            :class-dir class-dir
-            :basis     basis}))
+  (b/javac {:src-dirs    ["src-java"]
+            :class-dir   class-dir
+            :basis       basis
+            :javac-opts  ["--release" "8"]}))
 
 (defn jar
   [_]
