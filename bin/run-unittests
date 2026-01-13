@@ -1,6 +1,10 @@
 #!/bin/bash
 set -e
 
+# Compile Java classes first (required for tests)
+echo "Compiling Java classes..."
+clojure -T:build java
+
 # Run Clojure tests
 echo "Running Clojure tests..."
 clojure -X:test
