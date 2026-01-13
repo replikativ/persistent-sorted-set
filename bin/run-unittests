@@ -3,6 +3,6 @@ set -e
 
 # Run Clojure tests
 echo "Running Clojure tests..."
-clj -X:test
+clojure -X:test
 
 echo "All tests passed!"
