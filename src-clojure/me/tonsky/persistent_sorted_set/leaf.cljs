@@ -69,6 +69,7 @@
                 (async
                  (let [idx (garr/binarySearch keys old-key cmp)]
                    (when (<= 0 idx)
+                     ;; Always create new leaf (no transient support at node level for now)
                      (let [new-keys (arrays/aclone keys)]
                        (aset new-keys idx new-key)
                        (arrays/array (Leaf. new-keys settings))))))))

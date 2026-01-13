@@ -36,7 +36,9 @@
    :main-opts   ["-m" "cognitect.test-runner"]
    :exec-fn     cognitect.test-runner.api/test
    :exec-args   {:dirs ["test-clojure"]
-                 :patterns ["me\\.tonsky\\.persistent-sorted-set\\.test.*"]}}
+                 :patterns ["me\\.tonsky\\.persistent-sorted-set\\.test\\.core"
+                            "me\\.tonsky\\.persistent-sorted-set\\.test\\.small"
+                            "me\\.tonsky\\.persistent-sorted-set\\.test\\.replace-and-lookup"]}}
 
   :bench
   {:extra-paths ["test-clojure" "bench-clojure"]

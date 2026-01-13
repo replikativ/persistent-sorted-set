@@ -186,38 +186,67 @@
   (async+sync sync?
               (async
                (let [keys (.-keys this)
+                     settings (.-settings this)
+                     editable? (:edit settings)
                      idx  (let [arr-l (arrays/alength keys)
                                 i     (util/binary-search-l cmp keys (dec arr-l) old-key)]
                             (if (== i arr-l) -1 i))]
                  (when-not (== -1 idx)
                    (let [child  (await ($child this storage idx opts))
                          nodes  (await (node/$replace child storage old-key new-key cmp opts))]
-                     (when nodes
+                     (cond
+                       ;; Not found in child
+                       (nil? nodes)
+                       nil
+
+                       ;; Early exit from child (transient, no maxKey change)
+                       (= nodes :early-exit)
+                       :early-exit
+
+                       ;; Child returned updated node
+                       :else
                        (let [new-node      (arrays/aget nodes 0)
                              new-max-key   (node/max-key new-node)
                              children      (ensure-children this)
                              addrs         (.-addresses this)
-                             max-key-changed (and (== idx (dec (arrays/alength keys)))
-                                                  (not (== 0 (cmp new-max-key (arrays/aget keys idx)))))]
-                         (if (== 0 (cmp new-max-key (arrays/aget keys idx)))
-                  ;; maxKey unchanged - reuse keys array
-                           (let [new-children (arrays/aclone children)
-                                 new-addrs    (when addrs
-                                                (let [na (arrays/aclone addrs)]
-                                                  (aset na idx nil)
-                                                  na))]
-                             (aset new-children idx new-node)
-                             (arrays/array (Branch. (.-level this) keys new-children new-addrs (.-settings this))))
-                  ;; maxKey changed - create new keys array
-                           (let [new-keys     (arrays/aclone keys)
-                                 new-children (arrays/aclone children)
-                                 new-addrs    (when addrs
-                                                (let [na (arrays/aclone addrs)]
-                                                  (aset na idx nil)
-                                                  na))]
-                             (aset new-keys idx new-max-key)
-                             (aset new-children idx new-node)
-                             (arrays/array (Branch. (.-level this) new-keys new-children new-addrs (.-settings this)))))))))))))
+                             last-child?   (== idx (dec (arrays/alength keys)))
+                             max-key-changed (and last-child? (not (== 0 (cmp new-max-key (arrays/aget keys idx)))))]
+                         (if max-key-changed
+                           ;; maxKey changed - update keys array
+                           (if editable?
+                             ;; Transient: mutate in place
+                             (do
+                               (aset keys idx new-max-key)
+                               (aset children idx new-node)
+                               (when addrs (aset addrs idx nil))
+                               (arrays/array this))
+                             ;; Persistent: clone arrays
+                             (let [new-keys     (arrays/aclone keys)
+                                   new-children (arrays/aclone children)
+                                   new-addrs    (when addrs
+                                                  (let [na (arrays/aclone addrs)]
+                                                    (aset na idx nil)
+                                                    na))]
+                               (aset new-keys idx new-max-key)
+                               (aset new-children idx new-node)
+                               (arrays/array (Branch. (.-level this) new-keys new-children new-addrs settings))))
+                           ;; maxKey unchanged - reuse keys array
+                           (if editable?
+                             ;; Transient: mutate in place
+                             (do
+                               (aset children idx new-node)
+                               (when addrs (aset addrs idx nil))
+                               (if last-child?
+                                 (arrays/array this)  ; Last child, need to propagate
+                                 :early-exit))        ; Not last child, early exit
+                             ;; Persistent: clone children array
+                             (let [new-children (arrays/aclone children)
+                                   new-addrs    (when addrs
+                                                  (let [na (arrays/aclone addrs)]
+                                                    (aset na idx nil)
+                                                    na))]
+                               (aset new-children idx new-node)
+                               (arrays/array (Branch. (.-level this) keys new-children new-addrs settings)))))))))))))
 
 (defn $store
   [^Branch this storage {:keys [sync?] :or {sync? true} :as opts}]

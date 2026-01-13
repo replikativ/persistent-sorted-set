@@ -3,7 +3,7 @@
       :author "Nikita Prokopov"}
  me.tonsky.persistent-sorted-set
   (:refer-clojure :exclude [conj count disj sorted-set sorted-set-by contains?
-                            seq rseq into transduce reduce])
+                            seq rseq into transduce reduce replace])
   (:require [me.tonsky.persistent-sorted-set.arrays :as arrays]
             [me.tonsky.persistent-sorted-set.btset :as btset :refer [BTSet]]))
 

@@ -90,15 +90,14 @@
                       nodes (await (node/$replace root (.-storage set) old-key new-key cmp opts))]
                   (if (nil? nodes)
                     set
-                    (let [new-root (arrays/aget nodes 0)]
-                      (BTSet. new-root
-                              (.-cnt set)
-                              (.-comparator set)
-                              (.-meta set)
-                              UNINITIALIZED_HASH
-                              (.-storage set)
-                              nil
-                              (.-settings set)))))))))
+                    (BTSet. (arrays/aget nodes 0)
+                            (.-cnt set)
+                            (.-comparator set)
+                            (.-meta set)
+                            UNINITIALIZED_HASH
+                            (.-storage set)
+                            nil
+                            (.-settings set))))))))
 
 (defn $disjoin
   ([^BTSet set key]
@@ -1121,7 +1120,7 @@
 
 #!------------------------------------------------------------------------------
 
-(deftype BTSet [root cnt comparator meta ^:mutable _hash storage address settings]
+(deftype BTSet [^:mutable root cnt comparator meta ^:mutable _hash storage ^:mutable address settings]
   Object
   (toString [this] (pr-str* this))
 
