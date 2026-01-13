@@ -1,0 +1,9 @@
+#!/bin/bash
+set -e
+
+# Run ClojureScript tests
+echo "Running ClojureScript tests..."
+npx shadow-cljs compile ci
+node target/pss/ci-tests.js
+
+echo "All tests passed!"

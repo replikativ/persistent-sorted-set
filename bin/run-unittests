@@ -1,0 +1,8 @@
+#!/bin/bash
+set -e
+
+# Run Clojure tests
+echo "Running Clojure tests..."
+clj -X:test
+
+echo "All tests passed!"
