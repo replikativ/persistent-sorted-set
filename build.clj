@@ -28,6 +28,8 @@
 
 (defn jar
   [_]
+  ;; Ensure Java classes are compiled first
+  (java nil)
   (b/write-pom {:class-dir class-dir
                 :src-pom "./template/pom.xml"
                 :lib lib
