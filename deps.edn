@@ -1,8 +1,7 @@
 {:paths ["src-clojure" "target/classes"]
  :deps
  {org.clojure/clojure {:mvn/version "1.12.0"}
-  simm-is/partial-cps {:git/url "https://github.com/simm-is/partial-cps.git"
-                       :git/sha "87a82d8c39714a60247b51a10bc7d5842808b7fc"}}
+  is.simm/partial-cps {:mvn/version "0.1.50"}}
  :deps/prep-lib {:ensure "target/classes"
                  :alias :build
                  :fn java}
