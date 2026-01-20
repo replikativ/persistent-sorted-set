@@ -244,6 +244,66 @@
 
             (recur new-set (inc iteration))))))))
 
+(deftest test-automatic-marking-during-conj
+  (testing "Addresses are automatically marked as freed during conj operations"
+    (let [storage (auto-removal-storage)
+          ;; Create set WITH storage so operations can call markFreed
+          ;; Use sorted-set* with :storage option
+          initial-set (reduce conj (set/sorted-set* {:storage storage}) (range 100))
+          _ (set/store initial-set storage)
+          initial-size (storage-size storage)
+          initial-freed (freed-count storage)]
+
+      (when *debug*
+        (println "After initial store - size:" initial-size "freed:" initial-freed))
+
+      ;; Freed count should be 0 after initial store (no modifications yet)
+      (is (= 0 initial-freed))
+
+      ;; Now modify the set - this should automatically mark old leaf addresses as freed
+      ;; The storage is attached to the set, so conj will call markFreed
+      (let [modified-set (-> initial-set
+                             (conj 500)    ; Add new element
+                             (conj 501))   ; Add another
+            _ (set/store modified-set storage)
+            freed-after-modify (freed-count storage)]
+
+        (when *debug*
+          (println "After modify - freed:" freed-after-modify))
+
+        ;; The old leaf node(s) that were modified should be marked as freed
+        ;; (At least 1 address should be freed since we modified a leaf)
+        (is (pos? freed-after-modify) "At least one address should be marked as freed after modification")
+
+        ;; Delete the freed addresses
+        (.deleteFreed storage)
+
+        ;; Modified set should still be restorable
+        (let [restored (set/restore (set/store modified-set storage) storage)]
+          (is (contains? (set restored) 500))
+          (is (contains? (set restored) 501)))))))
+
+(deftest test-automatic-marking-during-disj
+  (testing "Addresses are automatically marked as freed during disj operations"
+    (let [storage (auto-removal-storage)
+          ;; Create set WITH storage
+          initial-set (reduce conj (set/sorted-set* {:storage storage}) (range 100))
+          _ (set/store initial-set storage)]
+
+      ;; Remove elements - should trigger automatic marking
+      (let [modified-set (-> initial-set
+                             (disj 50)
+                             (disj 51)
+                             (disj 52))
+            _ (set/store modified-set storage)
+            freed-after-disj (freed-count storage)]
+
+        (when *debug*
+          (println "After disj - freed:" freed-after-disj))
+
+        ;; Disj operations should mark old addresses as freed
+        (is (pos? freed-after-disj) "At least one address should be marked as freed after disj")))))
+
 ;; Run tests
 (comment
   (t/run-tests 'me.tonsky.persistent-sorted-set.test.auto-removal))

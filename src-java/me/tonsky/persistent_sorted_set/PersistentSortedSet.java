@@ -250,6 +250,11 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
 
     if (UNCHANGED == nodes) return this;
 
+    // Mark old root address as freed if it exists
+    if (_storage != null && _address != null) {
+      _storage.markFreed(_address);
+    }
+
     if (editable()) {
       if (1 == nodes.length) {
         _address = null;
@@ -285,6 +290,11 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
 
     // not in set
     if (UNCHANGED == nodes) return this;
+
+    // Mark old root address as freed if it exists
+    if (_storage != null && _address != null) {
+      _storage.markFreed(_address);
+    }
 
     // in place update
     if (nodes == EARLY_EXIT) {
@@ -329,6 +339,11 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
 
     // Not in set
     if (UNCHANGED == nodes) return this;
+
+    // Mark old root address as freed if it exists
+    if (_storage != null && _address != null) {
+      _storage.markFreed(_address);
+    }
 
     // In-place update (transient)
     if (EARLY_EXIT == nodes) {
