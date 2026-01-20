@@ -176,6 +176,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
     if (1 == nodes.length && editable()) {
       ANode<Key, Address> node = nodes[0];
       _keys[ins] = node.maxKey();
+      // Mark old child's address as freed before replacing
+      if (storage != null && _addresses != null && _addresses[ins] != null) {
+        storage.markFreed(_addresses[ins]);
+      }
       child(ins, node);
       if (ins == _len - 1 && node.maxKey() == maxKey()) // TODO why maxKey check?
         return new ANode[]{ this }; // update maxKey
@@ -652,14 +656,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
     // Transient: can modify in place
     if (editable()) {
       _keys[idx] = newMaxKey;
-      child(idx, newChild);
-      if (_addresses != null) {
-        // Mark old address as freed before clearing
-        if (storage != null && _addresses[idx] != null) {
-          storage.markFreed(_addresses[idx]);
-        }
-        _addresses[idx] = null; // clear stored address since child changed
+      // Mark old address as freed BEFORE child() nullifies it
+      if (storage != null && _addresses != null && _addresses[idx] != null) {
+        storage.markFreed(_addresses[idx]);
       }
+      child(idx, newChild); // This also sets _addresses[idx] = null
       if (maxKeyChanged)
         return new ANode[]{this};
       else
