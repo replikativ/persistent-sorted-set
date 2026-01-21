@@ -176,7 +176,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
     if (1 == nodes.length && editable()) {
       ANode<Key, Address> node = nodes[0];
       _keys[ins] = node.maxKey();
-      // Mark old child's address as freed before replacing
+      // Mark old child address as freed before clearing
       if (storage != null && _addresses != null && _addresses[ins] != null) {
         storage.markFreed(_addresses[ins]);
       }
@@ -206,10 +206,6 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
       } else {
         if (_addresses != null) {
           newAddresses = Arrays.copyOfRange(_addresses, 0, _len);
-          // Mark old address as freed before replacing
-          if (storage != null && _addresses[ins] != null) {
-            storage.markFreed(_addresses[ins]);
-          }
           newAddresses[ins] = null;
         }
 
@@ -222,11 +218,6 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
 
     // len + 1
     if (_len < _settings.branchingFactor()) {
-      // Mark old address as freed - it's being replaced by two new children
-      if (storage != null && _addresses != null && _addresses[ins] != null) {
-        storage.markFreed(_addresses[ins]);
-      }
-
       Branch n = new Branch(_level, _len + 1, settings);
       new Stitch(n._keys, 0)
         .copyAll(_keys, 0, ins)
@@ -254,11 +245,6 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
     }
 
     // split
-    // Mark old address as freed - it's being replaced by two new children
-    if (storage != null && _addresses != null && _addresses[ins] != null) {
-      storage.markFreed(_addresses[ins]);
-    }
-
     int half1 = (_len + 1) >>> 1;
     if (ins+1 == half1) ++half1;
     int half2 = _len + 1 - half1;
@@ -376,22 +362,6 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
     boolean leftChanged = leftChild != nodes[0] || leftChildLen != safeLen(nodes[0]);
     boolean rightChanged = rightChild != nodes[2] || rightChildLen != safeLen(nodes[2]);
 
-    // Mark freed addresses for changed children
-    if (storage != null && _addresses != null) {
-      // The child at idx is always changing (being removed/restructured)
-      if (_addresses[idx] != null) {
-        storage.markFreed(_addresses[idx]);
-      }
-      // Left child changed
-      if (leftChanged && idx > 0 && _addresses[idx - 1] != null) {
-        storage.markFreed(_addresses[idx - 1]);
-      }
-      // Right child changed
-      if (rightChanged && idx < _len - 1 && _addresses[idx + 1] != null) {
-        storage.markFreed(_addresses[idx + 1]);
-      }
-    }
-
     // nodes[1] always not nil
     int newLen = _len - 1
                  - (leftChild  != null ? 1 : 0)
@@ -404,6 +374,22 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
     if (newLen >= _settings.minBranchingFactor() || (left == null && right == null)) {
       // can update in place
       if (editable() && idx < _len-2) {
+        // Mark freed addresses before clearing them
+        if (storage != null && _addresses != null) {
+          // The child at idx is always being replaced
+          if (_addresses[idx] != null) {
+            storage.markFreed(_addresses[idx]);
+          }
+          // Left child if changed
+          if (leftChanged && idx > 0 && _addresses[idx - 1] != null) {
+            storage.markFreed(_addresses[idx - 1]);
+          }
+          // Right child if changed
+          if (rightChanged && idx < _len - 1 && _addresses[idx + 1] != null) {
+            storage.markFreed(_addresses[idx + 1]);
+          }
+        }
+
         Stitch ks = new Stitch(_keys, Math.max(idx-1, 0));
         if (nodes[0] != null) ks.copyOne(nodes[0].maxKey());
                               ks.copyOne(nodes[1].maxKey());
@@ -656,11 +642,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
     // Transient: can modify in place
     if (editable()) {
       _keys[idx] = newMaxKey;
-      // Mark old address as freed BEFORE child() nullifies it
+      // Mark old child address as freed before clearing
       if (storage != null && _addresses != null && _addresses[idx] != null) {
         storage.markFreed(_addresses[idx]);
       }
-      child(idx, newChild); // This also sets _addresses[idx] = null
+      child(idx, newChild);
+      // Note: child() already clears _addresses[idx] via address(idx, null)
       if (maxKeyChanged)
         return new ANode[]{this};
       else
@@ -668,11 +655,6 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
     }
 
     // Persistent: create new branch with updated child
-    // Mark old address as freed
-    if (storage != null && _addresses != null && _addresses[idx] != null) {
-      storage.markFreed(_addresses[idx]);
-    }
-
     Key[] newKeys;
     if (0 == cmp.compare(newMaxKey, _keys[idx])) {
       newKeys = _keys; // reuse array if maxKey unchanged

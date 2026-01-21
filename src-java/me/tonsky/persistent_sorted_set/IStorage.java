@@ -28,34 +28,11 @@ public interface IStorage<Key, Address> {
     Address store(ANode<Key, Address> node);
 
     /**
-     * Delete addresses that are no longer needed.
-     * Called to clean up obsolete nodes after modifications.
-     *
-     * Default implementation is no-op. Override in storage implementations
-     * that want to reclaim storage space during batch operations.
-     *
-     * @param addresses Collection of addresses to delete
-     */
-    default void delete(java.util.Collection<Address> addresses) {
-    }
-
-    /**
-     * Mark an address as freed (obsolete) during tree modifications.
-     * The storage may collect these for later batch deletion.
-     *
-     * Default implementation is no-op.
-     *
-     * @param address Address that is no longer needed
+     * Mark an address as freed/obsolete during tree modifications.
+     * Called when a stored node's address is being replaced (node no longer reachable).
+     * Storage implementations can track these for later deletion.
+     * Only called in editable/transient mode where modifications happen in-place.
      */
     default void markFreed(Address address) {
-    }
-
-    /**
-     * Delete all addresses that have been marked as freed via markFreed().
-     * Call this at the end of a batch operation to clean up obsolete nodes.
-     *
-     * Default implementation is no-op.
-     */
-    default void deleteFreed() {
     }
 }
