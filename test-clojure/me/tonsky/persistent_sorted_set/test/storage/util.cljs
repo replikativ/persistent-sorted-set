@@ -54,7 +54,10 @@
        (swap! *stats update :reads inc)
        (swap! *memory assoc address node)
        node)))
-  (accessed [_ address] (swap! *stats update :accessed inc) nil))
+  (accessed [_ address] (swap! *stats update :accessed inc) nil)
+  (markFreed [_ address] nil)
+  (isFreed [_ address] false)
+  (freedInfo [_ address] nil))
 
 (defn storage
   ([] (storage (atom {}) (atom {})))
@@ -91,7 +94,10 @@
         (swap! *stats update :reads inc)
         (swap! *memory assoc address node)
         node))))
-  (accessed [_ address] (swap! *stats update :accessed inc) nil))
+  (accessed [_ address] (swap! *stats update :accessed inc) nil)
+  (markFreed [_ address] nil)
+  (isFreed [_ address] false)
+  (freedInfo [_ address] nil))
 
 (defn async-storage
   ([] (async-storage (atom {}) (atom {})))

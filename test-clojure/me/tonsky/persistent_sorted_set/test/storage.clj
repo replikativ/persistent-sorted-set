@@ -57,7 +57,13 @@
                   (Leaf. keys settings))]
        (swap! *stats update :reads inc)
        (swap! *memory assoc address node)
-       node))))
+       node)))
+  (markFreed [_ address]
+    nil)
+  (isFreed [_ address]
+    false)
+  (freedInfo [_ address]
+    nil))
 
 (defn storage
   (^IStorage []

@@ -28,10 +28,11 @@ public interface IStorage<Key, Address> {
     Address store(ANode<Key, Address> node);
 
     /**
-     * Mark an address as freed/obsolete during tree modifications.
+     * Mark an address as freed/obsolete during tree modifications,
+     * including when the root address is updated.
      * Called when a stored node's address is being replaced (node no longer reachable).
-     * Storage implementations can track these for later deletion.
-     * Only called in editable/transient mode where modifications happen in-place.
+     * Storage implementations can track these for later deletion or compaction.
+     * This may be invoked in both persistent and editable/transient modes.
      */
     default void markFreed(Address address) {
     }

@@ -385,7 +385,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
             storage.markFreed(_addresses[idx - 1]);
           }
           // Right child if changed
-          if (rightChanged && idx < _len - 1 && _addresses[idx + 1] != null) {
+          if (rightChanged && _addresses[idx + 1] != null) {
             storage.markFreed(_addresses[idx + 1]);
           }
         }

@@ -118,13 +118,24 @@
                                        addrs
                                        (let [na (arrays/make-array (arrays/alength addrs))]
                                          (arrays/acopy addrs 0 (arrays/alength addrs) na 0)
+                                         ;; Mark old child address as freed before clearing
+                                         (when (and storage (aget addrs idx))
+                                           (storage/markFreed storage (aget addrs idx)))
                                          (aset na idx nil)
                                          na)))
-                                   (util/splice addrs idx (inc idx) (arrays/array nil nil))))]
+                                   (let [old-addr (aget addrs idx)]
+                                     ;; Mark old child address as freed before clearing
+                                     (when (and storage old-addr)
+                                       (storage/markFreed storage old-addr))
+                                     (util/splice addrs idx (inc idx) (arrays/array nil nil)))))]
                            (arrays/array (Branch. (.-level this) new-keys new-children new-addrs (.-settings this))))
                          (let [middle      (arrays/half (arrays/alength new-children))
                                tmp-addrs   (when addrs
-                                             (util/splice addrs idx (inc idx) (arrays/array nil nil)))
+                                             (let [old-addr (aget addrs idx)]
+                                               ;; Mark old child address as freed before clearing
+                                               (when (and storage old-addr)
+                                                 (storage/markFreed storage old-addr))
+                                               (util/splice addrs idx (inc idx) (arrays/array nil nil))))
                                left-addrs  (when tmp-addrs (.slice tmp-addrs 0 middle))
                                right-addrs (when tmp-addrs (.slice tmp-addrs middle))]
                            (arrays/array
@@ -166,12 +177,23 @@
                                          (let [alen  (arrays/alength disjoined)
                                                repl  (arrays/make-array alen)
                                                laddr (when left-child  (arrays/aget addrs left-idx))
-                                               raddr (when right-child (arrays/aget addrs (dec right-idx)))]
-                                           (when (and left-child (> alen 1)
-                                                      (identical? (arrays/aget disjoined 0) left-child))
+                                               raddr (when right-child (arrays/aget addrs (dec right-idx)))
+                                               left-unchanged  (and left-child (> alen 1)
+                                                                    (identical? (arrays/aget disjoined 0) left-child))
+                                               right-unchanged (and right-child (> alen 1)
+                                                                    (identical? (arrays/aget disjoined (dec alen)) right-child))]
+                                           ;; Mark freed addresses before clearing
+                                           (when storage
+                                             (dotimes [i (- right-idx left-idx)]
+                                               (let [addr-idx (+ left-idx i)
+                                                     old-addr (arrays/aget addrs addr-idx)]
+                                                 (when (and old-addr
+                                                            (not (and (= addr-idx left-idx) left-unchanged))
+                                                            (not (and (= addr-idx (dec right-idx)) right-unchanged)))
+                                                   (storage/markFreed storage old-addr)))))
+                                           (when left-unchanged
                                              (aset repl 0 laddr))
-                                           (when (and right-child (> alen 1)
-                                                      (identical? (arrays/aget disjoined (dec alen)) right-child))
+                                           (when right-unchanged
                                              (aset repl (dec alen) raddr))
                                            (util/splice addrs left-idx right-idx repl)))]
                          (util/rotate (Branch. (.-level this) new-keys new-kids new-addrs (.-settings this))
@@ -218,13 +240,20 @@
                              (do
                                (aset keys idx new-max-key)
                                (aset children idx new-node)
-                               (when addrs (aset addrs idx nil))
+                               (when addrs
+                                 ;; Mark old child address as freed before clearing
+                                 (when (and storage (aget addrs idx))
+                                   (storage/markFreed storage (aget addrs idx)))
+                                 (aset addrs idx nil))
                                (arrays/array this))
                              ;; Persistent: clone arrays
                              (let [new-keys     (arrays/aclone keys)
                                    new-children (arrays/aclone children)
                                    new-addrs    (when addrs
                                                   (let [na (arrays/aclone addrs)]
+                                                    ;; Mark old child address as freed before clearing
+                                                    (when (and storage (aget addrs idx))
+                                                      (storage/markFreed storage (aget addrs idx)))
                                                     (aset na idx nil)
                                                     na))]
                                (aset new-keys idx new-max-key)
@@ -235,7 +264,11 @@
                              ;; Transient: mutate in place
                              (do
                                (aset children idx new-node)
-                               (when addrs (aset addrs idx nil))
+                               (when addrs
+                                 ;; Mark old child address as freed before clearing
+                                 (when (and storage (aget addrs idx))
+                                   (storage/markFreed storage (aget addrs idx)))
+                                 (aset addrs idx nil))
                                (if last-child?
                                  (arrays/array this)  ; Last child, need to propagate
                                  :early-exit))        ; Not last child, early exit
@@ -243,6 +276,9 @@
                              (let [new-children (arrays/aclone children)
                                    new-addrs    (when addrs
                                                   (let [na (arrays/aclone addrs)]
+                                                    ;; Mark old child address as freed before clearing
+                                                    (when (and storage (aget addrs idx))
+                                                      (storage/markFreed storage (aget addrs idx)))
                                                     (aset na idx nil)
                                                     na))]
                                (aset new-children idx new-node)
