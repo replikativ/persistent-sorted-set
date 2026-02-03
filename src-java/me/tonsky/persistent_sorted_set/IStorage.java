@@ -35,4 +35,20 @@ public interface IStorage<Key, Address> {
      */
     default void markFreed(Address address) {
     }
+
+    /**
+     * Check if an address has been marked as freed.
+     * Used for testing and debugging.
+     */
+    default boolean isFreed(Address address) {
+        return false;
+    }
+
+    /**
+     * Get debug information about a freed address.
+     * Used for testing and debugging.
+     */
+    default Object freedInfo(Address address) {
+        return null;
+    }
 }
