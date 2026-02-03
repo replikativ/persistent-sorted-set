@@ -48,22 +48,28 @@
        (swap! *memory assoc address node)
        node)))
 
-  ;; Auto-removal methods
-  (delete [_ addresses]
-    (when (seq addresses)
-      (doseq [addr addresses]
-        (swap! *disk dissoc addr)
-        (swap! *memory dissoc addr))))
-
   (markFreed [_ address]
+    (when *debug*
+      (println "markFreed called with address:" address))
     (when address
-      (swap! *freed conj address)))
+      (swap! *freed conj address))))
 
-  (deleteFreed [this]
-    (let [freed @*freed]
-      (when (seq freed)
-        (.delete this freed)
-        (reset! *freed #{})))))
+;; Standalone functions for delete and deleteFreed (not part of IStorage interface)
+(defn delete
+  "Delete addresses from storage."
+  [^AutoRemovalStorage storage addresses]
+  (when (seq addresses)
+    (doseq [addr addresses]
+      (swap! (:*disk storage) dissoc addr)
+      (swap! (:*memory storage) dissoc addr))))
+
+(defn delete-freed
+  "Delete all addresses that have been marked as freed."
+  [^AutoRemovalStorage storage]
+  (let [freed @(:*freed storage)]
+    (when (seq freed)
+      (delete storage freed)
+      (reset! (:*freed storage) #{}))))
 
 (defn auto-removal-storage
   "Create storage with auto-removal tracking."
@@ -120,7 +126,7 @@
       (is (= 1 (freed-count storage)))
 
       ;; Delete freed addresses
-      (.deleteFreed storage)
+      (delete-freed storage)
 
       ;; Freed set should be cleared
       (is (= 0 (freed-count storage)))
@@ -141,7 +147,7 @@
       (is (>= initial-size 5))
 
       ;; Delete first 3 addresses
-      (.delete storage (take 3 addrs))
+      (delete storage (take 3 addrs))
 
       ;; Storage should be smaller
       (is (< (storage-size storage) initial-size)))))
@@ -185,7 +191,7 @@
           (is (>= size-after-modify size-after-initial))
 
           ;; Now delete the freed addresses
-          (.deleteFreed storage)
+          (delete-freed storage)
 
           (let [size-after-cleanup (storage-size storage)]
             (when *debug*
@@ -230,7 +236,7 @@
                 size-before-cleanup (storage-size storage)
 
                 ;; Cleanup
-                _ (.deleteFreed storage)
+                _ (delete-freed storage)
 
                 size-after-cleanup (storage-size storage)]
 
@@ -250,21 +256,29 @@
           ;; Create set WITH storage so operations can call markFreed
           ;; Use sorted-set* with :storage option
           initial-set (reduce conj (set/sorted-set* {:storage storage}) (range 100))
-          _ (set/store initial-set storage)
+          stored-addr (set/store initial-set storage)
           initial-size (storage-size storage)
           initial-freed (freed-count storage)]
 
       (when *debug*
-        (println "After initial store - size:" initial-size "freed:" initial-freed))
+        (println "After initial store - size:" initial-size "freed:" initial-freed)
+        (println "Stored address:" stored-addr)
+        (println "Set _address field:" (._address initial-set))
+        (println "Set _storage field:" (._storage initial-set)))
 
       ;; Freed count should be 0 after initial store (no modifications yet)
       (is (= 0 initial-freed))
 
       ;; Now modify the set - this should automatically mark old leaf addresses as freed
       ;; The storage is attached to the set, so conj will call markFreed
-      (let [modified-set (-> initial-set
-                             (conj 500)    ; Add new element
-                             (conj 501))   ; Add another
+      (let [_ (when *debug* (println "Before conj - freed:" (freed-count storage)))
+            set-after-first-conj (conj initial-set 500)
+            _ (when *debug*
+                (println "After first conj - freed:" (freed-count storage))
+                (println "First conj result _address:" (._address set-after-first-conj))
+                (println "First conj result _storage:" (if (._storage set-after-first-conj) "present" "nil")))
+            modified-set (conj set-after-first-conj 501)
+            _ (when *debug* (println "After second conj - freed:" (freed-count storage)))
             _ (set/store modified-set storage)
             freed-after-modify (freed-count storage)]
 
@@ -276,7 +290,7 @@
         (is (pos? freed-after-modify) "At least one address should be marked as freed after modification")
 
         ;; Delete the freed addresses
-        (.deleteFreed storage)
+        (delete-freed storage)
 
         ;; Modified set should still be restorable
         (let [restored (set/restore (set/store modified-set storage) storage)]
