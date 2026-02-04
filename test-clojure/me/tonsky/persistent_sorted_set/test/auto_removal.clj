@@ -52,7 +52,14 @@
     (when *debug*
       (println "markFreed called with address:" address))
     (when address
-      (swap! *freed conj address))))
+      (swap! *freed conj address)))
+
+  (isFreed [_ address]
+    (contains? @*freed address))
+
+  (freedInfo [_ address]
+    (when (contains? @*freed address)
+      "Freed in CLJ test")))
 
 ;; Standalone functions for delete and deleteFreed (not part of IStorage interface)
 (defn delete
