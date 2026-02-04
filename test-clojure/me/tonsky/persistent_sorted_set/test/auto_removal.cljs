@@ -17,8 +17,6 @@
             [me.tonsky.persistent-sorted-set.leaf :refer [Leaf]]
             [me.tonsky.persistent-sorted-set.branch :refer [Branch] :as branch]))
 
-(def ^:dynamic *debug* false)
-
 (defn gen-addr []
   (random-uuid))
 
@@ -58,8 +56,6 @@
         (swap! *memory dissoc addr))))
 
   (markFreed [_ address]
-    (when *debug*
-      (println "markFreed called with address:" address))
     (when address
       (swap! *freed conj address)))
 
@@ -184,15 +180,9 @@
           addr1 (set/store initial-set stg)
           size-after-initial (storage-size stg)]
 
-      (when *debug*
-        (println "Initial storage size:" size-after-initial))
-
       ;; Get all addresses in the initial tree
       (let [initial-addrs (atom #{})]
         (set/walk-addresses initial-set #(swap! initial-addrs conj %))
-
-        (when *debug*
-          (println "Initial addresses:" (count @initial-addrs)))
 
         ;; Mark all current addresses as "old" (would be freed after modification)
         (doseq [addr @initial-addrs]
@@ -207,10 +197,6 @@
               addr2 (set/store modified-set stg)
               size-after-modify (storage-size stg)]
 
-          (when *debug*
-            (println "After modify storage size:" size-after-modify)
-            (println "Freed count:" (freed-count stg)))
-
           ;; Storage grew because we have both old and new nodes
           (is (>= size-after-modify size-after-initial))
 
@@ -218,9 +204,6 @@
           (delete-freed! stg)
 
           (let [size-after-cleanup (storage-size stg)]
-            (when *debug*
-              (println "After cleanup storage size:" size-after-cleanup))
-
             ;; Freed set should be empty
             (is (= 0 (freed-count stg)))
 
@@ -264,11 +247,6 @@
 
                 size-after-cleanup (storage-size stg)]
 
-            (when *debug*
-              (println "Iteration" iteration
-                       "before:" size-before-cleanup
-                       "after:" size-after-cleanup))
-
             ;; Each cleanup should reduce storage size
             (is (<= size-after-cleanup size-before-cleanup))
 
@@ -283,30 +261,15 @@
           initial-size (storage-size stg)
           initial-freed (freed-count stg)]
 
-      (when *debug*
-        (println "After initial store - size:" initial-size "freed:" initial-freed)
-        (println "Stored address:" stored-addr)
-        (println "Set address field:" (.-address initial-set))
-        (println "Set storage field:" (.-storage initial-set)))
-
       ;; Freed count should be 0 after initial store (no modifications yet)
       (is (= 0 initial-freed))
 
       ;; Now modify the set - this should automatically mark old leaf addresses as freed
       ;; The storage is attached to the set, so conj will call markFreed
-      (let [_ (when *debug* (println "Before conj - freed:" (freed-count stg)))
-            set-after-first-conj (conj initial-set 500)
-            _ (when *debug*
-                (println "After first conj - freed:" (freed-count stg))
-                (println "First conj result address:" (.-address set-after-first-conj))
-                (println "First conj result storage:" (if (.-storage set-after-first-conj) "present" "nil")))
+      (let [set-after-first-conj (conj initial-set 500)
             modified-set (conj set-after-first-conj 501)
-            _ (when *debug* (println "After second conj - freed:" (freed-count stg)))
             _ (set/store modified-set stg)
             freed-after-modify (freed-count stg)]
-
-        (when *debug*
-          (println "After modify - freed:" freed-after-modify))
 
         ;; The old leaf node(s) that were modified should be marked as freed
         ;; (At least 1 address should be freed since we modified a leaf)
@@ -334,9 +297,6 @@
                              (disj 52))
             _ (set/store modified-set stg)
             freed-after-disj (freed-count stg)]
-
-        (when *debug*
-          (println "After disj - freed:" freed-after-disj))
 
         ;; Disj operations should mark old addresses as freed
         (is (pos? freed-after-disj) "At least one address should be marked as freed after disj")))))

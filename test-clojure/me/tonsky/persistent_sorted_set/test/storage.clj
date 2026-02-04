@@ -12,9 +12,6 @@
 
 (set! *warn-on-reflection* true)
 
-(def ^:dynamic *debug*
-  false)
-
 (defn gen-addr []
   (random-uuid)
   #_(str (str/join (repeatedly 10 #(rand-nth "ABCDEFGHIJKLMNOPQRSTUVWXYZ")))))
@@ -85,8 +82,6 @@
          root    (.-_root set)]
      (loaded-ratio (some-> storage :*memory deref) address root)))
   ([memory address node]
-   (when *debug*
-     (println address (contains? memory address) node (memory address)))
    (if (and address (not (contains? memory address)))
      0.0
      (let [node (if (instance? Reference node) (.get ^Reference node) node)

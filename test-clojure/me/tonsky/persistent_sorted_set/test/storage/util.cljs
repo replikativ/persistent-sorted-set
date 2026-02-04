@@ -10,11 +10,8 @@
             [me.tonsky.persistent-sorted-set.leaf :refer [Leaf] :as leaf]
             [me.tonsky.persistent-sorted-set.branch :refer [Branch] :as branch]))
 
-(def ^:dynamic *debug* false)
-
 (defn dbg [& args]
-  (when *debug*
-    (apply println args)))
+  nil)
 
 (defn gen-addr [] (random-uuid))
 
