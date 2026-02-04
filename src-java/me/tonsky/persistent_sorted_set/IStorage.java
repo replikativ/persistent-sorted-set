@@ -23,7 +23,33 @@ public interface IStorage<Key, Address> {
      * For node instanceof Leaf, store node.keys()
      * For node instanceof Branch, store node.level(), node.keys() and node.addresses()
      * Generate and return new address for node
-     * Return null if doesn’t need to be stored
+     * Return null if doesn't need to be stored
      */
     Address store(ANode<Key, Address> node);
+
+    /**
+     * Mark an address as freed/obsolete during tree modifications,
+     * including when the root address is updated.
+     * Called when a stored node's address is being replaced (node no longer reachable).
+     * Storage implementations can track these for later deletion or compaction.
+     * This may be invoked in both persistent and editable/transient modes.
+     */
+    default void markFreed(Address address) {
+    }
+
+    /**
+     * Check if an address has been marked as freed.
+     * Used for testing and debugging.
+     */
+    default boolean isFreed(Address address) {
+        return false;
+    }
+
+    /**
+     * Get debug information about a freed address.
+     * Used for testing and debugging.
+     */
+    default Object freedInfo(Address address) {
+        return null;
+    }
 }

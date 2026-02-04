@@ -5,8 +5,11 @@ PersistentSortedSet supports:
 - transients,
 - custom comparators,
 - fast iteration,
-- efficient slices (iterator over a part of the set)
-- efficient `rseq` on slices.
+- efficient slices (iterator over a part of the set),
+- efficient `rseq` on slices,
+- `lookup` to retrieve actual stored keys,
+- `replace` for single-traversal key updates at same logical position,
+- durable storage with automatic garbage collection via `markFreed`.
 
 Almost a drop-in replacement for `clojure.core/sorted-set`, the only difference being this one can’t store `nil`.
 
@@ -18,10 +21,6 @@ Implementations are provided for Clojure and ClojureScript.
 export JAVA8_HOME="/Library/Java/JavaVirtualMachines/jdk1.8.0_202.jdk/Contents/Home"
 lein jar
 ```
-
-## Support us
-
-<a href="https://www.patreon.com/bePatron?u=4230547"><img src="./extras/become_a_patron_button@2x.png" alt="Become a Patron!" width="217" height="51"></a>
 
 ## Usage
 
@@ -139,13 +138,31 @@ To do that, implement `IStorage` interface:
              :addresses (.addresses ^Branch node)}
             (.keys ^Leaf node))))
       address))
-    
+
   (restore [_ address]
     (let [value (-> (get @*storage address)
                   (edn/read-string))]
       (if (map? value)
         (Branch. (int (:level value)) ^java.util.List (:keys value) ^java.util.List (:addresses value))
-        (Leaf. ^java.util.List value)))))
+        (Leaf. ^java.util.List value))))
+
+  (markFreed [_ address]
+    ;; Optional: track addresses that become obsolete during modifications.
+    ;; Called automatically when tree nodes are replaced during conj/disj.
+    ;; Enables garbage collection of unreachable nodes.
+    nil)
+
+  (accessed [_ address]
+    ;; Optional: track node access for cache management (e.g., LRU).
+    nil)
+
+  (isFreed [_ address]
+    ;; Optional: check if address has been marked as freed.
+    false)
+
+  (freedInfo [_ address]
+    ;; Optional: return debug information about freed addresses.
+    nil))
 ```
 
 Storing Persistent Sorted Set works per node. This will save each node once:
@@ -225,7 +242,9 @@ Last piece of the puzzle: `set/walk-addresses`. Use it to check which nodes are 
 
 See [test_storage.clj](test-clojure/me/tonsky/persistent_sorted_set/test_storage.clj) for more examples.
 
-Durability for ClojureScript is not yet supported.
+### ClojureScript Durability
+
+ClojureScript also supports durable storage with async operations. The `IStorage` interface works the same way, but `store` and `restore` methods return promises/async values instead of direct values. This allows integration with IndexedDB, remote storage APIs, and other async storage backends.
 
 ## Performance
 
@@ -299,5 +318,6 @@ PersistentSortedSet (transient)   47..50ms
 ## License
 
 Copyright © 2019 Nikita Prokopov
+Copyright © 2024 Christian Weilbach
 
 Licensed under MIT (see [LICENSE](LICENSE)).

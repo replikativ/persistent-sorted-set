@@ -15,6 +15,7 @@ node_modules
 .calva/
 .clj-kondo/
 .lsp/
+.cljs_node_repl/
 
 # Internal docs and scratch work
 .internal/

@@ -176,6 +176,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
     if (1 == nodes.length && editable()) {
       ANode<Key, Address> node = nodes[0];
       _keys[ins] = node.maxKey();
+      // Mark old child address as freed before clearing
+      if (storage != null && _addresses != null && _addresses[ins] != null) {
+        storage.markFreed(_addresses[ins]);
+      }
       child(ins, node);
       if (ins == _len - 1 && node.maxKey() == maxKey()) // TODO why maxKey check?
         return new ANode[]{ this }; // update maxKey
@@ -370,6 +374,22 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
     if (newLen >= _settings.minBranchingFactor() || (left == null && right == null)) {
       // can update in place
       if (editable() && idx < _len-2) {
+        // Mark freed addresses before clearing them
+        if (storage != null && _addresses != null) {
+          // The child at idx is always being replaced
+          if (_addresses[idx] != null) {
+            storage.markFreed(_addresses[idx]);
+          }
+          // Left child if changed
+          if (leftChanged && idx > 0 && _addresses[idx - 1] != null) {
+            storage.markFreed(_addresses[idx - 1]);
+          }
+          // Right child if changed
+          if (rightChanged && _addresses[idx + 1] != null) {
+            storage.markFreed(_addresses[idx + 1]);
+          }
+        }
+
         Stitch ks = new Stitch(_keys, Math.max(idx-1, 0));
         if (nodes[0] != null) ks.copyOne(nodes[0].maxKey());
                               ks.copyOne(nodes[1].maxKey());
@@ -622,10 +642,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
     // Transient: can modify in place
     if (editable()) {
       _keys[idx] = newMaxKey;
-      child(idx, newChild);
-      if (_addresses != null) {
-        _addresses[idx] = null; // clear stored address since child changed
+      // Mark old child address as freed before clearing
+      if (storage != null && _addresses != null && _addresses[idx] != null) {
+        storage.markFreed(_addresses[idx]);
       }
+      child(idx, newChild);
+      // Note: child() already clears _addresses[idx] via address(idx, null)
       if (maxKeyChanged)
         return new ANode[]{this};
       else

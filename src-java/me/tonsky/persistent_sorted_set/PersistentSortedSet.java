@@ -250,16 +250,22 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
 
     if (UNCHANGED == nodes) return this;
 
+    // Mark old root address as freed if it exists (works in both persistent and transient modes)
+    if (_storage != null && _address != null) {
+      _storage.markFreed(_address);
+    }
+
     if (editable()) {
+      // Clear address - must always clear when tree is modified (including EARLY_EXIT case)
+      _address = null;
+
       if (1 == nodes.length) {
-        _address = null;
         _root = nodes[0];
       } else if (2 == nodes.length) {
         Object[] keys = new Object[] {nodes[0].maxKey(), nodes[1].maxKey()};
-        _address = null;
-
         _root = new Branch(nodes[0].level() + 1, 2, keys, null, new Object[] {nodes[0], nodes[1]}, _settings);
       }
+      // EARLY_EXIT case (nodes.length == 0): tree was modified in place, _address already cleared above
       _count = alterCount(1);
       _version += 1;
       return this;
@@ -286,8 +292,14 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     // not in set
     if (UNCHANGED == nodes) return this;
 
+    // Mark old root address as freed if it exists (works in both persistent and transient modes)
+    if (_storage != null && _address != null) {
+      _storage.markFreed(_address);
+    }
+
     // in place update
     if (nodes == EARLY_EXIT) {
+      // Clear address
       _address = null;
       _count = alterCount(-1);
       _version += 1;
@@ -298,6 +310,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     if (editable()) {
       if (newRoot instanceof Branch && newRoot._len == 1)
         newRoot = ((Branch) newRoot).child(_storage, 0);
+      // Clear address
       _address = null;
       _root = newRoot;
       _count = alterCount(-1);
@@ -330,8 +343,14 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     // Not in set
     if (UNCHANGED == nodes) return this;
 
+    // Mark old root address as freed if it exists (works in both persistent and transient modes)
+    if (_storage != null && _address != null) {
+      _storage.markFreed(_address);
+    }
+
     // In-place update (transient)
     if (EARLY_EXIT == nodes) {
+      // Clear address
       _address = null;
       _version += 1;
       return this;
@@ -340,6 +359,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     // New root node (persistent case or maxKey changed in transient)
     ANode newRoot = nodes[0];
     if (editable()) {
+      // Clear address
       _address = null;
       _root = newRoot;
       _version += 1;

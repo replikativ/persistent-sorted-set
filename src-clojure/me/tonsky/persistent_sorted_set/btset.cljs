@@ -56,25 +56,29 @@
                       roots (await (node/$add root (.-storage set) key cmp opts))]
                   (if (nil? roots)
                     set
-                    (if (== (arrays/alength roots) 1)
-                      (BTSet. (arrays/aget roots 0)
-                              (inc (.-cnt set))
-                              (.-comparator set)
-                              (.-meta set)
-                              UNINITIALIZED_HASH
-                              (.-storage set)
-                              nil
-                              (.-settings set))
-                      (let [child0 (arrays/aget roots 0)
-                            lvl    (inc (node/level child0))]
-                        (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil (.-settings set))
+                    (do
+                      ;; Mark old root address as freed if it exists
+                      (when (and (.-storage set) (.-address set))
+                        (storage/markFreed (.-storage set) (.-address set)))
+                      (if (== (arrays/alength roots) 1)
+                        (BTSet. (arrays/aget roots 0)
                                 (inc (.-cnt set))
                                 (.-comparator set)
                                 (.-meta set)
                                 UNINITIALIZED_HASH
                                 (.-storage set)
                                 nil
-                                (.-settings set))))))))))
+                                (.-settings set))
+                        (let [child0 (arrays/aget roots 0)
+                              lvl    (inc (node/level child0))]
+                          (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil (.-settings set))
+                                  (inc (.-cnt set))
+                                  (.-comparator set)
+                                  (.-meta set)
+                                  UNINITIALIZED_HASH
+                                  (.-storage set)
+                                  nil
+                                  (.-settings set)))))))))))
 
 (defn $replace
   ([^BTSet set old-key new-key]
@@ -90,14 +94,18 @@
                       nodes (await (node/$replace root (.-storage set) old-key new-key cmp opts))]
                   (if (nil? nodes)
                     set
-                    (BTSet. (arrays/aget nodes 0)
-                            (.-cnt set)
-                            (.-comparator set)
-                            (.-meta set)
-                            UNINITIALIZED_HASH
-                            (.-storage set)
-                            nil
-                            (.-settings set))))))))
+                    (do
+                      ;; Mark old root address as freed if it exists
+                      (when (and (.-storage set) (.-address set))
+                        (storage/markFreed (.-storage set) (.-address set)))
+                      (BTSet. (arrays/aget nodes 0)
+                              (.-cnt set)
+                              (.-comparator set)
+                              (.-meta set)
+                              UNINITIALIZED_HASH
+                              (.-storage set)
+                              nil
+                              (.-settings set)))))))))
 
 (defn $disjoin
   ([^BTSet set key]
@@ -113,19 +121,23 @@
                       new-roots (await (node/$remove root (.-storage set) key nil nil cmp opts))]
                   (if (nil? new-roots)
                     set
-                    (let [new-root (arrays/aget new-roots 0)
-                          new-root (if (and (instance? Branch new-root)
-                                            (== 1 (arrays/alength (.-children new-root))))
-                                     (await (branch/$child new-root (.-storage set) 0 opts))
-                                     new-root)]
-                      (BTSet. new-root
-                              (dec (.-cnt set))
-                              (.-comparator set)
-                              (.-meta set)
-                              UNINITIALIZED_HASH
-                              (.-storage set)
-                              nil
-                              (.-settings set)))))))))
+                    (do
+                      ;; Mark old root address as freed if it exists
+                      (when (and (.-storage set) (.-address set))
+                        (storage/markFreed (.-storage set) (.-address set)))
+                      (let [new-root (arrays/aget new-roots 0)
+                            new-root (if (and (instance? Branch new-root)
+                                              (== 1 (arrays/alength (.-children new-root))))
+                                       (await (branch/$child new-root (.-storage set) 0 opts))
+                                       new-root)]
+                        (BTSet. new-root
+                                (dec (.-cnt set))
+                                (.-comparator set)
+                                (.-meta set)
+                                UNINITIALIZED_HASH
+                                (.-storage set)
+                                nil
+                                (.-settings set))))))))))
 
 (defn $store
   ([^BTSet set arg]

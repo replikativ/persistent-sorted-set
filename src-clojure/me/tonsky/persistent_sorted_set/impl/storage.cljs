@@ -4,4 +4,7 @@
   (store [this node opts])
   (restore [this address opts])
   (accessed [this address])
-  (delete [this addresses]))
+  (delete [this addresses])
+  (markFreed [this address])
+  (isFreed [this address])
+  (freedInfo [this address]))
