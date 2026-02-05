@@ -76,8 +76,18 @@
                           (let [child0 (arrays/aget roots 0)
                                 lvl    (inc (node/level child0))
                                 ;; Compute subtree count as sum of children's counts
-                                subtree-count (reduce + 0 (map node/$subtree-count roots))]
-                            (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count nil (.-settings set))
+                                subtree-count (reduce + 0 (map node/$subtree-count roots))
+                                ;; Compute stats from children if stats-ops available
+                                stats-ops (:stats (.-settings set))
+                                root-stats (when stats-ops
+                                             (reduce (fn [acc child]
+                                                       (let [cs (node/$stats child)]
+                                                         (if cs
+                                                           (stats/merge-stats stats-ops acc cs)
+                                                           acc)))
+                                                     (stats/identity-stats stats-ops)
+                                                     roots))]
+                            (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count root-stats (.-settings set))
                                     new-cnt
                                     (.-comparator set)
                                     (.-meta set)
@@ -111,7 +121,7 @@
                               UNINITIALIZED_HASH
                               (.-storage set)
                               nil
-                              (.-settings set)))))))))
+                              (.-settings set))))))))))
 
 (defn $disjoin
   ([^BTSet set key]
@@ -877,6 +887,98 @@
            (if (zero? (node/len root))
              0
              (await ($count-slice-node root (.-storage set) from to cmp opts)))))))))
+
+(defn- stats-slice-leaf
+  "Compute stats for keys in range [from, to] within a leaf."
+  [^Leaf node stats-ops from to cmp]
+  (let [keys (.-keys node)
+        len  (arrays/alength keys)]
+    (loop [i 0
+           acc (stats/identity-stats stats-ops)]
+      (if (>= i len)
+        acc
+        (let [key (arrays/aget keys i)
+              in-range? (and (or (nil? from) (>= (cmp key from) 0))
+                             (or (nil? to) (<= (cmp key to) 0)))]
+          (recur (inc i)
+                 (if in-range?
+                   (stats/merge-stats stats-ops acc (stats/extract stats-ops key))
+                   acc)))))))
+
+(defn- $stats-slice-node
+  "Recursively compute stats for elements in range [from, to] within a node."
+  [node storage stats-ops from to cmp {:keys [sync?] :or {sync? true} :as opts}]
+  (async+sync sync?
+    (async
+      (if (instance? Leaf node)
+        (stats-slice-leaf node stats-ops from to cmp)
+        ;; Branch node
+        (let [keys (.-keys node)
+              len  (arrays/alength keys)
+              from-idx (if from
+                         (let [idx (binary-search-l cmp keys (- len 2) from)]
+                           (min idx (dec len)))
+                         0)
+              to-idx   (if to
+                         (let [idx (binary-search-r cmp keys (- len 2) to)]
+                           (min idx (dec len)))
+                         (dec len))]
+          (cond
+            ;; Empty range
+            (> from-idx to-idx)
+            (stats/identity-stats stats-ops)
+
+            ;; Same child, recurse into it
+            (== from-idx to-idx)
+            (let [child (await (branch/$child node storage from-idx opts))]
+              (await ($stats-slice-node child storage stats-ops from to cmp opts)))
+
+            ;; Spans multiple children
+            :else
+            (let [;; Stats from partial first child
+                  first-child (await (branch/$child node storage from-idx opts))
+                  first-stats (await ($stats-slice-node first-child storage stats-ops from nil cmp opts))
+                  ;; Stats from partial last child
+                  last-child  (await (branch/$child node storage to-idx opts))
+                  last-stats  (await ($stats-slice-node last-child storage stats-ops nil to cmp opts))
+                  ;; Stats from fully contained children in between
+                  middle-stats (loop [i (inc from-idx)
+                                      acc (stats/identity-stats stats-ops)]
+                                 (if (>= i to-idx)
+                                   acc
+                                   (let [child (await (branch/$child node storage i opts))
+                                         child-stats (or (node/$stats child)
+                                                         (await (node/$compute-stats child storage stats-ops opts)))]
+                                     (recur (inc i)
+                                            (stats/merge-stats stats-ops acc child-stats)))))]
+              (stats/merge-stats stats-ops
+                                 (stats/merge-stats stats-ops first-stats middle-stats)
+                                 last-stats))))))))
+
+(defn $stats-slice
+  "Compute stats for elements in the range [from, to] inclusive.
+   Uses O(log n) algorithm when subtree stats are available.
+   If from is nil, computes from the beginning.
+   If to is nil, computes to the end.
+   Returns nil if no stats-ops configured."
+  ([^BTSet set from to]
+   ($stats-slice set from to (.-comparator set) {:sync? true}))
+  ([^BTSet set from to arg]
+   (if (fn? arg)
+     ($stats-slice set from to arg {:sync? true})
+     ($stats-slice set from to (.-comparator set) arg)))
+  ([^BTSet set from to cmp {:keys [sync?] :or {sync? true} :as opts}]
+   (async+sync sync?
+     (async
+       (let [stats-ops (:stats (.-settings set))]
+         (if (nil? stats-ops)
+           nil
+           (if (and from to (pos? (cmp from to)))
+             (stats/identity-stats stats-ops) ;; Empty range
+             (let [root (await ($$root set opts))]
+               (if (zero? (node/len root))
+                 (stats/identity-stats stats-ops)
+                 (await ($stats-slice-node root (.-storage set) stats-ops from to cmp opts)))))))))))
 
 (defn $equivalent?
   [^BTSet set other {:keys [sync?] :or {sync? true} :as opts}]

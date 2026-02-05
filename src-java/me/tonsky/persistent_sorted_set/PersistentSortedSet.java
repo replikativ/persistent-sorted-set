@@ -350,6 +350,25 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     return cons(key, _cmp);
   }
 
+  /**
+   * Helper to compute stats from an array of child nodes.
+   */
+  private Object computeStatsFromChildren(ANode[] children) {
+    IStats statsOps = _settings.stats();
+    if (statsOps == null) return null;
+    Object result = statsOps.identity();
+    for (ANode child : children) {
+      Object childStats = child.stats();
+      if (childStats == null) {
+        childStats = child.computeStats(_storage);
+      }
+      if (childStats != null) {
+        result = statsOps.merge(result, childStats);
+      }
+    }
+    return result;
+  }
+
   public PersistentSortedSet cons(Object key, Comparator cmp) {
     ANode[] nodes = root().add(_storage, (Key) key, cmp, _settings);
 
@@ -370,7 +389,9 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
         Object[] keys = new Object[] {nodes[0].maxKey(), nodes[1].maxKey()};
         // Compute subtree count for new root = sum of both children's counts
         long subtreeCount = getSubtreeCount(nodes[0]) + getSubtreeCount(nodes[1]);
-        _root = new Branch(nodes[0].level() + 1, 2, keys, null, new Object[] {nodes[0], nodes[1]}, subtreeCount, _settings);
+        // Compute stats for new root
+        Object stats = computeStatsFromChildren(nodes);
+        _root = new Branch(nodes[0].level() + 1, 2, keys, null, new Object[] {nodes[0], nodes[1]}, subtreeCount, stats, _settings);
       }
       // EARLY_EXIT case (nodes.length == 0): tree was modified in place, _address already cleared above
       _count = alterCount(1);
@@ -385,7 +406,9 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     Object[] children = Arrays.copyOf(nodes, nodes.length, new Object[0].getClass());
     // Compute subtree count for new root = sum of both children's counts
     long subtreeCount = getSubtreeCount(nodes[0]) + getSubtreeCount(nodes[1]);
-    ANode newRoot = new Branch(nodes[0].level() + 1, 2, keys, null, children, subtreeCount, _settings);
+    // Compute stats for new root
+    Object stats = computeStatsFromChildren(nodes);
+    ANode newRoot = new Branch(nodes[0].level() + 1, 2, keys, null, children, subtreeCount, stats, _settings);
     return new PersistentSortedSet(_meta, _cmp, null, _storage, newRoot, alterCount(1), _settings, _version + 1);
   }
 

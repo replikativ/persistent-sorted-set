@@ -71,8 +71,9 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         _keys[_len] = key;
         _len += 1;
         // Update stats incrementally
-        if (statsOps != null && _stats != null) {
-          _stats = statsOps.merge(_stats, statsOps.extract(key));
+        if (statsOps != null) {
+          Object prevStats = _stats != null ? _stats : statsOps.identity();
+          _stats = statsOps.merge(prevStats, statsOps.extract(key));
         }
         return new ANode[]{this}; // maxKey needs updating
       } else {
@@ -80,8 +81,9 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         _keys[ins] = key;
         _len += 1;
         // Update stats incrementally
-        if (statsOps != null && _stats != null) {
-          _stats = statsOps.merge(_stats, statsOps.extract(key));
+        if (statsOps != null) {
+          Object prevStats = _stats != null ? _stats : statsOps.identity();
+          _stats = statsOps.merge(prevStats, statsOps.extract(key));
         }
         return PersistentSortedSet.EARLY_EXIT;
       }
@@ -150,8 +152,13 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         ArrayUtil.copy(_keys, idx + 1, _len, _keys, idx);
         _len = newLen;
         // Update stats using remove operation
-        if (statsOps != null && _stats != null) {
-          _stats = statsOps.remove(_stats, key, () -> thisLeaf.computeStats(storage));
+        if (statsOps != null) {
+          if (_stats != null) {
+            _stats = statsOps.remove(_stats, key, () -> thisLeaf.computeStats(storage));
+          } else {
+            // Stats were never initialized, compute from scratch
+            _stats = thisLeaf.computeStats(storage);
+          }
         }
         if (idx == newLen) // removed last, need to signal new maxKey
           return new ANode[]{left, this, right};

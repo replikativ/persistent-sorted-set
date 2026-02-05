@@ -306,6 +306,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (PersistentSortedSet.EARLY_EXIT == nodes) { // child signalling nothing to update
       // Still need to update count - we added one element
       if (_subtreeCount >= 0) _subtreeCount += 1;
+      // Update stats: recompute from children (child's stats were updated in place)
+      IStats statsOps = _settings.stats();
+      if (statsOps != null) {
+        _stats = computeStats(storage);
+      }
       return PersistentSortedSet.EARLY_EXIT;
     }
 
@@ -523,6 +528,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (PersistentSortedSet.EARLY_EXIT == nodes) { // child signalling nothing to update
       // Still need to update count - we removed one element
       if (_subtreeCount >= 0) _subtreeCount -= 1;
+      // Update stats: recompute from children (child's stats were updated in place)
+      IStats statsOps = _settings.stats();
+      if (statsOps != null) {
+        _stats = computeStats(storage);
+      }
       return PersistentSortedSet.EARLY_EXIT;
     }
 

@@ -43,8 +43,9 @@
       ;; Stats will be recomputed lazily for new leaves
       (util/return-array (Leaf. (arrays/aget ks 0) settings nil)
                          (Leaf. (arrays/aget ks 1) settings nil))))
-  ($add [this storage key cmp {:keys [sync? stats-ops] :or {sync? true}}]
+  ($add [this storage key cmp {:keys [sync?] :or {sync? true}}]
     (let [branching-factor (:branching-factor settings)
+          stats-ops (:stats settings)
           idx              (util/binary-search-l cmp keys (dec (arrays/alength keys)) key)
           keys-l           (arrays/alength keys)
           result           (cond
@@ -52,22 +53,27 @@
                              nil
 
                              (== keys-l branching-factor)
-                             (let [middle (arrays/half (inc keys-l))]
-                               (if (> idx middle)
-                                 (arrays/array
-                                  (Leaf. (.slice keys 0 middle) settings nil)
-                                  (Leaf. (util/cut-n-splice keys middle keys-l idx idx (arrays/array key)) settings nil))
-                                 (arrays/array
-                                  (Leaf. (util/cut-n-splice keys 0 middle idx idx (arrays/array key)) settings nil)
-                                  (Leaf. (.slice keys middle keys-l) settings nil))))
+                             (let [middle (arrays/half (inc keys-l))
+                                   left-leaf (if (> idx middle)
+                                               (Leaf. (.slice keys 0 middle) settings nil)
+                                               (Leaf. (util/cut-n-splice keys 0 middle idx idx (arrays/array key)) settings nil))
+                                   right-leaf (if (> idx middle)
+                                                (Leaf. (util/cut-n-splice keys middle keys-l idx idx (arrays/array key)) settings nil)
+                                                (Leaf. (.slice keys middle keys-l) settings nil))]
+                               ;; Compute stats for split leaves
+                               (when stats-ops
+                                 (node/$compute-stats left-leaf nil stats-ops {:sync? true})
+                                 (node/$compute-stats right-leaf nil stats-ops {:sync? true}))
+                               (arrays/array left-leaf right-leaf))
 
                              :else
                              (let [new-keys (util/splice keys idx idx (arrays/array key))
                                    new-leaf (Leaf. new-keys settings nil)]
-                               ;; Update stats incrementally if available
-                               (when (and stats-ops _stats)
-                                 (set! (.-_stats new-leaf)
-                                       (stats/merge-stats stats-ops _stats (stats/extract stats-ops key))))
+                               ;; Update stats incrementally
+                               (when stats-ops
+                                 (let [prev-stats (or _stats (stats/identity-stats stats-ops))]
+                                   (set! (.-_stats new-leaf)
+                                         (stats/merge-stats stats-ops prev-stats (stats/extract stats-ops key)))))
                                (arrays/array new-leaf)))]
       (if sync?
         result
@@ -85,19 +91,23 @@
                  (let [idx (garr/binarySearch keys key cmp)]
                    (when (<= 0 idx)
                      (arrays/aget keys idx))))))
-  ($remove [this storage key left right cmp {:keys [sync? stats-ops] :or {sync? true}}]
+  ($remove [this storage key left right cmp {:keys [sync?] :or {sync? true}}]
     (let [root? (and (nil? left) (nil? right))
+          stats-ops (:stats settings)
           idx   (garr/binarySearch keys key cmp)]
       (async+sync sync?
                   (async
                    (when (<= 0 idx)
                      (let [new-keys (util/splice keys idx (inc idx) (arrays/array))
                            new-leaf (Leaf. new-keys settings nil)]
-                       ;; Update stats if available
-                       (when (and stats-ops _stats)
-                         (set! (.-_stats new-leaf)
-                               (stats/remove-stats stats-ops _stats key
-                                                   #(node/$compute-stats new-leaf storage stats-ops {:sync? true}))))
+                       ;; Update stats
+                       (when stats-ops
+                         (if _stats
+                           (set! (.-_stats new-leaf)
+                                 (stats/remove-stats stats-ops _stats key
+                                                     #(node/$compute-stats new-leaf storage stats-ops {:sync? true})))
+                           ;; Stats were never initialized, compute from scratch
+                           (node/$compute-stats new-leaf storage stats-ops {:sync? true})))
                        (util/rotate new-leaf root? left right settings)))))))
   ($replace [this storage old-key new-key cmp {:keys [sync?] :or {sync? true}}]
     (assert (== 0 (cmp old-key new-key)) "old-key and new-key must compare as equal (cmp must return 0)")

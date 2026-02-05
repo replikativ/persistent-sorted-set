@@ -129,13 +129,14 @@
                                      (when (and storage old-addr)
                                        (storage/markFreed storage old-addr))
                                      (util/splice addrs idx (inc idx) (arrays/array nil nil)))))
-                               ;; After adding one element, increment count if known, stats invalidated
+                               ;; After adding one element, increment count if known
                                old-sc (.-subtree-count this)
                                new-sc (if (>= old-sc 0) (inc old-sc) -1)
-                               ;; Update stats incrementally if available
+                               ;; Update stats incrementally
                                stats-ops (:stats (.-settings this))
-                               new-stats (when (and stats-ops (.-_stats this))
-                                           (stats/merge-stats stats-ops (.-_stats this) (stats/extract stats-ops key)))]
+                               new-stats (when stats-ops
+                                           (let [prev-stats (or (.-_stats this) (stats/identity-stats stats-ops))]
+                                             (stats/merge-stats stats-ops prev-stats (stats/extract stats-ops key))))]
                            (arrays/array (Branch. (.-level this) new-keys new-children new-addrs new-sc new-stats (.-settings this))))
                          (let [middle      (arrays/half (arrays/alength new-children))
                                tmp-addrs   (when addrs
@@ -145,22 +146,41 @@
                                                  (storage/markFreed storage old-addr))
                                                (util/splice addrs idx (inc idx) (arrays/array nil nil))))
                                left-addrs  (when tmp-addrs (.slice tmp-addrs 0 middle))
-                               right-addrs (when tmp-addrs (.slice tmp-addrs middle))]
-                           ;; When splitting, we don't know exact counts or stats, use -1/nil for lazy computation
+                               right-addrs (when tmp-addrs (.slice tmp-addrs middle))
+                               left-children (.slice new-children 0 middle)
+                               right-children (.slice new-children middle)
+                               stats-ops (:stats (.-settings this))
+                               ;; Compute stats for split branches from their children
+                               left-stats (when stats-ops
+                                            (reduce (fn [acc child]
+                                                      (let [cs (node/$stats child)]
+                                                        (if cs
+                                                          (stats/merge-stats stats-ops acc cs)
+                                                          acc)))
+                                                    (stats/identity-stats stats-ops)
+                                                    left-children))
+                               right-stats (when stats-ops
+                                             (reduce (fn [acc child]
+                                                       (let [cs (node/$stats child)]
+                                                         (if cs
+                                                           (stats/merge-stats stats-ops acc cs)
+                                                           acc)))
+                                                     (stats/identity-stats stats-ops)
+                                                     right-children))]
                            (arrays/array
                             (Branch. (.-level this)
                                      (.slice new-keys 0 middle)
-                                     (.slice new-children 0 middle)
+                                     left-children
                                      left-addrs
                                      -1
-                                     nil
+                                     left-stats
                                      (.-settings this))
                             (Branch. (.-level this)
                                      (.slice new-keys middle)
-                                     (.slice new-children middle)
+                                     right-children
                                      right-addrs
                                      -1
-                                     nil
+                                     right-stats
                                      (.-settings this))))))))))))))
 
 (defn $remove
@@ -212,13 +232,18 @@
                              ;; After removing one element, decrement count if known
                              old-sc (.-subtree-count this)
                              new-sc (if (>= old-sc 0) (dec old-sc) -1)
-                             ;; Update stats if available
+                             ;; Update stats
                              stats-ops (:stats (.-settings this))
-                             new-stats (when (and stats-ops (.-_stats this))
-                                         (stats/remove-stats stats-ops (.-_stats this) key
-                                                             #(node/$compute-stats
-                                                                (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this))
-                                                                storage stats-ops {:sync? true})))]
+                             new-stats (when stats-ops
+                                         (if (.-_stats this)
+                                           (stats/remove-stats stats-ops (.-_stats this) key
+                                                               #(node/$compute-stats
+                                                                  (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this))
+                                                                  storage stats-ops {:sync? true}))
+                                           ;; Stats were never initialized, compute from scratch
+                                           (node/$compute-stats
+                                             (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this))
+                                             storage stats-ops {:sync? true})))]
                          (util/rotate (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-stats (.-settings this))
                                       (and (nil? left) (nil? right))
                                       left
@@ -305,7 +330,7 @@
                                                     (aset na idx nil)
                                                     na))]
                                (aset new-children idx new-node)
-                               (arrays/array (Branch. (.-level this) keys new-children new-addrs settings)))))))))))))))
+                               (arrays/array (Branch. (.-level this) keys new-children new-addrs settings))))))))))))))))
 
 (defn $store
   [^Branch this storage {:keys [sync?] :or {sync? true} :as opts}]
