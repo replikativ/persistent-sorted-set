@@ -11,6 +11,8 @@
   ($contains?      [this storage key cmp opts])
   ($count          [this storage opts])
   ($subtree-count  [this])
+  ($stats          [this])
+  ($compute-stats  [this storage stats-ops opts])
   ($remove         [this storage key left right cmp opts])
   ($store          [this storage opts])
   ($walk-addresses [this storage on-address opts]))

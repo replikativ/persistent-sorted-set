@@ -4,10 +4,11 @@
             [goog.array :as garr]
             [me.tonsky.persistent-sorted-set.arrays :as arrays]
             [me.tonsky.persistent-sorted-set.impl.node :as node :refer [INode]]
+            [me.tonsky.persistent-sorted-set.impl.stats :as stats]
             [me.tonsky.persistent-sorted-set.impl.storage :as storage]
             [me.tonsky.persistent-sorted-set.util :as util]))
 
-(deftype Leaf [keys settings]
+(deftype Leaf [keys settings ^:mutable _stats]
   Object
   (toString [_] (pr-str* (vec keys)))
   INode
@@ -15,12 +16,34 @@
   (level [_] 0)
   (max-key [_] (arrays/alast keys))
   ($subtree-count [_] (arrays/alength keys))
-  (merge [_ next] (Leaf. (arrays/aconcat keys (.-keys next)) settings))
+  ($stats [_] _stats)
+  ($compute-stats [this storage stats-ops {:keys [sync?] :or {sync? true}}]
+    (if sync?
+      (when stats-ops
+        (let [result (reduce (fn [acc key]
+                               (stats/merge-stats stats-ops acc (stats/extract stats-ops key)))
+                             (stats/identity-stats stats-ops)
+                             keys)]
+          (set! _stats result)
+          result))
+      (async
+        (when stats-ops
+          (let [result (reduce (fn [acc key]
+                                 (stats/merge-stats stats-ops acc (stats/extract stats-ops key)))
+                               (stats/identity-stats stats-ops)
+                               keys)]
+            (set! _stats result)
+            result)))))
+  (merge [_ next]
+    (let [new-leaf (Leaf. (arrays/aconcat keys (.-keys next)) settings nil)]
+      ;; Stats will be recomputed lazily if needed
+      new-leaf))
   (merge-split [_ next]
     (let [ks (util/merge-n-split keys (.-keys next))]
-      (util/return-array (Leaf. (arrays/aget ks 0) settings)
-                         (Leaf. (arrays/aget ks 1) settings))))
-  ($add [this storage key cmp {:keys [sync?] :or {sync? true}}]
+      ;; Stats will be recomputed lazily for new leaves
+      (util/return-array (Leaf. (arrays/aget ks 0) settings nil)
+                         (Leaf. (arrays/aget ks 1) settings nil))))
+  ($add [this storage key cmp {:keys [sync? stats-ops] :or {sync? true}}]
     (let [branching-factor (:branching-factor settings)
           idx              (util/binary-search-l cmp keys (dec (arrays/alength keys)) key)
           keys-l           (arrays/alength keys)
@@ -30,16 +53,22 @@
 
                              (== keys-l branching-factor)
                              (let [middle (arrays/half (inc keys-l))]
-                     (if (> idx middle)
-                       (arrays/array
-                        (Leaf. (.slice keys 0 middle) settings)
-                        (Leaf. (util/cut-n-splice keys middle keys-l idx idx (arrays/array key)) settings))
-                       (arrays/array
-                        (Leaf. (util/cut-n-splice keys 0 middle idx idx (arrays/array key)) settings)
-                        (Leaf. (.slice keys middle keys-l) settings))))
+                               (if (> idx middle)
+                                 (arrays/array
+                                  (Leaf. (.slice keys 0 middle) settings nil)
+                                  (Leaf. (util/cut-n-splice keys middle keys-l idx idx (arrays/array key)) settings nil))
+                                 (arrays/array
+                                  (Leaf. (util/cut-n-splice keys 0 middle idx idx (arrays/array key)) settings nil)
+                                  (Leaf. (.slice keys middle keys-l) settings nil))))
 
-                   :else
-                   (arrays/array (Leaf. (util/splice keys idx idx (arrays/array key)) settings)))]
+                             :else
+                             (let [new-keys (util/splice keys idx idx (arrays/array key))
+                                   new-leaf (Leaf. new-keys settings nil)]
+                               ;; Update stats incrementally if available
+                               (when (and stats-ops _stats)
+                                 (set! (.-_stats new-leaf)
+                                       (stats/merge-stats stats-ops _stats (stats/extract stats-ops key))))
+                               (arrays/array new-leaf)))]
       (if sync?
         result
         (async result))))
@@ -50,14 +79,20 @@
     (if sync?
       (alength keys)
       (async (alength keys))))
-  ($remove [this storage key left right cmp {:keys [sync?] :or {sync? true}}]
+  ($remove [this storage key left right cmp {:keys [sync? stats-ops] :or {sync? true}}]
     (let [root? (and (nil? left) (nil? right))
           idx   (garr/binarySearch keys key cmp)]
      (async+sync sync?
        (async
         (when (<= 0 idx)
-          (let [new-keys (util/splice keys idx (inc idx) (arrays/array))]
-            (util/rotate (Leaf. new-keys settings) root? left right settings)))))))
+          (let [new-keys (util/splice keys idx (inc idx) (arrays/array))
+                new-leaf (Leaf. new-keys settings nil)]
+            ;; Update stats if available
+            (when (and stats-ops _stats)
+              (set! (.-_stats new-leaf)
+                    (stats/remove-stats stats-ops _stats key
+                                        #(node/$compute-stats new-leaf storage stats-ops {:sync? true}))))
+            (util/rotate new-leaf root? left right settings)))))))
   ($store [this storage {:keys [sync?] :or {sync? true} :as opts}]
     (async+sync sync?
      (async
