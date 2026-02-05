@@ -9,7 +9,7 @@
     [java.lang.ref SoftReference]
     [java.util Comparator Arrays]
     [java.util.function BiConsumer]
-    [me.tonsky.persistent_sorted_set ANode ArrayUtil Branch IStorage Leaf PersistentSortedSet RefType Settings Seq]))
+    [me.tonsky.persistent_sorted_set ANode ArrayUtil Branch IStorage ISubtreeCount Leaf PersistentSortedSet RefType Settings Seq]))
 
 (set! *warn-on-reflection* true)
 
@@ -42,6 +42,17 @@
    (.rslice set from to))
   ([^PersistentSortedSet set from to ^Comparator cmp]
    (.rslice set from to cmp)))
+
+(defn count-slice
+  "Count elements in the range [from, to] inclusive.
+   Uses O(log n) algorithm when subtree counts are available.
+   If from is nil, counts from the beginning.
+   If to is nil, counts to the end.
+   Optionally pass in comparator that will override the one that set uses."
+  ([^PersistentSortedSet set from to]
+   (.countSlice set from to))
+  ([^PersistentSortedSet set from to ^Comparator cmp]
+   (.countSlice set from to cmp)))
 
 (defn seek
   "An efficient way to seek to a specific key in a seq (either returned by [[clojure.core.seq]] or a slice.)
@@ -110,13 +121,18 @@
          ->Leaf               (fn [keys]
                                 (Leaf. (count keys) keys settings))
          ->Branch             (fn [level ^objects children]
-                                (Branch.
-                                  level
-                                  (count children)
-                                  ^objects (arrays/amap #(.maxKey ^ANode %) Object children)
-                                  nil
-                                  children
-                                  settings))]
+                                (let [subtree-count (reduce + 0 (map #(if (instance? ISubtreeCount %)
+                                                                         (.subtreeCount ^ISubtreeCount %)
+                                                                         (.count ^ANode % nil))
+                                                                      children))]
+                                  (Branch.
+                                    level
+                                    (count children)
+                                    ^objects (arrays/amap #(.maxKey ^ANode %) Object children)
+                                    nil
+                                    children
+                                    (long subtree-count)
+                                    settings)))]
      (loop [level 1
             nodes (mapv ->Leaf (split keys len Object avg-branching-factor max-branching-factor))]
        (case (count nodes)
