@@ -126,7 +126,8 @@
      :soft   RefType/SOFT
      :weak   RefType/WEAK
      nil)
-   (:stats m)))
+   (:stats m)
+   (:leaf-processor m)))
 
 (defn- settings->map [^Settings s]
   {:branching-factor (.branchingFactor s)
@@ -134,7 +135,8 @@
                        RefType/STRONG :strong
                        RefType/SOFT   :soft
                        RefType/WEAK   :weak)
-   :stats            ^IStats (.stats s)})
+   :stats            ^IStats (.stats s)
+   :leaf-processor   (.leafProcessor s)})
 
 (defn from-sorted-array
   "Fast path to create a set if you already have a sorted array of elements on your hands."
