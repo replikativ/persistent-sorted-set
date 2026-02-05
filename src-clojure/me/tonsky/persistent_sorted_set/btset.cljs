@@ -121,7 +121,7 @@
                               UNINITIALIZED_HASH
                               (.-storage set)
                               nil
-                              (.-settings set))))))))))
+                              (.-settings set)))))))))
 
 (defn $disjoin
   ([^BTSet set key]
@@ -156,7 +156,7 @@
                                 UNINITIALIZED_HASH
                                 (.-storage set)
                                 nil
-                                (.-settings set)))))))))
+                                (.-settings set))))))))))
 
 (defn $store
   ([^BTSet set arg]

@@ -1,9 +1,9 @@
 (ns me.tonsky.persistent-sorted-set.test.stats
   (:require
-    [me.tonsky.persistent-sorted-set :as set]
-    [clojure.test :as t :refer [is are deftest testing]])
+   [me.tonsky.persistent-sorted-set :as set]
+   [clojure.test :as t :refer [is are deftest testing]])
   (:import
-    [me.tonsky.persistent_sorted_set ANode NumericStats NumericStatsOps]))
+   [me.tonsky.persistent_sorted_set ANode NumericStats NumericStatsOps]))
 
 (set! *warn-on-reflection* true)
 

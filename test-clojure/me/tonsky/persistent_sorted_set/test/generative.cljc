@@ -6,15 +6,15 @@
 
    Works on both CLJ and CLJS."
   (:require
-    [clojure.test :refer [deftest is testing]]
-    [clojure.test.check :as tc]
-    [clojure.test.check.generators :as gen]
-    [clojure.test.check.properties :as prop #?@(:cljs [:include-macros true])]
-    [clojure.test.check.clojure-test :refer [defspec] #?@(:cljs [:include-macros true])]
-    [me.tonsky.persistent-sorted-set :as set]
-    #?(:clj [me.tonsky.persistent-sorted-set.test.storage :as storage])
-    #?(:cljs [me.tonsky.persistent-sorted-set.test.storage.util :as storage-util])
-    #?(:cljs [me.tonsky.persistent-sorted-set.impl.numeric-stats :as numeric-stats]))
+   [clojure.test :refer [deftest is testing]]
+   [clojure.test.check :as tc]
+   [clojure.test.check.generators :as gen]
+   [clojure.test.check.properties :as prop #?@(:cljs [:include-macros true])]
+   [clojure.test.check.clojure-test :refer [defspec] #?@(:cljs [:include-macros true])]
+   [me.tonsky.persistent-sorted-set :as set]
+   #?(:clj [me.tonsky.persistent-sorted-set.test.storage :as storage])
+   #?(:cljs [me.tonsky.persistent-sorted-set.test.storage.util :as storage-util])
+   #?(:cljs [me.tonsky.persistent-sorted-set.impl.numeric-stats :as numeric-stats]))
   #?(:clj (:import [me.tonsky.persistent_sorted_set NumericStats NumericStatsOps])))
 
 ;; =============================================================================
@@ -78,11 +78,11 @@
 (defspec operations-match-sorted-set 100
   (prop/for-all [initial-elements gen-elements
                  ops gen-operations]
-    (let [pss-initial (into (set/sorted-set) initial-elements)
-          clj-initial (into (sorted-set) initial-elements)
-          [pss-final clj-final] (apply-ops pss-initial clj-initial ops)]
-      (and (= (count pss-final) (count clj-final))
-           (= (vec pss-final) (vec clj-final))))))
+                (let [pss-initial (into (set/sorted-set) initial-elements)
+                      clj-initial (into (sorted-set) initial-elements)
+                      [pss-final clj-final] (apply-ops pss-initial clj-initial ops)]
+                  (and (= (count pss-final) (count clj-final))
+                       (= (vec pss-final) (vec clj-final))))))
 
 ;; =============================================================================
 ;; Lazy set count correctness (via storage roundtrip)
@@ -91,44 +91,44 @@
 (defspec lazy-set-count-after-operations 100
   (prop/for-all [initial-elements gen-elements
                  ops gen-operations]
-    (let [;; Create a lazy set via storage roundtrip
-          base-set (into (set/sorted-set) initial-elements)
-          lazy-set (roundtrip base-set)
+                (let [;; Create a lazy set via storage roundtrip
+                      base-set (into (set/sorted-set) initial-elements)
+                      lazy-set (roundtrip base-set)
           ;; Apply operations
-          clj-set (into (sorted-set) initial-elements)
-          [pss-final clj-final] (apply-ops lazy-set clj-set ops)]
-      (= (count pss-final) (count clj-final)))))
+                      clj-set (into (sorted-set) initial-elements)
+                      [pss-final clj-final] (apply-ops lazy-set clj-set ops)]
+                  (= (count pss-final) (count clj-final)))))
 
 (defspec lazy-set-count-with-interleaved-count-calls 100
   (prop/for-all [initial-elements gen-elements
                  ops gen-operations]
-    (let [lazy-set (roundtrip (into (set/sorted-set) initial-elements))
-          clj-set (into (sorted-set) initial-elements)
+                (let [lazy-set (roundtrip (into (set/sorted-set) initial-elements))
+                      clj-set (into (sorted-set) initial-elements)
           ;; Apply operations, calling count between each
-          [pss-final clj-final]
-          (reduce (fn [[pss clj] [op val]]
+                      [pss-final clj-final]
+                      (reduce (fn [[pss clj] [op val]]
                     ;; Call count on both (forces computation on lazy set)
-                    (let [_ (count pss)
-                          _ (count clj)]
-                      (case op
-                        :add    [(conj pss val) (conj clj val)]
-                        :remove [(disj pss val) (disj clj val)])))
-                  [lazy-set clj-set]
-                  ops)]
-      (= (count pss-final) (count clj-final)))))
+                                (let [_ (count pss)
+                                      _ (count clj)]
+                                  (case op
+                                    :add    [(conj pss val) (conj clj val)]
+                                    :remove [(disj pss val) (disj clj val)])))
+                              [lazy-set clj-set]
+                              ops)]
+                  (= (count pss-final) (count clj-final)))))
 
 (defspec lazy-set-vec-matches-count 100
   (prop/for-all [initial-elements gen-elements
                  ops gen-operations]
-    (let [lazy-set (roundtrip (into (set/sorted-set) initial-elements))
-          result (reduce (fn [s [op val]]
-                          (case op
-                            :add (conj s val)
-                            :remove (disj s val)))
-                        lazy-set
-                        ops)]
+                (let [lazy-set (roundtrip (into (set/sorted-set) initial-elements))
+                      result (reduce (fn [s [op val]]
+                                       (case op
+                                         :add (conj s val)
+                                         :remove (disj s val)))
+                                     lazy-set
+                                     ops)]
       ;; The count should always match the actual number of elements
-      (= (count result) (count (vec result))))))
+                  (= (count result) (count (vec result))))))
 
 ;; =============================================================================
 ;; Transient operations
@@ -137,40 +137,40 @@
 (defspec transient-persistent-roundtrip 100
   (prop/for-all [initial-elements gen-elements
                  ops gen-operations]
-    (let [base-set (into (set/sorted-set) initial-elements)
+                (let [base-set (into (set/sorted-set) initial-elements)
           ;; Apply ops via transient
-          transient-result (-> (transient base-set)
-                              (#(reduce (fn [t [op val]]
-                                         (case op
-                                           :add (conj! t val)
-                                           :remove (disj! t val)))
-                                       % ops))
-                              persistent!)
+                      transient-result (-> (transient base-set)
+                                           (#(reduce (fn [t [op val]]
+                                                       (case op
+                                                         :add (conj! t val)
+                                                         :remove (disj! t val)))
+                                                     % ops))
+                                           persistent!)
           ;; Apply ops via persistent
-          persistent-result (reduce (fn [s [op val]]
-                                     (case op
-                                       :add (conj s val)
-                                       :remove (disj s val)))
-                                   base-set
-                                   ops)]
-      (and (= (count transient-result) (count persistent-result))
-           (= (vec transient-result) (vec persistent-result))))))
+                      persistent-result (reduce (fn [s [op val]]
+                                                  (case op
+                                                    :add (conj s val)
+                                                    :remove (disj s val)))
+                                                base-set
+                                                ops)]
+                  (and (= (count transient-result) (count persistent-result))
+                       (= (vec transient-result) (vec persistent-result))))))
 
 (defspec transient-lazy-set-count 100
   (prop/for-all [initial-elements gen-elements
                  adds (gen/vector gen-int 0 200)
                  removes (gen/vector gen-int 0 200)]
-    (let [lazy-set (roundtrip (into (set/sorted-set) initial-elements))
+                (let [lazy-set (roundtrip (into (set/sorted-set) initial-elements))
           ;; Transient operations
-          result (-> (transient lazy-set)
-                    (#(reduce conj! % adds))
-                    (#(reduce disj! % removes))
-                    persistent!)
+                      result (-> (transient lazy-set)
+                                 (#(reduce conj! % adds))
+                                 (#(reduce disj! % removes))
+                                 persistent!)
           ;; Expected result using Clojure's sorted-set
-          expected (-> (into (sorted-set) initial-elements)
-                      (into adds)
-                      (#(reduce disj % removes)))]
-      (= (count result) (count expected)))))
+                      expected (-> (into (sorted-set) initial-elements)
+                                   (into adds)
+                                   (#(reduce disj % removes)))]
+                  (= (count result) (count expected)))))
 
 ;; =============================================================================
 ;; Tree rebalancing (operations that cause splits/merges)
@@ -179,35 +179,35 @@
 (defspec rebalancing-preserves-count 100
   (prop/for-all [;; Use smaller branching factor to trigger more rebalancing
                  elements (gen/vector gen-int 0 2000)]
-    (let [;; Small branching factor = more tree levels = more rebalancing
-          opts {:branching-factor 8}
-          pss (reduce conj (set/sorted-set* opts) elements)
-          lazy-pss (roundtrip pss)
+                (let [;; Small branching factor = more tree levels = more rebalancing
+                      opts {:branching-factor 8}
+                      pss (reduce conj (set/sorted-set* opts) elements)
+                      lazy-pss (roundtrip pss)
           ;; Remove half the elements to trigger merges
-          to-remove (take (quot (count elements) 2) (shuffle elements))
-          result (reduce disj lazy-pss to-remove)
-          expected (reduce disj (into (sorted-set) elements) to-remove)]
-      (= (count result) (count expected)))))
+                      to-remove (take (quot (count elements) 2) (shuffle elements))
+                      result (reduce disj lazy-pss to-remove)
+                      expected (reduce disj (into (sorted-set) elements) to-remove)]
+                  (= (count result) (count expected)))))
 
 (defspec split-heavy-operations 100
   (prop/for-all [elements (gen/vector gen-int 100 500)]
-    (let [;; Very small branching factor = lots of splits
-          opts {:branching-factor 4}
-          pss (reduce conj (set/sorted-set* opts) elements)
-          expected (into (sorted-set) elements)]
-      (and (= (count pss) (count expected))
-           (= (vec pss) (vec expected))))))
+                (let [;; Very small branching factor = lots of splits
+                      opts {:branching-factor 4}
+                      pss (reduce conj (set/sorted-set* opts) elements)
+                      expected (into (sorted-set) elements)]
+                  (and (= (count pss) (count expected))
+                       (= (vec pss) (vec expected))))))
 
 (defspec merge-heavy-operations 100
   (prop/for-all [elements (gen/vector gen-int 100 500)]
-    (let [opts {:branching-factor 4}
-          pss (reduce conj (set/sorted-set* opts) elements)
+                (let [opts {:branching-factor 4}
+                      pss (reduce conj (set/sorted-set* opts) elements)
           ;; Remove most elements to trigger merges
-          to-remove (take (* 3 (quot (count elements) 4)) (shuffle elements))
-          result (reduce disj pss to-remove)
-          expected (reduce disj (into (sorted-set) elements) to-remove)]
-      (and (= (count result) (count expected))
-           (= (vec result) (vec expected))))))
+                      to-remove (take (* 3 (quot (count elements) 4)) (shuffle elements))
+                      result (reduce disj pss to-remove)
+                      expected (reduce disj (into (sorted-set) elements) to-remove)]
+                  (and (= (count result) (count expected))
+                       (= (vec result) (vec expected))))))
 
 ;; =============================================================================
 ;; Count-slice correctness
@@ -217,34 +217,34 @@
   (prop/for-all [elements gen-elements
                  from gen-int
                  to gen-int]
-    (let [[lo hi] (sort [from to])
-          pss (into (set/sorted-set) elements)
-          fast-count (set/count-slice pss lo hi)
-          expected (count (filter #(and (>= % lo) (<= % hi)) (distinct elements)))]
-      (= fast-count expected))))
+                (let [[lo hi] (sort [from to])
+                      pss (into (set/sorted-set) elements)
+                      fast-count (set/count-slice pss lo hi)
+                      expected (count (filter #(and (>= % lo) (<= % hi)) (distinct elements)))]
+                  (= fast-count expected))))
 
 (defspec count-slice-on-lazy-set 100
   (prop/for-all [elements gen-elements
                  from gen-int
                  to gen-int]
-    (let [[lo hi] (sort [from to])
-          lazy-pss (roundtrip (into (set/sorted-set) elements))
-          fast-count (set/count-slice lazy-pss lo hi)
-          expected (count (filter #(and (>= % lo) (<= % hi)) (distinct elements)))]
-      (= fast-count expected))))
+                (let [[lo hi] (sort [from to])
+                      lazy-pss (roundtrip (into (set/sorted-set) elements))
+                      fast-count (set/count-slice lazy-pss lo hi)
+                      expected (count (filter #(and (>= % lo) (<= % hi)) (distinct elements)))]
+                  (= fast-count expected))))
 
 (defspec count-slice-after-modifications 100
   (prop/for-all [elements gen-elements
                  ops (gen/vector gen-operation 0 100)
                  from gen-int
                  to gen-int]
-    (let [[lo hi] (sort [from to])
-          initial-pss (into (set/sorted-set) elements)
-          initial-clj (into (sorted-set) elements)
-          [final-pss final-clj] (apply-ops initial-pss initial-clj ops)
-          fast-count (set/count-slice final-pss lo hi)
-          expected (count (filter #(and (>= % lo) (<= % hi)) final-clj))]
-      (= fast-count expected))))
+                (let [[lo hi] (sort [from to])
+                      initial-pss (into (set/sorted-set) elements)
+                      initial-clj (into (sorted-set) elements)
+                      [final-pss final-clj] (apply-ops initial-pss initial-clj ops)
+                      fast-count (set/count-slice final-pss lo hi)
+                      expected (count (filter #(and (>= % lo) (<= % hi)) final-clj))]
+                  (= fast-count expected))))
 
 ;; =============================================================================
 ;; Multiple derived sets (structural sharing)
@@ -254,16 +254,16 @@
   (prop/for-all [elements gen-elements
                  ops1 (gen/vector gen-operation 0 50)
                  ops2 (gen/vector gen-operation 0 50)]
-    (let [base (roundtrip (into (set/sorted-set) elements))
-          clj-base (into (sorted-set) elements)
+                (let [base (roundtrip (into (set/sorted-set) elements))
+                      clj-base (into (sorted-set) elements)
           ;; Derive two different sets from same base
-          [pss1 clj1] (apply-ops base clj-base ops1)
-          [pss2 clj2] (apply-ops base clj-base ops2)]
-      (and (= (count pss1) (count clj1))
-           (= (count pss2) (count clj2))
+                      [pss1 clj1] (apply-ops base clj-base ops1)
+                      [pss2 clj2] (apply-ops base clj-base ops2)]
+                  (and (= (count pss1) (count clj1))
+                       (= (count pss2) (count clj2))
            ;; Also verify contents
-           (= (vec pss1) (vec clj1))
-           (= (vec pss2) (vec clj2))))))
+                       (= (vec pss1) (vec clj1))
+                       (= (vec pss2) (vec clj2))))))
 
 ;; =============================================================================
 ;; Concurrent-like operations (sequential simulation)
@@ -273,39 +273,39 @@
   (prop/for-all [elements gen-elements
                  ops1 (gen/vector gen-operation 0 50)
                  ops2 (gen/vector gen-operation 0 50)]
-    (let [base (into (set/sorted-set) elements)
+                (let [base (into (set/sorted-set) elements)
           ;; Simulate two "threads" doing transient operations
-          t1 (transient base)
-          t2 (transient base)
+                      t1 (transient base)
+                      t2 (transient base)
           ;; Apply ops to each transient
-          t1-final (reduce (fn [t [op val]]
-                            (case op
-                              :add (conj! t val)
-                              :remove (disj! t val)))
-                          t1 ops1)
-          t2-final (reduce (fn [t [op val]]
-                            (case op
-                              :add (conj! t val)
-                              :remove (disj! t val)))
-                          t2 ops2)
+                      t1-final (reduce (fn [t [op val]]
+                                         (case op
+                                           :add (conj! t val)
+                                           :remove (disj! t val)))
+                                       t1 ops1)
+                      t2-final (reduce (fn [t [op val]]
+                                         (case op
+                                           :add (conj! t val)
+                                           :remove (disj! t val)))
+                                       t2 ops2)
           ;; Persist both
-          p1 (persistent! t1-final)
-          p2 (persistent! t2-final)
+                      p1 (persistent! t1-final)
+                      p2 (persistent! t2-final)
           ;; Expected results
-          e1 (reduce (fn [s [op val]]
-                      (case op
-                        :add (conj s val)
-                        :remove (disj s val)))
-                    (into (sorted-set) elements) ops1)
-          e2 (reduce (fn [s [op val]]
-                      (case op
-                        :add (conj s val)
-                        :remove (disj s val)))
-                    (into (sorted-set) elements) ops2)]
-      (and (= (count p1) (count e1))
-           (= (count p2) (count e2))
-           (= (vec p1) (vec e1))
-           (= (vec p2) (vec e2))))))
+                      e1 (reduce (fn [s [op val]]
+                                   (case op
+                                     :add (conj s val)
+                                     :remove (disj s val)))
+                                 (into (sorted-set) elements) ops1)
+                      e2 (reduce (fn [s [op val]]
+                                   (case op
+                                     :add (conj s val)
+                                     :remove (disj s val)))
+                                 (into (sorted-set) elements) ops2)]
+                  (and (= (count p1) (count e1))
+                       (= (count p2) (count e2))
+                       (= (vec p1) (vec e1))
+                       (= (vec p2) (vec e2))))))
 
 ;; =============================================================================
 ;; Slice operations
@@ -315,21 +315,21 @@
   (prop/for-all [elements gen-elements
                  from gen-int
                  to gen-int]
-    (let [[lo hi] (sort [from to])
-          pss (into (set/sorted-set) elements)
-          slice-result (vec (set/slice pss lo hi))
-          expected (vec (filter #(and (>= % lo) (<= % hi)) (sort (distinct elements))))]
-      (= slice-result expected))))
+                (let [[lo hi] (sort [from to])
+                      pss (into (set/sorted-set) elements)
+                      slice-result (vec (set/slice pss lo hi))
+                      expected (vec (filter #(and (>= % lo) (<= % hi)) (sort (distinct elements))))]
+                  (= slice-result expected))))
 
 (defspec rslice-contents-correct 100
   (prop/for-all [elements gen-elements
                  from gen-int
                  to gen-int]
-    (let [[lo hi] (sort [from to])
-          pss (into (set/sorted-set) elements)
-          rslice-result (vec (set/rslice pss hi lo))
-          expected (vec (reverse (filter #(and (>= % lo) (<= % hi)) (sort (distinct elements)))))]
-      (= rslice-result expected))))
+                (let [[lo hi] (sort [from to])
+                      pss (into (set/sorted-set) elements)
+                      rslice-result (vec (set/rslice pss hi lo))
+                      expected (vec (reverse (filter #(and (>= % lo) (<= % hi)) (sort (distinct elements)))))]
+                  (= rslice-result expected))))
 
 ;; =============================================================================
 ;; Lazy set slice operations
@@ -339,21 +339,21 @@
   (prop/for-all [elements gen-elements
                  from gen-int
                  to gen-int]
-    (let [[lo hi] (sort [from to])
-          lazy-pss (roundtrip (into (set/sorted-set) elements))
-          slice-result (vec (set/slice lazy-pss lo hi))
-          expected (vec (filter #(and (>= % lo) (<= % hi)) (sort (distinct elements))))]
-      (= slice-result expected))))
+                (let [[lo hi] (sort [from to])
+                      lazy-pss (roundtrip (into (set/sorted-set) elements))
+                      slice-result (vec (set/slice lazy-pss lo hi))
+                      expected (vec (filter #(and (>= % lo) (<= % hi)) (sort (distinct elements))))]
+                  (= slice-result expected))))
 
 (defspec lazy-rslice-contents-correct 100
   (prop/for-all [elements gen-elements
                  from gen-int
                  to gen-int]
-    (let [[lo hi] (sort [from to])
-          lazy-pss (roundtrip (into (set/sorted-set) elements))
-          rslice-result (vec (set/rslice lazy-pss hi lo))
-          expected (vec (reverse (filter #(and (>= % lo) (<= % hi)) (sort (distinct elements)))))]
-      (= rslice-result expected))))
+                (let [[lo hi] (sort [from to])
+                      lazy-pss (roundtrip (into (set/sorted-set) elements))
+                      rslice-result (vec (set/rslice lazy-pss hi lo))
+                      expected (vec (reverse (filter #(and (>= % lo) (<= % hi)) (sort (distinct elements)))))]
+                  (= rslice-result expected))))
 
 ;; =============================================================================
 ;; Stats helpers
@@ -391,65 +391,65 @@
 
 (defspec stats-matches-expected 100
   (prop/for-all [elements (gen/no-shrink gen-elements)]
-    (let [pss (into (set/sorted-set* {:stats stats-ops}) elements)
-          actual (stats->map (set/stats pss))
-          expected (compute-expected-stats (distinct elements))]
-      (when-not (= actual expected)
-        (println "MISMATCH: actual=" actual "expected=" expected))
-      (= actual expected))))
+                (let [pss (into (set/sorted-set* {:stats stats-ops}) elements)
+                      actual (stats->map (set/stats pss))
+                      expected (compute-expected-stats (distinct elements))]
+                  (when-not (= actual expected)
+                    (println "MISMATCH: actual=" actual "expected=" expected))
+                  (= actual expected))))
 
 (defspec stats-slice-matches-filter 100
   (prop/for-all [elements gen-elements
                  from gen-int
                  to gen-int]
-    (let [[lo hi] (sort [from to])
-          pss (into (set/sorted-set* {:stats stats-ops}) elements)
-          actual (stats->map (set/stats-slice pss lo hi))
-          filtered (filter #(and (>= % lo) (<= % hi)) (distinct elements))
-          expected (compute-expected-stats filtered)]
-      (= actual expected))))
+                (let [[lo hi] (sort [from to])
+                      pss (into (set/sorted-set* {:stats stats-ops}) elements)
+                      actual (stats->map (set/stats-slice pss lo hi))
+                      filtered (filter #(and (>= % lo) (<= % hi)) (distinct elements))
+                      expected (compute-expected-stats filtered)]
+                  (= actual expected))))
 
 (defspec stats-after-modifications 100
   (prop/for-all [elements gen-elements
                  ops gen-operations]
-    (let [pss (into (set/sorted-set* {:stats stats-ops}) elements)
-          final-pss (reduce (fn [s [op val]]
-                              (case op
-                                :add (conj s val)
-                                :remove (disj s val)))
-                            pss ops)
-          actual (stats->map (set/stats final-pss))
+                (let [pss (into (set/sorted-set* {:stats stats-ops}) elements)
+                      final-pss (reduce (fn [s [op val]]
+                                          (case op
+                                            :add (conj s val)
+                                            :remove (disj s val)))
+                                        pss ops)
+                      actual (stats->map (set/stats final-pss))
           ;; Compute expected by applying ops to a regular set
-          final-set (reduce (fn [s [op val]]
-                              (case op
-                                :add (conj s val)
-                                :remove (disj s val)))
-                            (into #{} elements) ops)
-          expected (compute-expected-stats final-set)]
-      (= actual expected))))
+                      final-set (reduce (fn [s [op val]]
+                                          (case op
+                                            :add (conj s val)
+                                            :remove (disj s val)))
+                                        (into #{} elements) ops)
+                      expected (compute-expected-stats final-set)]
+                  (= actual expected))))
 
 (defspec stats-slice-after-modifications 100
   (prop/for-all [elements gen-elements
                  ops (gen/vector gen-operation 0 50)
                  from gen-int
                  to gen-int]
-    (let [[lo hi] (sort [from to])
-          pss (into (set/sorted-set* {:stats stats-ops}) elements)
-          final-pss (reduce (fn [s [op val]]
-                              (case op
-                                :add (conj s val)
-                                :remove (disj s val)))
-                            pss ops)
-          actual (stats->map (set/stats-slice final-pss lo hi))
+                (let [[lo hi] (sort [from to])
+                      pss (into (set/sorted-set* {:stats stats-ops}) elements)
+                      final-pss (reduce (fn [s [op val]]
+                                          (case op
+                                            :add (conj s val)
+                                            :remove (disj s val)))
+                                        pss ops)
+                      actual (stats->map (set/stats-slice final-pss lo hi))
           ;; Compute expected
-          final-set (reduce (fn [s [op val]]
-                              (case op
-                                :add (conj s val)
-                                :remove (disj s val)))
-                            (into #{} elements) ops)
-          filtered (filter #(and (>= % lo) (<= % hi)) final-set)
-          expected (compute-expected-stats filtered)]
-      (= actual expected))))
+                      final-set (reduce (fn [s [op val]]
+                                          (case op
+                                            :add (conj s val)
+                                            :remove (disj s val)))
+                                        (into #{} elements) ops)
+                      filtered (filter #(and (>= % lo) (<= % hi)) final-set)
+                      expected (compute-expected-stats filtered)]
+                  (= actual expected))))
 
 ;; =============================================================================
 ;; Run all specs (for manual testing)

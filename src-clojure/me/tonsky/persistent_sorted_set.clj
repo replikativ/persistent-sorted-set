@@ -155,9 +155,9 @@
                                   leaf))
          ->Branch             (fn [level ^objects children]
                                 (let [subtree-count (reduce + 0 (map #(if (instance? ISubtreeCount %)
-                                                                         (.subtreeCount ^ISubtreeCount %)
-                                                                         (.count ^ANode % nil))
-                                                                      children))
+                                                                        (.subtreeCount ^ISubtreeCount %)
+                                                                        (.count ^ANode % nil))
+                                                                     children))
                                       stats         (when stats-ops
                                                       (reduce (fn [acc ^ANode child]
                                                                 (let [child-stats (.-_stats child)]
@@ -167,14 +167,14 @@
                                                               (.identity stats-ops)
                                                               children))]
                                   (Branch.
-                                    (int level)
-                                    (int (count children))
-                                    ^objects (arrays/amap #(.maxKey ^ANode %) Object children)
-                                    nil
-                                    children
-                                    (long subtree-count)
-                                    stats
-                                    settings)))]
+                                   (int level)
+                                   (int (count children))
+                                   ^objects (arrays/amap #(.maxKey ^ANode %) Object children)
+                                   nil
+                                   children
+                                   (long subtree-count)
+                                   stats
+                                   settings)))]
      (loop [level 1
             nodes (mapv ->Leaf (split keys len Object avg-branching-factor max-branching-factor))]
        (case (count nodes)

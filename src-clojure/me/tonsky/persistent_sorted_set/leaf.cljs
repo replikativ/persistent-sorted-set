@@ -27,13 +27,13 @@
           (set! _stats result)
           result))
       (async
-        (when stats-ops
-          (let [result (reduce (fn [acc key]
-                                 (stats/merge-stats stats-ops acc (stats/extract stats-ops key)))
-                               (stats/identity-stats stats-ops)
-                               keys)]
-            (set! _stats result)
-            result)))))
+       (when stats-ops
+         (let [result (reduce (fn [acc key]
+                                (stats/merge-stats stats-ops acc (stats/extract stats-ops key)))
+                              (stats/identity-stats stats-ops)
+                              keys)]
+           (set! _stats result)
+           result)))))
   (merge [_ next]
     (let [new-leaf (Leaf. (arrays/aconcat keys (.-keys next)) settings nil)]
       ;; Stats will be recomputed lazily if needed

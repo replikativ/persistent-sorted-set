@@ -181,7 +181,7 @@
                                      right-addrs
                                      -1
                                      right-stats
-                                     (.-settings this))))))))))))))
+                                     (.-settings this))))))))))))
 
 (defn $remove
   [^Branch this storage key left right cmp {:keys [sync?] :or {sync? true} :as opts}]
@@ -238,12 +238,12 @@
                                          (if (.-_stats this)
                                            (stats/remove-stats stats-ops (.-_stats this) key
                                                                #(node/$compute-stats
-                                                                  (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this))
-                                                                  storage stats-ops {:sync? true}))
+                                                                 (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this))
+                                                                 storage stats-ops {:sync? true}))
                                            ;; Stats were never initialized, compute from scratch
                                            (node/$compute-stats
-                                             (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this))
-                                             storage stats-ops {:sync? true})))]
+                                            (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this))
+                                            storage stats-ops {:sync? true})))]
                          (util/rotate (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-stats (.-settings this))
                                       (and (nil? left) (nil? right))
                                       left
@@ -330,7 +330,7 @@
                                                     (aset na idx nil)
                                                     na))]
                                (aset new-children idx new-node)
-                               (arrays/array (Branch. (.-level this) keys new-children new-addrs settings))))))))))))))))
+                               (arrays/array (Branch. (.-level this) keys new-children new-addrs settings)))))))))))))
 
 (defn $store
   [^Branch this storage {:keys [sync?] :or {sync? true} :as opts}]
@@ -379,21 +379,21 @@
   ($stats [_] _stats)
   ($compute-stats [this storage stats-ops {:keys [sync?] :or {sync? true} :as opts}]
     (async+sync sync?
-      (async
-        (when stats-ops
-          (let [result (loop [i 0
-                              acc (stats/identity-stats stats-ops)]
-                         (if (< i (arrays/alength keys))
-                           (let [child (await ($child this storage i opts))
-                                 child-stats (or (node/$stats child)
-                                                 (await (node/$compute-stats child storage stats-ops opts)))]
-                             (recur (inc i)
-                                    (if child-stats
-                                      (stats/merge-stats stats-ops acc child-stats)
-                                      acc)))
-                           acc))]
-            (set! _stats result)
-            result)))))
+                (async
+                 (when stats-ops
+                   (let [result (loop [i 0
+                                       acc (stats/identity-stats stats-ops)]
+                                  (if (< i (arrays/alength keys))
+                                    (let [child (await ($child this storage i opts))
+                                          child-stats (or (node/$stats child)
+                                                          (await (node/$compute-stats child storage stats-ops opts)))]
+                                      (recur (inc i)
+                                             (if child-stats
+                                               (stats/merge-stats stats-ops acc child-stats)
+                                               acc)))
+                                    acc))]
+                     (set! _stats result)
+                     result)))))
   (merge [this next]
     (let [sc1 subtree-count
           sc2 (.-subtree-count next)
