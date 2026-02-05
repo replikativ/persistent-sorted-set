@@ -61,11 +61,9 @@
                       ;; Mark old root address as freed if it exists
                       (when (and (.-storage set) (.-address set))
                         (storage/markFreed (.-storage set) (.-address set)))
-                      ;; If count is unknown (-1), compute it first before incrementing
+                      ;; If count is unknown (-1), keep it unknown; will be computed lazily when needed
                       (let [current-cnt (.-cnt set)
-                            new-cnt (if (neg? current-cnt)
-                                      (inc (await ($count set opts)))
-                                      (inc current-cnt))]
+                            new-cnt (if (neg? current-cnt) -1 (inc current-cnt))]
                         (if (== (arrays/alength roots) 1)
                           (BTSet. (arrays/aget roots 0)
                                   new-cnt
@@ -113,7 +111,7 @@
                               UNINITIALIZED_HASH
                               (.-storage set)
                               nil
-                              (.-settings set))))))))
+                              (.-settings set)))))))))
 
 (defn $disjoin
   ([^BTSet set key]
@@ -138,11 +136,9 @@
                                               (== 1 (arrays/alength (.-children new-root))))
                                        (await (branch/$child new-root (.-storage set) 0 opts))
                                        new-root)
-                            ;; If count is unknown (-1), compute it first before decrementing
+                            ;; If count is unknown (-1), keep it unknown; will be computed lazily when needed
                             current-cnt (.-cnt set)
-                            new-cnt (if (neg? current-cnt)
-                                      (dec (await ($count set opts)))
-                                      (dec current-cnt))]
+                            new-cnt (if (neg? current-cnt) -1 (dec current-cnt))]
                         (BTSet. new-root
                                 new-cnt
                                 (.-comparator set)
