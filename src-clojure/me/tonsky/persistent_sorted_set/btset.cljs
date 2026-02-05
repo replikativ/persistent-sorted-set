@@ -7,6 +7,7 @@
             [me.tonsky.persistent-sorted-set.branch :as branch :refer [Branch]]
             [me.tonsky.persistent-sorted-set.leaf :as leaf :refer [Leaf]]
             [me.tonsky.persistent-sorted-set.impl.node :as node]
+            [me.tonsky.persistent-sorted-set.impl.stats :as stats]
             [me.tonsky.persistent-sorted-set.impl.storage :as storage]
             [me.tonsky.persistent-sorted-set.util :refer [rotate lookup-exact splice cut-n-splice binary-search-l binary-search-r return-array merge-n-split check-n-splice]]))
 
@@ -60,27 +61,32 @@
                       ;; Mark old root address as freed if it exists
                       (when (and (.-storage set) (.-address set))
                         (storage/markFreed (.-storage set) (.-address set)))
-                      (if (== (arrays/alength roots) 1)
-                        (BTSet. (arrays/aget roots 0)
-                                (inc (.-cnt set))
-                                (.-comparator set)
-                                (.-meta set)
-                                UNINITIALIZED_HASH
-                                (.-storage set)
-                                nil
-                                (.-settings set))
-                        (let [child0 (arrays/aget roots 0)
-                              lvl    (inc (node/level child0))
-                              ;; Compute subtree count as sum of children's counts
-                              subtree-count (reduce + 0 (map node/$subtree-count roots))]
-                          (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count (.-settings set))
-                                  (inc (.-cnt set))
+                      ;; If count is unknown (-1), compute it first before incrementing
+                      (let [current-cnt (.-cnt set)
+                            new-cnt (if (neg? current-cnt)
+                                      (inc (await ($count set opts)))
+                                      (inc current-cnt))]
+                        (if (== (arrays/alength roots) 1)
+                          (BTSet. (arrays/aget roots 0)
+                                  new-cnt
                                   (.-comparator set)
                                   (.-meta set)
                                   UNINITIALIZED_HASH
                                   (.-storage set)
                                   nil
-                                  (.-settings set)))))))))))
+                                  (.-settings set))
+                          (let [child0 (arrays/aget roots 0)
+                                lvl    (inc (node/level child0))
+                                ;; Compute subtree count as sum of children's counts
+                                subtree-count (reduce + 0 (map node/$subtree-count roots))]
+                            (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count nil (.-settings set))
+                                    new-cnt
+                                    (.-comparator set)
+                                    (.-meta set)
+                                    UNINITIALIZED_HASH
+                                    (.-storage set)
+                                    nil
+                                    (.-settings set))))))))))))
 
 (defn $replace
   ([^BTSet set old-key new-key]
@@ -107,7 +113,7 @@
                               UNINITIALIZED_HASH
                               (.-storage set)
                               nil
-                              (.-settings set))))))))))
+                              (.-settings set))))))))
 
 (defn $disjoin
   ([^BTSet set key]
@@ -131,15 +137,20 @@
                             new-root (if (and (instance? Branch new-root)
                                               (== 1 (arrays/alength (.-children new-root))))
                                        (await (branch/$child new-root (.-storage set) 0 opts))
-                                       new-root)]
+                                       new-root)
+                            ;; If count is unknown (-1), compute it first before decrementing
+                            current-cnt (.-cnt set)
+                            new-cnt (if (neg? current-cnt)
+                                      (dec (await ($count set opts)))
+                                      (dec current-cnt))]
                         (BTSet. new-root
-                                (dec (.-cnt set))
+                                new-cnt
                                 (.-comparator set)
                                 (.-meta set)
                                 UNINITIALIZED_HASH
                                 (.-storage set)
                                 nil
-                                (.-settings set))))))))))
+                                (.-settings set)))))))))
 
 (defn $store
   ([^BTSet set arg]
@@ -181,6 +192,18 @@
                  (if (some? result)
                    result
                    not-found)))))
+
+(defn $stats
+  "Get the aggregated statistics for the entire set."
+  [^BTSet set {:keys [sync?] :or {sync? true} :as opts}]
+  (async+sync sync?
+    (async
+      (let [root (await ($$root set opts))
+            stats-ops (:stats (.-settings set))]
+        (if (nil? stats-ops)
+          nil
+          (or (node/$stats root)
+              (await (node/$compute-stats root (.-storage set) stats-ops opts))))))))
 
 (defn restore
   [root-address-or-info storage opts]
@@ -1233,7 +1256,7 @@
   (-meta [_] meta)
 
   IEmptyableCollection
-  (-empty [_] (BTSet. (Leaf. (arrays/array) settings) 0 comparator meta UNINITIALIZED_HASH storage address settings))
+  (-empty [_] (BTSet. (Leaf. (arrays/array) settings nil) 0 comparator meta UNINITIALIZED_HASH storage address settings))
 
   IEquiv
   (-equiv [this other]
@@ -1358,26 +1381,42 @@
 
 (defn ^BTSet from-sorted-array
   [cmp arr _len opts]
-  (let [settings (select-keys opts [:branching-factor])
+  (let [settings (select-keys opts [:branching-factor :stats])
+        stats-ops (:stats settings)
         set      (BTSet. nil 0 cmp nil nil nil nil settings)
         leaves   (->> arr
                       (arr-partition-approx set)
-                      (arr-map-inplace #(Leaf. % settings)))
+                      (arr-map-inplace #(let [leaf (Leaf. % settings nil)]
+                                          ;; Compute stats for leaf if stats-ops available
+                                          (when stats-ops
+                                            (node/$compute-stats leaf nil stats-ops {:sync? true}))
+                                          leaf)))
         storage  (:storage opts)]
     (loop [current-level leaves
            shift 0]
       (case (count current-level)
-        0 (BTSet. (Leaf. (arrays/array) settings) 0 cmp nil UNINITIALIZED_HASH storage nil settings)
+        0 (BTSet. (Leaf. (arrays/array) settings nil) 0 cmp nil UNINITIALIZED_HASH storage nil settings)
         1 (BTSet. (first current-level) (arrays/alength arr) cmp nil UNINITIALIZED_HASH storage nil settings)
         (recur
          (->> current-level
               (arr-partition-approx set)
-              (arr-map-inplace #(let [subtree-count (reduce + 0 (map node/$subtree-count %))]
+              (arr-map-inplace #(let [subtree-count (reduce + 0 (map node/$subtree-count %))
+                                      ;; Compute stats from children if stats-ops available
+                                      stats-ops (:stats settings)
+                                      child-stats (when stats-ops
+                                                    (reduce (fn [acc child]
+                                                              (let [cs (node/$stats child)]
+                                                                (if cs
+                                                                  (stats/merge-stats stats-ops acc cs)
+                                                                  acc)))
+                                                            (stats/identity-stats stats-ops)
+                                                            %))]
                                   (Branch. (inc shift)
                                            (arrays/amap node/max-key %)
                                            %
                                            nil
                                            subtree-count
+                                           child-stats
                                            settings))))
          (inc shift))))))
 
@@ -1389,10 +1428,11 @@
   "Create a set with options map containing:
    - :storage  Storage implementation
    - :comparator  Custom comparator (defaults to compare)
+   - :stats    Statistics implementation (IStats protocol)
    - :meta     Metadata"
   [opts]
-  (let [settings (select-keys opts [:branching-factor])]
-    (BTSet. (Leaf. (arrays/array) settings) 0 (or (:comparator opts) compare)
+  (let [settings (select-keys opts [:branching-factor :stats])]
+    (BTSet. (Leaf. (arrays/array) settings nil) 0 (or (:comparator opts) compare)
             (:meta opts) UNINITIALIZED_HASH (:storage opts) nil settings)))
 
 (defn ^BTSet sorted-set-by

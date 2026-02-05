@@ -12,6 +12,8 @@
   ($count          [this storage opts])
   ($lookup         [this storage key cmp opts])
   ($subtree-count  [this])
+  ($stats          [this])
+  ($compute-stats  [this storage stats-ops opts])
   ($remove         [this storage key left right cmp opts])
   ($replace        [this storage old-key new-key cmp opts])
   ($store          [this storage opts])

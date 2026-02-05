@@ -235,3 +235,13 @@
   ([set xform from opts]
    (btset/$into set xform from opts)))
 
+(defn stats
+  "Get the aggregated statistics for the entire set.
+   Returns the stats object computed by the stats-ops provided when creating the set.
+   Returns nil if no stats-ops were provided or the set is empty.
+   Returns continuation yielding stats when {:sync? false}."
+  ([^btset/BTSet set]
+   (stats set {:sync? true}))
+  ([^btset/BTSet set opts]
+   (btset/$stats set opts)))
+

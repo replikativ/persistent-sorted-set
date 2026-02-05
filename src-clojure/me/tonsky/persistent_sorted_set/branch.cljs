@@ -4,6 +4,7 @@
             [is.simm.partial-cps.async :refer [await] :refer-macros [async]]
             [me.tonsky.persistent-sorted-set.arrays :as arrays]
             [me.tonsky.persistent-sorted-set.impl.node :as node :refer [INode]]
+            [me.tonsky.persistent-sorted-set.impl.stats :as stats]
             [me.tonsky.persistent-sorted-set.impl.storage :as storage]
             [me.tonsky.persistent-sorted-set.util :as util]))
 
@@ -128,10 +129,14 @@
                                      (when (and storage old-addr)
                                        (storage/markFreed storage old-addr))
                                      (util/splice addrs idx (inc idx) (arrays/array nil nil)))))
-                               ;; After adding one element, increment count if known
+                               ;; After adding one element, increment count if known, stats invalidated
                                old-sc (.-subtree-count this)
-                               new-sc (if (>= old-sc 0) (inc old-sc) -1)]
-                           (arrays/array (Branch. (.-level this) new-keys new-children new-addrs new-sc (.-settings this))))
+                               new-sc (if (>= old-sc 0) (inc old-sc) -1)
+                               ;; Update stats incrementally if available
+                               stats-ops (:stats (.-settings this))
+                               new-stats (when (and stats-ops (.-_stats this))
+                                           (stats/merge-stats stats-ops (.-_stats this) (stats/extract stats-ops key)))]
+                           (arrays/array (Branch. (.-level this) new-keys new-children new-addrs new-sc new-stats (.-settings this))))
                          (let [middle      (arrays/half (arrays/alength new-children))
                                tmp-addrs   (when addrs
                                              (let [old-addr (aget addrs idx)]
@@ -141,20 +146,22 @@
                                                (util/splice addrs idx (inc idx) (arrays/array nil nil))))
                                left-addrs  (when tmp-addrs (.slice tmp-addrs 0 middle))
                                right-addrs (when tmp-addrs (.slice tmp-addrs middle))]
-                           ;; When splitting, we don't know exact counts, use -1 for lazy computation
+                           ;; When splitting, we don't know exact counts or stats, use -1/nil for lazy computation
                            (arrays/array
                             (Branch. (.-level this)
                                      (.slice new-keys 0 middle)
                                      (.slice new-children 0 middle)
                                      left-addrs
                                      -1
+                                     nil
                                      (.-settings this))
                             (Branch. (.-level this)
                                      (.slice new-keys middle)
                                      (.slice new-children middle)
                                      right-addrs
                                      -1
-                                     (.-settings this)))))))))))))
+                                     nil
+                                     (.-settings this))))))))))))))
 
 (defn $remove
   [^Branch this storage key left right cmp {:keys [sync?] :or {sync? true} :as opts}]
@@ -204,8 +211,15 @@
                                            (util/splice addrs left-idx right-idx repl)))
                              ;; After removing one element, decrement count if known
                              old-sc (.-subtree-count this)
-                             new-sc (if (>= old-sc 0) (dec old-sc) -1)]
-                         (util/rotate (Branch. (.-level this) new-keys new-kids new-addrs new-sc (.-settings this))
+                             new-sc (if (>= old-sc 0) (dec old-sc) -1)
+                             ;; Update stats if available
+                             stats-ops (:stats (.-settings this))
+                             new-stats (when (and stats-ops (.-_stats this))
+                                         (stats/remove-stats stats-ops (.-_stats this) key
+                                                             #(node/$compute-stats
+                                                                (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this))
+                                                                storage stats-ops {:sync? true})))]
+                         (util/rotate (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-stats (.-settings this))
                                       (and (nil? left) (nil? right))
                                       left
                                       right
@@ -291,7 +305,7 @@
                                                     (aset na idx nil)
                                                     na))]
                                (aset new-children idx new-node)
-                               (arrays/array (Branch. (.-level this) keys new-children new-addrs settings))))))))))))))
+                               (arrays/array (Branch. (.-level this) keys new-children new-addrs settings)))))))))))))))
 
 (defn $store
   [^Branch this storage {:keys [sync?] :or {sync? true} :as opts}]
@@ -326,10 +340,10 @@
                        (recur (inc i)))))))))
 
 (defn ^Branch from-map
-  [{:keys [level keys addresses subtree-count settings]}]
-  (Branch. level keys nil addresses (or subtree-count -1) settings))
+  [{:keys [level keys addresses subtree-count stats settings]}]
+  (Branch. level keys nil addresses (or subtree-count -1) stats settings))
 
-(deftype Branch [^number level keys ^:mutable children ^:mutable addresses ^:mutable ^number subtree-count settings]
+(deftype Branch [^number level keys ^:mutable children ^:mutable addresses ^:mutable ^number subtree-count ^:mutable _stats settings]
   Object
   (toString [_] (pr-str* {:level level :keys (vec keys)}))
   INode
@@ -337,23 +351,60 @@
   (level [_] level)
   (max-key [_] (arrays/alast keys))
   ($subtree-count [_] subtree-count)
+  ($stats [_] _stats)
+  ($compute-stats [this storage stats-ops {:keys [sync?] :or {sync? true} :as opts}]
+    (async+sync sync?
+      (async
+        (when stats-ops
+          (let [result (loop [i 0
+                              acc (stats/identity-stats stats-ops)]
+                         (if (< i (arrays/alength keys))
+                           (let [child (await ($child this storage i opts))
+                                 child-stats (or (node/$stats child)
+                                                 (await (node/$compute-stats child storage stats-ops opts)))]
+                             (recur (inc i)
+                                    (if child-stats
+                                      (stats/merge-stats stats-ops acc child-stats)
+                                      acc)))
+                           acc))]
+            (set! _stats result)
+            result)))))
   (merge [this next]
     (let [sc1 subtree-count
           sc2 (.-subtree-count next)
-          new-sc (if (and (>= sc1 0) (>= sc2 0)) (+ sc1 sc2) -1)]
+          new-sc (if (and (>= sc1 0) (>= sc2 0)) (+ sc1 sc2) -1)
+          ;; Merge stats if both have them
+          new-stats (when (and _stats (.-_stats next))
+                      (when-let [stats-ops (:stats settings)]
+                        (stats/merge-stats stats-ops _stats (.-_stats next))))
+          ;; Ensure children arrays exist (may be arrays of nulls for lazy branches)
+          c1 (ensure-children this)
+          c2 (ensure-children next)
+          ;; Merge addresses too if present
+          new-addrs (when (or addresses (.-addresses next))
+                      (arrays/aconcat (or (ensure-addresses this) (arrays/make-array (arrays/alength keys)))
+                                      (or (ensure-addresses next) (arrays/make-array (arrays/alength (.-keys next))))))]
       (Branch. level
                (arrays/aconcat keys (.-keys next))
-               (arrays/aconcat children (.-children next))
-               nil
+               (arrays/aconcat c1 c2)
+               new-addrs
                new-sc
+               new-stats
                settings)))
   (merge-split [this next]
-    (let [ks (util/merge-n-split keys     (.-keys next))
-          ps (util/merge-n-split children (.-children next))]
-      ;; After split, we don't know exact counts, set to -1 for lazy computation
+    (let [;; Ensure children arrays exist
+          c1 (ensure-children this)
+          c2 (ensure-children next)
+          ks (util/merge-n-split keys (.-keys next))
+          ps (util/merge-n-split c1 c2)
+          ;; Also merge-split addresses if present
+          as (when (or addresses (.-addresses next))
+               (util/merge-n-split (or (ensure-addresses this) (arrays/make-array (arrays/alength keys)))
+                                   (or (ensure-addresses next) (arrays/make-array (arrays/alength (.-keys next))))))]
+      ;; After split, we don't know exact counts or stats, set to -1/nil for lazy computation
       (util/return-array
-       (Branch. level (arrays/aget ks 0) (arrays/aget ps 0) nil -1 settings)
-       (Branch. level (arrays/aget ks 1) (arrays/aget ps 1) nil -1 settings))))
+       (Branch. level (arrays/aget ks 0) (arrays/aget ps 0) (when as (arrays/aget as 0)) -1 nil settings)
+       (Branch. level (arrays/aget ks 1) (arrays/aget ps 1) (when as (arrays/aget as 1)) -1 nil settings))))
   ($add [this storage key cmp opts]
     ($add this storage key cmp opts))
   ($contains? [this storage key cmp opts]
