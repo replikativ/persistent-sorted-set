@@ -6,7 +6,7 @@ import java.util.function.*;
 import clojure.lang.*;
 
 @SuppressWarnings("unchecked")
-public class Branch<Key, Address> extends ANode<Key, Address> {
+public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtreeCount {
   // 1+ for Branches
   public final int _level;
 
@@ -19,6 +19,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
   // Object == ANode | SoftReference<ANode> | WeakReference<ANode>
   public Object[] _children;
 
+  // Total count of elements in this subtree. -1 means not yet computed.
+  // For lazy computation when restored from old storage format.
+  public long _subtreeCount;
+
   // For i in [0.._len):
   // 
   // 1. Not stored:       (_addresses == null || _addresses[i] == null) && _children[i] == ANode
@@ -26,23 +30,29 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
   // 3. Not restored yet:  _addresses[i] == Object && (_children == null || _children[i] == null)
 
   public Branch(int level, int len, Key[] keys, Address[] addresses, Object[] children, Settings settings) {
+    this(level, len, keys, addresses, children, -1, settings);
+  }
+
+  public Branch(int level, int len, Key[] keys, Address[] addresses, Object[] children, long subtreeCount, Settings settings) {
     super(len, keys, settings);
     assert level >= 1;
     assert addresses == null || addresses.length >= len : ("addresses = " + Arrays.toString(addresses) + ", len = " + len);
     assert children == null || children.length >= len;
 
-    _level     = level;
-    _addresses = addresses;
-    _children  = children;
+    _level        = level;
+    _addresses    = addresses;
+    _children     = children;
+    _subtreeCount = subtreeCount;
   }
 
   public Branch(int level, int len, Settings settings) {
     super(len, (Key[]) new Object[ANode.newLen(len, settings)], settings);
     assert level >= 1;
 
-    _level     = level;
-    _addresses = null;
-    _children  = null;
+    _level        = level;
+    _addresses    = null;
+    _children     = null;
+    _subtreeCount = -1;
   }
 
   public Branch(int level, List<Key> keys, List<Address> addresses, Settings settings) {
@@ -124,15 +134,69 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
 
   @Override
   public int count(IStorage storage) {
-    int count = 0;
-    for (int i = 0; i < _len; ++i) {
-      count += child(storage, i).count(storage);
+    if (_subtreeCount < 0) {
+      _subtreeCount = computeSubtreeCount(storage);
     }
-    return count;
+    return (int) _subtreeCount;
   }
 
   public int level() {
     return _level;
+  }
+
+  @Override
+  public long subtreeCount() {
+    return _subtreeCount;
+  }
+
+  /**
+   * Computes subtree count by summing children's counts.
+   * Used for lazy computation when restored from old storage without counts.
+   */
+  public long computeSubtreeCount(IStorage storage) {
+    long count = 0;
+    for (int i = 0; i < _len; ++i) {
+      ANode child = child(storage, i);
+      if (child instanceof ISubtreeCount) {
+        long childCount = ((ISubtreeCount) child).subtreeCount();
+        if (childCount < 0) {
+          // Child is a Branch with unknown count, compute recursively
+          childCount = ((Branch) child).computeSubtreeCount(storage);
+        }
+        count += childCount;
+      } else {
+        count += child.count(storage);
+      }
+    }
+    return count;
+  }
+
+  /**
+   * Helper to get subtree count from an ANode.
+   */
+  private static long getSubtreeCount(ANode node, IStorage storage) {
+    if (node instanceof ISubtreeCount) {
+      long count = ((ISubtreeCount) node).subtreeCount();
+      if (count >= 0) return count;
+      // Branch with unknown count - compute it
+      if (node instanceof Branch) {
+        return ((Branch) node).computeSubtreeCount(storage);
+      }
+    }
+    return node.count(storage);
+  }
+
+  /**
+   * Helper to compute subtree count from children array.
+   */
+  private static long sumChildCounts(Object[] children, int len, IStorage storage) {
+    long total = 0;
+    for (int i = 0; i < len; ++i) {
+      if (children[i] instanceof ANode) {
+        total += getSubtreeCount((ANode) children[i], storage);
+      }
+    }
+    return total;
   }
 
   protected Object[] ensureChildren() {
@@ -181,6 +245,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
         storage.markFreed(_addresses[ins]);
       }
       child(ins, node);
+      // Update subtree count: we added one element
+      if (_subtreeCount >= 0) _subtreeCount += 1;
       if (ins == _len - 1 && node.maxKey() == maxKey()) // TODO why maxKey check?
         return new ANode[]{ this }; // update maxKey
       else
@@ -213,7 +279,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
         newChildren[ins] = node;
       }
 
-      return new ANode[]{ new Branch(_level, _len, newKeys, newAddresses, newChildren, settings) };
+      // Subtree count = old count + 1 (added one element)
+      long newCount = _subtreeCount >= 0 ? _subtreeCount + 1 : sumChildCounts(newChildren, _len, storage);
+      return new ANode[]{ new Branch(_level, _len, newKeys, newAddresses, newChildren, newCount, settings) };
     }
 
     // len + 1
@@ -241,6 +309,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
         .copyOne(nodes[1])
         .copyAll(_children, ins + 1, _len);
 
+      // Subtree count = old count + 1 (added one element)
+      n._subtreeCount = _subtreeCount >= 0 ? _subtreeCount + 1 : sumChildCounts(n._children, n._len, storage);
       return new ANode[]{n};
     }
 
@@ -285,9 +355,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
         ArrayUtil.copy(_children, half1 - 1, _len, children2, 0);
       }
 
+      // Compute subtree counts for each half
+      long count1 = sumChildCounts(children1, half1, storage);
+      long count2 = children2 != null ? sumChildCounts(children2, half2, storage) : -1;
       return new ANode[] {
-        new Branch(_level, half1, keys1, addresses1, children1, settings),
-        new Branch(_level, half2, keys2, addresses2, children2, settings)
+        new Branch(_level, half1, keys1, addresses1, children1, count1, settings),
+        new Branch(_level, half2, keys2, addresses2, children2, count2, settings)
       };
     }
 
@@ -327,9 +400,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
       .copyOne(nodes[1])
       .copyAll(_children, ins + 1, _len);
 
+    // Compute subtree counts for each half
+    long count1 = children1 != null ? sumChildCounts(children1, half1, storage) : -1;
+    long count2 = sumChildCounts(children2, half2, storage);
     return new ANode[]{
-      new Branch(_level, half1, keys1, addresses1, children1, settings),
-      new Branch(_level, half2, keys2, addresses2, children2, settings)
+      new Branch(_level, half1, keys1, addresses1, children1, count1, settings),
+      new Branch(_level, half2, keys2, addresses2, children2, count2, settings)
     };
   }
 
@@ -415,6 +491,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
           cs.copyAll(_children, idx+2, _len);
 
         _len = newLen;
+        // Update subtree count: we removed one element
+        if (_subtreeCount >= 0) _subtreeCount -= 1;
         return PersistentSortedSet.EARLY_EXIT;
       }
 
@@ -444,6 +522,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
       if (nodes[2] != null) cs.copyOne(nodes[2]);
       cs.copyAll(_children, idx + 2, _len);
 
+      // Subtree count = old count - 1 (removed one element)
+      newCenter._subtreeCount = _subtreeCount >= 0 ? _subtreeCount - 1 : sumChildCounts(newCenter._children, newLen, storage);
       return new ANode[] { left, newCenter, right };
     }
 
@@ -478,6 +558,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
       if (nodes[2] != null) cs.copyOne(nodes[2]);
       cs.copyAll(_children, idx + 2, _len);
 
+      // Subtree count = left count + this count - 1 (joined and removed one element)
+      long leftCount = left._subtreeCount >= 0 ? left._subtreeCount : left.computeSubtreeCount(storage);
+      long thisCount = _subtreeCount >= 0 ? _subtreeCount : computeSubtreeCount(storage);
+      join._subtreeCount = leftCount + thisCount - 1;
       return new ANode[] { null, join, right };
     }
 
@@ -511,7 +595,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
       if (nodes[2] != null) cs.copyOne(nodes[2]);
       cs.copyAll(_children,     idx + 2, _len);
       cs.copyAll(right._children, 0, right._len);
-      
+
+      // Subtree count = this count + right count - 1 (joined and removed one element)
+      long thisCount = _subtreeCount >= 0 ? _subtreeCount : computeSubtreeCount(storage);
+      long rightCount = right._subtreeCount >= 0 ? right._subtreeCount : right.computeSubtreeCount(storage);
+      join._subtreeCount = thisCount + rightCount - 1;
       return new ANode[] { left, join, null };
     }
 
@@ -560,6 +648,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
       if (nodes[2] != null) cs.copyOne(nodes[2]);
       cs.copyAll(_children, idx + 2, _len);
 
+      // Compute subtree counts from children
+      if (newLeft._children != null) {
+        newLeft._subtreeCount = sumChildCounts(newLeft._children, newLeftLen, storage);
+      }
+      newCenter._subtreeCount = sumChildCounts(newCenter._children, newCenterLen, storage);
       return new ANode[] { newLeft, newCenter, right };
     }
 
@@ -609,6 +702,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> {
         ArrayUtil.copy(right._children, rightHead, right._len, newRight.ensureChildren(), 0);
       }
 
+      // Compute subtree counts from children
+      newCenter._subtreeCount = sumChildCounts(newCenter._children, newCenterLen, storage);
+      if (newRight._children != null) {
+        newRight._subtreeCount = sumChildCounts(newRight._children, newRightLen, storage);
+      }
       return new ANode[] { left, newCenter, newRight };
     }
 

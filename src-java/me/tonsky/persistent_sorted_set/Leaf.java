@@ -5,7 +5,7 @@ import java.util.function.*;
 import clojure.lang.*;
 
 @SuppressWarnings("unchecked")
-public class Leaf<Key, Address> extends ANode<Key, Address> {
+public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeCount {
   public Leaf(int len, Key[] keys, Settings settings) {
     super(len, keys, settings);
   }
@@ -25,6 +25,11 @@ public class Leaf<Key, Address> extends ANode<Key, Address> {
 
   @Override
   public int count(IStorage storage) {
+    return _len;
+  }
+
+  @Override
+  public long subtreeCount() {
     return _len;
   }
 

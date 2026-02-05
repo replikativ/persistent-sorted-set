@@ -322,6 +322,66 @@
        (is (thrown-with-msg? Exception #"iterating and mutating" (chunk-next seq)))
        (is (thrown-with-msg? Exception #"iterating and mutating" (.iterator ^Iterable seq))))))
 
+(deftest test-count-slice
+  (testing "count-slice on empty set"
+    (let [s (set/sorted-set)]
+      (is (= 0 (set/count-slice s nil nil)))
+      (is (= 0 (set/count-slice s 0 10)))))
+
+  (testing "count-slice single element"
+    (let [s (set/sorted-set 5)]
+      (is (= 1 (set/count-slice s nil nil)))
+      (is (= 1 (set/count-slice s 5 5)))
+      (is (= 1 (set/count-slice s 0 10)))
+      (is (= 0 (set/count-slice s 0 4)))
+      (is (= 0 (set/count-slice s 6 10)))))
+
+  (testing "count-slice 1 layer (leaf == root)"
+    (let [s (into (set/sorted-set) (range 11))]  ;; 0-10
+      (is (= 11 (set/count-slice s nil nil)))
+      (is (= 11 (set/count-slice s 0 10)))
+      (is (= 1 (set/count-slice s 5 5)))
+      (is (= 6 (set/count-slice s 0 5)))
+      (is (= 6 (set/count-slice s 5 10)))
+      (is (= 5 (set/count-slice s 3 7)))
+      ;; Out of range
+      (is (= 0 (set/count-slice s 20 30)))
+      (is (= 0 (set/count-slice s -10 -5)))))
+
+  (testing "count-slice 3 layers (large set)"
+    (let [s (into (set/sorted-set) (shuffle (range 5001)))]  ;; 0-5000
+      ;; Full range
+      (is (= 5001 (set/count-slice s nil nil)))
+      (is (= 5001 (set/count-slice s 0 5000)))
+      ;; Partial ranges
+      (is (= 1001 (set/count-slice s 0 1000)))
+      (is (= 1001 (set/count-slice s 4000 5000)))
+      (is (= 501 (set/count-slice s 2500 3000)))
+      ;; Single element
+      (is (= 1 (set/count-slice s 2500 2500)))
+      ;; Out of range
+      (is (= 0 (set/count-slice s 10000 20000)))
+      ;; nil boundaries
+      (is (= 1001 (set/count-slice s nil 1000)))
+      (is (= 1001 (set/count-slice s 4000 nil)))))
+
+  (testing "count-slice vs counting slice"
+    ;; Verify count-slice gives same result as counting the slice
+    (let [s (into (set/sorted-set) (shuffle (range 5001)))]
+      (doseq [[from to] [[0 1000] [1000 2000] [2500 2500] [nil 500] [4500 nil] [nil nil]]]
+        (let [slice-count (count (set/slice s from to))
+              fast-count (set/count-slice s from to)]
+          (is (= slice-count fast-count)
+              (str "Mismatch for range [" from ", " to "]: slice=" slice-count " count-slice=" fast-count))))))
+
+  (testing "count-slice with transients"
+    (let [s (-> (set/sorted-set)
+                transient
+                (conj! 1) (conj! 2) (conj! 3) (conj! 4) (conj! 5)
+                persistent!)]
+      (is (= 5 (set/count-slice s nil nil)))
+      (is (= 3 (set/count-slice s 2 4))))))
+
 (deftest seek-for-seq-test
   (let [size 1000
         set (apply set/sorted-set (range size))

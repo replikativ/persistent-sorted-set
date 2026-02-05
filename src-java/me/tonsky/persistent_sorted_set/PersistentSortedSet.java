@@ -65,6 +65,17 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     return _count < 0 ? _count : _count + delta;
   }
 
+  /**
+   * Helper to get subtree count from an ANode.
+   */
+  private static long getSubtreeCount(ANode node) {
+    if (node instanceof ISubtreeCount) {
+      return ((ISubtreeCount) node).subtreeCount();
+    }
+    // Fallback - shouldn't happen with proper implementation
+    return -1;
+  }
+
   public boolean editable() {
     return _settings.editable();
   }
@@ -157,6 +168,100 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
         }
       }
     }
+  }
+
+  /**
+   * Count elements in the range [from, to] inclusive.
+   * Uses O(log n) algorithm when subtree counts are available.
+   * If from is null, counts from the beginning.
+   * If to is null, counts to the end.
+   */
+  public long countSlice(Key from, Key to) {
+    return countSlice(from, to, _cmp);
+  }
+
+  public long countSlice(Key from, Key to, Comparator<Key> cmp) {
+    if (from != null && to != null && cmp.compare(from, to) > 0) {
+      return 0; // Empty range
+    }
+    ANode<Key, Address> node = root();
+    if (node.len() == 0) {
+      return 0;
+    }
+    return countSliceNode(node, from, to, cmp);
+  }
+
+  /**
+   * Recursive helper for countSlice.
+   */
+  private long countSliceNode(ANode<Key, Address> node, Key from, Key to, Comparator<Key> cmp) {
+    if (node instanceof Leaf) {
+      return countSliceLeaf((Leaf<Key, Address>) node, from, to, cmp);
+    }
+    return countSliceBranch((Branch<Key, Address>) node, from, to, cmp);
+  }
+
+  private long countSliceLeaf(Leaf<Key, Address> leaf, Key from, Key to, Comparator<Key> cmp) {
+    int fromIdx = 0;
+    int toIdx = leaf._len - 1;
+
+    if (from != null) {
+      fromIdx = leaf.searchFirst(from, cmp);
+      if (fromIdx >= leaf._len) return 0;
+    }
+
+    if (to != null) {
+      toIdx = leaf.searchLast(to, cmp);
+      if (toIdx < 0) return 0;
+    }
+
+    return Math.max(0, toIdx - fromIdx + 1);
+  }
+
+  private long countSliceBranch(Branch<Key, Address> branch, Key from, Key to, Comparator<Key> cmp) {
+    int fromIdx = 0;
+    int toIdx = branch._len - 1;
+
+    // Find the first child that could contain 'from'
+    if (from != null) {
+      fromIdx = branch.searchFirst(from, cmp);
+      if (fromIdx >= branch._len) fromIdx = branch._len - 1;
+    }
+
+    // Find the last child that could contain 'to'
+    if (to != null) {
+      toIdx = branch.searchLast(to, cmp) + 1;
+      if (toIdx >= branch._len) toIdx = branch._len - 1;
+      if (toIdx < 0) toIdx = 0;
+    }
+
+    // If same child, recurse into it
+    if (fromIdx == toIdx) {
+      return countSliceNode(branch.child(_storage, fromIdx), from, to, cmp);
+    }
+
+    long count = 0;
+
+    // Count partial from the first child
+    count += countSliceNode(branch.child(_storage, fromIdx), from, null, cmp);
+
+    // Count fully contained children in between
+    for (int i = fromIdx + 1; i < toIdx; i++) {
+      ANode<Key, Address> child = branch.child(_storage, i);
+      if (child instanceof ISubtreeCount) {
+        long childCount = ((ISubtreeCount) child).subtreeCount();
+        if (childCount >= 0) {
+          count += childCount;
+          continue;
+        }
+      }
+      count += child.count(_storage);
+    }
+
+    // Count partial in the last child
+    count += countSliceNode(branch.child(_storage, toIdx), null, to, cmp);
+
+    return count;
   }
 
   public void walkAddresses(IFn onAddress) {
@@ -263,7 +368,9 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
         _root = nodes[0];
       } else if (2 == nodes.length) {
         Object[] keys = new Object[] {nodes[0].maxKey(), nodes[1].maxKey()};
-        _root = new Branch(nodes[0].level() + 1, 2, keys, null, new Object[] {nodes[0], nodes[1]}, _settings);
+        // Compute subtree count for new root = sum of both children's counts
+        long subtreeCount = getSubtreeCount(nodes[0]) + getSubtreeCount(nodes[1]);
+        _root = new Branch(nodes[0].level() + 1, 2, keys, null, new Object[] {nodes[0], nodes[1]}, subtreeCount, _settings);
       }
       // EARLY_EXIT case (nodes.length == 0): tree was modified in place, _address already cleared above
       _count = alterCount(1);
@@ -276,8 +383,9 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
 
     Object[] keys = new Object[] {nodes[0].maxKey(), nodes[1].maxKey()};
     Object[] children = Arrays.copyOf(nodes, nodes.length, new Object[0].getClass());
-
-    ANode newRoot = new Branch(nodes[0].level() + 1, 2, keys, null, children, _settings);
+    // Compute subtree count for new root = sum of both children's counts
+    long subtreeCount = getSubtreeCount(nodes[0]) + getSubtreeCount(nodes[1]);
+    ANode newRoot = new Branch(nodes[0].level() + 1, 2, keys, null, children, subtreeCount, _settings);
     return new PersistentSortedSet(_meta, _cmp, null, _storage, newRoot, alterCount(1), _settings, _version + 1);
   }
 
