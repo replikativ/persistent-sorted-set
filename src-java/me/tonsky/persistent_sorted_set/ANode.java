@@ -15,13 +15,40 @@ public abstract class ANode<Key, Address> {
 
   public final Settings _settings;
 
+  // Optional statistics for the subtree rooted at this node.
+  // Null if stats are not configured in settings.
+  public Object _stats;
+
   public ANode(int len, Key[] keys, Settings settings) {
     assert keys.length >= len;
 
     _len   = len;
     _keys  = keys;
     _settings  = settings;
+    _stats = null;
   }
+
+  public ANode(int len, Key[] keys, Object stats, Settings settings) {
+    assert keys.length >= len;
+
+    _len   = len;
+    _keys  = keys;
+    _settings  = settings;
+    _stats = stats;
+  }
+
+  /**
+   * Get the stats for this node. May be null if stats not configured.
+   */
+  public Object stats() {
+    return _stats;
+  }
+
+  /**
+   * Compute stats from this node's keys (for Leaf) or children's stats (for Branch).
+   * Returns null if stats not configured in settings.
+   */
+  public abstract Object computeStats(IStorage storage);
 
   public int len() {
     return _len;

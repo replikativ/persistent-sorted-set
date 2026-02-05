@@ -45,6 +45,18 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     _subtreeCount = subtreeCount;
   }
 
+  public Branch(int level, int len, Key[] keys, Address[] addresses, Object[] children, long subtreeCount, Object stats, Settings settings) {
+    super(len, keys, stats, settings);
+    assert level >= 1;
+    assert addresses == null || addresses.length >= len : ("addresses = " + Arrays.toString(addresses) + ", len = " + len);
+    assert children == null || children.length >= len;
+
+    _level        = level;
+    _addresses    = addresses;
+    _children     = children;
+    _subtreeCount = subtreeCount;
+  }
+
   public Branch(int level, int len, Settings settings) {
     super(len, (Key[]) new Object[ANode.newLen(len, settings)], settings);
     assert level >= 1;
@@ -135,7 +147,13 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   @Override
   public int count(IStorage storage) {
     if (_subtreeCount < 0) {
-      _subtreeCount = computeSubtreeCount(storage);
+      long computed = computeSubtreeCount(storage);
+      // Only cache in transient mode where node is exclusive
+      // In persistent mode, shared nodes would get stale cached values
+      if (_settings.editable()) {
+        _subtreeCount = computed;
+      }
+      return (int) computed;
     }
     return (int) _subtreeCount;
   }
@@ -171,6 +189,25 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     return count;
   }
 
+  @Override
+  public Object computeStats(IStorage storage) {
+    IStats statsOps = _settings.stats();
+    if (statsOps == null) return null;
+
+    Object result = statsOps.identity();
+    for (int i = 0; i < _len; i++) {
+      ANode child = child(storage, i);
+      Object childStats = child.stats();
+      if (childStats == null) {
+        childStats = child.computeStats(storage);
+      }
+      if (childStats != null) {
+        result = statsOps.merge(result, childStats);
+      }
+    }
+    return result;
+  }
+
   /**
    * Helper to get subtree count from an ANode.
    */
@@ -188,15 +225,49 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
   /**
    * Helper to compute subtree count from children array.
+   * Handles direct ANode references, Reference-wrapped nodes, and unloaded children (null with address).
    */
-  private static long sumChildCounts(Object[] children, int len, IStorage storage) {
+  private static long sumChildCounts(Object[] children, Object[] addresses, int len, IStorage storage, Settings settings) {
     long total = 0;
     for (int i = 0; i < len; ++i) {
-      if (children[i] instanceof ANode) {
-        total += getSubtreeCount((ANode) children[i], storage);
+      Object raw = children != null ? children[i] : null;
+      ANode node = null;
+      if (raw instanceof ANode) {
+        node = (ANode) raw;
+      } else if (raw != null && settings != null) {
+        // Could be a Reference (SoftReference/WeakReference)
+        node = (ANode) settings.readReference(raw);
+      }
+      // If child is not loaded yet but has an address, load it from storage
+      if (node == null && addresses != null && addresses[i] != null && storage != null) {
+        node = storage.restore(addresses[i]);
+      }
+      if (node != null) {
+        total += getSubtreeCount(node, storage);
       }
     }
     return total;
+  }
+
+  /**
+   * Helper to compute stats from children array.
+   */
+  private static Object computeStatsFromChildren(Object[] children, int len, IStorage storage, IStats statsOps) {
+    if (statsOps == null) return null;
+    Object result = statsOps.identity();
+    for (int i = 0; i < len; ++i) {
+      if (children[i] instanceof ANode) {
+        ANode child = (ANode) children[i];
+        Object childStats = child.stats();
+        if (childStats == null) {
+          childStats = child.computeStats(storage);
+        }
+        if (childStats != null) {
+          result = statsOps.merge(result, childStats);
+        }
+      }
+    }
+    return result;
   }
 
   protected Object[] ensureChildren() {
@@ -233,9 +304,13 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     }
 
     if (PersistentSortedSet.EARLY_EXIT == nodes) { // child signalling nothing to update
+      // Still need to update count - we added one element
+      if (_subtreeCount >= 0) _subtreeCount += 1;
       return PersistentSortedSet.EARLY_EXIT;
     }
-    
+
+    IStats statsOps = _settings.stats();
+
     // same len, editable
     if (1 == nodes.length && editable()) {
       ANode<Key, Address> node = nodes[0];
@@ -243,6 +318,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       child(ins, node);
       // Update subtree count: we added one element
       if (_subtreeCount >= 0) _subtreeCount += 1;
+      // Update stats: recompute from children
+      if (statsOps != null) {
+        _stats = computeStats(storage);
+      }
       if (ins == _len - 1 && node.maxKey() == maxKey()) // TODO why maxKey check?
         return new ANode[]{ this }; // update maxKey
       else
@@ -276,8 +355,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       }
 
       // Subtree count = old count + 1 (added one element)
-      long newCount = _subtreeCount >= 0 ? _subtreeCount + 1 : sumChildCounts(newChildren, _len, storage);
-      return new ANode[]{ new Branch(_level, _len, newKeys, newAddresses, newChildren, newCount, settings) };
+      // When old count is unknown (-1), leave new count unknown to preserve lazy loading
+      long newCount = _subtreeCount >= 0 ? _subtreeCount + 1 : -1;
+      Object newStats = computeStatsFromChildren(newChildren, _len, storage, statsOps);
+      return new ANode[]{ new Branch(_level, _len, newKeys, newAddresses, newChildren, newCount, newStats, settings) };
     }
 
     // len + 1
@@ -306,7 +387,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         .copyAll(_children, ins + 1, _len);
 
       // Subtree count = old count + 1 (added one element)
-      n._subtreeCount = _subtreeCount >= 0 ? _subtreeCount + 1 : sumChildCounts(n._children, n._len, storage);
+      // When old count is unknown (-1), leave new count unknown to preserve lazy loading
+      n._subtreeCount = _subtreeCount >= 0 ? _subtreeCount + 1 : -1;
+      n._stats = computeStatsFromChildren(n._children, n._len, storage, statsOps);
       return new ANode[]{n};
     }
 
@@ -351,12 +434,15 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         ArrayUtil.copy(_children, half1 - 1, _len, children2, 0);
       }
 
-      // Compute subtree counts for each half
-      long count1 = sumChildCounts(children1, half1, storage);
-      long count2 = children2 != null ? sumChildCounts(children2, half2, storage) : -1;
+      // For splits, set subtree counts to -1 (unknown) to preserve lazy loading
+      // They will be computed on demand by computeSubtreeCount()
+      long count1 = -1;
+      long count2 = -1;
+      Object stats1 = computeStatsFromChildren(children1, half1, storage, statsOps);
+      Object stats2 = children2 != null ? computeStatsFromChildren(children2, half2, storage, statsOps) : null;
       return new ANode[] {
-        new Branch(_level, half1, keys1, addresses1, children1, count1, settings),
-        new Branch(_level, half2, keys2, addresses2, children2, count2, settings)
+        new Branch(_level, half1, keys1, addresses1, children1, count1, stats1, settings),
+        new Branch(_level, half2, keys2, addresses2, children2, count2, stats2, settings)
       };
     }
 
@@ -396,12 +482,15 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       .copyOne(nodes[1])
       .copyAll(_children, ins + 1, _len);
 
-    // Compute subtree counts for each half
-    long count1 = children1 != null ? sumChildCounts(children1, half1, storage) : -1;
-    long count2 = sumChildCounts(children2, half2, storage);
+    // For splits, set subtree counts to -1 (unknown) to preserve lazy loading
+    // They will be computed on demand by computeSubtreeCount()
+    long count1 = -1;
+    long count2 = -1;
+    Object stats1 = children1 != null ? computeStatsFromChildren(children1, half1, storage, statsOps) : null;
+    Object stats2 = computeStatsFromChildren(children2, half2, storage, statsOps);
     return new ANode[]{
-      new Branch(_level, half1, keys1, addresses1, children1, count1, settings),
-      new Branch(_level, half2, keys2, addresses2, children2, count2, settings)
+      new Branch(_level, half1, keys1, addresses1, children1, count1, stats1, settings),
+      new Branch(_level, half2, keys2, addresses2, children2, count2, stats2, settings)
     };
   }
 
@@ -428,11 +517,15 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       return PersistentSortedSet.UNCHANGED;
 
     if (PersistentSortedSet.EARLY_EXIT == nodes) { // child signalling nothing to update
+      // Still need to update count - we removed one element
+      if (_subtreeCount >= 0) _subtreeCount -= 1;
       return PersistentSortedSet.EARLY_EXIT;
     }
 
     boolean leftChanged = leftChild != nodes[0] || leftChildLen != safeLen(nodes[0]);
     boolean rightChanged = rightChild != nodes[2] || rightChildLen != safeLen(nodes[2]);
+
+    IStats statsOps = _settings.stats();
 
     // nodes[1] always not nil
     int newLen = _len - 1
@@ -473,6 +566,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         _len = newLen;
         // Update subtree count: we removed one element
         if (_subtreeCount >= 0) _subtreeCount -= 1;
+        // Update stats: recompute from children
+        if (statsOps != null) {
+          _stats = computeStats(storage);
+        }
         return PersistentSortedSet.EARLY_EXIT;
       }
 
@@ -503,7 +600,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       cs.copyAll(_children, idx + 2, _len);
 
       // Subtree count = old count - 1 (removed one element)
-      newCenter._subtreeCount = _subtreeCount >= 0 ? _subtreeCount - 1 : sumChildCounts(newCenter._children, newLen, storage);
+      // When old count is unknown (-1), leave new count unknown to preserve lazy loading
+      newCenter._subtreeCount = _subtreeCount >= 0 ? _subtreeCount - 1 : -1;
+      newCenter._stats = computeStatsFromChildren(newCenter._children, newLen, storage, statsOps);
       return new ANode[] { left, newCenter, right };
     }
 
@@ -542,6 +641,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       long leftCount = left._subtreeCount >= 0 ? left._subtreeCount : left.computeSubtreeCount(storage);
       long thisCount = _subtreeCount >= 0 ? _subtreeCount : computeSubtreeCount(storage);
       join._subtreeCount = leftCount + thisCount - 1;
+      join._stats = computeStatsFromChildren(join._children, left._len + newLen, storage, statsOps);
       return new ANode[] { null, join, right };
     }
 
@@ -580,6 +680,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       long thisCount = _subtreeCount >= 0 ? _subtreeCount : computeSubtreeCount(storage);
       long rightCount = right._subtreeCount >= 0 ? right._subtreeCount : right.computeSubtreeCount(storage);
       join._subtreeCount = thisCount + rightCount - 1;
+      join._stats = computeStatsFromChildren(join._children, newLen + right._len, storage, statsOps);
       return new ANode[] { left, join, null };
     }
 
@@ -628,11 +729,14 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (nodes[2] != null) cs.copyOne(nodes[2]);
       cs.copyAll(_children, idx + 2, _len);
 
-      // Compute subtree counts from children
+      // For rebalancing, set subtree counts to -1 (unknown) to preserve lazy loading
+      // They will be computed on demand by computeSubtreeCount()
       if (newLeft._children != null) {
-        newLeft._subtreeCount = sumChildCounts(newLeft._children, newLeftLen, storage);
+        newLeft._subtreeCount = -1;
+        newLeft._stats = computeStatsFromChildren(newLeft._children, newLeftLen, storage, statsOps);
       }
-      newCenter._subtreeCount = sumChildCounts(newCenter._children, newCenterLen, storage);
+      newCenter._subtreeCount = -1;
+      newCenter._stats = computeStatsFromChildren(newCenter._children, newCenterLen, storage, statsOps);
       return new ANode[] { newLeft, newCenter, right };
     }
 
@@ -682,10 +786,13 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         ArrayUtil.copy(right._children, rightHead, right._len, newRight.ensureChildren(), 0);
       }
 
-      // Compute subtree counts from children
-      newCenter._subtreeCount = sumChildCounts(newCenter._children, newCenterLen, storage);
+      // For rebalancing, set subtree counts to -1 (unknown) to preserve lazy loading
+      // They will be computed on demand by computeSubtreeCount()
+      newCenter._subtreeCount = -1;
+      newCenter._stats = computeStatsFromChildren(newCenter._children, newCenterLen, storage, statsOps);
       if (newRight._children != null) {
-        newRight._subtreeCount = sumChildCounts(newRight._children, newRightLen, storage);
+        newRight._subtreeCount = -1;
+        newRight._stats = computeStatsFromChildren(newRight._children, newRightLen, storage, statsOps);
       }
       return new ANode[] { left, newCenter, newRight };
     }
