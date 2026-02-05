@@ -70,8 +70,10 @@
                                 nil
                                 (.-settings set))
                         (let [child0 (arrays/aget roots 0)
-                              lvl    (inc (node/level child0))]
-                          (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil (.-settings set))
+                              lvl    (inc (node/level child0))
+                              ;; Compute subtree count as sum of children's counts
+                              subtree-count (reduce + 0 (map node/$subtree-count roots))]
+                          (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count (.-settings set))
                                   (inc (.-cnt set))
                                   (.-comparator set)
                                   (.-meta set)
@@ -105,7 +107,7 @@
                               UNINITIALIZED_HASH
                               (.-storage set)
                               nil
-                              (.-settings set)))))))))
+                              (.-settings set))))))))))
 
 (defn $disjoin
   ([^BTSet set key]
@@ -772,6 +774,91 @@
                   idx        (path-get set start-path 0)]
               (AsyncReverseSeq. set left-bound start-path ks idx)))))))))
 
+(defn- count-slice-leaf
+  "Count elements in range [from, to] within a leaf node."
+  [leaf from to cmp]
+  (let [keys (.-keys leaf)
+        len  (arrays/alength keys)
+        from-idx (if from
+                   (binary-search-l cmp keys (dec len) from)
+                   0)
+        to-idx   (if to
+                   (binary-search-r cmp keys (dec len) to)
+                   len)]
+    (if (or (>= from-idx len) (<= to-idx 0))
+      0
+      (max 0 (- (min to-idx len) (max from-idx 0))))))
+
+(defn- $count-slice-node
+  "Recursively count elements in range [from, to] within a node."
+  [node storage from to cmp {:keys [sync?] :or {sync? true} :as opts}]
+  (async+sync sync?
+    (async
+      (if (instance? Leaf node)
+        (count-slice-leaf node from to cmp)
+        ;; Branch node
+        (let [keys (.-keys node)
+              len  (arrays/alength keys)
+              from-idx (if from
+                         (let [idx (binary-search-l cmp keys (- len 2) from)]
+                           (min idx (dec len)))
+                         0)
+              to-idx   (if to
+                         (let [idx (binary-search-r cmp keys (- len 2) to)]
+                           (min idx (dec len)))
+                         (dec len))]
+          (cond
+            ;; Empty range
+            (> from-idx to-idx)
+            0
+
+            ;; Same child, recurse into it
+            (== from-idx to-idx)
+            (let [child (await (branch/$child node storage from-idx opts))]
+              (await ($count-slice-node child storage from to cmp opts)))
+
+            ;; Spans multiple children
+            :else
+            (let [;; Count partial from first child
+                  first-child (await (branch/$child node storage from-idx opts))
+                  first-count (await ($count-slice-node first-child storage from nil cmp opts))
+                  ;; Count partial in last child
+                  last-child  (await (branch/$child node storage to-idx opts))
+                  last-count  (await ($count-slice-node last-child storage nil to cmp opts))
+                  ;; Count fully contained children in between
+                  middle-count (loop [i (inc from-idx)
+                                      acc 0]
+                                 (if (>= i to-idx)
+                                   acc
+                                   (let [child (await (branch/$child node storage i opts))
+                                         child-count (node/$subtree-count child)
+                                         cnt (if (>= child-count 0)
+                                               child-count
+                                               (await (node/$count child storage opts)))]
+                                     (recur (inc i) (+ acc cnt)))))]
+              (+ first-count middle-count last-count))))))))
+
+(defn $count-slice
+  "Count elements in the range [from, to] inclusive.
+   Uses O(log n) algorithm when subtree counts are available.
+   If from is nil, counts from the beginning.
+   If to is nil, counts to the end."
+  ([^BTSet set from to]
+   ($count-slice set from to (.-comparator set) {:sync? true}))
+  ([^BTSet set from to arg]
+   (if (fn? arg)
+     ($count-slice set from to arg {:sync? true})
+     ($count-slice set from to (.-comparator set) arg)))
+  ([^BTSet set from to cmp {:keys [sync?] :or {sync? true} :as opts}]
+   (async+sync sync?
+     (async
+       (if (and from to (pos? (cmp from to)))
+         0 ;; Empty range
+         (let [root (await ($$root set opts))]
+           (if (zero? (node/len root))
+             0
+             (await ($count-slice-node root (.-storage set) from to cmp opts)))))))))
+
 (defn $equivalent?
   [^BTSet set other {:keys [sync?] :or {sync? true} :as opts}]
   (if sync?
@@ -1285,11 +1372,13 @@
         (recur
          (->> current-level
               (arr-partition-approx set)
-              (arr-map-inplace #(Branch. (inc shift)
-                                         (arrays/amap node/max-key %)
-                                         %
-                                         nil
-                                         settings)))
+              (arr-map-inplace #(let [subtree-count (reduce + 0 (map node/$subtree-count %))]
+                                  (Branch. (inc shift)
+                                           (arrays/amap node/max-key %)
+                                           %
+                                           nil
+                                           subtree-count
+                                           settings))))
          (inc shift))))))
 
 (defn ^BTSet from-sequential [cmp seq opts]

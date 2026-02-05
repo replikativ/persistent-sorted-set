@@ -127,8 +127,11 @@
                                      ;; Mark old child address as freed before clearing
                                      (when (and storage old-addr)
                                        (storage/markFreed storage old-addr))
-                                     (util/splice addrs idx (inc idx) (arrays/array nil nil)))))]
-                           (arrays/array (Branch. (.-level this) new-keys new-children new-addrs (.-settings this))))
+                                     (util/splice addrs idx (inc idx) (arrays/array nil nil)))))
+                               ;; After adding one element, increment count if known
+                               old-sc (.-subtree-count this)
+                               new-sc (if (>= old-sc 0) (inc old-sc) -1)]
+                           (arrays/array (Branch. (.-level this) new-keys new-children new-addrs new-sc (.-settings this))))
                          (let [middle      (arrays/half (arrays/alength new-children))
                                tmp-addrs   (when addrs
                                              (let [old-addr (aget addrs idx)]
@@ -138,17 +141,20 @@
                                                (util/splice addrs idx (inc idx) (arrays/array nil nil))))
                                left-addrs  (when tmp-addrs (.slice tmp-addrs 0 middle))
                                right-addrs (when tmp-addrs (.slice tmp-addrs middle))]
+                           ;; When splitting, we don't know exact counts, use -1 for lazy computation
                            (arrays/array
                             (Branch. (.-level this)
                                      (.slice new-keys 0 middle)
                                      (.slice new-children 0 middle)
                                      left-addrs
+                                     -1
                                      (.-settings this))
                             (Branch. (.-level this)
                                      (.slice new-keys middle)
                                      (.slice new-children middle)
                                      right-addrs
-                                     (.-settings this))))))))))))
+                                     -1
+                                     (.-settings this)))))))))))))
 
 (defn $remove
   [^Branch this storage key left right cmp {:keys [sync?] :or {sync? true} :as opts}]
@@ -195,8 +201,11 @@
                                              (aset repl 0 laddr))
                                            (when right-unchanged
                                              (aset repl (dec alen) raddr))
-                                           (util/splice addrs left-idx right-idx repl)))]
-                         (util/rotate (Branch. (.-level this) new-keys new-kids new-addrs (.-settings this))
+                                           (util/splice addrs left-idx right-idx repl)))
+                             ;; After removing one element, decrement count if known
+                             old-sc (.-subtree-count this)
+                             new-sc (if (>= old-sc 0) (dec old-sc) -1)]
+                         (util/rotate (Branch. (.-level this) new-keys new-kids new-addrs new-sc (.-settings this))
                                       (and (nil? left) (nil? right))
                                       left
                                       right
@@ -282,7 +291,7 @@
                                                     (aset na idx nil)
                                                     na))]
                                (aset new-children idx new-node)
-                               (arrays/array (Branch. (.-level this) keys new-children new-addrs settings)))))))))))))
+                               (arrays/array (Branch. (.-level this) keys new-children new-addrs settings))))))))))))))
 
 (defn $store
   [^Branch this storage {:keys [sync?] :or {sync? true} :as opts}]
@@ -317,28 +326,34 @@
                        (recur (inc i)))))))))
 
 (defn ^Branch from-map
-  [{:keys [level keys addresses settings]}]
-  (Branch. level keys nil addresses settings))
+  [{:keys [level keys addresses subtree-count settings]}]
+  (Branch. level keys nil addresses (or subtree-count -1) settings))
 
-(deftype Branch [^number level keys ^:mutable children ^:mutable addresses settings]
+(deftype Branch [^number level keys ^:mutable children ^:mutable addresses ^:mutable ^number subtree-count settings]
   Object
   (toString [_] (pr-str* {:level level :keys (vec keys)}))
   INode
   (len [_] (arrays/alength keys))
   (level [_] level)
   (max-key [_] (arrays/alast keys))
+  ($subtree-count [_] subtree-count)
   (merge [this next]
-    (Branch. level
-             (arrays/aconcat keys (.-keys next))
-             (arrays/aconcat children (.-children next))
-             nil
-             settings))
+    (let [sc1 subtree-count
+          sc2 (.-subtree-count next)
+          new-sc (if (and (>= sc1 0) (>= sc2 0)) (+ sc1 sc2) -1)]
+      (Branch. level
+               (arrays/aconcat keys (.-keys next))
+               (arrays/aconcat children (.-children next))
+               nil
+               new-sc
+               settings)))
   (merge-split [this next]
     (let [ks (util/merge-n-split keys     (.-keys next))
           ps (util/merge-n-split children (.-children next))]
+      ;; After split, we don't know exact counts, set to -1 for lazy computation
       (util/return-array
-       (Branch. level (arrays/aget ks 0) (arrays/aget ps 0) nil settings)
-       (Branch. level (arrays/aget ks 1) (arrays/aget ps 1) nil settings))))
+       (Branch. level (arrays/aget ks 0) (arrays/aget ps 0) nil -1 settings)
+       (Branch. level (arrays/aget ks 1) (arrays/aget ps 1) nil -1 settings))))
   ($add [this storage key cmp opts]
     ($add this storage key cmp opts))
   ($contains? [this storage key cmp opts]

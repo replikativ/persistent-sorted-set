@@ -145,6 +145,21 @@
   ([^BTSet set key-from key-to cmp opts]
    (btset/$rslice set key-from key-to cmp opts)))
 
+(defn count-slice
+  "Count elements in the range [from, to] inclusive.
+   Uses O(log n) algorithm when subtree counts are available.
+   If from is nil, counts from the beginning.
+   If to is nil, counts to the end.
+   Optionally pass in comparator that will override the one that set uses.
+   Returns number by default.
+   Returns continuation yielding number when {:sync? false}."
+  ([^BTSet set from to]
+   (btset/$count-slice set from to))
+  ([^BTSet set from to arg]
+   (btset/$count-slice set from to arg))
+  ([^BTSet set from to cmp opts]
+   (btset/$count-slice set from to cmp opts)))
+
 (defn seek
   "An efficient way to seek to a specific key in a seq (either returned by [[clojure.core.seq]] or a slice.)
    `(seek (seq set) to)` returns iterator for all Xs where to <= X.

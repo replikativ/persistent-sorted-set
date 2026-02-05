@@ -14,6 +14,7 @@
   (len [_] (arrays/alength keys))
   (level [_] 0)
   (max-key [_] (arrays/alast keys))
+  ($subtree-count [_] (arrays/alength keys))
   (merge [_ next] (Leaf. (arrays/aconcat keys (.-keys next)) settings))
   (merge-split [_ next]
     (let [ks (util/merge-n-split keys (.-keys next))]
