@@ -10,6 +10,10 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     super(len, keys, settings);
   }
 
+  public Leaf(int len, Key[] keys, Object stats, Settings settings) {
+    super(len, keys, stats, settings);
+  }
+
   public Leaf(int len, Settings settings) {
     super(len, (Key[]) new Object[ANode.newLen(len, settings)], settings);
   }
@@ -21,6 +25,18 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
   @Override
   public int level() {
     return 0;
+  }
+
+  @Override
+  public Object computeStats(IStorage storage) {
+    IStats statsOps = _settings.stats();
+    if (statsOps == null) return null;
+
+    Object result = statsOps.identity();
+    for (int i = 0; i < _len; i++) {
+      result = statsOps.merge(result, statsOps.extract(_keys[i]));
+    }
+    return result;
   }
 
   @Override
@@ -47,27 +63,38 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     int ins = -idx - 1;
     assert 0 <= ins && ins <= _len;
 
+    IStats statsOps = _settings.stats();
+
     // can modify array in place
     if (editable() && _len < _keys.length) {
       if (ins == _len) {
         _keys[_len] = key;
         _len += 1;
+        // Update stats incrementally
+        if (statsOps != null && _stats != null) {
+          _stats = statsOps.merge(_stats, statsOps.extract(key));
+        }
         return new ANode[]{this}; // maxKey needs updating
       } else {
         ArrayUtil.copy(_keys, ins, _len, _keys, ins+1);
         _keys[ins] = key;
         _len += 1;
+        // Update stats incrementally
+        if (statsOps != null && _stats != null) {
+          _stats = statsOps.merge(_stats, statsOps.extract(key));
+        }
         return PersistentSortedSet.EARLY_EXIT;
       }
     }
 
     // simply adding to array
     if (_len < _settings.branchingFactor()) {
-      ANode n = new Leaf(_len + 1, settings);
+      Leaf n = new Leaf(_len + 1, settings);
       new Stitch(n._keys, 0)
         .copyAll(_keys, 0, ins)
         .copyOne(key)
         .copyAll(_keys, ins, _len);
+      n._stats = n.computeStats(storage);
       return new ANode[]{n};
     }
 
@@ -84,6 +111,8 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         .copyOne(key)
         .copyAll(_keys, ins, half1 - 1);
       ArrayUtil.copy(_keys, half1 - 1, _len, n2._keys, 0);
+      n1._stats = n1.computeStats(storage);
+      n2._stats = n2.computeStats(storage);
       return new ANode[]{n1, n2};
     }
 
@@ -95,6 +124,8 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       .copyAll(_keys, half1, ins)
       .copyOne(key)
       .copyAll(_keys, ins, _len);
+    n1._stats = n1.computeStats(storage);
+    n2._stats = n2.computeStats(storage);
     return new ANode[]{n1, n2};
   }
 
@@ -108,6 +139,8 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       return PersistentSortedSet.UNCHANGED;
 
     int newLen = _len - 1;
+    IStats statsOps = _settings.stats();
+    final Leaf thisLeaf = this;
 
     // nothing to merge
     if (newLen >= _settings.minBranchingFactor() || (left == null && right == null)) {
@@ -116,6 +149,10 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       if (editable()) {
         ArrayUtil.copy(_keys, idx + 1, _len, _keys, idx);
         _len = newLen;
+        // Update stats using remove operation
+        if (statsOps != null && _stats != null) {
+          _stats = statsOps.remove(_stats, key, () -> thisLeaf.computeStats(storage));
+        }
         if (idx == newLen) // removed last, need to signal new maxKey
           return new ANode[]{left, this, right};
         return PersistentSortedSet.EARLY_EXIT;
@@ -126,6 +163,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       new Stitch(center._keys, 0)
         .copyAll(_keys, 0, idx)
         .copyAll(_keys, idx + 1, _len);
+      center._stats = center.computeStats(storage);
       return new ANode[] { left, center, right };
     }
 
@@ -136,6 +174,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         .copyAll(left._keys, 0,       left._len)
         .copyAll(_keys,      0,       idx)
         .copyAll(_keys,      idx + 1, _len);
+      join._stats = join.computeStats(storage);
       return new ANode[] { null, join, right };
     }
 
@@ -146,6 +185,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         .copyAll(_keys,       0,       idx)
         .copyAll(_keys,       idx + 1, _len)
         .copyAll(right._keys, 0,       right._len);
+      join._stats = join.computeStats(storage);
       return new ANode[]{ left, join, null };
     }
 
@@ -165,21 +205,31 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         ArrayUtil.copy(_keys,      0,          idx,      _keys, leftTail);
         ArrayUtil.copy(left._keys, newLeftLen, left._len, _keys, 0);
         _len = newCenterLen;
+        // Recompute stats since we borrowed from left
+        if (statsOps != null) {
+          newCenter._stats = newCenter.computeStats(storage);
+        }
       } else {
         newCenter = new Leaf(newCenterLen, settings);
         new Stitch(newCenter._keys, 0)
           .copyAll(left._keys, newLeftLen, left._len)
           .copyAll(_keys,      0,          idx)
           .copyAll(_keys,      idx+1,      _len);
+        newCenter._stats = newCenter.computeStats(storage);
       }
 
       // shrink left
       if (left.editable()) {
         newLeft  = left;
         left._len = newLeftLen;
+        // Recompute stats for shrunk left
+        if (statsOps != null) {
+          newLeft._stats = newLeft.computeStats(storage);
+        }
       } else {
         newLeft = new Leaf(newLeftLen, settings);
         ArrayUtil.copy(left._keys, 0, newLeftLen, newLeft._keys, 0);
+        newLeft._stats = newLeft.computeStats(storage);
       }
 
       return new ANode[]{ newLeft, newCenter, right };
@@ -201,12 +251,17 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
           .copyAll(_keys,       idx + 1, _len)
           .copyAll(right._keys, 0,       rightHead);
         _len = newCenterLen;
+        // Recompute stats since we borrowed from right
+        if (statsOps != null) {
+          newCenter._stats = newCenter.computeStats(storage);
+        }
       } else {
         newCenter = new Leaf(newCenterLen, settings);
         new Stitch(newCenter._keys, 0)
           .copyAll(_keys,       0,       idx)
           .copyAll(_keys,       idx + 1, _len)
           .copyAll(right._keys, 0,       rightHead);
+        newCenter._stats = newCenter.computeStats(storage);
       }
 
       // cut head from right
@@ -214,9 +269,14 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         newRight = right;
         ArrayUtil.copy(right._keys, rightHead, right._len, right._keys, 0);
         right._len = newRightLen;
+        // Recompute stats for shrunk right
+        if (statsOps != null) {
+          newRight._stats = newRight.computeStats(storage);
+        }
       } else {
         newRight = new Leaf(newRightLen, settings);
         ArrayUtil.copy(right._keys, rightHead, right._len, newRight._keys, 0);
+        newRight._stats = newRight.computeStats(storage);
       }
 
       return new ANode[]{ left, newCenter, newRight };

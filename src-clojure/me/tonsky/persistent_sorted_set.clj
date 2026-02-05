@@ -9,7 +9,7 @@
    [java.lang.ref SoftReference]
    [java.util Comparator Arrays]
    [java.util.function BiConsumer]
-   [me.tonsky.persistent_sorted_set ANode ArrayUtil Branch IStorage ISubtreeCount Leaf PersistentSortedSet RefType Settings Seq]))
+   [me.tonsky.persistent_sorted_set ANode ArrayUtil Branch IStats IStorage ISubtreeCount Leaf PersistentSortedSet RefType Settings Seq]))
 
 (set! *warn-on-reflection* true)
 
@@ -125,14 +125,16 @@
      :strong RefType/STRONG
      :soft   RefType/SOFT
      :weak   RefType/WEAK
-     nil)))
+     nil)
+   (:stats m)))
 
 (defn- settings->map [^Settings s]
   {:branching-factor (.branchingFactor s)
    :ref-type         (condp identical? (.refType s)
                        RefType/STRONG :strong
                        RefType/SOFT   :soft
-                       RefType/WEAK   :weak)})
+                       RefType/WEAK   :weak)
+   :stats            ^IStats (.stats s)})
 
 (defn from-sorted-array
   "Fast path to create a set if you already have a sorted array of elements on your hands."
@@ -145,31 +147,34 @@
          max-branching-factor (.branchingFactor settings)
          avg-branching-factor (-> (.minBranchingFactor settings) (+ max-branching-factor) (quot 2))
          storage              (:storage opts)
+         ^IStats stats-ops    (.stats settings)
          ->Leaf               (fn [keys]
-                                (Leaf. (count keys) keys settings))
+                                (let [^Leaf leaf (Leaf. (count keys) ^objects keys settings)]
+                                  (when stats-ops
+                                    (set! (.-_stats leaf) (.computeStats leaf nil)))
+                                  leaf))
          ->Branch             (fn [level ^objects children]
-<<<<<<< HEAD
-                                (Branch.
-                                 level
-                                 (count children)
-                                 ^objects (arrays/amap #(.maxKey ^ANode %) Object children)
-                                 nil
-                                 children
-                                 settings))]
-=======
                                 (let [subtree-count (reduce + 0 (map #(if (instance? ISubtreeCount %)
                                                                          (.subtreeCount ^ISubtreeCount %)
                                                                          (.count ^ANode % nil))
-                                                                      children))]
+                                                                      children))
+                                      stats         (when stats-ops
+                                                      (reduce (fn [acc ^ANode child]
+                                                                (let [child-stats (.-_stats child)]
+                                                                  (if child-stats
+                                                                    (.merge stats-ops acc child-stats)
+                                                                    acc)))
+                                                              (.identity stats-ops)
+                                                              children))]
                                   (Branch.
-                                    level
-                                    (count children)
+                                    (int level)
+                                    (int (count children))
                                     ^objects (arrays/amap #(.maxKey ^ANode %) Object children)
                                     nil
                                     children
                                     (long subtree-count)
+                                    stats
                                     settings)))]
->>>>>>> feeda45 (Add subtree counts for O(1) count() and O(log n) count-slice)
      (loop [level 1
             nodes (mapv ->Leaf (split keys len Object avg-branching-factor max-branching-factor))]
        (case (count nodes)

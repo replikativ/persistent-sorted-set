@@ -3,26 +3,33 @@ package me.tonsky.persistent_sorted_set;
 import java.lang.ref.*;
 import java.util.concurrent.atomic.*;
 
+@SuppressWarnings("rawtypes")
 public class Settings {
   public final int _branchingFactor;
   public final RefType _refType;
   public final AtomicBoolean _edit;
+  public final IStats _stats;
 
-  public Settings(int branchingFactor, RefType refType, AtomicBoolean edit) {
+  public Settings(int branchingFactor, RefType refType, AtomicBoolean edit, IStats stats) {
     _branchingFactor = branchingFactor;
     _refType = refType;
     _edit = edit;
+    _stats = stats;
   }
 
   public Settings() {
-    this(0, null);
+    this(0, null, null);
   }
 
   public Settings(int branchingFactor) {
-    this(branchingFactor, null);
+    this(branchingFactor, null, null);
   }
 
   public Settings(int branchingFactor, RefType refType) {
+    this(branchingFactor, refType, null);
+  }
+
+  public Settings(int branchingFactor, RefType refType, IStats stats) {
     if (branchingFactor <= 0) {
       branchingFactor = 512;
     }
@@ -32,6 +39,7 @@ public class Settings {
     _branchingFactor = branchingFactor;
     _refType = refType;
     _edit = null;
+    _stats = stats;
   }
 
   public int minBranchingFactor() {
@@ -57,7 +65,11 @@ public class Settings {
   public Settings editable(boolean value) {
     assert !editable();
     assert value == true;
-    return new Settings(_branchingFactor, _refType, new AtomicBoolean(value));
+    return new Settings(_branchingFactor, _refType, new AtomicBoolean(value), _stats);
+  }
+
+  public IStats stats() {
+    return _stats;
   }
 
   public void persistent() {
