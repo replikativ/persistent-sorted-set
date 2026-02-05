@@ -10,3 +10,9 @@ node_modules
 .shadow-cljs
 .cpcache
 .gemini/.env
+
+.calva/
+.clj-kondo/
+.cljs_node_repl/
+.internal/
+.lsp/

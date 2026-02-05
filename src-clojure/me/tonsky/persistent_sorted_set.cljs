@@ -235,3 +235,17 @@
   ([^btset/BTSet set opts]
    (btset/$stats set opts)))
 
+(defn stats-slice
+  "Compute stats for elements in the range [from, to] inclusive.
+   Uses O(log n + k) algorithm where k is keys in boundary leaves.
+   If from is nil, computes from the beginning.
+   If to is nil, computes to the end.
+   Returns nil if no stats-ops configured.
+   Returns continuation yielding stats when {:sync? false}."
+  ([set from to]
+   (btset/$stats-slice set from to))
+  ([set from to cmp]
+   (btset/$stats-slice set from to cmp))
+  ([set from to cmp opts]
+   (btset/$stats-slice set from to cmp opts)))
+

@@ -219,3 +219,88 @@
 
 (defn settings [^PersistentSortedSet set]
   (settings->map (.-_settings set)))
+
+(defn stats
+  "Get the aggregated statistics for the entire set.
+   Returns the stats object computed by the stats-ops provided when creating the set.
+   Returns nil if no stats-ops were provided."
+  [^PersistentSortedSet set]
+  (let [^ANode root (.-_root set)
+        settings (.-_settings set)
+        stats-ops (.stats settings)]
+    (when stats-ops
+      (or (.-_stats root)
+          (.computeStats root (.-_storage set))))))
+
+(defn- stats-slice-node
+  [^ANode node ^IStorage storage ^IStats stats-ops from to ^java.util.Comparator cmp]
+  (if (instance? Leaf node)
+    ;; Leaf: iterate keys in range
+    (let [^Leaf leaf node
+          keys (.-_keys leaf)
+          len (.-_len leaf)]
+      (loop [i 0
+             acc (.identity stats-ops)]
+        (if (>= i len)
+          acc
+          (let [key (aget ^objects keys i)
+                in-range? (and (or (nil? from) (>= (.compare cmp key from) 0))
+                               (or (nil? to) (<= (.compare cmp key to) 0)))]
+            (recur (inc i)
+                   (if in-range?
+                     (.merge stats-ops acc (.extract stats-ops key))
+                     acc))))))
+    ;; Branch: recurse
+    (let [^Branch branch node
+          len (int (.-_len branch))
+          from-idx (int (if from
+                          (let [idx (.searchFirst branch from cmp)]
+                            (if (>= idx len) (dec len) idx))
+                          0))
+          to-idx (int (if to
+                        (let [idx (inc (.searchLast branch to cmp))]
+                          (min (max idx 0) (dec len)))
+                        (dec len)))]
+      (cond
+        (> from-idx to-idx)
+        (.identity stats-ops)
+
+        (== from-idx to-idx)
+        (let [child (.child branch storage from-idx)]
+          (stats-slice-node child storage stats-ops from to cmp))
+
+        :else
+        (let [first-child (.child branch storage from-idx)
+              first-stats (stats-slice-node first-child storage stats-ops from nil cmp)
+              last-child (.child branch storage to-idx)
+              last-stats (stats-slice-node last-child storage stats-ops nil to cmp)
+              middle-stats (loop [i (int (inc from-idx))
+                                  acc (.identity stats-ops)]
+                             (if (>= i to-idx)
+                               acc
+                               (let [^ANode child (.child branch storage i)
+                                     child-stats (or (.-_stats child)
+                                                     (.computeStats child storage))]
+                                 (recur (inc i)
+                                        (.merge stats-ops acc child-stats)))))]
+          (.merge stats-ops
+                  (.merge stats-ops first-stats middle-stats)
+                  last-stats))))))
+
+(defn stats-slice
+  "Compute stats for elements in the range [from, to] inclusive.
+   Uses O(log n + k) algorithm where k is keys in boundary leaves.
+   If from is nil, computes from the beginning.
+   If to is nil, computes to the end.
+   Returns nil if no stats-ops configured."
+  [^PersistentSortedSet set from to]
+  (let [^ANode root (.-_root set)
+        settings (.-_settings set)
+        stats-ops (.stats settings)
+        ^Comparator cmp (.comparator set)]
+    (when stats-ops
+      (if (and from to (pos? (.compare cmp from to)))
+        (.identity stats-ops)
+        (if (zero? (.count root (.-_storage set)))
+          (.identity stats-ops)
+          (stats-slice-node root (.-_storage set) stats-ops from to cmp))))))

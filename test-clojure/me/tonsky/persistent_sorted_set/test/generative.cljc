@@ -13,7 +13,9 @@
     [clojure.test.check.clojure-test :refer [defspec] #?@(:cljs [:include-macros true])]
     [me.tonsky.persistent-sorted-set :as set]
     #?(:clj [me.tonsky.persistent-sorted-set.test.storage :as storage])
-    #?(:cljs [me.tonsky.persistent-sorted-set.test.storage.util :as storage-util])))
+    #?(:cljs [me.tonsky.persistent-sorted-set.test.storage.util :as storage-util])
+    #?(:cljs [me.tonsky.persistent-sorted-set.impl.numeric-stats :as numeric-stats]))
+  #?(:clj (:import [me.tonsky.persistent_sorted_set NumericStats NumericStatsOps])))
 
 ;; =============================================================================
 ;; Cross-platform helpers
@@ -352,6 +354,102 @@
           rslice-result (vec (set/rslice lazy-pss hi lo))
           expected (vec (reverse (filter #(and (>= % lo) (<= % hi)) (sort (distinct elements)))))]
       (= rslice-result expected))))
+
+;; =============================================================================
+;; Stats helpers
+;; =============================================================================
+
+(def stats-ops
+  "Cross-platform numeric stats operations"
+  #?(:clj  (NumericStatsOps.)
+     :cljs numeric-stats/numeric-stats-ops))
+
+(defn compute-expected-stats
+  "Compute expected stats from a collection of numbers"
+  [coll]
+  (if (empty? coll)
+    {:cnt 0 :sum 0.0 :min-val nil :max-val nil}
+    {:cnt (count coll)
+     :sum (double (reduce + coll))
+     :min-val (apply min coll)
+     :max-val (apply max coll)}))
+
+(defn stats->map
+  "Convert stats object to comparable map"
+  [s]
+  (if (nil? s)
+    {:cnt 0 :sum 0.0 :min-val nil :max-val nil}
+    #?(:clj  {:cnt (.-count ^NumericStats s)
+              :sum (.-sum ^NumericStats s)
+              :min-val (.-min ^NumericStats s)
+              :max-val (.-max ^NumericStats s)}
+       :cljs {:cnt (:cnt s) :sum (double (:sum s)) :min-val (:min-val s) :max-val (:max-val s)})))
+
+;; =============================================================================
+;; Stats tests
+;; =============================================================================
+
+(defspec stats-matches-expected 100
+  (prop/for-all [elements (gen/no-shrink gen-elements)]
+    (let [pss (into (set/sorted-set* {:stats stats-ops}) elements)
+          actual (stats->map (set/stats pss))
+          expected (compute-expected-stats (distinct elements))]
+      (when-not (= actual expected)
+        (println "MISMATCH: actual=" actual "expected=" expected))
+      (= actual expected))))
+
+(defspec stats-slice-matches-filter 100
+  (prop/for-all [elements gen-elements
+                 from gen-int
+                 to gen-int]
+    (let [[lo hi] (sort [from to])
+          pss (into (set/sorted-set* {:stats stats-ops}) elements)
+          actual (stats->map (set/stats-slice pss lo hi))
+          filtered (filter #(and (>= % lo) (<= % hi)) (distinct elements))
+          expected (compute-expected-stats filtered)]
+      (= actual expected))))
+
+(defspec stats-after-modifications 100
+  (prop/for-all [elements gen-elements
+                 ops gen-operations]
+    (let [pss (into (set/sorted-set* {:stats stats-ops}) elements)
+          final-pss (reduce (fn [s [op val]]
+                              (case op
+                                :add (conj s val)
+                                :remove (disj s val)))
+                            pss ops)
+          actual (stats->map (set/stats final-pss))
+          ;; Compute expected by applying ops to a regular set
+          final-set (reduce (fn [s [op val]]
+                              (case op
+                                :add (conj s val)
+                                :remove (disj s val)))
+                            (into #{} elements) ops)
+          expected (compute-expected-stats final-set)]
+      (= actual expected))))
+
+(defspec stats-slice-after-modifications 100
+  (prop/for-all [elements gen-elements
+                 ops (gen/vector gen-operation 0 50)
+                 from gen-int
+                 to gen-int]
+    (let [[lo hi] (sort [from to])
+          pss (into (set/sorted-set* {:stats stats-ops}) elements)
+          final-pss (reduce (fn [s [op val]]
+                              (case op
+                                :add (conj s val)
+                                :remove (disj s val)))
+                            pss ops)
+          actual (stats->map (set/stats-slice final-pss lo hi))
+          ;; Compute expected
+          final-set (reduce (fn [s [op val]]
+                              (case op
+                                :add (conj s val)
+                                :remove (disj s val)))
+                            (into #{} elements) ops)
+          filtered (filter #(and (>= % lo) (<= % hi)) final-set)
+          expected (compute-expected-stats filtered)]
+      (= actual expected))))
 
 ;; =============================================================================
 ;; Run all specs (for manual testing)

@@ -183,6 +183,155 @@ See [test_storage.clj](test-clojure/me/tonsky/persistent_sorted_set/test_storage
 
 Durability for ClojureScript is not yet supported.
 
+## Efficient Range Counting
+
+Count elements in a range without iterating through them:
+
+```clj
+(def s (into (set/sorted-set) (range 10000)))
+
+;; Count elements in [1000, 2000]
+(set/count-slice s 1000 2000)
+;=> 1001
+
+;; Count from beginning to 500
+(set/count-slice s nil 500)
+;=> 501
+
+;; Count from 9000 to end
+(set/count-slice s 9000 nil)
+;=> 1000
+
+;; Use custom comparator
+(set/count-slice s 1000 2000 my-comparator)
+```
+
+This uses O(log n) traversal by leveraging subtree counts stored in branch nodes.
+
+## Aggregate Statistics
+
+PersistentSortedSet can maintain aggregate statistics that update incrementally as elements are added or removed. This enables O(log n) queries for sum, count, min, max, variance, etc. over any range.
+
+### Using Built-in Numeric Statistics
+
+```clj
+(import '[me.tonsky.persistent_sorted_set NumericStatsOps])
+
+;; Create set with numeric stats tracking
+(def s (into (set/sorted-set* {:stats (NumericStatsOps.)})
+             [1 2 3 4 5]))
+
+;; Get stats for entire set
+(set/stats s)
+;=> NumericStats{count=5, sum=15.0, min=1, max=5, ...}
+
+;; Get stats for a range [2, 4]
+(set/stats-slice s 2 4)
+;=> NumericStats{count=3, sum=9.0, min=2, max=4, ...}
+```
+
+The `NumericStats` object provides `count`, `sum`, `sumSq`, `min`, `max`, plus derived `mean()`, `variance()`, and `stdDev()` methods.
+
+### Implementing Custom Statistics
+
+Statistics must form a **monoid** - they need an identity element and an associative merge operation. Implement the `IStats` interface:
+
+```java
+public interface IStats<Key, S> {
+    // Identity element: merge(identity, x) == x
+    S identity();
+
+    // Extract stats from a single key
+    S extract(Key key);
+
+    // Associative merge: merge(a, merge(b, c)) == merge(merge(a, b), c)
+    S merge(S s1, S s2);
+
+    // Remove a key's contribution (see below)
+    S remove(S current, Key key, Supplier<S> recompute);
+}
+```
+
+**Example: Counting distinct categories**
+
+```java
+public class CategoryStats implements IStats<Item, Map<String, Long>> {
+    public Map<String, Long> identity() {
+        return Collections.emptyMap();
+    }
+
+    public Map<String, Long> extract(Item item) {
+        return Map.of(item.category(), 1L);
+    }
+
+    public Map<String, Long> merge(Map<String, Long> a, Map<String, Long> b) {
+        Map<String, Long> result = new HashMap<>(a);
+        b.forEach((k, v) -> result.merge(k, v, Long::sum));
+        return result;
+    }
+
+    public Map<String, Long> remove(Map<String, Long> current, Item item,
+                                     Supplier<Map<String, Long>> recompute) {
+        // For invertible stats, compute directly
+        Map<String, Long> result = new HashMap<>(current);
+        result.computeIfPresent(item.category(), (k, v) -> v > 1 ? v - 1 : null);
+        return result;
+    }
+}
+```
+
+### Handling Non-Invertible Statistics
+
+Some statistics like `min` and `max` can't be updated incrementally when removing elements - if you remove the minimum, you need to scan to find the new one. The `remove` method receives a `recompute` supplier for this:
+
+```java
+public S remove(S current, Key key, Supplier<S> recompute) {
+    if (affectsResult(current, key)) {
+        // Can't compute incrementally, recompute from children
+        return recompute.get();
+    }
+    // Safe to compute incrementally
+    return subtractKey(current, key);
+}
+```
+
+The built-in `NumericStatsOps` handles this automatically for min/max.
+
+### ClojureScript Statistics
+
+For ClojureScript, implement the `IStats` protocol from `me.tonsky.persistent-sorted-set.impl.stats`:
+
+```cljs
+(require '[me.tonsky.persistent-sorted-set :as set])
+(require '[me.tonsky.persistent-sorted-set.impl.stats :as stats])
+(require '[me.tonsky.persistent-sorted-set.impl.numeric-stats :as numeric-stats])
+
+;; Use built-in numeric stats
+(def s (into (set/sorted-set* {:stats numeric-stats/numeric-stats-ops})
+             [1 2 3 4 5]))
+
+;; Or implement custom stats via the IStats protocol
+(defrecord MyStats [count sum])
+
+(def my-stats-ops
+  (reify stats/IStats
+    (identity-stats [_]
+      (->MyStats 0 0))
+
+    (extract [_ key]
+      (->MyStats 1 key))
+
+    (merge-stats [_ s1 s2]
+      (->MyStats (+ (:count s1) (:count s2))
+                 (+ (:sum s1) (:sum s2))))
+
+    (remove-stats [_ current key recompute-fn]
+      (->MyStats (dec (:count current))
+                 (- (:sum current) key)))))
+
+(def s (into (set/sorted-set* {:stats my-stats-ops}) [1 2 3 4 5]))
+```
+
 ## Performance
 
 To reproduce:
