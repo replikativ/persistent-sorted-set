@@ -10,6 +10,7 @@
   ($add            [this storage key cmp opts])
   ($contains?      [this storage key cmp opts])
   ($count          [this storage opts])
+  ($subtree-count  [this])
   ($remove         [this storage key left right cmp opts])
   ($store          [this storage opts])
   ($walk-addresses [this storage on-address opts]))

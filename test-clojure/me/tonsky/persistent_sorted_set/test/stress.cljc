@@ -51,9 +51,10 @@
                        (and
                         (if-not (is (= (vec set1) (vec xs-rm)))
                           (do
-                            (set! (.-set0 js/window) set0)
-                            (set! (.-rm js/window) rm)
-                            (set! (.-xs-rm js/window) xs-rm)
+                            #?(:cljs (do
+                                       (set! (.-set0 js/window) set0)
+                                       (set! (.-rm js/window) rm)
+                                       (set! (.-xs-rm js/window) xs-rm)))
                             false)
                           true)
                         (is (= (count set1) (count xs-rm)))
