@@ -97,7 +97,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         .copyOne(key)
         .copyAll(_keys, ins, _len);
       n._stats = n.computeStats(storage);
-      return new ANode[]{n};
+      return processLeafNodes(new ANode[]{n}, storage, settings);
     }
 
     // splitting
@@ -115,7 +115,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       ArrayUtil.copy(_keys, half1 - 1, _len, n2._keys, 0);
       n1._stats = n1.computeStats(storage);
       n2._stats = n2.computeStats(storage);
-      return new ANode[]{n1, n2};
+      return processLeafNodes(new ANode[]{n1, n2}, storage, settings);
     }
 
     // copy first, insert to second
@@ -128,7 +128,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       .copyAll(_keys, ins, _len);
     n1._stats = n1.computeStats(storage);
     n2._stats = n2.computeStats(storage);
-    return new ANode[]{n1, n2};
+    return processLeafNodes(new ANode[]{n1, n2}, storage, settings);
   }
 
   @Override
@@ -171,7 +171,18 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         .copyAll(_keys, 0, idx)
         .copyAll(_keys, idx + 1, _len);
       center._stats = center.computeStats(storage);
-      return new ANode[] { left, center, right };
+
+      // Process the center leaf (may split into multiple)
+      Leaf[] processed = processSingleLeaf(center, storage, settings);
+      if (processed.length == 1) {
+        return new ANode[] { left, processed[0], right };
+      } else if (processed.length > 1) {
+        // Split into multiple - return all (parent will handle re-organization)
+        return (ANode[]) processed;
+      } else {
+        // Empty - removed all entries
+        return new ANode[] { left, null, right };
+      }
     }
 
     // can join with left
@@ -182,7 +193,17 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         .copyAll(_keys,      0,       idx)
         .copyAll(_keys,      idx + 1, _len);
       join._stats = join.computeStats(storage);
-      return new ANode[] { null, join, right };
+
+      // Process the joined leaf
+      Leaf[] processed = processSingleLeaf(join, storage, settings);
+      if (processed.length == 1) {
+        return new ANode[] { null, processed[0], right };
+      } else if (processed.length > 1) {
+        // Split into multiple
+        return (ANode[]) processed;
+      } else {
+        return new ANode[] { null, null, right };
+      }
     }
 
     // can join with right
@@ -193,7 +214,17 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         .copyAll(_keys,       idx + 1, _len)
         .copyAll(right._keys, 0,       right._len);
       join._stats = join.computeStats(storage);
-      return new ANode[]{ left, join, null };
+
+      // Process the joined leaf
+      Leaf[] processed = processSingleLeaf(join, storage, settings);
+      if (processed.length == 1) {
+        return new ANode[]{ left, processed[0], null };
+      } else if (processed.length > 1) {
+        // Split into multiple
+        return (ANode[]) processed;
+      } else {
+        return new ANode[]{ left, null, null };
+      }
     }
 
     // borrow from left
@@ -342,5 +373,209 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
   public void toString(StringBuilder sb, Address address, String indent) {
     sb.append(indent);
     sb.append("Leaf   addr: " + address + " len: " + _len + " ");
+  }
+
+  /**
+   * Post-process a single leaf through ILeafProcessor if configured.
+   *
+   * Used for remove operations where we only want to process the center node.
+   * Zero overhead if no processor is configured.
+   *
+   * @param leaf The leaf to process
+   * @param storage The storage backend
+   * @param settings The settings (contains processor)
+   * @return Processed leaf (may be split into multiple)
+   */
+  @SuppressWarnings("unchecked")
+  private static <Key, Address> Leaf[] processSingleLeaf(
+      Leaf<Key, Address> leaf,
+      IStorage storage,
+      Settings settings) {
+
+    ILeafProcessor processor = settings.leafProcessor();
+
+    // Zero-cost early exit if no processor configured
+    if (processor == null) {
+      return new Leaf[]{ leaf };
+    }
+
+    // Check if processing is needed (avoid allocation if not)
+    if (!processor.shouldProcess(leaf._len, settings)) {
+      return new Leaf[]{ leaf };
+    }
+
+    // Convert leaf keys to list for processing
+    List<Key> entries = Arrays.asList(Arrays.copyOfRange(leaf._keys, 0, leaf._len));
+
+    // Call processor
+    List<Key> processed = processor.processLeaf(entries, storage, settings);
+
+    // If same size and same content, no changes needed
+    if (processed.size() == leaf._len && processed.equals(entries)) {
+      return new Leaf[]{ leaf };
+    }
+
+    // Rebuild leaf(s) from processed entries
+    int processedSize = processed.size();
+
+    if (processedSize == 0) {
+      // All entries removed
+      return new Leaf[0];
+    } else if (processedSize <= settings.branchingFactor()) {
+      // Fits in single leaf
+      Leaf<Key, Address> newLeaf = new Leaf<>(processedSize, settings);
+      for (int i = 0; i < processedSize; i++) {
+        newLeaf._keys[i] = processed.get(i);
+      }
+      newLeaf._stats = newLeaf.computeStats(storage);
+      return new Leaf[]{ newLeaf };
+    } else {
+      // Needs to split into multiple leaves
+      int numLeaves = (processedSize + settings.branchingFactor() - 1) / settings.branchingFactor();
+      int baseSize = processedSize / numLeaves;
+      int remainder = processedSize % numLeaves;
+
+      Leaf[] result = new Leaf[numLeaves];
+      int offset = 0;
+      for (int i = 0; i < numLeaves; i++) {
+        int leafSize = baseSize + (i < remainder ? 1 : 0);
+        Leaf<Key, Address> newLeaf = new Leaf<>(leafSize, settings);
+        for (int j = 0; j < leafSize; j++) {
+          newLeaf._keys[j] = processed.get(offset + j);
+        }
+        newLeaf._stats = newLeaf.computeStats(storage);
+        result[i] = newLeaf;
+        offset += leafSize;
+      }
+      return result;
+    }
+  }
+
+  /**
+   * Post-process leaf nodes through ILeafProcessor if configured.
+   *
+   * This is called AFTER add/remove logic completes but BEFORE returning
+   * to the parent branch. Allows custom compaction/splitting of entries.
+   *
+   * Zero overhead if no processor is configured (_leafProcessor == null).
+   *
+   * @param nodes The result from add/remove (array of 1-3 nodes)
+   * @param storage The storage backend
+   * @param settings The settings (contains processor)
+   * @return Processed nodes (may be split/merged differently)
+   */
+  @SuppressWarnings("unchecked")
+  private static <Key, Address> ANode[] processLeafNodes(
+      ANode[] nodes,
+      IStorage storage,
+      Settings settings) {
+
+    ILeafProcessor processor = settings.leafProcessor();
+
+    // Zero-cost early exit if no processor configured
+    if (processor == null) {
+      return nodes;
+    }
+
+    // Handle special return values (unchanged, early exit)
+    if (nodes == PersistentSortedSet.UNCHANGED || nodes == PersistentSortedSet.EARLY_EXIT) {
+      return nodes;
+    }
+
+    // Process each leaf node
+    List<Leaf<Key, Address>> processedLeaves = new ArrayList<>();
+
+    for (ANode node : nodes) {
+      if (node == null) {
+        // Preserve nulls (used in remove for signaling merges)
+        processedLeaves.add(null);
+        continue;
+      }
+
+      // Only process Leaf nodes (branches are handled separately)
+      if (!(node instanceof Leaf)) {
+        return nodes;  // Shouldn't happen in leaf operations, but be safe
+      }
+
+      Leaf<Key, Address> leaf = (Leaf<Key, Address>) node;
+
+      // Check if processing is needed (avoid allocation if not)
+      if (!processor.shouldProcess(leaf._len, settings)) {
+        processedLeaves.add(leaf);
+        continue;
+      }
+
+      // Convert leaf keys to list for processing
+      List<Key> entries = Arrays.asList(Arrays.copyOfRange(leaf._keys, 0, leaf._len));
+
+      // Call processor
+      List<Key> processed = processor.processLeaf(entries, storage, settings);
+
+      // If same size and same content, no changes needed
+      if (processed.size() == leaf._len && processed.equals(entries)) {
+        processedLeaves.add(leaf);
+        continue;
+      }
+
+      // Rebuild leaf(s) from processed entries
+      int processedSize = processed.size();
+
+      if (processedSize == 0) {
+        // All entries removed - signal by adding null (will be handled by parent)
+        processedLeaves.add(null);
+      } else if (processedSize <= settings.branchingFactor()) {
+        // Fits in single leaf
+        Leaf<Key, Address> newLeaf = new Leaf<>(processedSize, settings);
+        for (int i = 0; i < processedSize; i++) {
+          newLeaf._keys[i] = processed.get(i);
+        }
+        newLeaf._stats = newLeaf.computeStats(storage);
+        processedLeaves.add(newLeaf);
+      } else {
+        // Needs to split into multiple leaves
+        // Split as evenly as possible
+        int numLeaves = (processedSize + settings.branchingFactor() - 1) / settings.branchingFactor();
+        int baseSize = processedSize / numLeaves;
+        int remainder = processedSize % numLeaves;
+
+        int offset = 0;
+        for (int i = 0; i < numLeaves; i++) {
+          int leafSize = baseSize + (i < remainder ? 1 : 0);
+          Leaf<Key, Address> newLeaf = new Leaf<>(leafSize, settings);
+          for (int j = 0; j < leafSize; j++) {
+            newLeaf._keys[j] = processed.get(offset + j);
+          }
+          newLeaf._stats = newLeaf.computeStats(storage);
+          processedLeaves.add(newLeaf);
+          offset += leafSize;
+        }
+      }
+    }
+
+    // Convert back to array
+    // Handle case where processing caused splits (more leaves than input)
+    int resultSize = processedLeaves.size();
+
+    if (resultSize == nodes.length) {
+      // Same number of nodes, return directly
+      return processedLeaves.toArray(new ANode[resultSize]);
+    } else if (resultSize == 1 && nodes.length == 1) {
+      // Still one node
+      return new ANode[]{ processedLeaves.get(0) };
+    } else if (resultSize > nodes.length) {
+      // Split into more leaves - need to signal this
+      // Return array with all new leaves (parent will handle splits)
+      return processedLeaves.toArray(new ANode[resultSize]);
+    } else {
+      // Merged into fewer leaves
+      // For remove operations, preserve the 3-element [left, center, right] structure
+      if (nodes.length == 3) {
+        // Map back to 3-element structure
+        // This is complex - for now, just return processed nodes
+        // Parent will need to handle this
+        return processedLeaves.toArray(new ANode[resultSize]);
+      }
+      return processedLeaves.toArray(new ANode[resultSize]);
+    }
   }
 }

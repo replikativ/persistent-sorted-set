@@ -9,27 +9,33 @@ public class Settings {
   public final RefType _refType;
   public final AtomicBoolean _edit;
   public final IStats _stats;
+  public final ILeafProcessor _leafProcessor;
 
-  public Settings(int branchingFactor, RefType refType, AtomicBoolean edit, IStats stats) {
+  public Settings(int branchingFactor, RefType refType, AtomicBoolean edit, IStats stats, ILeafProcessor leafProcessor) {
     _branchingFactor = branchingFactor;
     _refType = refType;
     _edit = edit;
     _stats = stats;
+    _leafProcessor = leafProcessor;
   }
 
   public Settings() {
-    this(0, null, null);
+    this(0, null, null, null);
   }
 
   public Settings(int branchingFactor) {
-    this(branchingFactor, null, null);
+    this(branchingFactor, null, null, null);
   }
 
   public Settings(int branchingFactor, RefType refType) {
-    this(branchingFactor, refType, null);
+    this(branchingFactor, refType, null, null);
   }
 
   public Settings(int branchingFactor, RefType refType, IStats stats) {
+    this(branchingFactor, refType, stats, null);
+  }
+
+  public Settings(int branchingFactor, RefType refType, IStats stats, ILeafProcessor leafProcessor) {
     if (branchingFactor <= 0) {
       branchingFactor = 512;
     }
@@ -40,6 +46,7 @@ public class Settings {
     _refType = refType;
     _edit = null;
     _stats = stats;
+    _leafProcessor = leafProcessor;
   }
 
   public int minBranchingFactor() {
@@ -65,11 +72,15 @@ public class Settings {
   public Settings editable(boolean value) {
     assert !editable();
     assert value == true;
-    return new Settings(_branchingFactor, _refType, new AtomicBoolean(value), _stats);
+    return new Settings(_branchingFactor, _refType, new AtomicBoolean(value), _stats, _leafProcessor);
   }
 
   public IStats stats() {
     return _stats;
+  }
+
+  public ILeafProcessor leafProcessor() {
+    return _leafProcessor;
   }
 
   public void persistent() {
