@@ -44,7 +44,7 @@
      (let [{:keys [level keys addresses] :as m} (edn/read-string (@*disk address))
            node (if addresses
                   (branch/from-map (assoc m :settings settings))
-                  (Leaf. (clj->js keys) settings))]
+                  (Leaf. (clj->js keys) settings nil))]
        (swap! *memory assoc address node)
        node)))
 

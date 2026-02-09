@@ -12,12 +12,12 @@
 (defn make-branch-from-storage
   "Create a Branch with addresses for lazy restoration"
   [keys addresses]
-  (branch/Branch. keys nil (into-array addresses)))
+  (branch/Branch. 1 keys nil (into-array addresses) -1 nil nil))
 
 (defn make-leaf-from-storage
   "Create a Leaf from stored data"
   [keys]
-  (leaf/Leaf. keys))
+  (leaf/Leaf. keys nil nil))
 
 (defrecord TestSyncStorage [*store]
   IStorage

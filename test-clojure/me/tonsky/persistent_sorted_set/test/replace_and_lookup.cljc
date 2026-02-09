@@ -1,7 +1,9 @@
 (ns me.tonsky.persistent-sorted-set.test.replace-and-lookup
   (:require
    [me.tonsky.persistent-sorted-set :as set]
-   [clojure.test :as t :refer [is are deftest testing]]))
+   [clojure.test :as t :refer [is are deftest testing]]
+   #?(:cljs [me.tonsky.persistent-sorted-set.impl.numeric-stats :as numeric-stats]))
+  #?(:clj (:import [me.tonsky.persistent_sorted_set NumericStats NumericStatsOps])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -332,3 +334,122 @@
       (is (= 1000 (count s-replace)))
       (is (= 1500 (set/lookup s-replace 500)))   ; lookup with 500 finds 1500
       (is (= 1500 (set/lookup s-replace 1500))))))
+
+;; =============================================================================
+;; Replace with stats and subtree-count regression tests
+;; These tests verify that $replace preserves correct constructor args
+;; for Branch and Leaf nodes (regression for missing subtree-count/_stats args)
+;; =============================================================================
+
+(def stats-ops
+  #?(:clj  (NumericStatsOps/instance)
+     :cljs numeric-stats/numeric-stats-ops))
+
+(defn stats->map [s]
+  (if (nil? s)
+    {:cnt 0 :sum 0.0 :min-val nil :max-val nil}
+    #?(:clj  {:cnt (.-count ^NumericStats s)
+              :sum (.-sum ^NumericStats s)
+              :min-val (.-min ^NumericStats s)
+              :max-val (.-max ^NumericStats s)}
+       :cljs {:cnt (:cnt s) :sum (double (:sum s)) :min-val (:min-val s) :max-val (:max-val s)})))
+
+(deftest test-replace-preserves-stats
+  (testing "Replace in small set (single leaf) preserves stats"
+    (let [cmp-mod (fn [a b] (compare (mod a 100) (mod b 100)))
+          s (into (set/sorted-set* {:stats stats-ops :comparator cmp-mod})
+                  (range 10))
+          s2 (set/replace s 5 105)]
+      ;; Stats should reflect the replacement: sum changes by +100
+      (let [orig-stats (stats->map (set/stats s))
+            new-stats (stats->map (set/stats s2))]
+        (is (= 10 (:cnt orig-stats)))
+        (is (= 10 (:cnt new-stats)))
+        (is (= (+ (:sum orig-stats) 100.0) (:sum new-stats)))
+        (is (= 0 (long (:min-val new-stats))))
+        (is (= 105 (long (:max-val new-stats)))))))
+
+  (testing "Replace in large set (multi-level B-tree) preserves stats"
+    (let [cmp-mod (fn [a b] (compare (mod a 5000) (mod b 5000)))
+          s (into (set/sorted-set* {:stats stats-ops :comparator cmp-mod :branching-factor 64})
+                  (range 5000))
+          s2 (set/replace s 2500 7500)]
+      (let [orig-stats (stats->map (set/stats s))
+            new-stats (stats->map (set/stats s2))]
+        (is (= 5000 (:cnt orig-stats)))
+        (is (= 5000 (:cnt new-stats)))
+        (is (= (+ (:sum orig-stats) 5000.0) (:sum new-stats))))))
+
+  (testing "Replace preserves count-slice accuracy"
+    (let [s (into (set/sorted-set* {:stats stats-ops}) (range 5000))
+          ;; Use default comparator; replace 2500 with value that sorts the same
+          ;; Just verify count-slice works correctly after replace at all
+          s2 (set/replace s 2500 2500)] ;; identity replace
+      (is (= 5000 (set/count-slice s2 nil nil)))
+      (is (= 2501 (set/count-slice s2 nil 2500)))
+      (is (= 2500 (set/count-slice s2 2500 4999)))))
+
+  (testing "Replace preserves get-nth accuracy"
+    (let [s (into (set/sorted-set* {:stats stats-ops}) (range 10))
+          ;; Identity replace (same value) since default comparator
+          s2 (set/replace s 5 5)]
+      ;; get-nth should still work after replace
+      (let [[v _] (set/get-nth s2 0)]
+        (is (= 0 v)))
+      (let [[v _] (set/get-nth s2 5)]
+        (is (= 5 v)))
+      (let [[v _] (set/get-nth s2 9)]
+        (is (= 9 v)))
+      ;; Out of bounds should return nil
+      (is (nil? (set/get-nth s2 10)))))
+
+  (testing "Multiple sequential replaces preserve stats"
+    (let [cmp-mod (fn [a b] (compare (mod a 100) (mod b 100)))
+          s (into (set/sorted-set* {:stats stats-ops :comparator cmp-mod})
+                  (range 10))
+          s2 (-> s
+                 (set/replace 3 103)
+                 (set/replace 7 107))]
+      (let [stats (stats->map (set/stats s2))]
+        (is (= 10 (:cnt stats)))
+        ;; sum = (0+1+2+103+4+5+6+107+8+9) = 45 - 3 - 7 + 103 + 107 = 245
+        (is (= 245.0 (:sum stats)))
+        (is (= 0 (long (:min-val stats))))
+        (is (= 107 (long (:max-val stats)))))))
+
+  (testing "Replace at tree boundaries preserves stats"
+    (let [cmp-mod (fn [a b] (compare (mod a 5000) (mod b 5000)))
+          s (into (set/sorted-set* {:stats stats-ops :comparator cmp-mod :branching-factor 64})
+                  (range 5000))
+          ;; Replace first element (0 -> 5000, both compare equal under mod 5000)
+          s-first (set/replace s 0 5000)
+          ;; Replace last element (4999 -> 9999, both compare equal under mod 5000)
+          s-last (set/replace s 4999 9999)]
+      (let [first-stats (stats->map (set/stats s-first))
+            last-stats (stats->map (set/stats s-last))]
+        (is (= 5000 (:cnt first-stats)))
+        (is (= 5000 (:cnt last-stats)))
+        ;; After replacing 0 with 5000: min becomes 1, sum increases by 5000
+        (is (= 1 (long (:min-val first-stats))))
+        (is (= 5000 (long (:max-val first-stats))))
+        ;; After replacing 4999 with 9999: max becomes 9999, sum increases by 5000
+        (is (= 0 (long (:min-val last-stats))))
+        (is (= 9999 (long (:max-val last-stats)))))))
+
+  (testing "Replace in multi-level tree preserves get-nth"
+    (let [s (into (set/sorted-set* {:stats stats-ops :branching-factor 64})
+                  (range 5000))
+          ;; Identity replace at various positions
+          s2 (set/replace s 2500 2500)]
+      (is (= [0 0] (set/get-nth s2 0)))
+      (is (= [2500 0] (set/get-nth s2 2500)))
+      (is (= [4999 0] (set/get-nth s2 4999)))
+      (is (nil? (set/get-nth s2 5000)))))
+
+  (testing "Replace preserves count-slice with multi-level tree"
+    (let [cmp-mod (fn [a b] (compare (mod a 5000) (mod b 5000)))
+          s (into (set/sorted-set* {:stats stats-ops :comparator cmp-mod :branching-factor 64})
+                  (range 5000))
+          s2 (set/replace s 2500 7500)]
+      (is (= 5000 (set/count-slice s2 nil nil))))))
+

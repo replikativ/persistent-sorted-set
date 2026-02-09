@@ -118,7 +118,7 @@
                      ;; Always create new leaf (no transient support at node level for now)
                      (let [new-keys (arrays/aclone keys)]
                        (aset new-keys idx new-key)
-                       (arrays/array (Leaf. new-keys settings))))))))
+                       (arrays/array (Leaf. new-keys settings nil))))))))
   ($store [this storage {:keys [sync?] :or {sync? true} :as opts}]
     (async+sync sync?
                 (async

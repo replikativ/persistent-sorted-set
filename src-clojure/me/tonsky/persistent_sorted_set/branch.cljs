@@ -306,7 +306,7 @@
                                                     na))]
                                (aset new-keys idx new-max-key)
                                (aset new-children idx new-node)
-                               (arrays/array (Branch. (.-level this) new-keys new-children new-addrs settings))))
+                               (arrays/array (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this)))))
                            ;; maxKey unchanged - reuse keys array
                            (if editable?
                              ;; Transient: mutate in place
@@ -330,7 +330,8 @@
                                                     (aset na idx nil)
                                                     na))]
                                (aset new-children idx new-node)
-                               (arrays/array (Branch. (.-level this) keys new-children new-addrs settings)))))))))))))
+                               (arrays/array (Branch. (.-level this) keys new-children new-addrs (.-subtree-count this) nil (.-settings this))))))))))))))
+
 
 (defn $store
   [^Branch this storage {:keys [sync?] :or {sync? true} :as opts}]

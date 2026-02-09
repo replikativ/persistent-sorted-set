@@ -89,4 +89,10 @@ public class NumericStatsOps<Key> implements IStats<Key, NumericStats> {
 
         return result;
     }
+
+    @Override
+    public long weight(NumericStats stats) {
+        if (stats == null) return 0;
+        return stats.count;
+    }
 }
