@@ -29,4 +29,13 @@
        key - the key being removed
        recompute-fn - a no-arg function that recomputes stats from children (called only if needed)
 
-     Returns the updated statistics."))
+     Returns the updated statistics.")
+
+  (weight [this stats]
+    "Extract the element weight (count) from a statistics object.
+     Used by rank-based navigation (get-nth) to traverse the tree
+     by accumulated element counts rather than by key comparison.
+
+     Must satisfy: weight(merge(a, b)) == weight(a) + weight(b)
+
+     Returns the number of data elements represented by this stats."))

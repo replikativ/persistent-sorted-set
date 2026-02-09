@@ -36,4 +36,7 @@
           ;; Min or max was removed, need to recompute
           (recompute-fn)
           ;; Can update incrementally
-          (->NumericStats new-cnt new-sum (:min-val current) (:max-val current)))))))
+          (->NumericStats new-cnt new-sum (:min-val current) (:max-val current)))))
+
+    (weight [_ stats]
+      (:cnt stats))))

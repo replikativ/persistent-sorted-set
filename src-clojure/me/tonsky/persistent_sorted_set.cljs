@@ -160,6 +160,21 @@
   ([^BTSet set from to cmp opts]
    (btset/$count-slice set from to cmp opts)))
 
+(defn get-nth
+  "Find the entry at weighted rank `n`.
+   Navigation uses cached subtree stats and IStats weight for
+   O(log entries) performance.
+
+   Returns [entry local-offset] where local-offset is the rank
+   within the found entry, or nil if out of bounds.
+
+   Requires stats with weight to be configured on the set.
+   Returns continuation yielding result when {:sync? false}."
+  ([^BTSet set n]
+   (btset/$get-nth set n))
+  ([^BTSet set n opts]
+   (btset/$get-nth set n opts)))
+
 (defn seek
   "An efficient way to seek to a specific key in a seq (either returned by [[clojure.core.seq]] or a slice.)
    `(seek (seq set) to)` returns iterator for all Xs where to <= X.

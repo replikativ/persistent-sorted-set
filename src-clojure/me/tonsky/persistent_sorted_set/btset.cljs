@@ -980,6 +980,60 @@
                           (stats/identity-stats stats-ops)
                           (await ($stats-slice-node root (.-storage set) stats-ops from to cmp opts)))))))))))
 
+(defn $get-nth
+  "Find the entry at weighted rank `n`.
+   Navigation uses cached subtree stats and IStats weight for
+   O(log entries) performance.
+
+   Returns [entry local-offset] where local-offset is the rank
+   within the found entry, or nil if out of bounds.
+
+   Requires stats with weight to be configured on the set."
+  ([^BTSet set n]
+   ($get-nth set n {:sync? true}))
+  ([^BTSet set n {:keys [sync?] :or {sync? true} :as opts}]
+   (async+sync sync?
+               (async
+                (let [root (await ($$root set opts))
+                      stats-ops (:stats (.-settings set))]
+                  (when (nil? stats-ops)
+                    (throw (js/Error. "get-nth requires stats to be configured")))
+                  (when (pos? (node/len root))
+                    (let [root-stats (or (node/$stats root)
+                                         (await (node/$compute-stats root (.-storage set) stats-ops opts)))
+                          total-weight (stats/weight stats-ops root-stats)]
+                      (when (and (>= n 0) (< n total-weight))
+                        ;; Navigate tree
+                        (loop [cur-node root
+                               rank n]
+                          (if (instance? Branch cur-node)
+                            ;; Branch: find child by weight
+                            (let [len (node/len cur-node)
+                                  result (loop [i 0
+                                                r rank]
+                                           (when (< i len)
+                                             (let [child (await (branch/$child cur-node (.-storage set) i opts))
+                                                   child-stats (or (node/$stats child)
+                                                                   (await (node/$compute-stats child (.-storage set) stats-ops opts)))
+                                                   child-weight (stats/weight stats-ops child-stats)]
+                                               (if (< r child-weight)
+                                                 [child r]
+                                                 (recur (inc i) (- r child-weight))))))]
+                              (when result
+                                (recur (nth result 0) (nth result 1))))
+                            ;; Leaf: iterate keys by weight
+                            (let [keys (.-keys cur-node)
+                                  len (arrays/alength keys)]
+                              (loop [i 0
+                                     r rank]
+                                (when (< i len)
+                                  (let [key (arrays/aget keys i)
+                                        key-stats (stats/extract stats-ops key)
+                                        key-weight (stats/weight stats-ops key-stats)]
+                                    (if (< r key-weight)
+                                      [key r]
+                                      (recur (inc i) (- r key-weight)))))))))))))))))
+
 (defn $equivalent?
   [^BTSet set other {:keys [sync?] :or {sync? true} :as opts}]
   (if sync?
