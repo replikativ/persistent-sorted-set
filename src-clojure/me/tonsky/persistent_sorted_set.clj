@@ -316,6 +316,20 @@
                   (.merge stats-ops first-stats middle-stats)
                   last-stats))))))
 
+(defn get-nth
+  "Find the entry at weighted rank `n`.
+   Navigation uses cached subtree stats and IStats.weight() for
+   O(log entries) performance.
+
+   Returns `[entry local-offset]` where `local-offset` is the rank
+   within the found entry, or nil if out of bounds.
+
+   Requires stats with weight() to be configured on the set."
+  [^PersistentSortedSet set ^long n]
+  (let [offset (long-array 1)]
+    (when-let [entry (.getNth set n offset)]
+      [entry (aget offset 0)])))
+
 (defn stats-slice
   "Compute stats for elements in the range [from, to] inclusive.
    Uses O(log n + k) algorithm where k is keys in boundary leaves.

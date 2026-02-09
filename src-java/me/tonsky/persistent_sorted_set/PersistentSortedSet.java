@@ -264,6 +264,67 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     return count;
   }
 
+  /**
+   * Find the key at a given weighted rank.
+   * Each key has a weight determined by statsOps.weight(stats).
+   * Interior nodes use cached subtree stats for O(log n) navigation.
+   *
+   * Requires stats with weight() to be configured on the set.
+   *
+   * @param rank       The target rank (0-based, in terms of total weight)
+   * @param outOffset  If non-null, outOffset[0] is set to the local offset
+   *                   within the found key (rank remainder after subtraction)
+   * @return The key at the given rank, or null if out of bounds
+   */
+  @SuppressWarnings("unchecked")
+  public Key getNth(long rank, long[] outOffset) {
+    ANode<Key, Address> node = root();
+    if (node.len() == 0) return null;
+
+    IStats statsOps = _settings.stats();
+    if (statsOps == null) {
+      throw new IllegalStateException("getNth requires stats to be configured");
+    }
+
+    // Check bounds using root stats
+    Object rootStats = node._stats;
+    if (rootStats == null) rootStats = node.computeStats(_storage);
+    long totalWeight = statsOps.weight(rootStats);
+    if (rank < 0 || rank >= totalWeight) return null;
+
+    // Navigate tree
+    while (node instanceof Branch) {
+      Branch<Key, Address> branch = (Branch<Key, Address>) node;
+      boolean found = false;
+      for (int i = 0; i < branch._len; i++) {
+        ANode<Key, Address> child = branch.child(_storage, i);
+        Object childStats = child._stats;
+        if (childStats == null) childStats = child.computeStats(_storage);
+        long childWeight = statsOps.weight(childStats);
+        if (rank < childWeight) {
+          node = child;
+          found = true;
+          break;
+        }
+        rank -= childWeight;
+      }
+      if (!found) return null; // shouldn't happen if bounds check passed
+    }
+
+    // At leaf level — iterate keys
+    Leaf<Key, Address> leaf = (Leaf<Key, Address>) node;
+    for (int i = 0; i < leaf._len; i++) {
+      Object keyStats = statsOps.extract(leaf._keys[i]);
+      long keyWeight = statsOps.weight(keyStats);
+      if (rank < keyWeight) {
+        if (outOffset != null) outOffset[0] = rank;
+        return leaf._keys[i];
+      }
+      rank -= keyWeight;
+    }
+    return null; // shouldn't happen
+  }
+
   public void walkAddresses(IFn onAddress) {
     if (_address != null) {
       if (!RT.booleanCast(onAddress.invoke(_address))) {

@@ -41,4 +41,18 @@ public interface IStats<Key, S> {
      * @return the updated statistics
      */
     S remove(S current, Key key, Supplier<S> recompute);
+
+    /**
+     * Extract the element weight (count) from a statistics object.
+     * Used by rank-based navigation (getNth) to traverse the tree
+     * by accumulated element counts rather than by key comparison.
+     *
+     * Must satisfy: weight(merge(a, b)) == weight(a) + weight(b)
+     *
+     * @param stats the statistics object
+     * @return the number of data elements represented by this stats
+     */
+    default long weight(S stats) {
+        return 1; // default: each entry has weight 1 (= subtreeCount behavior)
+    }
 }
