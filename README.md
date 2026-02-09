@@ -271,6 +271,61 @@ Count elements in a range without iterating through them:
 
 This uses O(log n) traversal by leveraging subtree counts stored in branch nodes.
 
+## Rank-Based Access (getNth)
+
+Access elements by their position (rank) in O(log n) time, enabling efficient percentile and quantile queries:
+
+```clj
+(def s (into (set/sorted-set* {:stats (NumericStatsOps.)})
+             (range 1000)))
+
+;; Get median (50th percentile) - O(log n)
+(set/get-nth s 500)
+;=> [500 0]  ; [value local-offset]
+
+;; Get 95th percentile
+(set/get-nth s 950)
+;=> [950 0]
+
+;; Helper function for percentiles
+(defn percentile [s p]
+  (let [n (count s)
+        rank (long (* n p))]
+    (first (set/get-nth s rank))))
+
+(percentile s 0.5)   ;=> 500  (median)
+(percentile s 0.95)  ;=> 950  (95th percentile)
+(percentile s 0.25)  ;=> 250  (first quartile)
+```
+
+`get-nth` returns `[entry local-offset]` where `local-offset` is useful for weighted statistics (each entry can represent multiple elements). Returns `nil` if the rank is out of bounds.
+
+**Requirements:** Must configure `:stats` with a `weight` implementation. The built-in `NumericStatsOps` uses count as weight (each element has weight 1).
+
+**Use cases:**
+- **Percentile queries:** Median, quartiles, deciles for statistical analysis
+- **Outlier detection:** Use IQR (Q3 - Q1) with Tukey's fences
+- **Quantile regression:** Fit models at different percentiles
+- **Weighted sampling:** Importance sampling for Monte Carlo methods
+- **CDF evaluation:** Empirical cumulative distribution functions
+
+### ClojureScript
+
+ClojureScript provides the same `get-nth` API:
+
+```cljs
+(require '[me.tonsky.persistent-sorted-set :as set])
+(require '[me.tonsky.persistent-sorted-set.impl.numeric-stats :as nstats])
+
+(def s (into (set/sorted-set* {:stats nstats/numeric-stats-ops})
+             (range 1000)))
+
+(set/get-nth s 500)
+;=> [500 0]
+```
+
+Both sync and async modes are supported via the `:sync?` option.
+
 ## Aggregate Statistics
 
 PersistentSortedSet can maintain aggregate statistics that update incrementally as elements are added or removed. This enables O(log n) queries for sum, count, min, max, variance, etc. over any range.
