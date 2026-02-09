@@ -1378,7 +1378,7 @@
            (async seq)
            (async
             (when-some [left' (await ($$seek set key cmp opts))]
-              (let [ks ($$keys-for set left' opts)]
+              (let [ks (await ($$keys-for set left' opts))]
                 (AsyncSeq. set left' (.-right seq) ks (path-get set left' 0))))))
          (if (instance? AsyncReverseSeq seq)
            (if (nat-int? (cmp key (arrays/aget (.-keys seq) (.-idx seq))))
@@ -1389,7 +1389,7 @@
                 (when (and right' (>= right' (js* "0n"))
                            (path-lte (.-left seq) right')
                            (path-lt  right' (.-right seq)))
-                  (AsyncReverseSeq. set (.-left seq) right' ($$keys-for set right' opts) (path-get set right' 0))))))
+                  (AsyncReverseSeq. set (.-left seq) right' (await ($$keys-for set right' opts)) (path-get set right' 0))))))
            (throw (js/Error. (str "unsupported type: '" (type seq) "'")))))))))
 
 #!------------------------------------------------------------------------------

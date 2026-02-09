@@ -195,11 +195,18 @@
      (from-sorted-array cmp arr len opts))))
 
 (defn sorted-set*
-  "Create a set with custom comparator, metadata and settings"
+  "Create a set with custom comparator, metadata and settings.
+   Options:
+     :comparator  Custom comparator (defaults to compare)
+     :storage     IStorage implementation
+     :stats       IStats implementation for aggregate statistics
+     :meta        Metadata map
+     :branching-factor  B-tree branching factor (default 512)
+     :ref-type    Reference type for cached nodes (:strong, :soft, :weak)"
   [opts]
   (PersistentSortedSet.
    (:meta opts)
-   ^Comparator (or (:cmp opts) compare)
+   ^Comparator (or (:comparator opts) (:cmp opts) compare)
    (:storage opts)
    (map->settings opts)))
 

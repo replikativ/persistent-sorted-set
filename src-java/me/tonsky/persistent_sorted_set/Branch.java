@@ -846,13 +846,21 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (PersistentSortedSet.UNCHANGED == nodes) // key not found
       return PersistentSortedSet.UNCHANGED;
 
-    if (PersistentSortedSet.EARLY_EXIT == nodes) // replaced in transient child, no updates needed
+    if (PersistentSortedSet.EARLY_EXIT == nodes) { // replaced in transient child, no updates needed
+      // Still need to update stats eagerly at this level
+      IStats statsOps = settings.stats();
+      if (statsOps != null && _stats != null) {
+        Object removed = statsOps.remove(_stats, oldKey, () -> computeStats(storage));
+        _stats = statsOps.merge(removed, statsOps.extract(newKey));
+      }
       return PersistentSortedSet.EARLY_EXIT;
+    }
 
     // Child was replaced (nodes.length == 1)
     ANode<Key, Address> newChild = nodes[0];
     Key newMaxKey = newChild.maxKey();
     boolean maxKeyChanged = (idx == _len - 1) && (0 != cmp.compare(newMaxKey, _keys[idx]));
+    IStats statsOps = settings.stats();
 
     // Transient: can modify in place
     if (editable()) {
@@ -863,6 +871,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       }
       child(idx, newChild);
       // Note: child() already clears _addresses[idx] via address(idx, null)
+      // Eagerly update stats: remove old key, add new key
+      if (statsOps != null && _stats != null) {
+        Object removed = statsOps.remove(_stats, oldKey, () -> computeStats(storage));
+        _stats = statsOps.merge(removed, statsOps.extract(newKey));
+      }
       if (maxKeyChanged)
         return new ANode[]{this};
       else
@@ -878,16 +891,25 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       newKeys[idx] = newMaxKey;
     }
 
-    Address[] newAddresses = null;
-    if (_addresses != null) {
-      newAddresses = Arrays.copyOfRange(_addresses, 0, _len);
+    final Address[] newAddresses = _addresses != null ? Arrays.copyOfRange(_addresses, 0, _len) : null;
+    if (newAddresses != null) {
       newAddresses[idx] = null; // child changed, address invalid
     }
 
-    Object[] newChildren = _children == null ? new Object[_keys.length] : Arrays.copyOfRange(_children, 0, _len);
+    final Object[] newChildren = _children == null ? new Object[_keys.length] : Arrays.copyOfRange(_children, 0, _len);
     newChildren[idx] = newChild;
 
-    return new ANode[]{new Branch(_level, _len, newKeys, newAddresses, newChildren, settings)};
+    // Eagerly compute stats for the new branch
+    Object newStats = null;
+    if (statsOps != null && _stats != null) {
+      Object removed = statsOps.remove(_stats, oldKey, () -> {
+        Branch<Key, Address> tmp = new Branch<>(_level, _len, newKeys, newAddresses, newChildren, _subtreeCount, null, settings);
+        return tmp.computeStats(storage);
+      });
+      newStats = statsOps.merge(removed, statsOps.extract(newKey));
+    }
+
+    return new ANode[]{new Branch(_level, _len, newKeys, newAddresses, newChildren, _subtreeCount, newStats, settings)};
   }
 
   @Override

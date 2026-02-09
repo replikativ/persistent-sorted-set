@@ -330,9 +330,16 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     if (idx < 0) // not in set
       return PersistentSortedSet.UNCHANGED;
 
+    IStats statsOps = settings.stats();
+
     // Transient: can modify in place
     if (editable()) {
       _keys[idx] = newKey;
+      // Eagerly update stats: remove old key, add new key
+      if (statsOps != null && _stats != null) {
+        Object removed = statsOps.remove(_stats, oldKey, () -> computeStats(storage));
+        _stats = statsOps.merge(removed, statsOps.extract(newKey));
+      }
       // If we replaced the last element, maxKey changed
       if (idx == _len - 1) {
         return new ANode[]{this}; // signal maxKey update needed
@@ -344,6 +351,11 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     Leaf n = new Leaf(_len, settings);
     ArrayUtil.copy(_keys, 0, _len, n._keys, 0);
     n._keys[idx] = newKey;
+    // Eagerly compute stats for new leaf
+    if (statsOps != null && _stats != null) {
+      Object removed = statsOps.remove(_stats, oldKey, () -> n.computeStats(storage));
+      n._stats = statsOps.merge(removed, statsOps.extract(newKey));
+    }
 
     // Always return the new node - parent needs to update its child reference
     return new ANode[]{n};

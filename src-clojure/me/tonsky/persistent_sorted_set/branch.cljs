@@ -250,6 +250,15 @@
                                       right
                                       (.-settings this))))))))))
 
+(defn- replace-stats
+  "Eagerly update stats for replace: remove old key's contribution, add new key's."
+  [stats-ops current-stats old-key new-key recompute-fn]
+  (if current-stats
+    (stats/merge-stats stats-ops
+                       (stats/remove-stats stats-ops current-stats old-key recompute-fn)
+                       (stats/extract stats-ops new-key))
+    nil))
+
 (defn $replace
   [^Branch this storage old-key new-key cmp {:keys [sync?] :or {sync? true} :as opts}]
   (assert (== 0 (cmp old-key new-key)) "old-key and new-key must compare as equal (cmp must return 0)")
@@ -258,6 +267,7 @@
                (let [keys (.-keys this)
                      settings (.-settings this)
                      editable? (:edit settings)
+                     stats-ops (:stats settings)
                      idx  (let [arr-l (arrays/alength keys)
                                 i     (util/binary-search-l cmp keys (dec arr-l) old-key)]
                             (if (== i arr-l) -1 i))]
@@ -293,6 +303,10 @@
                                  (when (and storage (aget addrs idx))
                                    (storage/markFreed storage (aget addrs idx)))
                                  (aset addrs idx nil))
+                               (when stats-ops
+                                 (set! (.-_stats this)
+                                       (replace-stats stats-ops (.-_stats this) old-key new-key
+                                                      #(node/$compute-stats this storage stats-ops {:sync? true}))))
                                (arrays/array this))
                              ;; Persistent: clone arrays
                              (let [new-keys     (arrays/aclone keys)
@@ -303,10 +317,15 @@
                                                     (when (and storage (aget addrs idx))
                                                       (storage/markFreed storage (aget addrs idx)))
                                                     (aset na idx nil)
-                                                    na))]
-                               (aset new-keys idx new-max-key)
-                               (aset new-children idx new-node)
-                               (arrays/array (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this)))))
+                                                    na))
+                                   _            (aset new-keys idx new-max-key)
+                                   _            (aset new-children idx new-node)
+                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this))
+                                   new-stats    (when stats-ops
+                                                  (replace-stats stats-ops (.-_stats this) old-key new-key
+                                                                 #(node/$compute-stats new-branch storage stats-ops {:sync? true})))]
+                               (set! (.-_stats new-branch) new-stats)
+                               (arrays/array new-branch)))
                            ;; maxKey unchanged - reuse keys array
                            (if editable?
                              ;; Transient: mutate in place
@@ -317,6 +336,10 @@
                                  (when (and storage (aget addrs idx))
                                    (storage/markFreed storage (aget addrs idx)))
                                  (aset addrs idx nil))
+                               (when stats-ops
+                                 (set! (.-_stats this)
+                                       (replace-stats stats-ops (.-_stats this) old-key new-key
+                                                      #(node/$compute-stats this storage stats-ops {:sync? true}))))
                                (if last-child?
                                  (arrays/array this)  ; Last child, need to propagate
                                  :early-exit))        ; Not last child, early exit
@@ -328,9 +351,14 @@
                                                     (when (and storage (aget addrs idx))
                                                       (storage/markFreed storage (aget addrs idx)))
                                                     (aset na idx nil)
-                                                    na))]
-                               (aset new-children idx new-node)
-                               (arrays/array (Branch. (.-level this) keys new-children new-addrs (.-subtree-count this) nil (.-settings this))))))))))))))
+                                                    na))
+                                   _            (aset new-children idx new-node)
+                                   new-branch   (Branch. (.-level this) keys new-children new-addrs (.-subtree-count this) nil (.-settings this))
+                                   new-stats    (when stats-ops
+                                                  (replace-stats stats-ops (.-_stats this) old-key new-key
+                                                                 #(node/$compute-stats new-branch storage stats-ops {:sync? true})))]
+                               (set! (.-_stats new-branch) new-stats)
+                               (arrays/array new-branch)))))))))))))
 
 
 (defn $store

@@ -115,10 +115,20 @@
                 (async
                  (let [idx (garr/binarySearch keys old-key cmp)]
                    (when (<= 0 idx)
-                     ;; Always create new leaf (no transient support at node level for now)
-                     (let [new-keys (arrays/aclone keys)]
-                       (aset new-keys idx new-key)
-                       (arrays/array (Leaf. new-keys settings nil))))))))
+                     (let [new-keys (arrays/aclone keys)
+                           _        (aset new-keys idx new-key)
+                           new-leaf (Leaf. new-keys settings nil)
+                           stats-ops (:stats settings)]
+                       ;; Eagerly maintain stats: remove old key, add new key
+                       (when stats-ops
+                         (if _stats
+                           (set! (.-_stats new-leaf)
+                                 (stats/merge-stats stats-ops
+                                                    (stats/remove-stats stats-ops _stats old-key
+                                                                        #(node/$compute-stats new-leaf storage stats-ops {:sync? true}))
+                                                    (stats/extract stats-ops new-key)))
+                           (node/$compute-stats new-leaf storage stats-ops {:sync? true})))
+                       (arrays/array new-leaf)))))))
   ($store [this storage {:keys [sync?] :or {sync? true} :as opts}]
     (async+sync sync?
                 (async
