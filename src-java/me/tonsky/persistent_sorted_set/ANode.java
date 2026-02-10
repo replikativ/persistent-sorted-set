@@ -45,10 +45,28 @@ public abstract class ANode<Key, Address> {
   }
 
   /**
+   * Try to compute stats from this node's keys (for Leaf) or children's stats (for Branch).
+   * Returns null if stats not configured in settings OR if any child has unavailable stats.
+   * Used during operations (add/remove/replace) to avoid O(n) traversals.
+   */
+  public abstract Object tryComputeStats(IStorage storage);
+
+  /**
+   * Force compute stats from this node, recursively descending into children if needed.
+   * Returns null if stats not configured in settings.
+   * Used for explicit user queries where O(n) traversal is acceptable.
+   */
+  public abstract Object forceComputeStats(IStorage storage);
+
+  /**
    * Compute stats from this node's keys (for Leaf) or children's stats (for Branch).
    * Returns null if stats not configured in settings.
+   * @deprecated Use tryComputeStats for operations or forceComputeStats for queries
    */
-  public abstract Object computeStats(IStorage storage);
+  @Deprecated
+  public Object computeStats(IStorage storage) {
+    return forceComputeStats(storage);
+  }
 
   public int len() {
     return _len;

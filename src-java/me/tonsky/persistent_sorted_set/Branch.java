@@ -190,7 +190,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   }
 
   @Override
-  public Object computeStats(IStorage storage) {
+  public Object tryComputeStats(IStorage storage) {
+    // Try to compute stats, postpone if any child unavailable
     IStats statsOps = _settings.stats();
     if (statsOps == null) return null;
 
@@ -199,7 +200,27 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       ANode child = child(storage, i);
       Object childStats = child.stats();
       if (childStats == null) {
-        childStats = child.computeStats(storage);
+        // Child stats unavailable - postpone our stats computation
+        return null;
+      }
+      result = statsOps.merge(result, childStats);
+    }
+    return result;
+  }
+
+  @Override
+  public Object forceComputeStats(IStorage storage) {
+    // Force compute stats, recursively descending if needed
+    IStats statsOps = _settings.stats();
+    if (statsOps == null) return null;
+
+    Object result = statsOps.identity();
+    for (int i = 0; i < _len; i++) {
+      ANode child = child(storage, i);
+      Object childStats = child.stats();
+      if (childStats == null) {
+        // Force computation by recursively computing child stats
+        childStats = child.forceComputeStats(storage);
       }
       if (childStats != null) {
         result = statsOps.merge(result, childStats);
@@ -250,8 +271,36 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   }
 
   /**
-   * Helper to compute stats from children array.
+   * Helper to try computing stats from children array (postpone if any child unavailable).
    */
+  private static Object tryComputeStatsFromChildren(Object[] children, int len, IStorage storage, IStats statsOps) {
+    if (statsOps == null) return null;
+    Object result = statsOps.identity();
+    for (int i = 0; i < len; ++i) {
+      Object raw = children[i];
+      ANode child = null;
+      if (raw instanceof ANode) {
+        child = (ANode) raw;
+      } else if (raw instanceof java.lang.ref.Reference) {
+        child = (ANode) ((java.lang.ref.Reference<?>) raw).get();
+      }
+      if (child != null) {
+        Object childStats = child.stats();
+        if (childStats == null) {
+          // Child stats unavailable - postpone
+          return null;
+        }
+        result = statsOps.merge(result, childStats);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Helper to force compute stats from children array (descend if needed).
+   * @deprecated Use tryComputeStatsFromChildren for operations
+   */
+  @Deprecated
   private static Object computeStatsFromChildren(Object[] children, int len, IStorage storage, IStats statsOps) {
     if (statsOps == null) return null;
     Object result = statsOps.identity();
@@ -266,7 +315,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (child != null) {
         Object childStats = child.stats();
         if (childStats == null) {
-          childStats = child.computeStats(storage);
+          childStats = child.forceComputeStats(storage);
         }
         if (childStats != null) {
           result = statsOps.merge(result, childStats);
@@ -372,7 +421,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // Subtree count = old count + 1 (added one element)
       // When old count is unknown (-1), leave new count unknown to preserve lazy loading
       long newCount = _subtreeCount >= 0 ? _subtreeCount + 1 : -1;
-      Object newStats = computeStatsFromChildren(newChildren, _len, storage, statsOps);
+      Object newStats = tryComputeStatsFromChildren(newChildren, _len, storage, statsOps);
       return new ANode[]{ new Branch(_level, _len, newKeys, newAddresses, newChildren, newCount, newStats, settings) };
     }
 
@@ -404,7 +453,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // Subtree count = old count + 1 (added one element)
       // When old count is unknown (-1), leave new count unknown to preserve lazy loading
       n._subtreeCount = _subtreeCount >= 0 ? _subtreeCount + 1 : -1;
-      n._stats = computeStatsFromChildren(n._children, n._len, storage, statsOps);
+      n._stats = tryComputeStatsFromChildren(n._children, n._len, storage, statsOps);
       return new ANode[]{n};
     }
 
@@ -453,8 +502,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // They will be computed on demand by computeSubtreeCount()
       long count1 = -1;
       long count2 = -1;
-      Object stats1 = computeStatsFromChildren(children1, half1, storage, statsOps);
-      Object stats2 = children2 != null ? computeStatsFromChildren(children2, half2, storage, statsOps) : null;
+      Object stats1 = tryComputeStatsFromChildren(children1, half1, storage, statsOps);
+      Object stats2 = children2 != null ? tryComputeStatsFromChildren(children2, half2, storage, statsOps) : null;
       return new ANode[] {
         new Branch(_level, half1, keys1, addresses1, children1, count1, stats1, settings),
         new Branch(_level, half2, keys2, addresses2, children2, count2, stats2, settings)
@@ -501,8 +550,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // They will be computed on demand by computeSubtreeCount()
     long count1 = -1;
     long count2 = -1;
-    Object stats1 = children1 != null ? computeStatsFromChildren(children1, half1, storage, statsOps) : null;
-    Object stats2 = computeStatsFromChildren(children2, half2, storage, statsOps);
+    Object stats1 = children1 != null ? tryComputeStatsFromChildren(children1, half1, storage, statsOps) : null;
+    Object stats2 = tryComputeStatsFromChildren(children2, half2, storage, statsOps);
     return new ANode[]{
       new Branch(_level, half1, keys1, addresses1, children1, count1, stats1, settings),
       new Branch(_level, half2, keys2, addresses2, children2, count2, stats2, settings)
@@ -638,7 +687,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // Subtree count = old count - 1 (removed one element)
       // When old count is unknown (-1), leave new count unknown to preserve lazy loading
       newCenter._subtreeCount = _subtreeCount >= 0 ? _subtreeCount - 1 : -1;
-      newCenter._stats = computeStatsFromChildren(newCenter._children, newLen, storage, statsOps);
+      newCenter._stats = tryComputeStatsFromChildren(newCenter._children, newLen, storage, statsOps);
       return new ANode[] { left, newCenter, right };
     }
 
@@ -677,7 +726,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       long leftCount = left._subtreeCount >= 0 ? left._subtreeCount : left.computeSubtreeCount(storage);
       long thisCount = _subtreeCount >= 0 ? _subtreeCount : computeSubtreeCount(storage);
       join._subtreeCount = leftCount + thisCount - 1;
-      join._stats = computeStatsFromChildren(join._children, left._len + newLen, storage, statsOps);
+      join._stats = tryComputeStatsFromChildren(join._children, left._len + newLen, storage, statsOps);
       return new ANode[] { null, join, right };
     }
 
@@ -716,7 +765,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       long thisCount = _subtreeCount >= 0 ? _subtreeCount : computeSubtreeCount(storage);
       long rightCount = right._subtreeCount >= 0 ? right._subtreeCount : right.computeSubtreeCount(storage);
       join._subtreeCount = thisCount + rightCount - 1;
-      join._stats = computeStatsFromChildren(join._children, newLen + right._len, storage, statsOps);
+      join._stats = tryComputeStatsFromChildren(join._children, newLen + right._len, storage, statsOps);
       return new ANode[] { left, join, null };
     }
 
@@ -769,10 +818,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // They will be computed on demand by computeSubtreeCount()
       if (newLeft._children != null) {
         newLeft._subtreeCount = -1;
-        newLeft._stats = computeStatsFromChildren(newLeft._children, newLeftLen, storage, statsOps);
+        newLeft._stats = tryComputeStatsFromChildren(newLeft._children, newLeftLen, storage, statsOps);
       }
       newCenter._subtreeCount = -1;
-      newCenter._stats = computeStatsFromChildren(newCenter._children, newCenterLen, storage, statsOps);
+      newCenter._stats = tryComputeStatsFromChildren(newCenter._children, newCenterLen, storage, statsOps);
       return new ANode[] { newLeft, newCenter, right };
     }
 
@@ -825,10 +874,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // For rebalancing, set subtree counts to -1 (unknown) to preserve lazy loading
       // They will be computed on demand by computeSubtreeCount()
       newCenter._subtreeCount = -1;
-      newCenter._stats = computeStatsFromChildren(newCenter._children, newCenterLen, storage, statsOps);
+      newCenter._stats = tryComputeStatsFromChildren(newCenter._children, newCenterLen, storage, statsOps);
       if (newRight._children != null) {
         newRight._subtreeCount = -1;
-        newRight._stats = computeStatsFromChildren(newRight._children, newRightLen, storage, statsOps);
+        newRight._stats = tryComputeStatsFromChildren(newRight._children, newRightLen, storage, statsOps);
       }
       return new ANode[] { left, newCenter, newRight };
     }
@@ -853,10 +902,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       return PersistentSortedSet.UNCHANGED;
 
     if (PersistentSortedSet.EARLY_EXIT == nodes) { // replaced in transient child, no updates needed
-      // Recompute stats from scratch
+      // Try to recompute stats from final state (after child replacement)
       IStats statsOps = settings.stats();
       if (statsOps != null && _stats != null) {
-        _stats = computeStats(storage);
+        _stats = tryComputeStats(storage);
       }
       return PersistentSortedSet.EARLY_EXIT;
     }
@@ -876,9 +925,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       }
       child(idx, newChild);
       // Note: child() already clears _addresses[idx] via address(idx, null)
-      // Recompute stats from scratch
+      // Try to recompute stats from final state (after child replacement)
       if (statsOps != null && _stats != null) {
-        _stats = computeStats(storage);
+        _stats = tryComputeStats(storage);
       }
       if (maxKeyChanged)
         return new ANode[]{this};
@@ -903,11 +952,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     final Object[] newChildren = _children == null ? new Object[_keys.length] : Arrays.copyOfRange(_children, 0, _len);
     newChildren[idx] = newChild;
 
-    // Recompute stats from scratch for new branch
+    // Try to recompute stats from final state (after child replacement) for new branch
     Branch<Key, Address> newBranch = new Branch(_level, _len, newKeys, newAddresses, newChildren, _subtreeCount, null, settings);
     Object newStats = null;
     if (statsOps != null && _stats != null) {
-      newStats = newBranch.computeStats(storage);
+      newStats = newBranch.tryComputeStats(storage);
     }
 
     return new ANode[]{new Branch(_level, _len, newKeys, newAddresses, newChildren, _subtreeCount, newStats, settings)};

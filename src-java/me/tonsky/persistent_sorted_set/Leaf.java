@@ -28,7 +28,8 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
   }
 
   @Override
-  public Object computeStats(IStorage storage) {
+  public Object tryComputeStats(IStorage storage) {
+    // For leaves, try and force are the same - just compute from keys
     IStats statsOps = _settings.stats();
     if (statsOps == null) return null;
 
@@ -37,6 +38,12 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       result = statsOps.merge(result, statsOps.extract(_keys[i]));
     }
     return result;
+  }
+
+  @Override
+  public Object forceComputeStats(IStorage storage) {
+    // For leaves, try and force are the same - just compute from keys
+    return tryComputeStats(storage);
   }
 
   @Override
@@ -333,9 +340,9 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     // Transient: can modify in place
     if (editable()) {
       _keys[idx] = newKey;
-      // Recompute stats from scratch
+      // Recompute stats from final state (after replacement)
       if (statsOps != null && _stats != null) {
-        _stats = computeStats(storage);
+        _stats = tryComputeStats(storage);
       }
       // If we replaced the last element, maxKey changed
       if (idx == _len - 1) {
@@ -348,9 +355,9 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     Leaf n = new Leaf(_len, settings);
     ArrayUtil.copy(_keys, 0, _len, n._keys, 0);
     n._keys[idx] = newKey;
-    // Recompute stats from scratch
+    // Recompute stats from final state (after replacement)
     if (statsOps != null && _stats != null) {
-      n._stats = n.computeStats(storage);
+      n._stats = n.tryComputeStats(storage);
     }
 
     // Always return the new node - parent needs to update its child reference
