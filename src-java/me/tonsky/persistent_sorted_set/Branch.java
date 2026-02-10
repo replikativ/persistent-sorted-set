@@ -256,8 +256,14 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (statsOps == null) return null;
     Object result = statsOps.identity();
     for (int i = 0; i < len; ++i) {
-      if (children[i] instanceof ANode) {
-        ANode child = (ANode) children[i];
+      Object raw = children[i];
+      ANode child = null;
+      if (raw instanceof ANode) {
+        child = (ANode) raw;
+      } else if (raw instanceof java.lang.ref.Reference) {
+        child = (ANode) ((java.lang.ref.Reference<?>) raw).get();
+      }
+      if (child != null) {
         Object childStats = child.stats();
         if (childStats == null) {
           childStats = child.computeStats(storage);
@@ -847,11 +853,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       return PersistentSortedSet.UNCHANGED;
 
     if (PersistentSortedSet.EARLY_EXIT == nodes) { // replaced in transient child, no updates needed
-      // Still need to update stats eagerly at this level
+      // Recompute stats from scratch
       IStats statsOps = settings.stats();
       if (statsOps != null && _stats != null) {
-        Object removed = statsOps.remove(_stats, oldKey, () -> computeStats(storage));
-        _stats = statsOps.merge(removed, statsOps.extract(newKey));
+        _stats = computeStats(storage);
       }
       return PersistentSortedSet.EARLY_EXIT;
     }
@@ -871,10 +876,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       }
       child(idx, newChild);
       // Note: child() already clears _addresses[idx] via address(idx, null)
-      // Eagerly update stats: remove old key, add new key
+      // Recompute stats from scratch
       if (statsOps != null && _stats != null) {
-        Object removed = statsOps.remove(_stats, oldKey, () -> computeStats(storage));
-        _stats = statsOps.merge(removed, statsOps.extract(newKey));
+        _stats = computeStats(storage);
       }
       if (maxKeyChanged)
         return new ANode[]{this};
@@ -899,14 +903,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     final Object[] newChildren = _children == null ? new Object[_keys.length] : Arrays.copyOfRange(_children, 0, _len);
     newChildren[idx] = newChild;
 
-    // Eagerly compute stats for the new branch
+    // Recompute stats from scratch for new branch
+    Branch<Key, Address> newBranch = new Branch(_level, _len, newKeys, newAddresses, newChildren, _subtreeCount, null, settings);
     Object newStats = null;
     if (statsOps != null && _stats != null) {
-      Object removed = statsOps.remove(_stats, oldKey, () -> {
-        Branch<Key, Address> tmp = new Branch<>(_level, _len, newKeys, newAddresses, newChildren, _subtreeCount, null, settings);
-        return tmp.computeStats(storage);
-      });
-      newStats = statsOps.merge(removed, statsOps.extract(newKey));
+      newStats = newBranch.computeStats(storage);
     }
 
     return new ANode[]{new Branch(_level, _len, newKeys, newAddresses, newChildren, _subtreeCount, newStats, settings)};

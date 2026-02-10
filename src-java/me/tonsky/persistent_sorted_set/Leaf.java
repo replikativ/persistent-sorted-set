@@ -70,20 +70,18 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       if (ins == _len) {
         _keys[_len] = key;
         _len += 1;
-        // Update stats incrementally
-        if (statsOps != null) {
-          Object prevStats = _stats != null ? _stats : statsOps.identity();
-          _stats = statsOps.merge(prevStats, statsOps.extract(key));
+        // Update stats incrementally only if already computed
+        if (statsOps != null && _stats != null) {
+          _stats = statsOps.merge(_stats, statsOps.extract(key));
         }
         return new ANode[]{this}; // maxKey needs updating
       } else {
         ArrayUtil.copy(_keys, ins, _len, _keys, ins+1);
         _keys[ins] = key;
         _len += 1;
-        // Update stats incrementally
-        if (statsOps != null) {
-          Object prevStats = _stats != null ? _stats : statsOps.identity();
-          _stats = statsOps.merge(prevStats, statsOps.extract(key));
+        // Update stats incrementally only if already computed
+        if (statsOps != null && _stats != null) {
+          _stats = statsOps.merge(_stats, statsOps.extract(key));
         }
         return PersistentSortedSet.EARLY_EXIT;
       }
@@ -335,10 +333,9 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     // Transient: can modify in place
     if (editable()) {
       _keys[idx] = newKey;
-      // Eagerly update stats: remove old key, add new key
+      // Recompute stats from scratch
       if (statsOps != null && _stats != null) {
-        Object removed = statsOps.remove(_stats, oldKey, () -> computeStats(storage));
-        _stats = statsOps.merge(removed, statsOps.extract(newKey));
+        _stats = computeStats(storage);
       }
       // If we replaced the last element, maxKey changed
       if (idx == _len - 1) {
@@ -351,10 +348,9 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     Leaf n = new Leaf(_len, settings);
     ArrayUtil.copy(_keys, 0, _len, n._keys, 0);
     n._keys[idx] = newKey;
-    // Eagerly compute stats for new leaf
+    // Recompute stats from scratch
     if (statsOps != null && _stats != null) {
-      Object removed = statsOps.remove(_stats, oldKey, () -> n.computeStats(storage));
-      n._stats = statsOps.merge(removed, statsOps.extract(newKey));
+      n._stats = n.computeStats(storage);
     }
 
     // Always return the new node - parent needs to update its child reference

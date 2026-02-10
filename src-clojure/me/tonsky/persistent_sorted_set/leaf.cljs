@@ -69,11 +69,11 @@
                              :else
                              (let [new-keys (util/splice keys idx idx (arrays/array key))
                                    new-leaf (Leaf. new-keys settings nil)]
-                               ;; Update stats incrementally
-                               (when stats-ops
-                                 (let [prev-stats (or _stats (stats/identity-stats stats-ops))]
-                                   (set! (.-_stats new-leaf)
-                                         (stats/merge-stats stats-ops prev-stats (stats/extract stats-ops key)))))
+                               ;; Update stats incrementally only if we already have stats.
+                               ;; If _stats is nil (e.g. from merge/merge-split), leave nil for lazy recomputation.
+                               (when (and stats-ops _stats)
+                                 (set! (.-_stats new-leaf)
+                                       (stats/merge-stats stats-ops _stats (stats/extract stats-ops key))))
                                (arrays/array new-leaf)))]
       (if sync?
         result
@@ -119,14 +119,12 @@
                            _        (aset new-keys idx new-key)
                            new-leaf (Leaf. new-keys settings nil)
                            stats-ops (:stats settings)]
-                       ;; Eagerly maintain stats: remove old key, add new key
+                       ;; Eagerly maintain stats: compute from new leaf (which has replacement done)
                        (when stats-ops
                          (if _stats
                            (set! (.-_stats new-leaf)
-                                 (stats/merge-stats stats-ops
-                                                    (stats/remove-stats stats-ops _stats old-key
-                                                                        #(node/$compute-stats new-leaf storage stats-ops {:sync? true}))
-                                                    (stats/extract stats-ops new-key)))
+                                 ;; Compute from new-leaf which has new-key instead of old-key
+                                 (node/$compute-stats new-leaf storage stats-ops {:sync? true}))
                            (node/$compute-stats new-leaf storage stats-ops {:sync? true})))
                        (arrays/array new-leaf)))))))
   ($store [this storage {:keys [sync?] :or {sync? true} :as opts}]

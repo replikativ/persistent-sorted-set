@@ -448,9 +448,8 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
         _root = nodes[0];
       } else if (2 == nodes.length) {
         Object[] keys = new Object[] {nodes[0].maxKey(), nodes[1].maxKey()};
-        // Compute subtree count for new root = sum of both children's counts
-        long subtreeCount = getSubtreeCount(nodes[0]) + getSubtreeCount(nodes[1]);
-        // Compute stats for new root
+        long c0 = getSubtreeCount(nodes[0]), c1 = getSubtreeCount(nodes[1]);
+        long subtreeCount = (c0 >= 0 && c1 >= 0) ? c0 + c1 : -1;
         Object stats = computeStatsFromChildren(nodes);
         _root = new Branch(nodes[0].level() + 1, 2, keys, null, new Object[] {nodes[0], nodes[1]}, subtreeCount, stats, _settings);
       }
@@ -465,8 +464,8 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
 
     Object[] keys = new Object[] {nodes[0].maxKey(), nodes[1].maxKey()};
     Object[] children = Arrays.copyOf(nodes, nodes.length, new Object[0].getClass());
-    // Compute subtree count for new root = sum of both children's counts
-    long subtreeCount = getSubtreeCount(nodes[0]) + getSubtreeCount(nodes[1]);
+    long c0 = getSubtreeCount(nodes[0]), c1 = getSubtreeCount(nodes[1]);
+    long subtreeCount = (c0 >= 0 && c1 >= 0) ? c0 + c1 : -1;
     // Compute stats for new root
     Object stats = computeStatsFromChildren(nodes);
     ANode newRoot = new Branch(nodes[0].level() + 1, 2, keys, null, children, subtreeCount, stats, _settings);

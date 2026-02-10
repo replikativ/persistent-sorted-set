@@ -261,10 +261,10 @@
    Returns the stats object computed by the stats-ops provided when creating the set.
    Returns nil if no stats-ops were provided."
   [^PersistentSortedSet set]
-  (let [^ANode root (.-_root set)
+  (let [^ANode root (.root set)
         settings (.-_settings set)
         stats-ops (.stats settings)]
-    (when stats-ops
+    (when (and stats-ops root)
       (or (.-_stats root)
           (.computeStats root (.-_storage set))))))
 

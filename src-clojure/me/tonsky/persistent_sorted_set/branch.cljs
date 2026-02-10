@@ -251,13 +251,10 @@
                                       (.-settings this))))))))))
 
 (defn- replace-stats
-  "Eagerly update stats for replace: remove old key's contribution, add new key's."
-  [stats-ops current-stats old-key new-key recompute-fn]
-  (if current-stats
-    (stats/merge-stats stats-ops
-                       (stats/remove-stats stats-ops current-stats old-key recompute-fn)
-                       (stats/extract stats-ops new-key))
-    nil))
+  "Recompute stats after replace."
+  [branch storage stats-ops]
+  (when stats-ops
+    (node/$compute-stats branch storage stats-ops {:sync? true})))
 
 (defn $replace
   [^Branch this storage old-key new-key cmp {:keys [sync?] :or {sync? true} :as opts}]
@@ -305,8 +302,7 @@
                                  (aset addrs idx nil))
                                (when stats-ops
                                  (set! (.-_stats this)
-                                       (replace-stats stats-ops (.-_stats this) old-key new-key
-                                                      #(node/$compute-stats this storage stats-ops {:sync? true}))))
+                                       (replace-stats this storage stats-ops)))
                                (arrays/array this))
                              ;; Persistent: clone arrays
                              (let [new-keys     (arrays/aclone keys)
@@ -322,8 +318,7 @@
                                    _            (aset new-children idx new-node)
                                    new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this))
                                    new-stats    (when stats-ops
-                                                  (replace-stats stats-ops (.-_stats this) old-key new-key
-                                                                 #(node/$compute-stats new-branch storage stats-ops {:sync? true})))]
+                                                  (replace-stats new-branch storage stats-ops))]
                                (set! (.-_stats new-branch) new-stats)
                                (arrays/array new-branch)))
                            ;; maxKey unchanged - reuse keys array
@@ -338,8 +333,7 @@
                                  (aset addrs idx nil))
                                (when stats-ops
                                  (set! (.-_stats this)
-                                       (replace-stats stats-ops (.-_stats this) old-key new-key
-                                                      #(node/$compute-stats this storage stats-ops {:sync? true}))))
+                                       (replace-stats this storage stats-ops)))
                                (if last-child?
                                  (arrays/array this)  ; Last child, need to propagate
                                  :early-exit))        ; Not last child, early exit
@@ -355,10 +349,9 @@
                                    _            (aset new-children idx new-node)
                                    new-branch   (Branch. (.-level this) keys new-children new-addrs (.-subtree-count this) nil (.-settings this))
                                    new-stats    (when stats-ops
-                                                  (replace-stats stats-ops (.-_stats this) old-key new-key
-                                                                 #(node/$compute-stats new-branch storage stats-ops {:sync? true})))]
+                                                  (replace-stats new-branch storage stats-ops))]
                                (set! (.-_stats new-branch) new-stats)
-                               (arrays/array new-branch)))))))))))))
+                               (arrays/array new-branch))))))))))))
 
 
 (defn $store

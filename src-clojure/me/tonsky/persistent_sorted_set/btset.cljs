@@ -75,18 +75,21 @@
                                   (.-settings set))
                           (let [child0 (arrays/aget roots 0)
                                 lvl    (inc (node/level child0))
-                                ;; Compute subtree count as sum of children's counts
-                                subtree-count (reduce + 0 (map node/$subtree-count roots))
+                                ;; Compute subtree count; propagate -1 (unknown) if any child is unknown
+                                child-counts (map node/$subtree-count roots)
+                                subtree-count (if (every? #(>= % 0) child-counts)
+                                                (reduce + 0 child-counts)
+                                                -1)
                                 ;; Compute stats from children if stats-ops available
                                 stats-ops (:stats (.-settings set))
-                                root-stats (when stats-ops
-                                             (reduce (fn [acc child]
-                                                       (let [cs (node/$stats child)]
-                                                         (if cs
-                                                           (stats/merge-stats stats-ops acc cs)
-                                                           acc)))
+                                ;; Only compute root-stats when all children have stats;
+                                ;; otherwise keep nil to allow lazy recomputation
+                                child-stats (when stats-ops (map node/$stats roots))
+                                root-stats (when (and stats-ops (every? some? child-stats))
+                                             (reduce (fn [acc cs]
+                                                       (stats/merge-stats stats-ops acc cs))
                                                      (stats/identity-stats stats-ops)
-                                                     roots))]
+                                                     child-stats))]
                             (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count root-stats (.-settings set))
                                     new-cnt
                                     (.-comparator set)
