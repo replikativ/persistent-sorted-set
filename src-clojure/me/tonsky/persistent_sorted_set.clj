@@ -153,7 +153,7 @@
          ->Leaf               (fn [keys]
                                 (let [^Leaf leaf (Leaf. (count keys) ^objects keys settings)]
                                   (when stats-ops
-                                    (set! (.-_stats leaf) (.computeStats leaf nil)))
+                                    (set! (.-_stats leaf) (.tryComputeStats leaf nil)))
                                   leaf))
          ->Branch             (fn [level ^objects children]
                                 (let [subtree-count (reduce + 0 (map #(if (instance? ISubtreeCount %)
@@ -266,7 +266,7 @@
         stats-ops (.stats settings)]
     (when (and stats-ops root)
       (or (.-_stats root)
-          (.computeStats root (.-_storage set))))))
+          (.forceComputeStats root (.-_storage set))))))
 
 (defn- stats-slice-node
   [^ANode node ^IStorage storage ^IStats stats-ops from to ^java.util.Comparator cmp]
@@ -316,7 +316,7 @@
                                acc
                                (let [^ANode child (.child branch storage i)
                                      child-stats (or (.-_stats child)
-                                                     (.computeStats child storage))]
+                                                     (.forceComputeStats child storage))]
                                  (recur (inc i)
                                         (.merge stats-ops acc child-stats)))))]
           (.merge stats-ops

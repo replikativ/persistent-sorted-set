@@ -237,11 +237,11 @@
                              new-stats (when stats-ops
                                          (if (.-_stats this)
                                            (stats/remove-stats stats-ops (.-_stats this) key
-                                                               #(node/$compute-stats
+                                                               #(node/try-compute-stats
                                                                  (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this))
                                                                  storage stats-ops {:sync? true}))
                                            ;; Stats were never initialized, compute from scratch
-                                           (node/$compute-stats
+                                           (node/try-compute-stats
                                             (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this))
                                             storage stats-ops {:sync? true})))]
                          (util/rotate (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-stats (.-settings this))
@@ -251,10 +251,10 @@
                                       (.-settings this))))))))))
 
 (defn- replace-stats
-  "Recompute stats after replace."
+  "Try to recompute stats after replace (postpone if children unavailable)."
   [branch storage stats-ops]
   (when stats-ops
-    (node/$compute-stats branch storage stats-ops {:sync? true})))
+    (node/try-compute-stats branch storage stats-ops {:sync? true})))
 
 (defn $replace
   [^Branch this storage old-key new-key cmp {:keys [sync?] :or {sync? true} :as opts}]
@@ -399,7 +399,27 @@
   (max-key [_] (arrays/alast keys))
   ($subtree-count [_] subtree-count)
   ($stats [_] _stats)
-  ($compute-stats [this storage stats-ops {:keys [sync?] :or {sync? true} :as opts}]
+  (try-compute-stats [this storage stats-ops {:keys [sync?] :or {sync? true} :as opts}]
+    ;; Try to compute stats, postpone if any child unavailable
+    (async+sync sync?
+                (async
+                 (when stats-ops
+                   (let [result (loop [i 0
+                                       acc (stats/identity-stats stats-ops)]
+                                  (if (< i (arrays/alength keys))
+                                    (let [child (await ($child this storage i opts))
+                                          child-stats (node/$stats child)]
+                                      (if child-stats
+                                        (recur (inc i)
+                                               (stats/merge-stats stats-ops acc child-stats))
+                                        ;; Child stats unavailable - postpone our computation
+                                        nil))
+                                    acc))]
+                     (when result
+                       (set! _stats result))
+                     result)))))
+  (force-compute-stats [this storage stats-ops {:keys [sync?] :or {sync? true} :as opts}]
+    ;; Force compute stats, recursively descending if needed
     (async+sync sync?
                 (async
                  (when stats-ops
@@ -408,7 +428,7 @@
                                   (if (< i (arrays/alength keys))
                                     (let [child (await ($child this storage i opts))
                                           child-stats (or (node/$stats child)
-                                                          (await (node/$compute-stats child storage stats-ops opts)))]
+                                                          (await (force-compute-stats child storage stats-ops opts)))]
                                       (recur (inc i)
                                              (if child-stats
                                                (stats/merge-stats stats-ops acc child-stats)

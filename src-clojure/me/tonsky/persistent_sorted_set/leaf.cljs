@@ -17,7 +17,8 @@
   (max-key [_] (arrays/alast keys))
   ($subtree-count [_] (arrays/alength keys))
   ($stats [_] _stats)
-  ($compute-stats [this storage stats-ops {:keys [sync?] :or {sync? true}}]
+  (try-compute-stats [this storage stats-ops {:keys [sync?] :or {sync? true}}]
+    ;; For leaves, try and force are the same - just compute from keys
     (if sync?
       (when stats-ops
         (let [result (reduce (fn [acc key]
@@ -34,6 +35,9 @@
                               keys)]
            (set! _stats result)
            result)))))
+  (force-compute-stats [this storage stats-ops opts]
+    ;; For leaves, try and force are the same - just compute from keys
+    (node/try-compute-stats this storage stats-ops opts))
   (merge [_ next]
     (let [new-leaf (Leaf. (arrays/aconcat keys (.-keys next)) settings nil)]
       ;; Stats will be recomputed lazily if needed
@@ -62,8 +66,8 @@
                                                 (Leaf. (.slice keys middle keys-l) settings nil))]
                                ;; Compute stats for split leaves
                                (when stats-ops
-                                 (node/$compute-stats left-leaf nil stats-ops {:sync? true})
-                                 (node/$compute-stats right-leaf nil stats-ops {:sync? true}))
+                                 (node/try-compute-stats left-leaf nil stats-ops {:sync? true})
+                                 (node/try-compute-stats right-leaf nil stats-ops {:sync? true}))
                                (arrays/array left-leaf right-leaf))
 
                              :else
@@ -105,9 +109,9 @@
                          (if _stats
                            (set! (.-_stats new-leaf)
                                  (stats/remove-stats stats-ops _stats key
-                                                     #(node/$compute-stats new-leaf storage stats-ops {:sync? true})))
+                                                     #(node/try-compute-stats new-leaf storage stats-ops {:sync? true})))
                            ;; Stats were never initialized, compute from scratch
-                           (node/$compute-stats new-leaf storage stats-ops {:sync? true})))
+                           (node/try-compute-stats new-leaf storage stats-ops {:sync? true})))
                        (util/rotate new-leaf root? left right settings)))))))
   ($replace [this storage old-key new-key cmp {:keys [sync?] :or {sync? true}}]
     (assert (== 0 (cmp old-key new-key)) "old-key and new-key must compare as equal (cmp must return 0)")
@@ -124,8 +128,8 @@
                          (if _stats
                            (set! (.-_stats new-leaf)
                                  ;; Compute from new-leaf which has new-key instead of old-key
-                                 (node/$compute-stats new-leaf storage stats-ops {:sync? true}))
-                           (node/$compute-stats new-leaf storage stats-ops {:sync? true})))
+                                 (node/try-compute-stats new-leaf storage stats-ops {:sync? true}))
+                           (node/try-compute-stats new-leaf storage stats-ops {:sync? true})))
                        (arrays/array new-leaf)))))))
   ($store [this storage {:keys [sync?] :or {sync? true} :as opts}]
     (async+sync sync?

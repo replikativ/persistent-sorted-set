@@ -288,7 +288,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
 
     // Check bounds using root stats
     Object rootStats = node._stats;
-    if (rootStats == null) rootStats = node.computeStats(_storage);
+    if (rootStats == null) rootStats = node.forceComputeStats(_storage);
     long totalWeight = statsOps.weight(rootStats);
     if (rank < 0 || rank >= totalWeight) return null;
 
@@ -299,7 +299,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       for (int i = 0; i < branch._len; i++) {
         ANode<Key, Address> child = branch.child(_storage, i);
         Object childStats = child._stats;
-        if (childStats == null) childStats = child.computeStats(_storage);
+        if (childStats == null) childStats = child.forceComputeStats(_storage);
         long childWeight = statsOps.weight(childStats);
         if (rank < childWeight) {
           node = child;
@@ -421,7 +421,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     for (ANode child : children) {
       Object childStats = child.stats();
       if (childStats == null) {
-        childStats = child.computeStats(_storage);
+        childStats = child.forceComputeStats(_storage);
       }
       if (childStats != null) {
         result = statsOps.merge(result, childStats);

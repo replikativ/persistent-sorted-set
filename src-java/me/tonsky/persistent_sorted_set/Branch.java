@@ -296,35 +296,6 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     return result;
   }
 
-  /**
-   * Helper to force compute stats from children array (descend if needed).
-   * @deprecated Use tryComputeStatsFromChildren for operations
-   */
-  @Deprecated
-  private static Object computeStatsFromChildren(Object[] children, int len, IStorage storage, IStats statsOps) {
-    if (statsOps == null) return null;
-    Object result = statsOps.identity();
-    for (int i = 0; i < len; ++i) {
-      Object raw = children[i];
-      ANode child = null;
-      if (raw instanceof ANode) {
-        child = (ANode) raw;
-      } else if (raw instanceof java.lang.ref.Reference) {
-        child = (ANode) ((java.lang.ref.Reference<?>) raw).get();
-      }
-      if (child != null) {
-        Object childStats = child.stats();
-        if (childStats == null) {
-          childStats = child.forceComputeStats(storage);
-        }
-        if (childStats != null) {
-          result = statsOps.merge(result, childStats);
-        }
-      }
-    }
-    return result;
-  }
-
   protected Object[] ensureChildren() {
     if (_children == null) {
       _children = new Object[_keys.length];
@@ -364,7 +335,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // Update stats: recompute from children (child's stats were updated in place)
       IStats statsOps = _settings.stats();
       if (statsOps != null) {
-        _stats = computeStats(storage);
+        _stats = tryComputeStats(storage);
       }
       return PersistentSortedSet.EARLY_EXIT;
     }
@@ -384,7 +355,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (_subtreeCount >= 0) _subtreeCount += 1;
       // Update stats: recompute from children
       if (statsOps != null) {
-        _stats = computeStats(storage);
+        _stats = tryComputeStats(storage);
       }
       if (ins == _len - 1 && node.maxKey() == maxKey()) // TODO why maxKey check?
         return new ANode[]{ this }; // update maxKey
@@ -586,7 +557,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // Update stats: recompute from children (child's stats were updated in place)
       IStats statsOps = _settings.stats();
       if (statsOps != null) {
-        _stats = computeStats(storage);
+        _stats = tryComputeStats(storage);
       }
       return PersistentSortedSet.EARLY_EXIT;
     }
@@ -653,7 +624,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         if (_subtreeCount >= 0) _subtreeCount -= 1;
         // Update stats: recompute from children
         if (statsOps != null) {
-          _stats = computeStats(storage);
+          _stats = tryComputeStats(storage);
         }
         return PersistentSortedSet.EARLY_EXIT;
       }

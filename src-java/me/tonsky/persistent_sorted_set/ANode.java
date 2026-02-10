@@ -58,16 +58,6 @@ public abstract class ANode<Key, Address> {
    */
   public abstract Object forceComputeStats(IStorage storage);
 
-  /**
-   * Compute stats from this node's keys (for Leaf) or children's stats (for Branch).
-   * Returns null if stats not configured in settings.
-   * @deprecated Use tryComputeStats for operations or forceComputeStats for queries
-   */
-  @Deprecated
-  public Object computeStats(IStorage storage) {
-    return forceComputeStats(storage);
-  }
-
   public int len() {
     return _len;
   }

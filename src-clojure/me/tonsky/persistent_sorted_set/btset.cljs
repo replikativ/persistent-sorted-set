@@ -212,7 +212,7 @@
                  (if (nil? stats-ops)
                    nil
                    (or (node/$stats root)
-                       (await (node/$compute-stats root (.-storage set) stats-ops opts))))))))
+                       (await (node/force-compute-stats root (.-storage set) stats-ops opts))))))))
 
 (defn restore
   [root-address-or-info storage opts]
@@ -951,7 +951,7 @@
                                             acc
                                             (let [child (await (branch/$child node storage i opts))
                                                   child-stats (or (node/$stats child)
-                                                                  (await (node/$compute-stats child storage stats-ops opts)))]
+                                                                  (await (node/force-compute-stats child storage stats-ops opts)))]
                                               (recur (inc i)
                                                      (stats/merge-stats stats-ops acc child-stats)))))]
                        (stats/merge-stats stats-ops
@@ -1003,7 +1003,7 @@
                     (throw (js/Error. "get-nth requires stats to be configured")))
                   (when (pos? (node/len root))
                     (let [root-stats (or (node/$stats root)
-                                         (await (node/$compute-stats root (.-storage set) stats-ops opts)))
+                                         (await (node/force-compute-stats root (.-storage set) stats-ops opts)))
                           total-weight (stats/weight stats-ops root-stats)]
                       (when (and (>= n 0) (< n total-weight))
                         ;; Navigate tree
@@ -1017,7 +1017,7 @@
                                            (when (< i len)
                                              (let [child (await (branch/$child cur-node (.-storage set) i opts))
                                                    child-stats (or (node/$stats child)
-                                                                   (await (node/$compute-stats child (.-storage set) stats-ops opts)))
+                                                                   (await (node/force-compute-stats child (.-storage set) stats-ops opts)))
                                                    child-weight (stats/weight stats-ops child-stats)]
                                                (if (< r child-weight)
                                                  [child r]
@@ -1544,7 +1544,7 @@
                       (arr-map-inplace #(let [leaf (Leaf. % settings nil)]
                                           ;; Compute stats for leaf if stats-ops available
                                           (when stats-ops
-                                            (node/$compute-stats leaf nil stats-ops {:sync? true}))
+                                            (node/try-compute-stats leaf nil stats-ops {:sync? true}))
                                           leaf)))
         storage  (:storage opts)]
     (loop [current-level leaves
