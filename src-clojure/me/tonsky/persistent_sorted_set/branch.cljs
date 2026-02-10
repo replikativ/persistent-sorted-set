@@ -353,7 +353,6 @@
                                (set! (.-_stats new-branch) new-stats)
                                (arrays/array new-branch))))))))))))
 
-
 (defn $store
   [^Branch this storage {:keys [sync?] :or {sync? true} :as opts}]
   (ensure-addresses this)
