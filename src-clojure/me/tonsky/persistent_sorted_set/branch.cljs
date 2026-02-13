@@ -132,11 +132,10 @@
                                ;; After adding one element, increment count if known
                                old-sc (.-subtree-count this)
                                new-sc (if (>= old-sc 0) (inc old-sc) -1)
-                               ;; Update measure incrementally
+                               ;; Update measure incrementally only if already computed
                                measure-ops (:measure (.-settings this))
-                               new-measure (when measure-ops
-                                           (let [prev-measure (or (.-_measure this) (measure/identity-measure measure-ops))]
-                                             (measure/merge-measure measure-ops prev-measure (measure/extract measure-ops key))))]
+                               new-measure (when (and measure-ops (.-_measure this))
+                                             (measure/merge-measure measure-ops (.-_measure this) (measure/extract measure-ops key)))]
                            (arrays/array (Branch. (.-level this) new-keys new-children new-addrs new-sc new-measure (.-settings this))))
                          (let [middle      (arrays/half (arrays/alength new-children))
                                tmp-addrs   (when addrs
@@ -232,18 +231,13 @@
                              ;; After removing one element, decrement count if known
                              old-sc (.-subtree-count this)
                              new-sc (if (>= old-sc 0) (dec old-sc) -1)
-                             ;; Update measure
+                             ;; Update measure only if already computed
                              measure-ops (:measure (.-settings this))
-                             new-measure (when measure-ops
-                                         (if (.-_measure this)
+                             new-measure (when (and measure-ops (.-_measure this))
                                            (measure/remove-measure measure-ops (.-_measure this) key
                                                                #(node/try-compute-measure
                                                                  (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this))
-                                                                 storage measure-ops {:sync? true}))
-                                           ;; Measure was never initialized, compute from scratch
-                                           (node/try-compute-measure
-                                            (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this))
-                                            storage measure-ops {:sync? true})))]
+                                                                 storage measure-ops {:sync? true})))]
                          (util/rotate (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-measure (.-settings this))
                                       (and (nil? left) (nil? right))
                                       left
@@ -399,24 +393,43 @@
   ($subtree-count [_] subtree-count)
   ($measure [_] _measure)
   (try-compute-measure [this storage measure-ops {:keys [sync?] :or {sync? true} :as opts}]
-    ;; Try to compute measure, postpone if any child unavailable
-    (async+sync sync?
-                (async
-                 (when measure-ops
-                   (let [result (loop [i 0
-                                       acc (measure/identity-measure measure-ops)]
-                                  (if (< i (arrays/alength keys))
-                                    (let [child (await ($child this storage i opts))
-                                          child-measure (node/$measure child)]
-                                      (if child-measure
-                                        (recur (inc i)
-                                               (measure/merge-measure measure-ops acc child-measure))
-                                        ;; Child measure unavailable - postpone our computation
-                                        nil))
-                                    acc))]
-                     (when result
-                       (set! _measure result))
-                     result)))))
+    ;; Try to compute measure from in-memory children only; postpone if any child not loaded
+    (if sync?
+      (when measure-ops
+        (when (some? children)
+          (let [result (loop [i 0
+                              acc (measure/identity-measure measure-ops)]
+                         (if (< i (arrays/alength keys))
+                           (let [child (when (some? children) (aget children i))]
+                             (if (nil? child)
+                               nil ;; child not in memory, postpone
+                               (let [child-measure (node/$measure child)]
+                                 (if child-measure
+                                   (recur (inc i)
+                                          (measure/merge-measure measure-ops acc child-measure))
+                                   nil)))) ;; child measure unavailable, postpone
+                           acc))]
+            (when result
+              (set! _measure result))
+            result)))
+      (async
+       (when measure-ops
+         (when (some? children)
+           (let [result (loop [i 0
+                               acc (measure/identity-measure measure-ops)]
+                          (if (< i (arrays/alength keys))
+                            (let [child (when (some? children) (aget children i))]
+                              (if (nil? child)
+                                nil
+                                (let [child-measure (node/$measure child)]
+                                  (if child-measure
+                                    (recur (inc i)
+                                           (measure/merge-measure measure-ops acc child-measure))
+                                    nil))))
+                            acc))]
+             (when result
+               (set! _measure result))
+             result))))))
   (force-compute-measure [this storage measure-ops {:keys [sync?] :or {sync? true} :as opts}]
     ;; Force compute measure, recursively descending if needed
     (async+sync sync?

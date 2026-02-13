@@ -104,14 +104,11 @@
                    (when (<= 0 idx)
                      (let [new-keys (util/splice keys idx (inc idx) (arrays/array))
                            new-leaf (Leaf. new-keys settings nil)]
-                       ;; Update measure
-                       (when measure-ops
-                         (if _measure
-                           (set! (.-_measure new-leaf)
-                                 (measure/remove-measure measure-ops _measure key
-                                                     #(node/try-compute-measure new-leaf storage measure-ops {:sync? true})))
-                           ;; Measure was never initialized, compute from scratch
-                           (node/try-compute-measure new-leaf storage measure-ops {:sync? true})))
+                       ;; Update measure only if already computed
+                       (when (and measure-ops _measure)
+                         (set! (.-_measure new-leaf)
+                               (measure/remove-measure measure-ops _measure key
+                                                   #(node/try-compute-measure new-leaf storage measure-ops {:sync? true}))))
                        (util/rotate new-leaf root? left right settings)))))))
   ($replace [this storage old-key new-key cmp {:keys [sync?] :or {sync? true}}]
     (assert (== 0 (cmp old-key new-key)) "old-key and new-key must compare as equal (cmp must return 0)")
@@ -124,12 +121,10 @@
                            new-leaf (Leaf. new-keys settings nil)
                            measure-ops (:measure settings)]
                        ;; Eagerly maintain measure: compute from new leaf (which has replacement done)
-                       (when measure-ops
-                         (if _measure
-                           (set! (.-_measure new-leaf)
-                                 ;; Compute from new-leaf which has new-key instead of old-key
-                                 (node/try-compute-measure new-leaf storage measure-ops {:sync? true}))
-                           (node/try-compute-measure new-leaf storage measure-ops {:sync? true})))
+                       (when (and measure-ops _measure)
+                         (set! (.-_measure new-leaf)
+                               ;; Compute from new-leaf which has new-key instead of old-key
+                               (node/try-compute-measure new-leaf storage measure-ops {:sync? true})))
                        (arrays/array new-leaf)))))))
   ($store [this storage {:keys [sync?] :or {sync? true} :as opts}]
     (async+sync sync?

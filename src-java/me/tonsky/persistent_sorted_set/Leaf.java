@@ -101,7 +101,9 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         .copyAll(_keys, 0, ins)
         .copyOne(key)
         .copyAll(_keys, ins, _len);
-      n._measure = n.tryComputeMeasure(storage);
+      if (_measure != null) {
+        n._measure = n.tryComputeMeasure(storage);
+      }
       return processLeafNodes(new ANode[]{n}, storage, settings);
     }
 
@@ -118,8 +120,10 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         .copyOne(key)
         .copyAll(_keys, ins, half1 - 1);
       ArrayUtil.copy(_keys, half1 - 1, _len, n2._keys, 0);
-      n1._measure = n1.tryComputeMeasure(storage);
-      n2._measure = n2.tryComputeMeasure(storage);
+      if (_measure != null) {
+        n1._measure = n1.tryComputeMeasure(storage);
+        n2._measure = n2.tryComputeMeasure(storage);
+      }
       return processLeafNodes(new ANode[]{n1, n2}, storage, settings);
     }
 
@@ -131,8 +135,10 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       .copyAll(_keys, half1, ins)
       .copyOne(key)
       .copyAll(_keys, ins, _len);
-    n1._measure = n1.tryComputeMeasure(storage);
-    n2._measure = n2.tryComputeMeasure(storage);
+    if (_measure != null) {
+      n1._measure = n1.tryComputeMeasure(storage);
+      n2._measure = n2.tryComputeMeasure(storage);
+    }
     return processLeafNodes(new ANode[]{n1, n2}, storage, settings);
   }
 
@@ -156,14 +162,9 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       if (editable()) {
         ArrayUtil.copy(_keys, idx + 1, _len, _keys, idx);
         _len = newLen;
-        // Update stats using remove operation
-        if (measureOps != null) {
-          if (_measure != null) {
-            _measure = measureOps.remove(_measure, key, () -> thisLeaf.tryComputeMeasure(storage));
-          } else {
-            // Stats were never initialized, compute from scratch
-            _measure = thisLeaf.tryComputeMeasure(storage);
-          }
+        // Update stats using remove operation only if already computed
+        if (measureOps != null && _measure != null) {
+          _measure = measureOps.remove(_measure, key, () -> thisLeaf.tryComputeMeasure(storage));
         }
         if (idx == newLen) // removed last, need to signal new maxKey
           return new ANode[]{left, this, right};

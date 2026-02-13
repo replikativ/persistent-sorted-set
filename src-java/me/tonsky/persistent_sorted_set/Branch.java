@@ -106,7 +106,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // if (_children != null) {
       //   _children[idx] = null;
       // }
-      if (address != null && _children[idx] instanceof ANode) {
+      if (address != null && _children != null && _children[idx] instanceof ANode) {
         _children[idx] = _settings.makeReference(_children[idx]);
       }
     }
@@ -191,18 +191,23 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
   @Override
   public Object tryComputeMeasure(IStorage storage) {
-    // Try to compute measure, postpone if any child unavailable
+    // Try to compute measure from in-memory children only; postpone if any child not loaded
     IMeasure measureOps = _settings.measure();
     if (measureOps == null) return null;
+    if (_children == null) return null; // no children loaded
 
     Object result = measureOps.identity();
     for (int i = 0; i < _len; i++) {
-      ANode child = child(storage, i);
-      Object childMeasure = child.measure();
-      if (childMeasure == null) {
-        // Child measure unavailable - postpone our stats computation
-        return null;
+      Object raw = _children[i];
+      ANode child = null;
+      if (raw instanceof ANode) {
+        child = (ANode) raw;
+      } else if (raw instanceof java.lang.ref.Reference) {
+        child = (ANode) ((java.lang.ref.Reference<?>) raw).get();
       }
+      if (child == null) return null; // child not in memory, postpone
+      Object childMeasure = child.measure();
+      if (childMeasure == null) return null; // child measure unavailable, postpone
       result = measureOps.merge(result, childMeasure);
     }
     return result;
@@ -244,37 +249,13 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     return node.count(storage);
   }
 
-  /**
-   * Helper to compute subtree count from children array.
-   * Handles direct ANode references, Reference-wrapped nodes, and unloaded children (null with address).
-   */
-  private static long sumChildCounts(Object[] children, Object[] addresses, int len, IStorage storage, Settings settings) {
-    long total = 0;
-    for (int i = 0; i < len; ++i) {
-      Object raw = children != null ? children[i] : null;
-      ANode node = null;
-      if (raw instanceof ANode) {
-        node = (ANode) raw;
-      } else if (raw != null && settings != null) {
-        // Could be a Reference (SoftReference/WeakReference)
-        node = (ANode) settings.readReference(raw);
-      }
-      // If child is not loaded yet but has an address, load it from storage
-      if (node == null && addresses != null && addresses[i] != null && storage != null) {
-        node = storage.restore(addresses[i]);
-      }
-      if (node != null) {
-        total += getSubtreeCount(node, storage);
-      }
-    }
-    return total;
-  }
 
   /**
    * Helper to try computing measure from children array (postpone if any child unavailable).
    */
   private static Object tryComputeMeasureFromChildren(Object[] children, int len, IStorage storage, IMeasure measureOps) {
     if (measureOps == null) return null;
+    if (children == null) return null;
     Object result = measureOps.identity();
     for (int i = 0; i < len; ++i) {
       Object raw = children[i];
@@ -284,14 +265,13 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       } else if (raw instanceof java.lang.ref.Reference) {
         child = (ANode) ((java.lang.ref.Reference<?>) raw).get();
       }
-      if (child != null) {
-        Object childMeasure = child.measure();
-        if (childMeasure == null) {
-          // Child measure unavailable - postpone
-          return null;
-        }
-        result = measureOps.merge(result, childMeasure);
+      if (child == null) return null; // child not available, postpone
+      Object childMeasure = child.measure();
+      if (childMeasure == null) {
+        // Child measure unavailable - postpone
+        return null;
       }
+      result = measureOps.merge(result, childMeasure);
     }
     return result;
   }
@@ -334,7 +314,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (_subtreeCount >= 0) _subtreeCount += 1;
       // Update measure: recompute from children (child's stats were updated in place)
       IMeasure measureOps = _settings.measure();
-      if (measureOps != null) {
+      if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
       return PersistentSortedSet.EARLY_EXIT;
@@ -354,7 +334,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // Update subtree count: we added one element
       if (_subtreeCount >= 0) _subtreeCount += 1;
       // Update measure: recompute from children
-      if (measureOps != null) {
+      if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
       if (ins == _len - 1 && node.maxKey() == maxKey()) // TODO why maxKey check?
@@ -556,7 +536,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (_subtreeCount >= 0) _subtreeCount -= 1;
       // Update measure: recompute from children (child's stats were updated in place)
       IMeasure measureOps = _settings.measure();
-      if (measureOps != null) {
+      if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
       return PersistentSortedSet.EARLY_EXIT;
@@ -623,7 +603,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         // Update subtree count: we removed one element
         if (_subtreeCount >= 0) _subtreeCount -= 1;
         // Update measure: recompute from children
-        if (measureOps != null) {
+        if (measureOps != null && _measure != null) {
           _measure = tryComputeMeasure(storage);
         }
         return PersistentSortedSet.EARLY_EXIT;
@@ -694,9 +674,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       cs.copyAll(_children, idx + 2, _len);
 
       // Subtree count = left count + this count - 1 (joined and removed one element)
-      long leftCount = left._subtreeCount >= 0 ? left._subtreeCount : left.computeSubtreeCount(storage);
-      long thisCount = _subtreeCount >= 0 ? _subtreeCount : computeSubtreeCount(storage);
-      join._subtreeCount = leftCount + thisCount - 1;
+      // Propagate -1 if either side is unknown to preserve laziness
+      join._subtreeCount = (left._subtreeCount >= 0 && _subtreeCount >= 0)
+          ? left._subtreeCount + _subtreeCount - 1
+          : -1;
       join._measure = tryComputeMeasureFromChildren(join._children, left._len + newLen, storage, measureOps);
       return new ANode[] { null, join, right };
     }
@@ -733,9 +714,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       cs.copyAll(right._children, 0, right._len);
 
       // Subtree count = this count + right count - 1 (joined and removed one element)
-      long thisCount = _subtreeCount >= 0 ? _subtreeCount : computeSubtreeCount(storage);
-      long rightCount = right._subtreeCount >= 0 ? right._subtreeCount : right.computeSubtreeCount(storage);
-      join._subtreeCount = thisCount + rightCount - 1;
+      // Propagate -1 if either side is unknown to preserve laziness
+      join._subtreeCount = (_subtreeCount >= 0 && right._subtreeCount >= 0)
+          ? _subtreeCount + right._subtreeCount - 1
+          : -1;
       join._measure = tryComputeMeasureFromChildren(join._children, newLen + right._len, storage, measureOps);
       return new ANode[] { left, join, null };
     }
@@ -925,12 +907,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
     // Try to recompute measure from final state (after child replacement) for new branch
     Branch<Key, Address> newBranch = new Branch(_level, _len, newKeys, newAddresses, newChildren, _subtreeCount, null, settings);
-    Object newMeasure = null;
     if (measureOps != null && _measure != null) {
-      newMeasure = newBranch.tryComputeMeasure(storage);
+      newBranch._measure = newBranch.tryComputeMeasure(storage);
     }
 
-    return new ANode[]{new Branch(_level, _len, newKeys, newAddresses, newChildren, _subtreeCount, newMeasure, settings)};
+    return new ANode[]{newBranch};
   }
 
   @Override
