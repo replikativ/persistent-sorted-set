@@ -17,8 +17,8 @@ This document demonstrates how to use `get-nth` for efficient statistical analys
 Create a sorted set with numeric statistics enabled:
 
 ```clojure
-(require '[me.tonsky.persistent-sorted-set :as pss])
-(import '[me.tonsky.persistent_sorted_set NumericStatsOps])
+(require '[org.replikativ.persistent-sorted-set :as pss])
+(import '[org.replikativ.persistent_sorted_set NumericStatsOps])
 
 ;; Create a dataset with statistics tracking
 (defn make-dataset [values]

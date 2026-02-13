@@ -82,14 +82,14 @@ rm -rf target
 
 ### Core Components
 
-1. **Java Implementation** (`src-java/me/tonsky/persistent_sorted_set/`)
+1. **Java Implementation** (`src-java/org/replikativ/persistent_sorted_set/`)
    - `APersistentSortedSet.java` - Abstract base class
    - `PersistentSortedSet.java` - Main implementation
    - `ANode.java`, `Branch.java`, `Leaf.java` - B-tree node structure
    - `IStorage.java` - Interface for persistent storage
    - `Settings.java` - Configuration (branching factor, reference types)
 
-2. **Clojure/ClojureScript API** (`src-clojure/me/tonsky/persistent_sorted_set/`)
+2. **Clojure/ClojureScript API** (`src-clojure/org/replikativ/persistent_sorted_set/`)
    - Public API functions: `sorted-set`, `sorted-set-by`, `conj`, `disj`, `slice`, `rslice`, `seek`
    - Storage operations: `store`, `restore`, `walk-addresses`
    - Utility namespace: `arrays.cljc` for cross-platform array operations
@@ -112,7 +112,7 @@ rm -rf target
 
 ### Testing Structure
 
-Tests are located in `test-clojure/me/tonsky/persistent_sorted_set/test/`:
+Tests are located in `test-clojure/org/replikativ/persistent_sorted_set/test/`:
 - `core.cljc` - Main test suite
 - `small.cljc` - Focused tests for specific cases
 - `storage.clj` - Storage interface tests (Clojure only)

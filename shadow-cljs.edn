@@ -4,7 +4,7 @@
  {:node-tests
   {:target    :node-test  ;shadow-cljs release node-tests && node target/pss/tests.min.js
    :output-to "target/pss/tests.min.js"
-   :ns-regexp "^(?!me.tonsky.persistent-sorted-set.test.stress|me.tonsky.persistent-sorted-set.test.structural-invariants|me.tonsky.persistent-sorted-set.test.generative)"
+   :ns-regexp "^(?!org.replikativ.persistent-sorted-set.test.stress|org.replikativ.persistent-sorted-set.test.structural-invariants|org.replikativ.persistent-sorted-set.test.generative)"
    :compiler-options {:infer-externs true
                       :parallel-build true
                       :static-fns true
@@ -14,7 +14,7 @@
   :node-stress ;shadow-cljs release node-stress && node target/pss/stress.min.js
   {:target    :node-test
    :output-to "target/pss/stress.min.js"
-   :ns-regexp "^me.tonsky.persistent-sorted-set.test.stress"
+   :ns-regexp "^org.replikativ.persistent-sorted-set.test.stress"
    :compiler-options {:infer-externs true
                       :parallel-build true
                       :static-fns true
@@ -24,7 +24,7 @@
   :ci ;shadow-cljs compile ci && node target/pss/ci-tests.js
   {:target    :node-test
    :output-to "target/pss/ci-tests.js"
-   :ns-regexp "^(?!me.tonsky.persistent-sorted-set.test.stress|me.tonsky.persistent-sorted-set.test.storage|me.tonsky.persistent-sorted-set.test.structural-invariants|me.tonsky.persistent-sorted-set.test.generative)"
+   :ns-regexp "^(?!org.replikativ.persistent-sorted-set.test.stress|org.replikativ.persistent-sorted-set.test.storage|org.replikativ.persistent-sorted-set.test.structural-invariants|org.replikativ.persistent-sorted-set.test.generative)"
    :compiler-options {:infer-externs true
                       :parallel-build false
                       :static-fns true
@@ -33,5 +33,5 @@
                       :optimizations :advanced}}
   :node-repl ;shadow-cljs node-repl
   {:target :node-script
-   :main me.tonsky.persistent-sorted-set/sorted-set
+   :main org.replikativ.persistent-sorted-set/sorted-set
    :output-to "target/repl.js"}}}

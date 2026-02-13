@@ -35,7 +35,7 @@ The version follows the pattern `0.3.{commit-count}` and is automatically increm
 Code:
 
 ```clj
-(require '[me.tonsky.persistent-sorted-set :as set])
+(require '[org.replikativ.persistent-sorted-set :as set])
 
 (set/sorted-set 3 2 1)
 ;=> #{1 2 3}
@@ -240,7 +240,7 @@ Last piece of the puzzle: `set/walk-addresses`. Use it to check which nodes are 
   @*alive-addresses)
 ```
 
-See [test_storage.clj](test-clojure/me/tonsky/persistent_sorted_set/test_storage.clj) for more examples.
+See [test_storage.clj](test-clojure/org/replikativ/persistent_sorted_set/test_storage.clj) for more examples.
 
 ### ClojureScript Durability
 
@@ -314,8 +314,8 @@ Access elements by their position (rank) in O(log n) time, enabling efficient pe
 ClojureScript provides the same `get-nth` API:
 
 ```cljs
-(require '[me.tonsky.persistent-sorted-set :as set])
-(require '[me.tonsky.persistent-sorted-set.impl.numeric-stats :as nstats])
+(require '[org.replikativ.persistent-sorted-set :as set])
+(require '[org.replikativ.persistent-sorted-set.impl.numeric-stats :as nstats])
 
 (def s (into (set/sorted-set* {:measure nstats/numeric-stats-ops})
              (range 1000)))
@@ -333,7 +333,7 @@ PersistentSortedSet can maintain aggregate statistics that update incrementally 
 ### Using Built-in Numeric Statistics
 
 ```clj
-(import '[me.tonsky.persistent_sorted_set NumericStatsOps])
+(import '[org.replikativ.persistent_sorted_set NumericStatsOps])
 
 ;; Create set with numeric stats tracking
 (def s (into (set/sorted-set* {:measure (NumericStatsOps.)})
@@ -417,12 +417,12 @@ The built-in `NumericStatsOps` handles this automatically for min/max.
 
 ### ClojureScript Statistics
 
-For ClojureScript, implement the `IMeasure` protocol from `me.tonsky.persistent-sorted-set.impl.measure`:
+For ClojureScript, implement the `IMeasure` protocol from `org.replikativ.persistent-sorted-set.impl.measure`:
 
 ```cljs
-(require '[me.tonsky.persistent-sorted-set :as set])
-(require '[me.tonsky.persistent-sorted-set.impl.stats :as stats])
-(require '[me.tonsky.persistent-sorted-set.impl.numeric-stats :as numeric-stats])
+(require '[org.replikativ.persistent-sorted-set :as set])
+(require '[org.replikativ.persistent-sorted-set.impl.stats :as stats])
+(require '[org.replikativ.persistent-sorted-set.impl.numeric-stats :as numeric-stats])
 
 ;; Use built-in numeric stats
 (def s (into (set/sorted-set* {:measure numeric-stats/numeric-stats-ops})

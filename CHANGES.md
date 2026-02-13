@@ -34,7 +34,7 @@ Special handling of nils in slice/rslice in CLJS, matching CLJ behaviour #6
 
 # 0.1.3
 
-Fixed NPE in `me.tonsky.persistent-sorted-set.arrays/array?` #4 #5 thx @timothypratley
+Fixed NPE in `org.replikativ.persistent-sorted-set.arrays/array?` #4 #5 thx @timothypratley
 
 # 0.1.2
 

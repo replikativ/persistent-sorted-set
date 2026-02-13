@@ -35,10 +35,12 @@
   {:extra-paths ["test-clojure"]
    :extra-deps  {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}
                  org.clojure/test.check {:mvn/version "1.1.1"}}
-   :main-opts   ["-m" "cognitect.test-runner"]
+   :main-opts   ["-m" "cognitect.test-runner"
+                  "-d" "test-clojure"
+                  "-r" "org\\.replikativ\\.persistent-sorted-set\\.test.*"]
    :exec-fn     cognitect.test-runner.api/test
    :exec-args   {:dirs ["test-clojure"]
-                 :patterns ["me\\.tonsky\\.persistent-sorted-set\\.test.*"]}}
+                 :patterns ["org\\.replikativ\\.persistent-sorted-set\\.test.*"]}}
 
   :bench
   {:extra-paths ["test-clojure" "bench-clojure"]
