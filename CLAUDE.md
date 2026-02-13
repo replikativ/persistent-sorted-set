@@ -123,3 +123,7 @@ Tests are located in `test-clojure/org/replikativ/persistent_sorted_set/test/`:
 - Java 8 is required for building due to bootclasspath requirements
 - The set cannot store `nil` values (unlike `clojure.core/sorted-set`)
 - ClojureScript version does not yet support the storage/durability features
+
+### Test Failures Are Critical
+
+This is a data structure library — correctness is paramount. **Any test failure that indicates a potential correctness error MUST be investigated and fixed before proceeding.** Do not skip, ignore, or dismiss failing tests. A failing generative/property-based test means the data structure may be producing wrong results, which can silently corrupt user data. If a test hangs during shrinking, that itself indicates a real failure that triggered the shrink. Always wait for tests to complete on both CLJ and CLJS before considering a change done.

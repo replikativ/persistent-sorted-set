@@ -68,7 +68,7 @@
   ([^BTSet set key]
    (btset/lookup set key nil {:sync? true}))
   ([^BTSet set key cmp]
-   (btset/lookup set key nil {:sync? true :comparator cmp})))
+   (btset/lookup set key cmp {:sync? true})))
 
 (defn equiv?
   "Is _other_ a set with the same items?

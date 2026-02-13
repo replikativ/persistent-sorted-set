@@ -193,15 +193,12 @@
                                              opts))))))
 
 (defn lookup
-  [^BTSet set key not-found {:keys [sync? comparator] :or {sync? true} :as opts}]
+  [^BTSet set key cmp {:keys [sync?] :or {sync? true} :as opts}]
   (async+sync sync?
               (async
-               (let [root   (await (-root set opts))
-                     cmp    (or comparator (.-comparator set))
-                     result (await (node/lookup root (.-storage set) key cmp opts))]
-                 (if (some? result)
-                   result
-                   not-found)))))
+               (let [root (await (-root set opts))
+                     cmp  (or cmp (.-comparator set))]
+                 (await (node/lookup root (.-storage set) key cmp opts))))))
 
 (defn measure
   "Get the aggregated statistics for the entire set."
@@ -1430,7 +1427,9 @@
 
   ILookup
   (-lookup [this k] (lookup this k nil {:sync? true}))
-  (-lookup [this k not-found] (lookup this k not-found {:sync? true}))
+  (-lookup [this k not-found]
+    (let [result (lookup this k nil {:sync? true})]
+      (if (some? result) result not-found)))
 
   ISeqable
   (-seq [this]
