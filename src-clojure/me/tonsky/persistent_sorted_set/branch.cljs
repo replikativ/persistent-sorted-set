@@ -93,6 +93,22 @@
                      (let [c (await ($child node storage ins opts))]
                        (await (node/$lookup c storage key cmp opts)))))))))
 
+(defn- try-compute-subtree-count-from-children
+  "Compute subtree count from in-memory children. Returns -1 if any child unavailable."
+  [children len]
+  (if (nil? children)
+    -1
+    (loop [i 0, cnt 0]
+      (if (>= i len)
+        cnt
+        (let [child (aget children i)]
+          (if (nil? child)
+            -1
+            (let [cc (node/$subtree-count child)]
+              (if (>= cc 0)
+                (recur (inc i) (+ cnt cc))
+                -1))))))))
+
 (defn $add
   [^Branch this storage key cmp opts]
   (let [{:keys [sync?] :or {sync? true}} opts
@@ -176,14 +192,14 @@
                                      (.slice new-keys 0 middle)
                                      left-children
                                      left-addrs
-                                     -1
+                                     (try-compute-subtree-count-from-children left-children (arrays/alength left-children))
                                      left-measure
                                      (.-settings this))
                             (Branch. (.-level this)
                                      (.slice new-keys middle)
                                      right-children
                                      right-addrs
-                                     -1
+                                     (try-compute-subtree-count-from-children right-children (arrays/alength right-children))
                                      right-measure
                                      (.-settings this))))))))))))
 
@@ -485,10 +501,34 @@
           as (when (or addresses (.-addresses next))
                (util/merge-n-split (or (ensure-addresses this) (arrays/make-array (arrays/alength keys)))
                                    (or (ensure-addresses next) (arrays/make-array (arrays/alength (.-keys next))))))]
-      ;; After split, we don't know exact counts or measure, set to -1/nil for lazy computation
-      (util/return-array
-       (Branch. level (arrays/aget ks 0) (arrays/aget ps 0) (when as (arrays/aget as 0)) -1 nil settings)
-       (Branch. level (arrays/aget ks 1) (arrays/aget ps 1) (when as (arrays/aget as 1)) -1 nil settings))))
+      (let [p0 (arrays/aget ps 0)
+            p1 (arrays/aget ps 1)
+            sc0 (try-compute-subtree-count-from-children p0 (arrays/alength p0))
+            sc1 (try-compute-subtree-count-from-children p1 (arrays/alength p1))
+            measure-ops (:measure settings)
+            m0 (when (and measure-ops _measure (.-_measure next))
+                 (reduce (fn [acc child]
+                           (if (nil? acc)
+                             (reduced nil)
+                             (let [cs (node/$measure child)]
+                               (if cs
+                                 (measure/merge-measure measure-ops acc cs)
+                                 (reduced nil)))))
+                         (measure/identity-measure measure-ops)
+                         p0))
+            m1 (when (and measure-ops _measure (.-_measure next))
+                 (reduce (fn [acc child]
+                           (if (nil? acc)
+                             (reduced nil)
+                             (let [cs (node/$measure child)]
+                               (if cs
+                                 (measure/merge-measure measure-ops acc cs)
+                                 (reduced nil)))))
+                         (measure/identity-measure measure-ops)
+                         p1))]
+        (util/return-array
+         (Branch. level (arrays/aget ks 0) p0 (when as (arrays/aget as 0)) sc0 m0 settings)
+         (Branch. level (arrays/aget ks 1) p1 (when as (arrays/aget as 1)) sc1 m1 settings)))))
   ($add [this storage key cmp opts]
     ($add this storage key cmp opts))
   ($contains? [this storage key cmp opts]

@@ -179,6 +179,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         if (childCount < 0) {
           // Child is a Branch with unknown count, compute recursively
           childCount = ((Branch) child).computeSubtreeCount(storage);
+          // Cache in child — safe for persistent (immutable count) and transient
+          // (add/remove maintain counts; this only fires for unknown/-1 values)
+          ((Branch) child)._subtreeCount = childCount;
         }
         count += childCount;
       } else {
@@ -234,6 +237,27 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     }
     _measure = result;
     return result;
+  }
+
+  /**
+   * Try to compute subtree count from in-memory children.
+   * Returns -1 if any child is not available in memory or has unknown count.
+   */
+  private static long tryComputeSubtreeCountFromChildren(Object[] children, int len, IStorage storage) {
+    if (children == null) return -1;
+    long count = 0;
+    for (int i = 0; i < len; i++) {
+      Object raw = children[i];
+      ANode child = null;
+      if (raw instanceof ANode) child = (ANode) raw;
+      else if (raw instanceof java.lang.ref.Reference)
+        child = (ANode) ((java.lang.ref.Reference<?>) raw).get();
+      if (child == null) return -1; // not in memory, propagate unknown
+      long childCount = getSubtreeCount(child, storage);
+      if (childCount < 0) return -1;
+      count += childCount;
+    }
+    return count;
   }
 
   /**
@@ -451,10 +475,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         ArrayUtil.copy(_children, half1 - 1, _len, children2, 0);
       }
 
-      // For splits, set subtree counts to -1 (unknown) to preserve lazy loading
-      // They will be computed on demand by computeSubtreeCount()
-      long count1 = -1;
-      long count2 = -1;
+      long count1 = tryComputeSubtreeCountFromChildren(children1, half1, storage);
+      long count2 = tryComputeSubtreeCountFromChildren(children2, half2, storage);
       Object measure1 = tryComputeMeasureFromChildren(children1, half1, storage, measureOps);
       Object measure2 = children2 != null ? tryComputeMeasureFromChildren(children2, half2, storage, measureOps) : null;
       return new ANode[] {
@@ -499,10 +521,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       .copyOne(nodes[1])
       .copyAll(_children, ins + 1, _len);
 
-    // For splits, set subtree counts to -1 (unknown) to preserve lazy loading
-    // They will be computed on demand by computeSubtreeCount()
-    long count1 = -1;
-    long count2 = -1;
+    long count1 = tryComputeSubtreeCountFromChildren(children1, half1, storage);
+    long count2 = tryComputeSubtreeCountFromChildren(children2, half2, storage);
     Object measure1 = children1 != null ? tryComputeMeasureFromChildren(children1, half1, storage, measureOps) : null;
     Object measure2 = tryComputeMeasureFromChildren(children2, half2, storage, measureOps);
     return new ANode[]{
@@ -769,13 +789,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (nodes[2] != null) cs.copyOne(nodes[2]);
       cs.copyAll(_children, idx + 2, _len);
 
-      // For rebalancing, set subtree counts to -1 (unknown) to preserve lazy loading
-      // They will be computed on demand by computeSubtreeCount()
       if (newLeft._children != null) {
-        newLeft._subtreeCount = -1;
+        newLeft._subtreeCount = tryComputeSubtreeCountFromChildren(newLeft._children, newLeftLen, storage);
         newLeft._measure = tryComputeMeasureFromChildren(newLeft._children, newLeftLen, storage, measureOps);
       }
-      newCenter._subtreeCount = -1;
+      newCenter._subtreeCount = tryComputeSubtreeCountFromChildren(newCenter._children, newCenterLen, storage);
       newCenter._measure = tryComputeMeasureFromChildren(newCenter._children, newCenterLen, storage, measureOps);
       return new ANode[] { newLeft, newCenter, right };
     }
@@ -826,12 +844,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         ArrayUtil.copy(right._children, rightHead, right._len, newRight.ensureChildren(), 0);
       }
 
-      // For rebalancing, set subtree counts to -1 (unknown) to preserve lazy loading
-      // They will be computed on demand by computeSubtreeCount()
-      newCenter._subtreeCount = -1;
+      newCenter._subtreeCount = tryComputeSubtreeCountFromChildren(newCenter._children, newCenterLen, storage);
       newCenter._measure = tryComputeMeasureFromChildren(newCenter._children, newCenterLen, storage, measureOps);
       if (newRight._children != null) {
-        newRight._subtreeCount = -1;
+        newRight._subtreeCount = tryComputeSubtreeCountFromChildren(newRight._children, newRightLen, storage);
         newRight._measure = tryComputeMeasureFromChildren(newRight._children, newRightLen, storage, measureOps);
       }
       return new ANode[] { left, newCenter, newRight };
