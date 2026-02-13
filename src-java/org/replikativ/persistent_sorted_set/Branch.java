@@ -372,28 +372,19 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // same len, not editable
     if (1 == nodes.length) {
       ANode<Key, Address> node = nodes[0];
-      Key[] newKeys;
-      if (0 == cmp.compare(node.maxKey(), _keys[ins])) {
-        newKeys = _keys;
-      } else {
-        newKeys = Arrays.copyOfRange(_keys, 0, _len);
-        newKeys[ins] = node.maxKey();
-      }
+      // Always copy arrays — sharing them would allow a later transient
+      // editable() path to mutate the original persistent branch's arrays
+      Key[] newKeys = Arrays.copyOfRange(_keys, 0, _len);
+      newKeys[ins] = node.maxKey();
 
       Address[] newAddresses = null;
-      Object[] newChildren = null;
-      if (node == child(storage, ins)) { // TODO how is this possible?
-        newAddresses = _addresses;
-        newChildren = _children;
-      } else {
-        if (_addresses != null) {
-          newAddresses = Arrays.copyOfRange(_addresses, 0, _len);
-          newAddresses[ins] = null;
-        }
-
-        newChildren = _children == null ? new Object[_keys.length] : Arrays.copyOfRange(_children, 0, _len);
-        newChildren[ins] = node;
+      if (_addresses != null) {
+        newAddresses = Arrays.copyOfRange(_addresses, 0, _len);
+        newAddresses[ins] = null;
       }
+
+      Object[] newChildren = _children == null ? new Object[_keys.length] : Arrays.copyOfRange(_children, 0, _len);
+      newChildren[ins] = node;
 
       // Subtree count = old count + 1 (added one element)
       // When old count is unknown (-1), leave new count unknown to preserve lazy loading
@@ -907,13 +898,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     }
 
     // Persistent: create new branch with updated child
-    Key[] newKeys;
-    if (0 == cmp.compare(newMaxKey, _keys[idx])) {
-      newKeys = _keys; // reuse array if maxKey unchanged
-    } else {
-      newKeys = Arrays.copyOfRange(_keys, 0, _len);
-      newKeys[idx] = newMaxKey;
-    }
+    // Always copy — sharing arrays would allow a later transient
+    // editable() path to mutate the original persistent branch's arrays
+    Key[] newKeys = Arrays.copyOfRange(_keys, 0, _len);
+    newKeys[idx] = newMaxKey;
 
     final Address[] newAddresses = _addresses != null ? Arrays.copyOfRange(_addresses, 0, _len) : null;
     if (newAddresses != null) {
