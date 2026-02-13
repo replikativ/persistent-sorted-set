@@ -43,7 +43,8 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
   @Override
   public Object forceComputeMeasure(IStorage storage) {
     // For leaves, try and force are the same - just compute from keys
-    return tryComputeMeasure(storage);
+    _measure = tryComputeMeasure(storage);
+    return _measure;
   }
 
   @Override

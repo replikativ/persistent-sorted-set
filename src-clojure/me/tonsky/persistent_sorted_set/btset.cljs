@@ -86,10 +86,10 @@
                                 ;; otherwise keep nil to allow lazy recomputation
                                 child-measure (when measure-ops (map node/$measure roots))
                                 root-measure (when (and measure-ops (every? some? child-measure))
-                                             (reduce (fn [acc cs]
-                                                       (measure/merge-measure measure-ops acc cs))
-                                                     (measure/identity-measure measure-ops)
-                                                     child-measure))]
+                                               (reduce (fn [acc cs]
+                                                         (measure/merge-measure measure-ops acc cs))
+                                                       (measure/identity-measure measure-ops)
+                                                       child-measure))]
                             (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count root-measure (.-settings set))
                                     new-cnt
                                     (.-comparator set)
@@ -311,7 +311,7 @@
                    (let [child-node (await (branch/$child node (.-storage set) idx opts))
                          sub-path (await ($$_next-path set child-node path (dec level) opts))]
                      (if (nil? sub-path)
-                       (if (< (inc idx) (arrays/alength (.-children node)))
+                       (if (< (inc idx) (arrays/alength (.-keys node)))
                          (path-set set EMPTY_PATH level (inc idx))
                          nil)
                        (path-set set sub-path level idx)))
@@ -947,17 +947,17 @@
                            last-measure  (await ($measure-slice-node last-child storage measure-ops nil to cmp opts))
                   ;; Measure from fully contained children in between
                            middle-measure (loop [i (inc from-idx)
-                                               acc (measure/identity-measure measure-ops)]
-                                          (if (>= i to-idx)
-                                            acc
-                                            (let [child (await (branch/$child node storage i opts))
-                                                  child-measure (or (node/$measure child)
-                                                                  (await (node/force-compute-measure child storage measure-ops opts)))]
-                                              (recur (inc i)
-                                                     (measure/merge-measure measure-ops acc child-measure)))))]
+                                                 acc (measure/identity-measure measure-ops)]
+                                            (if (>= i to-idx)
+                                              acc
+                                              (let [child (await (branch/$child node storage i opts))
+                                                    child-measure (or (node/$measure child)
+                                                                      (await (node/force-compute-measure child storage measure-ops opts)))]
+                                                (recur (inc i)
+                                                       (measure/merge-measure measure-ops acc child-measure)))))]
                        (measure/merge-measure measure-ops
-                                          (measure/merge-measure measure-ops first-measure middle-measure)
-                                          last-measure))))))))
+                                              (measure/merge-measure measure-ops first-measure middle-measure)
+                                              last-measure))))))))
 
 (defn $measure-slice
   "Compute measure for elements in the range [from, to] inclusive.
@@ -1004,40 +1004,40 @@
                     (throw (js/Error. "get-nth requires measure to be configured")))
                   (when (pos? (node/len root))
                     (let [root-measure (or (node/$measure root)
-                                         (await (node/force-compute-measure root (.-storage set) measure-ops opts)))]
+                                           (await (node/force-compute-measure root (.-storage set) measure-ops opts)))]
                       (when root-measure
                         (let [total-weight (measure/weight measure-ops root-measure)]
                           (when (and (>= n 0) (< n total-weight))
                             ;; Navigate tree
                             (loop [cur-node root
                                    rank n]
-                          (if (instance? Branch cur-node)
+                              (if (instance? Branch cur-node)
                             ;; Branch: find child by weight
-                            (let [len (node/len cur-node)
-                                  result (loop [i 0
-                                                r rank]
-                                           (when (< i len)
-                                             (let [child (await (branch/$child cur-node (.-storage set) i opts))
-                                                   child-measure (or (node/$measure child)
-                                                                   (await (node/force-compute-measure child (.-storage set) measure-ops opts)))
-                                                   child-weight (measure/weight measure-ops child-measure)]
-                                               (if (< r child-weight)
-                                                 [child r]
-                                                 (recur (inc i) (- r child-weight))))))]
-                              (when result
-                                (recur (nth result 0) (nth result 1))))
+                                (let [len (node/len cur-node)
+                                      result (loop [i 0
+                                                    r rank]
+                                               (when (< i len)
+                                                 (let [child (await (branch/$child cur-node (.-storage set) i opts))
+                                                       child-measure (or (node/$measure child)
+                                                                         (await (node/force-compute-measure child (.-storage set) measure-ops opts)))
+                                                       child-weight (measure/weight measure-ops child-measure)]
+                                                   (if (< r child-weight)
+                                                     [child r]
+                                                     (recur (inc i) (- r child-weight))))))]
+                                  (when result
+                                    (recur (nth result 0) (nth result 1))))
                             ;; Leaf: iterate keys by weight
-                            (let [keys (.-keys cur-node)
-                                  len (arrays/alength keys)]
-                              (loop [i 0
-                                     r rank]
-                                (when (< i len)
-                                  (let [key (arrays/aget keys i)
-                                        key-measure (measure/extract measure-ops key)
-                                        key-weight (measure/weight measure-ops key-measure)]
-                                    (if (< r key-weight)
-                                      [key r]
-                                      (recur (inc i) (- r key-weight)))))))))))))))))))
+                                (let [keys (.-keys cur-node)
+                                      len (arrays/alength keys)]
+                                  (loop [i 0
+                                         r rank]
+                                    (when (< i len)
+                                      (let [key (arrays/aget keys i)
+                                            key-measure (measure/extract measure-ops key)
+                                            key-weight (measure/weight measure-ops key-measure)]
+                                        (if (< r key-weight)
+                                          [key r]
+                                          (recur (inc i) (- r key-weight)))))))))))))))))))
 
 (defn $equivalent?
   [^BTSet set other {:keys [sync?] :or {sync? true} :as opts}]
@@ -1413,7 +1413,7 @@
   (-meta [_] meta)
 
   IEmptyableCollection
-  (-empty [_] (BTSet. (Leaf. (arrays/array) settings nil) 0 comparator meta UNINITIALIZED_HASH storage address settings))
+  (-empty [_] (BTSet. (Leaf. (arrays/array) settings nil) 0 comparator meta UNINITIALIZED_HASH nil nil settings))
 
   IEquiv
   (-equiv [this other]
@@ -1561,13 +1561,15 @@
                                       ;; Compute measure from children if measure-ops available
                                       measure-ops (:measure settings)
                                       child-measure (when measure-ops
-                                                    (reduce (fn [acc child]
-                                                              (let [cs (node/$measure child)]
-                                                                (if cs
-                                                                  (measure/merge-measure measure-ops acc cs)
-                                                                  acc)))
-                                                            (measure/identity-measure measure-ops)
-                                                            %))]
+                                                      (reduce (fn [acc child]
+                                                                (if (nil? acc)
+                                                                  (reduced nil)
+                                                                  (let [cs (node/$measure child)]
+                                                                    (if cs
+                                                                      (measure/merge-measure measure-ops acc cs)
+                                                                      (reduced nil)))))
+                                                              (measure/identity-measure measure-ops)
+                                                              %))]
                                   (Branch. (inc shift)
                                            (arrays/amap node/max-key %)
                                            %

@@ -108,7 +108,7 @@
                        (when (and measure-ops _measure)
                          (set! (.-_measure new-leaf)
                                (measure/remove-measure measure-ops _measure key
-                                                   #(node/try-compute-measure new-leaf storage measure-ops {:sync? true}))))
+                                                       #(node/try-compute-measure new-leaf storage measure-ops {:sync? true}))))
                        (util/rotate new-leaf root? left right settings)))))))
   ($replace [this storage old-key new-key cmp {:keys [sync?] :or {sync? true}}]
     (assert (== 0 (cmp old-key new-key)) "old-key and new-key must compare as equal (cmp must return 0)")

@@ -311,14 +311,14 @@
               last-child (.child branch storage to-idx)
               last-measure (measure-slice-node last-child storage measure-ops nil to cmp)
               middle-measure (loop [i (int (inc from-idx))
-                                  acc (.identity measure-ops)]
-                             (if (>= i to-idx)
-                               acc
-                               (let [^ANode child (.child branch storage i)
-                                     child-measure (or (.-_measure child)
-                                                     (.forceComputeMeasure child storage))]
-                                 (recur (inc i)
-                                        (.merge measure-ops acc child-measure)))))]
+                                    acc (.identity measure-ops)]
+                               (if (>= i to-idx)
+                                 acc
+                                 (let [^ANode child (.child branch storage i)
+                                       child-measure (or (.-_measure child)
+                                                         (.forceComputeMeasure child storage))]
+                                   (recur (inc i)
+                                          (.merge measure-ops acc child-measure)))))]
           (.merge measure-ops
                   (.merge measure-ops first-measure middle-measure)
                   last-measure))))))

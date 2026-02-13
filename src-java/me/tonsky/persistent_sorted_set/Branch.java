@@ -226,9 +226,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         // Force computation by recursively computing child measure
         childMeasure = child.forceComputeMeasure(storage);
       }
-      if (childMeasure != null) {
-        result = measureOps.merge(result, childMeasure);
+      if (childMeasure == null) {
+        // Child cannot compute measure - cannot produce accurate branch measure
+        return null;
       }
+      result = measureOps.merge(result, childMeasure);
     }
     _measure = result;
     return result;

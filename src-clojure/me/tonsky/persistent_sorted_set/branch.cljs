@@ -150,22 +150,27 @@
                                right-children (.slice new-children middle)
                                measure-ops (:measure (.-settings this))
                                ;; Compute measure for split branches from their children only if already computed
+                               ;; Return nil if any child measure is nil (don't silently undercount)
                                left-measure (when (and measure-ops (.-_measure this))
-                                            (reduce (fn [acc child]
-                                                      (let [cs (node/$measure child)]
-                                                        (if cs
-                                                          (measure/merge-measure measure-ops acc cs)
-                                                          acc)))
-                                                    (measure/identity-measure measure-ops)
-                                                    left-children))
+                                              (reduce (fn [acc child]
+                                                        (if (nil? acc)
+                                                          (reduced nil)
+                                                          (let [cs (node/$measure child)]
+                                                            (if cs
+                                                              (measure/merge-measure measure-ops acc cs)
+                                                              (reduced nil)))))
+                                                      (measure/identity-measure measure-ops)
+                                                      left-children))
                                right-measure (when (and measure-ops (.-_measure this))
-                                             (reduce (fn [acc child]
-                                                       (let [cs (node/$measure child)]
-                                                         (if cs
-                                                           (measure/merge-measure measure-ops acc cs)
-                                                           acc)))
-                                                     (measure/identity-measure measure-ops)
-                                                     right-children))]
+                                               (reduce (fn [acc child]
+                                                         (if (nil? acc)
+                                                           (reduced nil)
+                                                           (let [cs (node/$measure child)]
+                                                             (if cs
+                                                               (measure/merge-measure measure-ops acc cs)
+                                                               (reduced nil)))))
+                                                       (measure/identity-measure measure-ops)
+                                                       right-children))]
                            (arrays/array
                             (Branch. (.-level this)
                                      (.slice new-keys 0 middle)
@@ -235,9 +240,9 @@
                              measure-ops (:measure (.-settings this))
                              new-measure (when (and measure-ops (.-_measure this))
                                            (measure/remove-measure measure-ops (.-_measure this) key
-                                                               #(node/try-compute-measure
-                                                                 (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this))
-                                                                 storage measure-ops {:sync? true})))]
+                                                                   #(node/try-compute-measure
+                                                                     (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this))
+                                                                     storage measure-ops {:sync? true})))]
                          (util/rotate (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-measure (.-settings this))
                                       (and (nil? left) (nil? right))
                                       left
@@ -312,7 +317,7 @@
                                    _            (aset new-children idx new-node)
                                    new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this))
                                    new-measure    (when (and measure-ops (.-_measure this))
-                                                  (replace-measure new-branch storage measure-ops))]
+                                                    (replace-measure new-branch storage measure-ops))]
                                (set! (.-_measure new-branch) new-measure)
                                (arrays/array new-branch)))
                            ;; maxKey unchanged - reuse keys array
@@ -343,7 +348,7 @@
                                    _            (aset new-children idx new-node)
                                    new-branch   (Branch. (.-level this) keys new-children new-addrs (.-subtree-count this) nil (.-settings this))
                                    new-measure    (when (and measure-ops (.-_measure this))
-                                                  (replace-measure new-branch storage measure-ops))]
+                                                    (replace-measure new-branch storage measure-ops))]
                                (set! (.-_measure new-branch) new-measure)
                                (arrays/array new-branch))))))))))))
 
@@ -440,7 +445,7 @@
                                   (if (< i (arrays/alength keys))
                                     (let [child (await ($child this storage i opts))
                                           child-measure (or (node/$measure child)
-                                                          (await (node/force-compute-measure child storage measure-ops opts)))]
+                                                            (await (node/force-compute-measure child storage measure-ops opts)))]
                                       (recur (inc i)
                                              (if child-measure
                                                (measure/merge-measure measure-ops acc child-measure)
@@ -454,8 +459,8 @@
           new-sc (if (and (>= sc1 0) (>= sc2 0)) (+ sc1 sc2) -1)
           ;; Merge measure if both have them
           new-measure (when (and _measure (.-_measure next))
-                      (when-let [measure-ops (:measure settings)]
-                        (measure/merge-measure measure-ops _measure (.-_measure next))))
+                        (when-let [measure-ops (:measure settings)]
+                          (measure/merge-measure measure-ops _measure (.-_measure next))))
           ;; Ensure children arrays exist (may be arrays of nulls for lazy branches)
           c1 (ensure-children this)
           c2 (ensure-children next)
