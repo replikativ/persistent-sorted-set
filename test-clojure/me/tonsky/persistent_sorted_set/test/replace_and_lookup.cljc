@@ -336,9 +336,9 @@
       (is (= 1500 (set/lookup s-replace 1500))))))
 
 ;; =============================================================================
-;; Replace with stats and subtree-count regression tests
+;; Replace with measure and subtree-count regression tests
 ;; These tests verify that $replace preserves correct constructor args
-;; for Branch and Leaf nodes (regression for missing subtree-count/_stats args)
+;; for Branch and Leaf nodes (regression for missing subtree-count/_measure args)
 ;; =============================================================================
 
 (def stats-ops
@@ -357,12 +357,12 @@
 (deftest test-replace-preserves-stats
   (testing "Replace in small set (single leaf) preserves stats"
     (let [cmp-mod (fn [a b] (compare (mod a 100) (mod b 100)))
-          s (into (set/sorted-set* {:stats stats-ops :comparator cmp-mod})
+          s (into (set/sorted-set* {:measure stats-ops :comparator cmp-mod})
                   (range 10))
           s2 (set/replace s 5 105)]
       ;; Stats should reflect the replacement: sum changes by +100
-      (let [orig-stats (stats->map (set/stats s))
-            new-stats (stats->map (set/stats s2))]
+      (let [orig-stats (stats->map (set/measure s))
+            new-stats (stats->map (set/measure s2))]
         (is (= 10 (:cnt orig-stats)))
         (is (= 10 (:cnt new-stats)))
         (is (= (+ (:sum orig-stats) 100.0) (:sum new-stats)))
@@ -371,17 +371,17 @@
 
   (testing "Replace in large set (multi-level B-tree) preserves stats"
     (let [cmp-mod (fn [a b] (compare (mod a 5000) (mod b 5000)))
-          s (into (set/sorted-set* {:stats stats-ops :comparator cmp-mod :branching-factor 64})
+          s (into (set/sorted-set* {:measure stats-ops :comparator cmp-mod :branching-factor 64})
                   (range 5000))
           s2 (set/replace s 2500 7500)]
-      (let [orig-stats (stats->map (set/stats s))
-            new-stats (stats->map (set/stats s2))]
+      (let [orig-stats (stats->map (set/measure s))
+            new-stats (stats->map (set/measure s2))]
         (is (= 5000 (:cnt orig-stats)))
         (is (= 5000 (:cnt new-stats)))
         (is (= (+ (:sum orig-stats) 5000.0) (:sum new-stats))))))
 
   (testing "Replace preserves count-slice accuracy"
-    (let [s (into (set/sorted-set* {:stats stats-ops}) (range 5000))
+    (let [s (into (set/sorted-set* {:measure stats-ops}) (range 5000))
           ;; Use default comparator; replace 2500 with value that sorts the same
           ;; Just verify count-slice works correctly after replace at all
           s2 (set/replace s 2500 2500)] ;; identity replace
@@ -390,7 +390,7 @@
       (is (= 2500 (set/count-slice s2 2500 4999)))))
 
   (testing "Replace preserves get-nth accuracy"
-    (let [s (into (set/sorted-set* {:stats stats-ops}) (range 10))
+    (let [s (into (set/sorted-set* {:measure stats-ops}) (range 10))
           ;; Identity replace (same value) since default comparator
           s2 (set/replace s 5 5)]
       ;; get-nth should still work after replace
@@ -405,12 +405,12 @@
 
   (testing "Multiple sequential replaces preserve stats"
     (let [cmp-mod (fn [a b] (compare (mod a 100) (mod b 100)))
-          s (into (set/sorted-set* {:stats stats-ops :comparator cmp-mod})
+          s (into (set/sorted-set* {:measure stats-ops :comparator cmp-mod})
                   (range 10))
           s2 (-> s
                  (set/replace 3 103)
                  (set/replace 7 107))]
-      (let [stats (stats->map (set/stats s2))]
+      (let [stats (stats->map (set/measure s2))]
         (is (= 10 (:cnt stats)))
         ;; sum = (0+1+2+103+4+5+6+107+8+9) = 45 - 3 - 7 + 103 + 107 = 245
         (is (= 245.0 (:sum stats)))
@@ -419,14 +419,14 @@
 
   (testing "Replace at tree boundaries preserves stats"
     (let [cmp-mod (fn [a b] (compare (mod a 5000) (mod b 5000)))
-          s (into (set/sorted-set* {:stats stats-ops :comparator cmp-mod :branching-factor 64})
+          s (into (set/sorted-set* {:measure stats-ops :comparator cmp-mod :branching-factor 64})
                   (range 5000))
           ;; Replace first element (0 -> 5000, both compare equal under mod 5000)
           s-first (set/replace s 0 5000)
           ;; Replace last element (4999 -> 9999, both compare equal under mod 5000)
           s-last (set/replace s 4999 9999)]
-      (let [first-stats (stats->map (set/stats s-first))
-            last-stats (stats->map (set/stats s-last))]
+      (let [first-stats (stats->map (set/measure s-first))
+            last-stats (stats->map (set/measure s-last))]
         (is (= 5000 (:cnt first-stats)))
         (is (= 5000 (:cnt last-stats)))
         ;; After replacing 0 with 5000: min becomes 1, sum increases by 5000
@@ -437,7 +437,7 @@
         (is (= 9999 (long (:max-val last-stats)))))))
 
   (testing "Replace in multi-level tree preserves get-nth"
-    (let [s (into (set/sorted-set* {:stats stats-ops :branching-factor 64})
+    (let [s (into (set/sorted-set* {:measure stats-ops :branching-factor 64})
                   (range 5000))
           ;; Identity replace at various positions
           s2 (set/replace s 2500 2500)]
@@ -448,7 +448,7 @@
 
   (testing "Replace preserves count-slice with multi-level tree"
     (let [cmp-mod (fn [a b] (compare (mod a 5000) (mod b 5000)))
-          s (into (set/sorted-set* {:stats stats-ops :comparator cmp-mod :branching-factor 64})
+          s (into (set/sorted-set* {:measure stats-ops :comparator cmp-mod :branching-factor 64})
                   (range 5000))
           s2 (set/replace s 2500 7500)]
       (is (= 5000 (set/count-slice s2 nil nil))))))

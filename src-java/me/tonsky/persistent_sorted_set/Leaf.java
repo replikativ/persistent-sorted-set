@@ -10,8 +10,8 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     super(len, keys, settings);
   }
 
-  public Leaf(int len, Key[] keys, Object stats, Settings settings) {
-    super(len, keys, stats, settings);
+  public Leaf(int len, Key[] keys, Object measure, Settings settings) {
+    super(len, keys, measure, settings);
   }
 
   public Leaf(int len, Settings settings) {
@@ -28,22 +28,22 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
   }
 
   @Override
-  public Object tryComputeStats(IStorage storage) {
+  public Object tryComputeMeasure(IStorage storage) {
     // For leaves, try and force are the same - just compute from keys
-    IStats statsOps = _settings.stats();
-    if (statsOps == null) return null;
+    IMeasure measureOps = _settings.measure();
+    if (measureOps == null) return null;
 
-    Object result = statsOps.identity();
+    Object result = measureOps.identity();
     for (int i = 0; i < _len; i++) {
-      result = statsOps.merge(result, statsOps.extract(_keys[i]));
+      result = measureOps.merge(result, measureOps.extract(_keys[i]));
     }
     return result;
   }
 
   @Override
-  public Object forceComputeStats(IStorage storage) {
+  public Object forceComputeMeasure(IStorage storage) {
     // For leaves, try and force are the same - just compute from keys
-    return tryComputeStats(storage);
+    return tryComputeMeasure(storage);
   }
 
   @Override
@@ -70,7 +70,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     int ins = -idx - 1;
     assert 0 <= ins && ins <= _len;
 
-    IStats statsOps = _settings.stats();
+    IMeasure measureOps = _settings.measure();
 
     // can modify array in place
     if (editable() && _len < _keys.length) {
@@ -78,8 +78,8 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         _keys[_len] = key;
         _len += 1;
         // Update stats incrementally only if already computed
-        if (statsOps != null && _stats != null) {
-          _stats = statsOps.merge(_stats, statsOps.extract(key));
+        if (measureOps != null && _measure != null) {
+          _measure = measureOps.merge(_measure, measureOps.extract(key));
         }
         return new ANode[]{this}; // maxKey needs updating
       } else {
@@ -87,8 +87,8 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         _keys[ins] = key;
         _len += 1;
         // Update stats incrementally only if already computed
-        if (statsOps != null && _stats != null) {
-          _stats = statsOps.merge(_stats, statsOps.extract(key));
+        if (measureOps != null && _measure != null) {
+          _measure = measureOps.merge(_measure, measureOps.extract(key));
         }
         return PersistentSortedSet.EARLY_EXIT;
       }
@@ -101,7 +101,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         .copyAll(_keys, 0, ins)
         .copyOne(key)
         .copyAll(_keys, ins, _len);
-      n._stats = n.tryComputeStats(storage);
+      n._measure = n.tryComputeMeasure(storage);
       return processLeafNodes(new ANode[]{n}, storage, settings);
     }
 
@@ -118,8 +118,8 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         .copyOne(key)
         .copyAll(_keys, ins, half1 - 1);
       ArrayUtil.copy(_keys, half1 - 1, _len, n2._keys, 0);
-      n1._stats = n1.tryComputeStats(storage);
-      n2._stats = n2.tryComputeStats(storage);
+      n1._measure = n1.tryComputeMeasure(storage);
+      n2._measure = n2.tryComputeMeasure(storage);
       return processLeafNodes(new ANode[]{n1, n2}, storage, settings);
     }
 
@@ -131,8 +131,8 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       .copyAll(_keys, half1, ins)
       .copyOne(key)
       .copyAll(_keys, ins, _len);
-    n1._stats = n1.tryComputeStats(storage);
-    n2._stats = n2.tryComputeStats(storage);
+    n1._measure = n1.tryComputeMeasure(storage);
+    n2._measure = n2.tryComputeMeasure(storage);
     return processLeafNodes(new ANode[]{n1, n2}, storage, settings);
   }
 
@@ -146,7 +146,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       return PersistentSortedSet.UNCHANGED;
 
     int newLen = _len - 1;
-    IStats statsOps = _settings.stats();
+    IMeasure measureOps = _settings.measure();
     final Leaf thisLeaf = this;
 
     // nothing to merge
@@ -157,12 +157,12 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         ArrayUtil.copy(_keys, idx + 1, _len, _keys, idx);
         _len = newLen;
         // Update stats using remove operation
-        if (statsOps != null) {
-          if (_stats != null) {
-            _stats = statsOps.remove(_stats, key, () -> thisLeaf.tryComputeStats(storage));
+        if (measureOps != null) {
+          if (_measure != null) {
+            _measure = measureOps.remove(_measure, key, () -> thisLeaf.tryComputeMeasure(storage));
           } else {
             // Stats were never initialized, compute from scratch
-            _stats = thisLeaf.tryComputeStats(storage);
+            _measure = thisLeaf.tryComputeMeasure(storage);
           }
         }
         if (idx == newLen) // removed last, need to signal new maxKey
@@ -175,7 +175,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       new Stitch(center._keys, 0)
         .copyAll(_keys, 0, idx)
         .copyAll(_keys, idx + 1, _len);
-      center._stats = center.tryComputeStats(storage);
+      center._measure = center.tryComputeMeasure(storage);
 
       // Process the center leaf (may split into multiple)
       Leaf[] processed = processSingleLeaf(center, storage, settings);
@@ -197,7 +197,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         .copyAll(left._keys, 0,       left._len)
         .copyAll(_keys,      0,       idx)
         .copyAll(_keys,      idx + 1, _len);
-      join._stats = join.tryComputeStats(storage);
+      join._measure = join.tryComputeMeasure(storage);
 
       // Process the joined leaf
       Leaf[] processed = processSingleLeaf(join, storage, settings);
@@ -218,7 +218,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         .copyAll(_keys,       0,       idx)
         .copyAll(_keys,       idx + 1, _len)
         .copyAll(right._keys, 0,       right._len);
-      join._stats = join.tryComputeStats(storage);
+      join._measure = join.tryComputeMeasure(storage);
 
       // Process the joined leaf
       Leaf[] processed = processSingleLeaf(join, storage, settings);
@@ -249,8 +249,8 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         ArrayUtil.copy(left._keys, newLeftLen, left._len, _keys, 0);
         _len = newCenterLen;
         // Recompute stats since we borrowed from left
-        if (statsOps != null) {
-          newCenter._stats = newCenter.tryComputeStats(storage);
+        if (measureOps != null) {
+          newCenter._measure = newCenter.tryComputeMeasure(storage);
         }
       } else {
         newCenter = new Leaf(newCenterLen, settings);
@@ -258,7 +258,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
           .copyAll(left._keys, newLeftLen, left._len)
           .copyAll(_keys,      0,          idx)
           .copyAll(_keys,      idx+1,      _len);
-        newCenter._stats = newCenter.tryComputeStats(storage);
+        newCenter._measure = newCenter.tryComputeMeasure(storage);
       }
 
       // shrink left
@@ -266,13 +266,13 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         newLeft  = left;
         left._len = newLeftLen;
         // Recompute stats for shrunk left
-        if (statsOps != null) {
-          newLeft._stats = newLeft.tryComputeStats(storage);
+        if (measureOps != null) {
+          newLeft._measure = newLeft.tryComputeMeasure(storage);
         }
       } else {
         newLeft = new Leaf(newLeftLen, settings);
         ArrayUtil.copy(left._keys, 0, newLeftLen, newLeft._keys, 0);
-        newLeft._stats = newLeft.tryComputeStats(storage);
+        newLeft._measure = newLeft.tryComputeMeasure(storage);
       }
 
       return new ANode[]{ newLeft, newCenter, right };
@@ -295,8 +295,8 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
           .copyAll(right._keys, 0,       rightHead);
         _len = newCenterLen;
         // Recompute stats since we borrowed from right
-        if (statsOps != null) {
-          newCenter._stats = newCenter.tryComputeStats(storage);
+        if (measureOps != null) {
+          newCenter._measure = newCenter.tryComputeMeasure(storage);
         }
       } else {
         newCenter = new Leaf(newCenterLen, settings);
@@ -304,7 +304,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
           .copyAll(_keys,       0,       idx)
           .copyAll(_keys,       idx + 1, _len)
           .copyAll(right._keys, 0,       rightHead);
-        newCenter._stats = newCenter.tryComputeStats(storage);
+        newCenter._measure = newCenter.tryComputeMeasure(storage);
       }
 
       // cut head from right
@@ -313,13 +313,13 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         ArrayUtil.copy(right._keys, rightHead, right._len, right._keys, 0);
         right._len = newRightLen;
         // Recompute stats for shrunk right
-        if (statsOps != null) {
-          newRight._stats = newRight.tryComputeStats(storage);
+        if (measureOps != null) {
+          newRight._measure = newRight.tryComputeMeasure(storage);
         }
       } else {
         newRight = new Leaf(newRightLen, settings);
         ArrayUtil.copy(right._keys, rightHead, right._len, newRight._keys, 0);
-        newRight._stats = newRight.tryComputeStats(storage);
+        newRight._measure = newRight.tryComputeMeasure(storage);
       }
 
       return new ANode[]{ left, newCenter, newRight };
@@ -335,14 +335,14 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     if (idx < 0) // not in set
       return PersistentSortedSet.UNCHANGED;
 
-    IStats statsOps = settings.stats();
+    IMeasure measureOps = settings.measure();
 
     // Transient: can modify in place
     if (editable()) {
       _keys[idx] = newKey;
       // Recompute stats from final state (after replacement)
-      if (statsOps != null && _stats != null) {
-        _stats = tryComputeStats(storage);
+      if (measureOps != null && _measure != null) {
+        _measure = tryComputeMeasure(storage);
       }
       // If we replaced the last element, maxKey changed
       if (idx == _len - 1) {
@@ -356,8 +356,8 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     ArrayUtil.copy(_keys, 0, _len, n._keys, 0);
     n._keys[idx] = newKey;
     // Recompute stats from final state (after replacement)
-    if (statsOps != null && _stats != null) {
-      n._stats = n.tryComputeStats(storage);
+    if (measureOps != null && _measure != null) {
+      n._measure = n.tryComputeMeasure(storage);
     }
 
     // Always return the new node - parent needs to update its child reference
@@ -442,7 +442,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       for (int i = 0; i < processedSize; i++) {
         newLeaf._keys[i] = processed.get(i);
       }
-      newLeaf._stats = newLeaf.tryComputeStats(storage);
+      newLeaf._measure = newLeaf.tryComputeMeasure(storage);
       return new Leaf[]{ newLeaf };
     } else {
       // Needs to split into multiple leaves
@@ -458,7 +458,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         for (int j = 0; j < leafSize; j++) {
           newLeaf._keys[j] = processed.get(offset + j);
         }
-        newLeaf._stats = newLeaf.tryComputeStats(storage);
+        newLeaf._measure = newLeaf.tryComputeMeasure(storage);
         result[i] = newLeaf;
         offset += leafSize;
       }
@@ -544,7 +544,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         for (int i = 0; i < processedSize; i++) {
           newLeaf._keys[i] = processed.get(i);
         }
-        newLeaf._stats = newLeaf.tryComputeStats(storage);
+        newLeaf._measure = newLeaf.tryComputeMeasure(storage);
         processedLeaves.add(newLeaf);
       } else {
         // Needs to split into multiple leaves
@@ -560,7 +560,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
           for (int j = 0; j < leafSize; j++) {
             newLeaf._keys[j] = processed.get(offset + j);
           }
-          newLeaf._stats = newLeaf.tryComputeStats(storage);
+          newLeaf._measure = newLeaf.tryComputeMeasure(storage);
           processedLeaves.add(newLeaf);
           offset += leafSize;
         }

@@ -4,11 +4,11 @@
             [goog.array :as garr]
             [me.tonsky.persistent-sorted-set.arrays :as arrays]
             [me.tonsky.persistent-sorted-set.impl.node :as node :refer [INode]]
-            [me.tonsky.persistent-sorted-set.impl.stats :as stats]
+            [me.tonsky.persistent-sorted-set.impl.measure :as measure]
             [me.tonsky.persistent-sorted-set.impl.storage :as storage]
             [me.tonsky.persistent-sorted-set.util :as util]))
 
-(deftype Leaf [keys settings ^:mutable _stats]
+(deftype Leaf [keys settings ^:mutable _measure]
   Object
   (toString [_] (pr-str* (vec keys)))
   INode
@@ -16,40 +16,40 @@
   (level [_] 0)
   (max-key [_] (arrays/alast keys))
   ($subtree-count [_] (arrays/alength keys))
-  ($stats [_] _stats)
-  (try-compute-stats [this storage stats-ops {:keys [sync?] :or {sync? true}}]
+  ($measure [_] _measure)
+  (try-compute-measure [this storage measure-ops {:keys [sync?] :or {sync? true}}]
     ;; For leaves, try and force are the same - just compute from keys
     (if sync?
-      (when stats-ops
+      (when measure-ops
         (let [result (reduce (fn [acc key]
-                               (stats/merge-stats stats-ops acc (stats/extract stats-ops key)))
-                             (stats/identity-stats stats-ops)
+                               (measure/merge-measure measure-ops acc (measure/extract measure-ops key)))
+                             (measure/identity-measure measure-ops)
                              keys)]
-          (set! _stats result)
+          (set! _measure result)
           result))
       (async
-       (when stats-ops
+       (when measure-ops
          (let [result (reduce (fn [acc key]
-                                (stats/merge-stats stats-ops acc (stats/extract stats-ops key)))
-                              (stats/identity-stats stats-ops)
+                                (measure/merge-measure measure-ops acc (measure/extract measure-ops key)))
+                              (measure/identity-measure measure-ops)
                               keys)]
-           (set! _stats result)
+           (set! _measure result)
            result)))))
-  (force-compute-stats [this storage stats-ops opts]
+  (force-compute-measure [this storage measure-ops opts]
     ;; For leaves, try and force are the same - just compute from keys
-    (node/try-compute-stats this storage stats-ops opts))
+    (node/try-compute-measure this storage measure-ops opts))
   (merge [_ next]
     (let [new-leaf (Leaf. (arrays/aconcat keys (.-keys next)) settings nil)]
-      ;; Stats will be recomputed lazily if needed
+      ;; Measure will be recomputed lazily if needed
       new-leaf))
   (merge-split [_ next]
     (let [ks (util/merge-n-split keys (.-keys next))]
-      ;; Stats will be recomputed lazily for new leaves
+      ;; Measure will be recomputed lazily for new leaves
       (util/return-array (Leaf. (arrays/aget ks 0) settings nil)
                          (Leaf. (arrays/aget ks 1) settings nil))))
   ($add [this storage key cmp {:keys [sync?] :or {sync? true}}]
     (let [branching-factor (:branching-factor settings)
-          stats-ops (:stats settings)
+          measure-ops (:measure settings)
           idx              (util/binary-search-l cmp keys (dec (arrays/alength keys)) key)
           keys-l           (arrays/alength keys)
           result           (cond
@@ -64,20 +64,20 @@
                                    right-leaf (if (> idx middle)
                                                 (Leaf. (util/cut-n-splice keys middle keys-l idx idx (arrays/array key)) settings nil)
                                                 (Leaf. (.slice keys middle keys-l) settings nil))]
-                               ;; Compute stats for split leaves
-                               (when stats-ops
-                                 (node/try-compute-stats left-leaf nil stats-ops {:sync? true})
-                                 (node/try-compute-stats right-leaf nil stats-ops {:sync? true}))
+                               ;; Compute measure for split leaves
+                               (when measure-ops
+                                 (node/try-compute-measure left-leaf nil measure-ops {:sync? true})
+                                 (node/try-compute-measure right-leaf nil measure-ops {:sync? true}))
                                (arrays/array left-leaf right-leaf))
 
                              :else
                              (let [new-keys (util/splice keys idx idx (arrays/array key))
                                    new-leaf (Leaf. new-keys settings nil)]
-                               ;; Update stats incrementally only if we already have stats.
-                               ;; If _stats is nil (e.g. from merge/merge-split), leave nil for lazy recomputation.
-                               (when (and stats-ops _stats)
-                                 (set! (.-_stats new-leaf)
-                                       (stats/merge-stats stats-ops _stats (stats/extract stats-ops key))))
+                               ;; Update measure incrementally only if we already have measure.
+                               ;; If _measure is nil (e.g. from merge/merge-split), leave nil for lazy recomputation.
+                               (when (and measure-ops _measure)
+                                 (set! (.-_measure new-leaf)
+                                       (measure/merge-measure measure-ops _measure (measure/extract measure-ops key))))
                                (arrays/array new-leaf)))]
       (if sync?
         result
@@ -97,21 +97,21 @@
                      (arrays/aget keys idx))))))
   ($remove [this storage key left right cmp {:keys [sync?] :or {sync? true}}]
     (let [root? (and (nil? left) (nil? right))
-          stats-ops (:stats settings)
+          measure-ops (:measure settings)
           idx   (garr/binarySearch keys key cmp)]
       (async+sync sync?
                   (async
                    (when (<= 0 idx)
                      (let [new-keys (util/splice keys idx (inc idx) (arrays/array))
                            new-leaf (Leaf. new-keys settings nil)]
-                       ;; Update stats
-                       (when stats-ops
-                         (if _stats
-                           (set! (.-_stats new-leaf)
-                                 (stats/remove-stats stats-ops _stats key
-                                                     #(node/try-compute-stats new-leaf storage stats-ops {:sync? true})))
-                           ;; Stats were never initialized, compute from scratch
-                           (node/try-compute-stats new-leaf storage stats-ops {:sync? true})))
+                       ;; Update measure
+                       (when measure-ops
+                         (if _measure
+                           (set! (.-_measure new-leaf)
+                                 (measure/remove-measure measure-ops _measure key
+                                                     #(node/try-compute-measure new-leaf storage measure-ops {:sync? true})))
+                           ;; Measure was never initialized, compute from scratch
+                           (node/try-compute-measure new-leaf storage measure-ops {:sync? true})))
                        (util/rotate new-leaf root? left right settings)))))))
   ($replace [this storage old-key new-key cmp {:keys [sync?] :or {sync? true}}]
     (assert (== 0 (cmp old-key new-key)) "old-key and new-key must compare as equal (cmp must return 0)")
@@ -122,14 +122,14 @@
                      (let [new-keys (arrays/aclone keys)
                            _        (aset new-keys idx new-key)
                            new-leaf (Leaf. new-keys settings nil)
-                           stats-ops (:stats settings)]
-                       ;; Eagerly maintain stats: compute from new leaf (which has replacement done)
-                       (when stats-ops
-                         (if _stats
-                           (set! (.-_stats new-leaf)
+                           measure-ops (:measure settings)]
+                       ;; Eagerly maintain measure: compute from new leaf (which has replacement done)
+                       (when measure-ops
+                         (if _measure
+                           (set! (.-_measure new-leaf)
                                  ;; Compute from new-leaf which has new-key instead of old-key
-                                 (node/try-compute-stats new-leaf storage stats-ops {:sync? true}))
-                           (node/try-compute-stats new-leaf storage stats-ops {:sync? true})))
+                                 (node/try-compute-measure new-leaf storage measure-ops {:sync? true}))
+                           (node/try-compute-measure new-leaf storage measure-ops {:sync? true})))
                        (arrays/array new-leaf)))))))
   ($store [this storage {:keys [sync?] :or {sync? true} :as opts}]
     (async+sync sync?

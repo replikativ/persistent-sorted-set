@@ -3,7 +3,7 @@ package me.tonsky.persistent_sorted_set;
 import java.util.function.Supplier;
 
 /**
- * IStats implementation for numeric data.
+ * IMeasure implementation for numeric data.
  *
  * Handles both Number types (with sum/sumSq) and general Comparable types (min/max only).
  * Use this for Sagitta columnar indices where columns are homogeneous numeric types.
@@ -11,7 +11,7 @@ import java.util.function.Supplier;
  * @param <Key> the key type, should be Comparable (and ideally Number for full stats)
  */
 @SuppressWarnings("unchecked")
-public class NumericStatsOps<Key> implements IStats<Key, NumericStats> {
+public class NumericStatsOps<Key> implements IMeasure<Key, NumericStats> {
 
     private static final NumericStatsOps<?> INSTANCE = new NumericStatsOps<>();
 

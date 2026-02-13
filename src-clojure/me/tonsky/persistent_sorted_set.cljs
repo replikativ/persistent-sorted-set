@@ -163,13 +163,13 @@
 
 (defn get-nth
   "Find the entry at weighted rank `n`.
-   Navigation uses cached subtree stats and IStats weight for
+   Navigation uses cached subtree measure and IMeasure weight for
    O(log entries) performance.
 
    Returns [entry local-offset] where local-offset is the rank
    within the found entry, or nil if out of bounds.
 
-   Requires stats with weight to be configured on the set.
+   Requires measure with weight to be configured on the set.
    Returns continuation yielding result when {:sync? false}."
   ([^BTSet set n]
    (btset/$get-nth set n))
@@ -251,27 +251,27 @@
   ([set xform from opts]
    (btset/$into set xform from opts)))
 
-(defn stats
-  "Get the aggregated statistics for the entire set.
-   Returns the stats object computed by the stats-ops provided when creating the set.
-   Returns nil if no stats-ops were provided or the set is empty.
-   Returns continuation yielding stats when {:sync? false}."
+(defn measure
+  "Get the aggregated measure for the entire set.
+   Returns the measure object computed by the measure-ops provided when creating the set.
+   Returns nil if no measure-ops were provided or the set is empty.
+   Returns continuation yielding measure when {:sync? false}."
   ([^btset/BTSet set]
-   (stats set {:sync? true}))
+   (measure set {:sync? true}))
   ([^btset/BTSet set opts]
-   (btset/$stats set opts)))
+   (btset/$measure set opts)))
 
-(defn stats-slice
-  "Compute stats for elements in the range [from, to] inclusive.
+(defn measure-slice
+  "Compute measure for elements in the range [from, to] inclusive.
    Uses O(log n + k) algorithm where k is keys in boundary leaves.
    If from is nil, computes from the beginning.
    If to is nil, computes to the end.
-   Returns nil if no stats-ops configured.
-   Returns continuation yielding stats when {:sync? false}."
+   Returns nil if no measure-ops configured.
+   Returns continuation yielding measure when {:sync? false}."
   ([set from to]
-   (btset/$stats-slice set from to))
+   (btset/$measure-slice set from to))
   ([set from to cmp]
-   (btset/$stats-slice set from to cmp))
+   (btset/$measure-slice set from to cmp))
   ([set from to cmp opts]
-   (btset/$stats-slice set from to cmp opts)))
+   (btset/$measure-slice set from to cmp opts)))
 

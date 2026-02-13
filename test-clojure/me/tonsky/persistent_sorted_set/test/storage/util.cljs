@@ -39,16 +39,16 @@
                :keys      (.-keys node)
                :addresses (when (branch? node) (.-addresses node))
                :subtree-count (when (branch? node) (.-subtree-count node))
-               :stats     (.-_stats node)}))
+               :measure   (.-_measure node)}))
       address))
   (restore [_ address opts]
     (assert (not (false? (:sync? opts))))
     (or
      (@*memory address)
-     (let [{:keys [keys addresses level stats] :as m} (edn/read-string (@*disk address))
+     (let [{:keys [keys addresses level measure] :as m} (edn/read-string (@*disk address))
            node (if addresses
                   (branch/from-map (assoc m :settings settings))
-                  (Leaf. keys settings stats))]
+                  (Leaf. keys settings measure))]
        (dbg "restored<" (type node) ">")
        (swap! *stats update :reads inc)
        (swap! *memory assoc address node)
@@ -80,17 +80,17 @@
                :keys      (.-keys node)
                :addresses (when (branch? node) (.-addresses node))
                :subtree-count (when (branch? node) (.-subtree-count node))
-               :stats     (.-_stats node)}))
+               :measure   (.-_measure node)}))
       (async address)))
   (restore [_ address opts]
     (assert (false? (:sync? opts)))
     (async
      (or
       (@*memory address)
-      (let [{:keys [keys addresses level stats] :as m} (edn/read-string (@*disk address))
+      (let [{:keys [keys addresses level measure] :as m} (edn/read-string (@*disk address))
             node (if addresses
                    (branch/from-map (assoc m :settings settings))
-                   (Leaf. keys settings stats))]
+                   (Leaf. keys settings measure))]
         (dbg "restored<" (type node) ">")
         (swap! *stats update :reads inc)
         (swap! *memory assoc address node)

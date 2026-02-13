@@ -7,7 +7,7 @@
             [me.tonsky.persistent-sorted-set.branch :as branch :refer [Branch]]
             [me.tonsky.persistent-sorted-set.leaf :as leaf :refer [Leaf]]
             [me.tonsky.persistent-sorted-set.impl.node :as node]
-            [me.tonsky.persistent-sorted-set.impl.stats :as stats]
+            [me.tonsky.persistent-sorted-set.impl.measure :as measure]
             [me.tonsky.persistent-sorted-set.impl.storage :as storage]
             [me.tonsky.persistent-sorted-set.util :refer [rotate lookup-exact splice cut-n-splice binary-search-l binary-search-r return-array merge-n-split check-n-splice]]))
 
@@ -80,17 +80,17 @@
                                 subtree-count (if (every? #(>= % 0) child-counts)
                                                 (reduce + 0 child-counts)
                                                 -1)
-                                ;; Compute stats from children if stats-ops available
-                                stats-ops (:stats (.-settings set))
-                                ;; Only compute root-stats when all children have stats;
+                                ;; Compute measure from children if measure-ops available
+                                measure-ops (:measure (.-settings set))
+                                ;; Only compute root-measure when all children have measure;
                                 ;; otherwise keep nil to allow lazy recomputation
-                                child-stats (when stats-ops (map node/$stats roots))
-                                root-stats (when (and stats-ops (every? some? child-stats))
+                                child-measure (when measure-ops (map node/$measure roots))
+                                root-measure (when (and measure-ops (every? some? child-measure))
                                              (reduce (fn [acc cs]
-                                                       (stats/merge-stats stats-ops acc cs))
-                                                     (stats/identity-stats stats-ops)
-                                                     child-stats))]
-                            (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count root-stats (.-settings set))
+                                                       (measure/merge-measure measure-ops acc cs))
+                                                     (measure/identity-measure measure-ops)
+                                                     child-measure))]
+                            (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count root-measure (.-settings set))
                                     new-cnt
                                     (.-comparator set)
                                     (.-meta set)
@@ -193,26 +193,27 @@
                                               opts))))))
 
 (defn $lookup
-  [^BTSet set key not-found {:keys [sync?] :or {sync? true} :as opts}]
+  [^BTSet set key not-found {:keys [sync? comparator] :or {sync? true} :as opts}]
   (async+sync sync?
               (async
                (let [root   (await ($$root set opts))
-                     result (await (node/$lookup root (.-storage set) key (.-comparator set) opts))]
+                     cmp    (or comparator (.-comparator set))
+                     result (await (node/$lookup root (.-storage set) key cmp opts))]
                  (if (some? result)
                    result
                    not-found)))))
 
-(defn $stats
+(defn $measure
   "Get the aggregated statistics for the entire set."
   [^BTSet set {:keys [sync?] :or {sync? true} :as opts}]
   (async+sync sync?
               (async
                (let [root (await ($$root set opts))
-                     stats-ops (:stats (.-settings set))]
-                 (if (nil? stats-ops)
+                     measure-ops (:measure (.-settings set))]
+                 (if (nil? measure-ops)
                    nil
-                   (or (node/$stats root)
-                       (await (node/force-compute-stats root (.-storage set) stats-ops opts))))))))
+                   (or (node/$measure root)
+                       (await (node/force-compute-measure root (.-storage set) measure-ops opts))))))))
 
 (defn restore
   [root-address-or-info storage opts]
@@ -891,13 +892,13 @@
                       0
                       (await ($count-slice-node root (.-storage set) from to cmp opts)))))))))
 
-(defn- stats-slice-leaf
-  "Compute stats for keys in range [from, to] within a leaf."
-  [^Leaf node stats-ops from to cmp]
+(defn- measure-slice-leaf
+  "Compute measure for keys in range [from, to] within a leaf."
+  [^Leaf node measure-ops from to cmp]
   (let [keys (.-keys node)
         len  (arrays/alength keys)]
     (loop [i 0
-           acc (stats/identity-stats stats-ops)]
+           acc (measure/identity-measure measure-ops)]
       (if (>= i len)
         acc
         (let [key (arrays/aget keys i)
@@ -905,16 +906,16 @@
                              (or (nil? to) (<= (cmp key to) 0)))]
           (recur (inc i)
                  (if in-range?
-                   (stats/merge-stats stats-ops acc (stats/extract stats-ops key))
+                   (measure/merge-measure measure-ops acc (measure/extract measure-ops key))
                    acc)))))))
 
-(defn- $stats-slice-node
-  "Recursively compute stats for elements in range [from, to] within a node."
-  [node storage stats-ops from to cmp {:keys [sync?] :or {sync? true} :as opts}]
+(defn- $measure-slice-node
+  "Recursively compute measure for elements in range [from, to] within a node."
+  [node storage measure-ops from to cmp {:keys [sync?] :or {sync? true} :as opts}]
   (async+sync sync?
               (async
                (if (instance? Leaf node)
-                 (stats-slice-leaf node stats-ops from to cmp)
+                 (measure-slice-leaf node measure-ops from to cmp)
         ;; Branch node
                  (let [keys (.-keys node)
                        len  (arrays/alength keys)
@@ -929,82 +930,82 @@
                    (cond
             ;; Empty range
                      (> from-idx to-idx)
-                     (stats/identity-stats stats-ops)
+                     (measure/identity-measure measure-ops)
 
             ;; Same child, recurse into it
                      (== from-idx to-idx)
                      (let [child (await (branch/$child node storage from-idx opts))]
-                       (await ($stats-slice-node child storage stats-ops from to cmp opts)))
+                       (await ($measure-slice-node child storage measure-ops from to cmp opts)))
 
             ;; Spans multiple children
                      :else
-                     (let [;; Stats from partial first child
+                     (let [;; Measure from partial first child
                            first-child (await (branch/$child node storage from-idx opts))
-                           first-stats (await ($stats-slice-node first-child storage stats-ops from nil cmp opts))
-                  ;; Stats from partial last child
+                           first-measure (await ($measure-slice-node first-child storage measure-ops from nil cmp opts))
+                  ;; Measure from partial last child
                            last-child  (await (branch/$child node storage to-idx opts))
-                           last-stats  (await ($stats-slice-node last-child storage stats-ops nil to cmp opts))
-                  ;; Stats from fully contained children in between
-                           middle-stats (loop [i (inc from-idx)
-                                               acc (stats/identity-stats stats-ops)]
+                           last-measure  (await ($measure-slice-node last-child storage measure-ops nil to cmp opts))
+                  ;; Measure from fully contained children in between
+                           middle-measure (loop [i (inc from-idx)
+                                               acc (measure/identity-measure measure-ops)]
                                           (if (>= i to-idx)
                                             acc
                                             (let [child (await (branch/$child node storage i opts))
-                                                  child-stats (or (node/$stats child)
-                                                                  (await (node/force-compute-stats child storage stats-ops opts)))]
+                                                  child-measure (or (node/$measure child)
+                                                                  (await (node/force-compute-measure child storage measure-ops opts)))]
                                               (recur (inc i)
-                                                     (stats/merge-stats stats-ops acc child-stats)))))]
-                       (stats/merge-stats stats-ops
-                                          (stats/merge-stats stats-ops first-stats middle-stats)
-                                          last-stats))))))))
+                                                     (measure/merge-measure measure-ops acc child-measure)))))]
+                       (measure/merge-measure measure-ops
+                                          (measure/merge-measure measure-ops first-measure middle-measure)
+                                          last-measure))))))))
 
-(defn $stats-slice
-  "Compute stats for elements in the range [from, to] inclusive.
-   Uses O(log n) algorithm when subtree stats are available.
+(defn $measure-slice
+  "Compute measure for elements in the range [from, to] inclusive.
+   Uses O(log n) algorithm when subtree measure is available.
    If from is nil, computes from the beginning.
    If to is nil, computes to the end.
-   Returns nil if no stats-ops configured."
+   Returns nil if no measure-ops configured."
   ([^BTSet set from to]
-   ($stats-slice set from to (.-comparator set) {:sync? true}))
+   ($measure-slice set from to (.-comparator set) {:sync? true}))
   ([^BTSet set from to arg]
    (if (fn? arg)
-     ($stats-slice set from to arg {:sync? true})
-     ($stats-slice set from to (.-comparator set) arg)))
+     ($measure-slice set from to arg {:sync? true})
+     ($measure-slice set from to (.-comparator set) arg)))
   ([^BTSet set from to cmp {:keys [sync?] :or {sync? true} :as opts}]
    (async+sync sync?
                (async
-                (let [stats-ops (:stats (.-settings set))]
-                  (if (nil? stats-ops)
+                (let [measure-ops (:measure (.-settings set))]
+                  (if (nil? measure-ops)
                     nil
                     (if (and from to (pos? (cmp from to)))
-                      (stats/identity-stats stats-ops) ;; Empty range
+                      (measure/identity-measure measure-ops) ;; Empty range
                       (let [root (await ($$root set opts))]
                         (if (zero? (node/len root))
-                          (stats/identity-stats stats-ops)
-                          (await ($stats-slice-node root (.-storage set) stats-ops from to cmp opts)))))))))))
+                          (measure/identity-measure measure-ops)
+                          (await ($measure-slice-node root (.-storage set) measure-ops from to cmp opts)))))))))))
 
 (defn $get-nth
   "Find the entry at weighted rank `n`.
-   Navigation uses cached subtree stats and IStats weight for
+   Navigation uses cached subtree measure and IMeasure weight for
    O(log entries) performance.
 
    Returns [entry local-offset] where local-offset is the rank
    within the found entry, or nil if out of bounds.
 
-   Requires stats with weight to be configured on the set."
+   Requires measure with weight to be configured on the set."
   ([^BTSet set n]
    ($get-nth set n {:sync? true}))
   ([^BTSet set n {:keys [sync?] :or {sync? true} :as opts}]
    (async+sync sync?
                (async
                 (let [root (await ($$root set opts))
-                      stats-ops (:stats (.-settings set))]
-                  (when (nil? stats-ops)
-                    (throw (js/Error. "get-nth requires stats to be configured")))
+                      measure-ops (:measure (.-settings set))]
+                  (when (nil? measure-ops)
+                    (throw (js/Error. "get-nth requires measure to be configured")))
                   (when (pos? (node/len root))
-                    (let [root-stats (or (node/$stats root)
-                                         (await (node/force-compute-stats root (.-storage set) stats-ops opts)))
-                          total-weight (stats/weight stats-ops root-stats)]
+                    (let [root-measure (or (node/$measure root)
+                                         (await (node/force-compute-measure root (.-storage set) measure-ops opts)))
+                          total-weight (measure/weight measure-ops root-measure)]
                       (when (and (>= n 0) (< n total-weight))
                         ;; Navigate tree
                         (loop [cur-node root
@@ -1016,9 +1017,9 @@
                                                 r rank]
                                            (when (< i len)
                                              (let [child (await (branch/$child cur-node (.-storage set) i opts))
-                                                   child-stats (or (node/$stats child)
-                                                                   (await (node/force-compute-stats child (.-storage set) stats-ops opts)))
-                                                   child-weight (stats/weight stats-ops child-stats)]
+                                                   child-measure (or (node/$measure child)
+                                                                   (await (node/force-compute-measure child (.-storage set) measure-ops opts)))
+                                                   child-weight (measure/weight measure-ops child-measure)]
                                                (if (< r child-weight)
                                                  [child r]
                                                  (recur (inc i) (- r child-weight))))))]
@@ -1031,8 +1032,8 @@
                                      r rank]
                                 (when (< i len)
                                   (let [key (arrays/aget keys i)
-                                        key-stats (stats/extract stats-ops key)
-                                        key-weight (stats/weight stats-ops key-stats)]
+                                        key-measure (measure/extract measure-ops key)
+                                        key-weight (measure/weight measure-ops key-measure)]
                                     (if (< r key-weight)
                                       [key r]
                                       (recur (inc i) (- r key-weight)))))))))))))))))
@@ -1536,15 +1537,15 @@
 
 (defn ^BTSet from-sorted-array
   [cmp arr _len opts]
-  (let [settings (select-keys opts [:branching-factor :stats])
-        stats-ops (:stats settings)
+  (let [settings (select-keys opts [:branching-factor :measure])
+        measure-ops (:measure settings)
         set      (BTSet. nil 0 cmp nil nil nil nil settings)
         leaves   (->> arr
                       (arr-partition-approx set)
                       (arr-map-inplace #(let [leaf (Leaf. % settings nil)]
-                                          ;; Compute stats for leaf if stats-ops available
-                                          (when stats-ops
-                                            (node/try-compute-stats leaf nil stats-ops {:sync? true}))
+                                          ;; Compute measure for leaf if measure-ops available
+                                          (when measure-ops
+                                            (node/try-compute-measure leaf nil measure-ops {:sync? true}))
                                           leaf)))
         storage  (:storage opts)]
     (loop [current-level leaves
@@ -1556,22 +1557,22 @@
          (->> current-level
               (arr-partition-approx set)
               (arr-map-inplace #(let [subtree-count (reduce + 0 (map node/$subtree-count %))
-                                      ;; Compute stats from children if stats-ops available
-                                      stats-ops (:stats settings)
-                                      child-stats (when stats-ops
+                                      ;; Compute measure from children if measure-ops available
+                                      measure-ops (:measure settings)
+                                      child-measure (when measure-ops
                                                     (reduce (fn [acc child]
-                                                              (let [cs (node/$stats child)]
+                                                              (let [cs (node/$measure child)]
                                                                 (if cs
-                                                                  (stats/merge-stats stats-ops acc cs)
+                                                                  (measure/merge-measure measure-ops acc cs)
                                                                   acc)))
-                                                            (stats/identity-stats stats-ops)
+                                                            (measure/identity-measure measure-ops)
                                                             %))]
                                   (Branch. (inc shift)
                                            (arrays/amap node/max-key %)
                                            %
                                            nil
                                            subtree-count
-                                           child-stats
+                                           child-measure
                                            settings))))
          (inc shift))))))
 
@@ -1583,10 +1584,10 @@
   "Create a set with options map containing:
    - :storage  Storage implementation
    - :comparator  Custom comparator (defaults to compare)
-   - :stats    Statistics implementation (IStats protocol)
+   - :measure  Measure implementation (IMeasure protocol)
    - :meta     Metadata"
   [opts]
-  (let [settings (select-keys opts [:branching-factor :stats])]
+  (let [settings (select-keys opts [:branching-factor :measure])]
     (BTSet. (Leaf. (arrays/array) settings nil) 0 (or (:comparator opts) compare)
             (:meta opts) UNINITIALIZED_HASH (:storage opts) nil settings)))
 

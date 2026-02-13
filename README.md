@@ -276,7 +276,7 @@ This uses O(log n) traversal by leveraging subtree counts stored in branch nodes
 Access elements by their position (rank) in O(log n) time, enabling efficient percentile and quantile queries:
 
 ```clj
-(def s (into (set/sorted-set* {:stats (NumericStatsOps.)})
+(def s (into (set/sorted-set* {:measure (NumericStatsOps.)})
              (range 1000)))
 
 ;; Get median (50th percentile) - O(log n)
@@ -300,7 +300,7 @@ Access elements by their position (rank) in O(log n) time, enabling efficient pe
 
 `get-nth` returns `[entry local-offset]` where `local-offset` is useful for weighted statistics (each entry can represent multiple elements). Returns `nil` if the rank is out of bounds.
 
-**Requirements:** Must configure `:stats` with a `weight` implementation. The built-in `NumericStatsOps` uses count as weight (each element has weight 1).
+**Requirements:** Must configure `:measure` with a `weight` implementation. The built-in `NumericStatsOps` uses count as weight (each element has weight 1).
 
 **Use cases:**
 - **Percentile queries:** Median, quartiles, deciles for statistical analysis
@@ -317,7 +317,7 @@ ClojureScript provides the same `get-nth` API:
 (require '[me.tonsky.persistent-sorted-set :as set])
 (require '[me.tonsky.persistent-sorted-set.impl.numeric-stats :as nstats])
 
-(def s (into (set/sorted-set* {:stats nstats/numeric-stats-ops})
+(def s (into (set/sorted-set* {:measure nstats/numeric-stats-ops})
              (range 1000)))
 
 (set/get-nth s 500)
@@ -336,15 +336,15 @@ PersistentSortedSet can maintain aggregate statistics that update incrementally 
 (import '[me.tonsky.persistent_sorted_set NumericStatsOps])
 
 ;; Create set with numeric stats tracking
-(def s (into (set/sorted-set* {:stats (NumericStatsOps.)})
+(def s (into (set/sorted-set* {:measure (NumericStatsOps.)})
              [1 2 3 4 5]))
 
-;; Get stats for entire set
-(set/stats s)
+;; Get measure for entire set
+(set/measure s)
 ;=> NumericStats{count=5, sum=15.0, min=1, max=5, ...}
 
-;; Get stats for a range [2, 4]
-(set/stats-slice s 2 4)
+;; Get measure for a range [2, 4]
+(set/measure-slice s 2 4)
 ;=> NumericStats{count=3, sum=9.0, min=2, max=4, ...}
 ```
 
@@ -352,14 +352,14 @@ The `NumericStats` object provides `count`, `sum`, `sumSq`, `min`, `max`, plus d
 
 ### Implementing Custom Statistics
 
-Statistics must form a **monoid** - they need an identity element and an associative merge operation. Implement the `IStats` interface:
+Statistics must form a **monoid** - they need an identity element and an associative merge operation. Implement the `IMeasure` interface:
 
 ```java
-public interface IStats<Key, S> {
+public interface IMeasure<Key, S> {
     // Identity element: merge(identity, x) == x
     S identity();
 
-    // Extract stats from a single key
+    // Extract measure from a single key
     S extract(Key key);
 
     // Associative merge: merge(a, merge(b, c)) == merge(merge(a, b), c)
@@ -373,7 +373,7 @@ public interface IStats<Key, S> {
 **Example: Counting distinct categories**
 
 ```java
-public class CategoryStats implements IStats<Item, Map<String, Long>> {
+public class CategoryStats implements IMeasure<Item, Map<String, Long>> {
     public Map<String, Long> identity() {
         return Collections.emptyMap();
     }
@@ -417,7 +417,7 @@ The built-in `NumericStatsOps` handles this automatically for min/max.
 
 ### ClojureScript Statistics
 
-For ClojureScript, implement the `IStats` protocol from `me.tonsky.persistent-sorted-set.impl.stats`:
+For ClojureScript, implement the `IMeasure` protocol from `me.tonsky.persistent-sorted-set.impl.measure`:
 
 ```cljs
 (require '[me.tonsky.persistent-sorted-set :as set])
@@ -425,29 +425,29 @@ For ClojureScript, implement the `IStats` protocol from `me.tonsky.persistent-so
 (require '[me.tonsky.persistent-sorted-set.impl.numeric-stats :as numeric-stats])
 
 ;; Use built-in numeric stats
-(def s (into (set/sorted-set* {:stats numeric-stats/numeric-stats-ops})
+(def s (into (set/sorted-set* {:measure numeric-stats/numeric-stats-ops})
              [1 2 3 4 5]))
 
-;; Or implement custom stats via the IStats protocol
+;; Or implement custom measure via the IMeasure protocol
 (defrecord MyStats [count sum])
 
 (def my-stats-ops
-  (reify stats/IStats
-    (identity-stats [_]
+  (reify measure/IMeasure
+    (identity-measure [_]
       (->MyStats 0 0))
 
     (extract [_ key]
       (->MyStats 1 key))
 
-    (merge-stats [_ s1 s2]
+    (merge-measure [_ s1 s2]
       (->MyStats (+ (:count s1) (:count s2))
                  (+ (:sum s1) (:sum s2))))
 
-    (remove-stats [_ current key recompute-fn]
+    (remove-measure [_ current key recompute-fn]
       (->MyStats (dec (:count current))
                  (- (:sum current) key)))))
 
-(def s (into (set/sorted-set* {:stats my-stats-ops}) [1 2 3 4 5]))
+(def s (into (set/sorted-set* {:measure my-stats-ops}) [1 2 3 4 5]))
 ```
 
 ## Performance

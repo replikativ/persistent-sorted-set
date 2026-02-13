@@ -39,4 +39,5 @@
   {:target :node-script
    :main test-stats/-main
    :output-to "target/test-stats.js"
-   :compiler-options {:optimizations :simple}}}}
+   :compiler-options {:optimizations :simple}}
+}}

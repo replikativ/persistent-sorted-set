@@ -266,10 +266,10 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
 
   /**
    * Find the key at a given weighted rank.
-   * Each key has a weight determined by statsOps.weight(stats).
-   * Interior nodes use cached subtree stats for O(log n) navigation.
+   * Each key has a weight determined by measureOps.weight(measure).
+   * Interior nodes use cached subtree measure for O(log n) navigation.
    *
-   * Requires stats with weight() to be configured on the set.
+   * Requires measure with weight() to be configured on the set.
    *
    * @param rank       The target rank (0-based, in terms of total weight)
    * @param outOffset  If non-null, outOffset[0] is set to the local offset
@@ -281,15 +281,15 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     ANode<Key, Address> node = root();
     if (node.len() == 0) return null;
 
-    IStats statsOps = _settings.stats();
-    if (statsOps == null) {
-      throw new IllegalStateException("getNth requires stats to be configured");
+    IMeasure measureOps = _settings.measure();
+    if (measureOps == null) {
+      throw new IllegalStateException("getNth requires measure to be configured");
     }
 
-    // Check bounds using root stats
-    Object rootStats = node._stats;
-    if (rootStats == null) rootStats = node.forceComputeStats(_storage);
-    long totalWeight = statsOps.weight(rootStats);
+    // Check bounds using root measure
+    Object rootMeasure = node._measure;
+    if (rootMeasure == null) rootMeasure = node.forceComputeMeasure(_storage);
+    long totalWeight = measureOps.weight(rootMeasure);
     if (rank < 0 || rank >= totalWeight) return null;
 
     // Navigate tree
@@ -298,9 +298,9 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       boolean found = false;
       for (int i = 0; i < branch._len; i++) {
         ANode<Key, Address> child = branch.child(_storage, i);
-        Object childStats = child._stats;
-        if (childStats == null) childStats = child.forceComputeStats(_storage);
-        long childWeight = statsOps.weight(childStats);
+        Object childMeasure = child._measure;
+        if (childMeasure == null) childMeasure = child.forceComputeMeasure(_storage);
+        long childWeight = measureOps.weight(childMeasure);
         if (rank < childWeight) {
           node = child;
           found = true;
@@ -314,8 +314,8 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     // At leaf level — iterate keys
     Leaf<Key, Address> leaf = (Leaf<Key, Address>) node;
     for (int i = 0; i < leaf._len; i++) {
-      Object keyStats = statsOps.extract(leaf._keys[i]);
-      long keyWeight = statsOps.weight(keyStats);
+      Object keyMeasure = measureOps.extract(leaf._keys[i]);
+      long keyWeight = measureOps.weight(keyMeasure);
       if (rank < keyWeight) {
         if (outOffset != null) outOffset[0] = rank;
         return leaf._keys[i];
@@ -412,19 +412,19 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   }
 
   /**
-   * Helper to compute stats from an array of child nodes.
+   * Helper to compute measure from an array of child nodes.
    */
-  private Object computeStatsFromChildren(ANode[] children) {
-    IStats statsOps = _settings.stats();
-    if (statsOps == null) return null;
-    Object result = statsOps.identity();
+  private Object computeMeasureFromChildren(ANode[] children) {
+    IMeasure measureOps = _settings.measure();
+    if (measureOps == null) return null;
+    Object result = measureOps.identity();
     for (ANode child : children) {
-      Object childStats = child.stats();
-      if (childStats == null) {
-        childStats = child.forceComputeStats(_storage);
+      Object childMeasure = child.measure();
+      if (childMeasure == null) {
+        childMeasure = child.forceComputeMeasure(_storage);
       }
-      if (childStats != null) {
-        result = statsOps.merge(result, childStats);
+      if (childMeasure != null) {
+        result = measureOps.merge(result, childMeasure);
       }
     }
     return result;
@@ -450,8 +450,8 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
         Object[] keys = new Object[] {nodes[0].maxKey(), nodes[1].maxKey()};
         long c0 = getSubtreeCount(nodes[0]), c1 = getSubtreeCount(nodes[1]);
         long subtreeCount = (c0 >= 0 && c1 >= 0) ? c0 + c1 : -1;
-        Object stats = computeStatsFromChildren(nodes);
-        _root = new Branch(nodes[0].level() + 1, 2, keys, null, new Object[] {nodes[0], nodes[1]}, subtreeCount, stats, _settings);
+        Object measure = computeMeasureFromChildren(nodes);
+        _root = new Branch(nodes[0].level() + 1, 2, keys, null, new Object[] {nodes[0], nodes[1]}, subtreeCount, measure, _settings);
       }
       // EARLY_EXIT case (nodes.length == 0): tree was modified in place, _address already cleared above
       _count = alterCount(1);
@@ -466,9 +466,9 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     Object[] children = Arrays.copyOf(nodes, nodes.length, new Object[0].getClass());
     long c0 = getSubtreeCount(nodes[0]), c1 = getSubtreeCount(nodes[1]);
     long subtreeCount = (c0 >= 0 && c1 >= 0) ? c0 + c1 : -1;
-    // Compute stats for new root
-    Object stats = computeStatsFromChildren(nodes);
-    ANode newRoot = new Branch(nodes[0].level() + 1, 2, keys, null, children, subtreeCount, stats, _settings);
+    // Compute measure for new root
+    Object measure = computeMeasureFromChildren(nodes);
+    ANode newRoot = new Branch(nodes[0].level() + 1, 2, keys, null, children, subtreeCount, measure, _settings);
     return new PersistentSortedSet(_meta, _cmp, null, _storage, newRoot, alterCount(1), _settings, _version + 1);
   }
 

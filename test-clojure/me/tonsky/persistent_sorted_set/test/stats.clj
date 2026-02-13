@@ -11,12 +11,12 @@
 
 (defn get-root-stats [^me.tonsky.persistent_sorted_set.PersistentSortedSet s]
   (when-let [root (.root s)]
-    (.-_stats ^ANode root)))
+    (.-_measure ^ANode root)))
 
 (deftest test-from-sorted-array-stats
   (testing "stats computed for small set"
     (let [arr (object-array [1 2 3 4 5])
-          s   (set/from-sorted-array compare arr 5 {:stats stats-ops})
+          s   (set/from-sorted-array compare arr 5 {:measure stats-ops})
           ^NumericStats stats (get-root-stats s)]
       (is (some? stats))
       (is (= 5 (.count stats)))
@@ -30,7 +30,7 @@
   (testing "stats computed for larger set (with branches)"
     (let [n    1000
           arr  (object-array (range n))
-          s    (set/from-sorted-array compare arr n {:stats stats-ops :branching-factor 64})
+          s    (set/from-sorted-array compare arr n {:measure stats-ops :branching-factor 64})
           ^NumericStats stats (get-root-stats s)]
       (is (some? stats))
       (is (= n (.count stats)))
@@ -42,7 +42,7 @@
 (deftest test-conj-maintains-stats
   (testing "stats updated after conj"
     (let [arr (object-array [1 2 3])
-          s1  (set/from-sorted-array compare arr 3 {:stats stats-ops})
+          s1  (set/from-sorted-array compare arr 3 {:measure stats-ops})
           s2  (conj s1 4)
           s3  (conj s2 5)
           ^NumericStats stats1 (get-root-stats s1)
@@ -66,7 +66,7 @@
 (deftest test-disj-maintains-stats
   (testing "stats updated after disj"
     (let [arr (object-array [1 2 3 4 5])
-          s1  (set/from-sorted-array compare arr 5 {:stats stats-ops})
+          s1  (set/from-sorted-array compare arr 5 {:measure stats-ops})
           s2  (disj s1 5)
           s3  (disj s2 1)
           ^NumericStats stats1 (get-root-stats s1)
@@ -93,7 +93,7 @@
 (deftest test-transient-maintains-stats
   (testing "stats updated for transient operations"
     (let [arr   (object-array [1 2 3])
-          base  (set/from-sorted-array compare arr 3 {:stats stats-ops})
+          base  (set/from-sorted-array compare arr 3 {:measure stats-ops})
           s     (-> (transient base)
                     (conj! 4)
                     (conj! 5)

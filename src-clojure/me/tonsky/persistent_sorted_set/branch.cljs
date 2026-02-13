@@ -4,7 +4,7 @@
             [is.simm.partial-cps.async :refer [await] :refer-macros [async]]
             [me.tonsky.persistent-sorted-set.arrays :as arrays]
             [me.tonsky.persistent-sorted-set.impl.node :as node :refer [INode]]
-            [me.tonsky.persistent-sorted-set.impl.stats :as stats]
+            [me.tonsky.persistent-sorted-set.impl.measure :as measure]
             [me.tonsky.persistent-sorted-set.impl.storage :as storage]
             [me.tonsky.persistent-sorted-set.util :as util]))
 
@@ -132,12 +132,12 @@
                                ;; After adding one element, increment count if known
                                old-sc (.-subtree-count this)
                                new-sc (if (>= old-sc 0) (inc old-sc) -1)
-                               ;; Update stats incrementally
-                               stats-ops (:stats (.-settings this))
-                               new-stats (when stats-ops
-                                           (let [prev-stats (or (.-_stats this) (stats/identity-stats stats-ops))]
-                                             (stats/merge-stats stats-ops prev-stats (stats/extract stats-ops key))))]
-                           (arrays/array (Branch. (.-level this) new-keys new-children new-addrs new-sc new-stats (.-settings this))))
+                               ;; Update measure incrementally
+                               measure-ops (:measure (.-settings this))
+                               new-measure (when measure-ops
+                                           (let [prev-measure (or (.-_measure this) (measure/identity-measure measure-ops))]
+                                             (measure/merge-measure measure-ops prev-measure (measure/extract measure-ops key))))]
+                           (arrays/array (Branch. (.-level this) new-keys new-children new-addrs new-sc new-measure (.-settings this))))
                          (let [middle      (arrays/half (arrays/alength new-children))
                                tmp-addrs   (when addrs
                                              (let [old-addr (aget addrs idx)]
@@ -149,23 +149,23 @@
                                right-addrs (when tmp-addrs (.slice tmp-addrs middle))
                                left-children (.slice new-children 0 middle)
                                right-children (.slice new-children middle)
-                               stats-ops (:stats (.-settings this))
-                               ;; Compute stats for split branches from their children
-                               left-stats (when stats-ops
+                               measure-ops (:measure (.-settings this))
+                               ;; Compute measure for split branches from their children
+                               left-measure (when measure-ops
                                             (reduce (fn [acc child]
-                                                      (let [cs (node/$stats child)]
+                                                      (let [cs (node/$measure child)]
                                                         (if cs
-                                                          (stats/merge-stats stats-ops acc cs)
+                                                          (measure/merge-measure measure-ops acc cs)
                                                           acc)))
-                                                    (stats/identity-stats stats-ops)
+                                                    (measure/identity-measure measure-ops)
                                                     left-children))
-                               right-stats (when stats-ops
+                               right-measure (when measure-ops
                                              (reduce (fn [acc child]
-                                                       (let [cs (node/$stats child)]
+                                                       (let [cs (node/$measure child)]
                                                          (if cs
-                                                           (stats/merge-stats stats-ops acc cs)
+                                                           (measure/merge-measure measure-ops acc cs)
                                                            acc)))
-                                                     (stats/identity-stats stats-ops)
+                                                     (measure/identity-measure measure-ops)
                                                      right-children))]
                            (arrays/array
                             (Branch. (.-level this)
@@ -173,14 +173,14 @@
                                      left-children
                                      left-addrs
                                      -1
-                                     left-stats
+                                     left-measure
                                      (.-settings this))
                             (Branch. (.-level this)
                                      (.slice new-keys middle)
                                      right-children
                                      right-addrs
                                      -1
-                                     right-stats
+                                     right-measure
                                      (.-settings this))))))))))))
 
 (defn $remove
@@ -232,29 +232,29 @@
                              ;; After removing one element, decrement count if known
                              old-sc (.-subtree-count this)
                              new-sc (if (>= old-sc 0) (dec old-sc) -1)
-                             ;; Update stats
-                             stats-ops (:stats (.-settings this))
-                             new-stats (when stats-ops
-                                         (if (.-_stats this)
-                                           (stats/remove-stats stats-ops (.-_stats this) key
-                                                               #(node/try-compute-stats
+                             ;; Update measure
+                             measure-ops (:measure (.-settings this))
+                             new-measure (when measure-ops
+                                         (if (.-_measure this)
+                                           (measure/remove-measure measure-ops (.-_measure this) key
+                                                               #(node/try-compute-measure
                                                                  (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this))
-                                                                 storage stats-ops {:sync? true}))
-                                           ;; Stats were never initialized, compute from scratch
-                                           (node/try-compute-stats
+                                                                 storage measure-ops {:sync? true}))
+                                           ;; Measure was never initialized, compute from scratch
+                                           (node/try-compute-measure
                                             (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this))
-                                            storage stats-ops {:sync? true})))]
-                         (util/rotate (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-stats (.-settings this))
+                                            storage measure-ops {:sync? true})))]
+                         (util/rotate (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-measure (.-settings this))
                                       (and (nil? left) (nil? right))
                                       left
                                       right
                                       (.-settings this))))))))))
 
-(defn- replace-stats
-  "Try to recompute stats after replace (postpone if children unavailable)."
-  [branch storage stats-ops]
-  (when stats-ops
-    (node/try-compute-stats branch storage stats-ops {:sync? true})))
+(defn- replace-measure
+  "Try to recompute measure after replace (postpone if children unavailable)."
+  [branch storage measure-ops]
+  (when measure-ops
+    (node/try-compute-measure branch storage measure-ops {:sync? true})))
 
 (defn $replace
   [^Branch this storage old-key new-key cmp {:keys [sync?] :or {sync? true} :as opts}]
@@ -264,7 +264,7 @@
                (let [keys (.-keys this)
                      settings (.-settings this)
                      editable? (:edit settings)
-                     stats-ops (:stats settings)
+                     measure-ops (:measure settings)
                      idx  (let [arr-l (arrays/alength keys)
                                 i     (util/binary-search-l cmp keys (dec arr-l) old-key)]
                             (if (== i arr-l) -1 i))]
@@ -300,9 +300,9 @@
                                  (when (and storage (aget addrs idx))
                                    (storage/markFreed storage (aget addrs idx)))
                                  (aset addrs idx nil))
-                               (when stats-ops
-                                 (set! (.-_stats this)
-                                       (replace-stats this storage stats-ops)))
+                               (when measure-ops
+                                 (set! (.-_measure this)
+                                       (replace-measure this storage measure-ops)))
                                (arrays/array this))
                              ;; Persistent: clone arrays
                              (let [new-keys     (arrays/aclone keys)
@@ -317,9 +317,9 @@
                                    _            (aset new-keys idx new-max-key)
                                    _            (aset new-children idx new-node)
                                    new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this))
-                                   new-stats    (when stats-ops
-                                                  (replace-stats new-branch storage stats-ops))]
-                               (set! (.-_stats new-branch) new-stats)
+                                   new-measure    (when measure-ops
+                                                  (replace-measure new-branch storage measure-ops))]
+                               (set! (.-_measure new-branch) new-measure)
                                (arrays/array new-branch)))
                            ;; maxKey unchanged - reuse keys array
                            (if editable?
@@ -331,9 +331,9 @@
                                  (when (and storage (aget addrs idx))
                                    (storage/markFreed storage (aget addrs idx)))
                                  (aset addrs idx nil))
-                               (when stats-ops
-                                 (set! (.-_stats this)
-                                       (replace-stats this storage stats-ops)))
+                               (when measure-ops
+                                 (set! (.-_measure this)
+                                       (replace-measure this storage measure-ops)))
                                (if last-child?
                                  (arrays/array this)  ; Last child, need to propagate
                                  :early-exit))        ; Not last child, early exit
@@ -348,9 +348,9 @@
                                                     na))
                                    _            (aset new-children idx new-node)
                                    new-branch   (Branch. (.-level this) keys new-children new-addrs (.-subtree-count this) nil (.-settings this))
-                                   new-stats    (when stats-ops
-                                                  (replace-stats new-branch storage stats-ops))]
-                               (set! (.-_stats new-branch) new-stats)
+                                   new-measure    (when measure-ops
+                                                  (replace-measure new-branch storage measure-ops))]
+                               (set! (.-_measure new-branch) new-measure)
                                (arrays/array new-branch))))))))))))
 
 (defn $store
@@ -386,10 +386,10 @@
                        (recur (inc i)))))))))
 
 (defn ^Branch from-map
-  [{:keys [level keys addresses subtree-count stats settings]}]
-  (Branch. level keys nil addresses (or subtree-count -1) stats settings))
+  [{:keys [level keys addresses subtree-count measure settings]}]
+  (Branch. level keys nil addresses (or subtree-count -1) measure settings))
 
-(deftype Branch [^number level keys ^:mutable children ^:mutable addresses ^:mutable ^number subtree-count ^:mutable _stats settings]
+(deftype Branch [^number level keys ^:mutable children ^:mutable addresses ^:mutable ^number subtree-count ^:mutable _measure settings]
   Object
   (toString [_] (pr-str* {:level level :keys (vec keys)}))
   INode
@@ -397,52 +397,52 @@
   (level [_] level)
   (max-key [_] (arrays/alast keys))
   ($subtree-count [_] subtree-count)
-  ($stats [_] _stats)
-  (try-compute-stats [this storage stats-ops {:keys [sync?] :or {sync? true} :as opts}]
-    ;; Try to compute stats, postpone if any child unavailable
+  ($measure [_] _measure)
+  (try-compute-measure [this storage measure-ops {:keys [sync?] :or {sync? true} :as opts}]
+    ;; Try to compute measure, postpone if any child unavailable
     (async+sync sync?
                 (async
-                 (when stats-ops
+                 (when measure-ops
                    (let [result (loop [i 0
-                                       acc (stats/identity-stats stats-ops)]
+                                       acc (measure/identity-measure measure-ops)]
                                   (if (< i (arrays/alength keys))
                                     (let [child (await ($child this storage i opts))
-                                          child-stats (node/$stats child)]
-                                      (if child-stats
+                                          child-measure (node/$measure child)]
+                                      (if child-measure
                                         (recur (inc i)
-                                               (stats/merge-stats stats-ops acc child-stats))
-                                        ;; Child stats unavailable - postpone our computation
+                                               (measure/merge-measure measure-ops acc child-measure))
+                                        ;; Child measure unavailable - postpone our computation
                                         nil))
                                     acc))]
                      (when result
-                       (set! _stats result))
+                       (set! _measure result))
                      result)))))
-  (force-compute-stats [this storage stats-ops {:keys [sync?] :or {sync? true} :as opts}]
-    ;; Force compute stats, recursively descending if needed
+  (force-compute-measure [this storage measure-ops {:keys [sync?] :or {sync? true} :as opts}]
+    ;; Force compute measure, recursively descending if needed
     (async+sync sync?
                 (async
-                 (when stats-ops
+                 (when measure-ops
                    (let [result (loop [i 0
-                                       acc (stats/identity-stats stats-ops)]
+                                       acc (measure/identity-measure measure-ops)]
                                   (if (< i (arrays/alength keys))
                                     (let [child (await ($child this storage i opts))
-                                          child-stats (or (node/$stats child)
-                                                          (await (force-compute-stats child storage stats-ops opts)))]
+                                          child-measure (or (node/$measure child)
+                                                          (await (node/force-compute-measure child storage measure-ops opts)))]
                                       (recur (inc i)
-                                             (if child-stats
-                                               (stats/merge-stats stats-ops acc child-stats)
+                                             (if child-measure
+                                               (measure/merge-measure measure-ops acc child-measure)
                                                acc)))
                                     acc))]
-                     (set! _stats result)
+                     (set! _measure result)
                      result)))))
   (merge [this next]
     (let [sc1 subtree-count
           sc2 (.-subtree-count next)
           new-sc (if (and (>= sc1 0) (>= sc2 0)) (+ sc1 sc2) -1)
-          ;; Merge stats if both have them
-          new-stats (when (and _stats (.-_stats next))
-                      (when-let [stats-ops (:stats settings)]
-                        (stats/merge-stats stats-ops _stats (.-_stats next))))
+          ;; Merge measure if both have them
+          new-measure (when (and _measure (.-_measure next))
+                      (when-let [measure-ops (:measure settings)]
+                        (measure/merge-measure measure-ops _measure (.-_measure next))))
           ;; Ensure children arrays exist (may be arrays of nulls for lazy branches)
           c1 (ensure-children this)
           c2 (ensure-children next)
@@ -455,7 +455,7 @@
                (arrays/aconcat c1 c2)
                new-addrs
                new-sc
-               new-stats
+               new-measure
                settings)))
   (merge-split [this next]
     (let [;; Ensure children arrays exist
@@ -467,7 +467,7 @@
           as (when (or addresses (.-addresses next))
                (util/merge-n-split (or (ensure-addresses this) (arrays/make-array (arrays/alength keys)))
                                    (or (ensure-addresses next) (arrays/make-array (arrays/alength (.-keys next))))))]
-      ;; After split, we don't know exact counts or stats, set to -1/nil for lazy computation
+      ;; After split, we don't know exact counts or measure, set to -1/nil for lazy computation
       (util/return-array
        (Branch. level (arrays/aget ks 0) (arrays/aget ps 0) (when as (arrays/aget as 0)) -1 nil settings)
        (Branch. level (arrays/aget ks 1) (arrays/aget ps 1) (when as (arrays/aget as 1)) -1 nil settings))))

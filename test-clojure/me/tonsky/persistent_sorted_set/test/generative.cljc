@@ -391,20 +391,20 @@
 
 (defspec stats-matches-expected 100
   (prop/for-all [elements (gen/no-shrink gen-elements)]
-                (let [pss (into (set/sorted-set* {:stats stats-ops}) elements)
-                      actual (stats->map (set/stats pss))
+                (let [pss (into (set/sorted-set* {:measure stats-ops}) elements)
+                      actual (stats->map (set/measure pss))
                       expected (compute-expected-stats (distinct elements))]
                   (when-not (= actual expected)
                     (println "MISMATCH: actual=" actual "expected=" expected))
                   (= actual expected))))
 
-(defspec stats-slice-matches-filter 100
+(defspec measure-slice-matches-filter 100
   (prop/for-all [elements gen-elements
                  from gen-int
                  to gen-int]
                 (let [[lo hi] (sort [from to])
-                      pss (into (set/sorted-set* {:stats stats-ops}) elements)
-                      actual (stats->map (set/stats-slice pss lo hi))
+                      pss (into (set/sorted-set* {:measure stats-ops}) elements)
+                      actual (stats->map (set/measure-slice pss lo hi))
                       filtered (filter #(and (>= % lo) (<= % hi)) (distinct elements))
                       expected (compute-expected-stats filtered)]
                   (= actual expected))))
@@ -412,13 +412,13 @@
 (defspec stats-after-modifications 100
   (prop/for-all [elements gen-elements
                  ops gen-operations]
-                (let [pss (into (set/sorted-set* {:stats stats-ops}) elements)
+                (let [pss (into (set/sorted-set* {:measure stats-ops}) elements)
                       final-pss (reduce (fn [s [op val]]
                                           (case op
                                             :add (conj s val)
                                             :remove (disj s val)))
                                         pss ops)
-                      actual (stats->map (set/stats final-pss))
+                      actual (stats->map (set/measure final-pss))
           ;; Compute expected by applying ops to a regular set
                       final-set (reduce (fn [s [op val]]
                                           (case op
@@ -428,19 +428,19 @@
                       expected (compute-expected-stats final-set)]
                   (= actual expected))))
 
-(defspec stats-slice-after-modifications 100
+(defspec measure-slice-after-modifications 100
   (prop/for-all [elements gen-elements
                  ops (gen/vector gen-operation 0 50)
                  from gen-int
                  to gen-int]
                 (let [[lo hi] (sort [from to])
-                      pss (into (set/sorted-set* {:stats stats-ops}) elements)
+                      pss (into (set/sorted-set* {:measure stats-ops}) elements)
                       final-pss (reduce (fn [s [op val]]
                                           (case op
                                             :add (conj s val)
                                             :remove (disj s val)))
                                         pss ops)
-                      actual (stats->map (set/stats-slice final-pss lo hi))
+                      actual (stats->map (set/measure-slice final-pss lo hi))
           ;; Compute expected
                       final-set (reduce (fn [s [op val]]
                                           (case op

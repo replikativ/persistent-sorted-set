@@ -8,14 +8,14 @@ public class Settings {
   public final int _branchingFactor;
   public final RefType _refType;
   public final AtomicBoolean _edit;
-  public final IStats _stats;
+  public final IMeasure _measure;
   public final ILeafProcessor _leafProcessor;
 
-  public Settings(int branchingFactor, RefType refType, AtomicBoolean edit, IStats stats, ILeafProcessor leafProcessor) {
+  public Settings(int branchingFactor, RefType refType, AtomicBoolean edit, IMeasure measure, ILeafProcessor leafProcessor) {
     _branchingFactor = branchingFactor;
     _refType = refType;
     _edit = edit;
-    _stats = stats;
+    _measure = measure;
     _leafProcessor = leafProcessor;
   }
 
@@ -31,11 +31,11 @@ public class Settings {
     this(branchingFactor, refType, null, null);
   }
 
-  public Settings(int branchingFactor, RefType refType, IStats stats) {
-    this(branchingFactor, refType, stats, null);
+  public Settings(int branchingFactor, RefType refType, IMeasure measure) {
+    this(branchingFactor, refType, measure, null);
   }
 
-  public Settings(int branchingFactor, RefType refType, IStats stats, ILeafProcessor leafProcessor) {
+  public Settings(int branchingFactor, RefType refType, IMeasure measure, ILeafProcessor leafProcessor) {
     if (branchingFactor <= 0) {
       branchingFactor = 512;
     }
@@ -45,7 +45,7 @@ public class Settings {
     _branchingFactor = branchingFactor;
     _refType = refType;
     _edit = null;
-    _stats = stats;
+    _measure = measure;
     _leafProcessor = leafProcessor;
   }
 
@@ -72,11 +72,11 @@ public class Settings {
   public Settings editable(boolean value) {
     assert !editable();
     assert value == true;
-    return new Settings(_branchingFactor, _refType, new AtomicBoolean(value), _stats, _leafProcessor);
+    return new Settings(_branchingFactor, _refType, new AtomicBoolean(value), _measure, _leafProcessor);
   }
 
-  public IStats stats() {
-    return _stats;
+  public IMeasure measure() {
+    return _measure;
   }
 
   public ILeafProcessor leafProcessor() {

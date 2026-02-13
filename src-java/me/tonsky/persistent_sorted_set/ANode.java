@@ -15,9 +15,9 @@ public abstract class ANode<Key, Address> {
 
   public final Settings _settings;
 
-  // Optional statistics for the subtree rooted at this node.
-  // Null if stats are not configured in settings.
-  public Object _stats;
+  // Optional measure for the subtree rooted at this node.
+  // Null if measure is not configured in settings.
+  public Object _measure;
 
   public ANode(int len, Key[] keys, Settings settings) {
     assert keys.length >= len;
@@ -25,38 +25,38 @@ public abstract class ANode<Key, Address> {
     _len   = len;
     _keys  = keys;
     _settings  = settings;
-    _stats = null;
+    _measure = null;
   }
 
-  public ANode(int len, Key[] keys, Object stats, Settings settings) {
+  public ANode(int len, Key[] keys, Object measure, Settings settings) {
     assert keys.length >= len;
 
     _len   = len;
     _keys  = keys;
     _settings  = settings;
-    _stats = stats;
+    _measure = measure;
   }
 
   /**
-   * Get the stats for this node. May be null if stats not configured.
+   * Get the measure for this node. May be null if measure not configured.
    */
-  public Object stats() {
-    return _stats;
+  public Object measure() {
+    return _measure;
   }
 
   /**
-   * Try to compute stats from this node's keys (for Leaf) or children's stats (for Branch).
-   * Returns null if stats not configured in settings OR if any child has unavailable stats.
+   * Try to compute measure from this node's keys (for Leaf) or children's measures (for Branch).
+   * Returns null if measure not configured in settings OR if any child has unavailable measure.
    * Used during operations (add/remove/replace) to avoid O(n) traversals.
    */
-  public abstract Object tryComputeStats(IStorage storage);
+  public abstract Object tryComputeMeasure(IStorage storage);
 
   /**
-   * Force compute stats from this node, recursively descending into children if needed.
-   * Returns null if stats not configured in settings.
+   * Force compute measure from this node, recursively descending into children if needed.
+   * Returns null if measure not configured in settings.
    * Used for explicit user queries where O(n) traversal is acceptable.
    */
-  public abstract Object forceComputeStats(IStorage storage);
+  public abstract Object forceComputeMeasure(IStorage storage);
 
   public int len() {
     return _len;

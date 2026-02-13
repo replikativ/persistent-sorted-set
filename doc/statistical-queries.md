@@ -22,7 +22,7 @@ Create a sorted set with numeric statistics enabled:
 
 ;; Create a dataset with statistics tracking
 (defn make-dataset [values]
-  (into (pss/sorted-set* {:stats (NumericStatsOps.)})
+  (into (pss/sorted-set* {:measure (NumericStatsOps.)})
         values))
 
 ;; Example: Sales data
@@ -90,7 +90,7 @@ Median and IQR are more robust to outliers than mean and standard deviation:
 ;; Compare robust vs. traditional statistics
 (def stats-comparison
   (let [;; Get traditional stats from NumericStats
-        all-stats (pss/stats sales)
+        all-stats (pss/measure sales)
         mean-val (.mean all-stats)
         std-dev (.stdDev all-stats)]
     {:mean mean-val

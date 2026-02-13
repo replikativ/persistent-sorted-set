@@ -9,7 +9,7 @@
    [java.lang.ref SoftReference]
    [java.util Comparator Arrays]
    [java.util.function BiConsumer]
-   [me.tonsky.persistent_sorted_set ANode ArrayUtil Branch IStats IStorage ISubtreeCount Leaf PersistentSortedSet RefType Settings Seq]))
+   [me.tonsky.persistent_sorted_set ANode ArrayUtil Branch IMeasure IStorage ISubtreeCount Leaf PersistentSortedSet RefType Settings Seq]))
 
 (set! *warn-on-reflection* true)
 
@@ -126,7 +126,7 @@
      :soft   RefType/SOFT
      :weak   RefType/WEAK
      nil)
-   (:stats m)
+   (:measure m)
    (:leaf-processor m)))
 
 (defn- settings->map [^Settings s]
@@ -135,7 +135,7 @@
                        RefType/STRONG :strong
                        RefType/SOFT   :soft
                        RefType/WEAK   :weak)
-   :stats            ^IStats (.stats s)
+   :measure          ^IMeasure (.measure s)
    :leaf-processor   (.leafProcessor s)})
 
 (defn from-sorted-array
@@ -149,24 +149,24 @@
          max-branching-factor (.branchingFactor settings)
          avg-branching-factor (-> (.minBranchingFactor settings) (+ max-branching-factor) (quot 2))
          storage              (:storage opts)
-         ^IStats stats-ops    (.stats settings)
+         ^IMeasure measure-ops  (.measure settings)
          ->Leaf               (fn [keys]
                                 (let [^Leaf leaf (Leaf. (count keys) ^objects keys settings)]
-                                  (when stats-ops
-                                    (set! (.-_stats leaf) (.tryComputeStats leaf nil)))
+                                  (when measure-ops
+                                    (set! (.-_measure leaf) (.tryComputeMeasure leaf nil)))
                                   leaf))
          ->Branch             (fn [level ^objects children]
                                 (let [subtree-count (reduce + 0 (map #(if (instance? ISubtreeCount %)
                                                                         (.subtreeCount ^ISubtreeCount %)
                                                                         (.count ^ANode % nil))
                                                                      children))
-                                      stats         (when stats-ops
+                                      measure       (when measure-ops
                                                       (reduce (fn [acc ^ANode child]
-                                                                (let [child-stats (.-_stats child)]
-                                                                  (if child-stats
-                                                                    (.merge stats-ops acc child-stats)
+                                                                (let [child-measure (.-_measure child)]
+                                                                  (if child-measure
+                                                                    (.merge measure-ops acc child-measure)
                                                                     acc)))
-                                                              (.identity stats-ops)
+                                                              (.identity measure-ops)
                                                               children))]
                                   (Branch.
                                    (int level)
@@ -175,7 +175,7 @@
                                    nil
                                    children
                                    (long subtree-count)
-                                   stats
+                                   measure
                                    settings)))]
      (loop [level 1
             nodes (mapv ->Leaf (split keys len Object avg-branching-factor max-branching-factor))]
@@ -199,7 +199,7 @@
    Options:
      :comparator  Custom comparator (defaults to compare)
      :storage     IStorage implementation
-     :stats       IStats implementation for aggregate statistics
+     :measure     IMeasure implementation for aggregate measures
      :meta        Metadata map
      :branching-factor  B-tree branching factor (default 512)
      :ref-type    Reference type for cached nodes (:strong, :soft, :weak)"
@@ -256,27 +256,27 @@
 (defn settings [^PersistentSortedSet set]
   (settings->map (.-_settings set)))
 
-(defn stats
-  "Get the aggregated statistics for the entire set.
-   Returns the stats object computed by the stats-ops provided when creating the set.
-   Returns nil if no stats-ops were provided."
+(defn measure
+  "Get the aggregated measure for the entire set.
+   Returns the measure object computed by the measure-ops provided when creating the set.
+   Returns nil if no measure-ops were provided."
   [^PersistentSortedSet set]
   (let [^ANode root (.root set)
         settings (.-_settings set)
-        stats-ops (.stats settings)]
-    (when (and stats-ops root)
-      (or (.-_stats root)
-          (.forceComputeStats root (.-_storage set))))))
+        measure-ops (.measure settings)]
+    (when (and measure-ops root)
+      (or (.-_measure root)
+          (.forceComputeMeasure root (.-_storage set))))))
 
-(defn- stats-slice-node
-  [^ANode node ^IStorage storage ^IStats stats-ops from to ^java.util.Comparator cmp]
+(defn- measure-slice-node
+  [^ANode node ^IStorage storage ^IMeasure measure-ops from to ^java.util.Comparator cmp]
   (if (instance? Leaf node)
     ;; Leaf: iterate keys in range
     (let [^Leaf leaf node
           keys (.-_keys leaf)
           len (.-_len leaf)]
       (loop [i 0
-             acc (.identity stats-ops)]
+             acc (.identity measure-ops)]
         (if (>= i len)
           acc
           (let [key (aget ^objects keys i)
@@ -284,7 +284,7 @@
                                (or (nil? to) (<= (.compare cmp key to) 0)))]
             (recur (inc i)
                    (if in-range?
-                     (.merge stats-ops acc (.extract stats-ops key))
+                     (.merge measure-ops acc (.extract measure-ops key))
                      acc))))))
     ;; Branch: recurse
     (let [^Branch branch node
@@ -299,58 +299,58 @@
                         (dec len)))]
       (cond
         (> from-idx to-idx)
-        (.identity stats-ops)
+        (.identity measure-ops)
 
         (== from-idx to-idx)
         (let [child (.child branch storage from-idx)]
-          (stats-slice-node child storage stats-ops from to cmp))
+          (measure-slice-node child storage measure-ops from to cmp))
 
         :else
         (let [first-child (.child branch storage from-idx)
-              first-stats (stats-slice-node first-child storage stats-ops from nil cmp)
+              first-measure (measure-slice-node first-child storage measure-ops from nil cmp)
               last-child (.child branch storage to-idx)
-              last-stats (stats-slice-node last-child storage stats-ops nil to cmp)
-              middle-stats (loop [i (int (inc from-idx))
-                                  acc (.identity stats-ops)]
+              last-measure (measure-slice-node last-child storage measure-ops nil to cmp)
+              middle-measure (loop [i (int (inc from-idx))
+                                  acc (.identity measure-ops)]
                              (if (>= i to-idx)
                                acc
                                (let [^ANode child (.child branch storage i)
-                                     child-stats (or (.-_stats child)
-                                                     (.forceComputeStats child storage))]
+                                     child-measure (or (.-_measure child)
+                                                     (.forceComputeMeasure child storage))]
                                  (recur (inc i)
-                                        (.merge stats-ops acc child-stats)))))]
-          (.merge stats-ops
-                  (.merge stats-ops first-stats middle-stats)
-                  last-stats))))))
+                                        (.merge measure-ops acc child-measure)))))]
+          (.merge measure-ops
+                  (.merge measure-ops first-measure middle-measure)
+                  last-measure))))))
 
 (defn get-nth
   "Find the entry at weighted rank `n`.
-   Navigation uses cached subtree stats and IStats.weight() for
+   Navigation uses cached subtree measure and IMeasure.weight() for
    O(log entries) performance.
 
    Returns `[entry local-offset]` where `local-offset` is the rank
    within the found entry, or nil if out of bounds.
 
-   Requires stats with weight() to be configured on the set."
+   Requires measure with weight() to be configured on the set."
   [^PersistentSortedSet set ^long n]
   (let [offset (long-array 1)]
     (when-let [entry (.getNth set n offset)]
       [entry (aget offset 0)])))
 
-(defn stats-slice
-  "Compute stats for elements in the range [from, to] inclusive.
+(defn measure-slice
+  "Compute measure for elements in the range [from, to] inclusive.
    Uses O(log n + k) algorithm where k is keys in boundary leaves.
    If from is nil, computes from the beginning.
    If to is nil, computes to the end.
-   Returns nil if no stats-ops configured."
+   Returns nil if no measure-ops configured."
   [^PersistentSortedSet set from to]
   (let [^ANode root (.-_root set)
         settings (.-_settings set)
-        stats-ops (.stats settings)
+        measure-ops (.measure settings)
         ^Comparator cmp (.comparator set)]
-    (when stats-ops
+    (when measure-ops
       (if (and from to (pos? (.compare cmp from to)))
-        (.identity stats-ops)
+        (.identity measure-ops)
         (if (zero? (.count root (.-_storage set)))
-          (.identity stats-ops)
-          (stats-slice-node root (.-_storage set) stats-ops from to cmp))))))
+          (.identity measure-ops)
+          (measure-slice-node root (.-_storage set) measure-ops from to cmp))))))
