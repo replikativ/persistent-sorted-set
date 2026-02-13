@@ -129,17 +129,13 @@
                          (let [new-addrs
                                (when addrs
                                  (if (= nodes-len 1)
-                                   (let [n0        (arrays/aget nodes 0)
-                                         same-node (identical? n0 child-node)]
-                                     (if same-node
-                                       addrs
-                                       (let [na (arrays/make-array (arrays/alength addrs))]
-                                         (arrays/acopy addrs 0 (arrays/alength addrs) na 0)
-                                         ;; Mark old child address as freed before clearing
-                                         (when (and storage (aget addrs idx))
-                                           (storage/markFreed storage (aget addrs idx)))
-                                         (aset na idx nil)
-                                         na)))
+                                   (let [na (arrays/make-array (arrays/alength addrs))]
+                                     (arrays/acopy addrs 0 (arrays/alength addrs) na 0)
+                                     ;; Mark old child address as freed before clearing
+                                     (when (and storage (aget addrs idx))
+                                       (storage/markFreed storage (aget addrs idx)))
+                                     (aset na idx nil)
+                                     na)
                                    (let [old-addr (aget addrs idx)]
                                      ;; Mark old child address as freed before clearing
                                      (when (and storage old-addr)
@@ -352,8 +348,10 @@
                                (if last-child?
                                  (arrays/array this)  ; Last child, need to propagate
                                  :early-exit))        ; Not last child, early exit
-                             ;; Persistent: clone children array
-                             (let [new-children (arrays/aclone children)
+                             ;; Persistent: clone ALL arrays — sharing would allow a
+                             ;; later transient editable path to corrupt the original
+                             (let [new-keys     (arrays/aclone keys)
+                                   new-children (arrays/aclone children)
                                    new-addrs    (when addrs
                                                   (let [na (arrays/aclone addrs)]
                                                     ;; Mark old child address as freed before clearing
@@ -362,7 +360,7 @@
                                                     (aset na idx nil)
                                                     na))
                                    _            (aset new-children idx new-node)
-                                   new-branch   (Branch. (.-level this) keys new-children new-addrs (.-subtree-count this) nil (.-settings this))
+                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this))
                                    new-measure    (when (and measure-ops (.-_measure this))
                                                     (replace-measure new-branch storage measure-ops))]
                                (set! (.-_measure new-branch) new-measure)

@@ -57,9 +57,9 @@
          (recur (inc i)))))))
 
 (defn check-n-splice [cmp arr from to new-arr]
-  (if (eq-arr cmp arr from to new-arr 0 (arrays/alength new-arr))
-    arr
-    (splice arr from to new-arr)))
+  ;; Always create a new array — returning `arr` would share it, allowing
+  ;; a later transient editable path to corrupt the original persistent node
+  (splice arr from to new-arr))
 
 (defn return-array
   "Drop non-nil references and return array of arguments"

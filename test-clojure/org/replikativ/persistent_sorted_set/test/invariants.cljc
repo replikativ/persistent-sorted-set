@@ -235,6 +235,35 @@
                        (validate-tree s2)))))
 
 ;; =============================================================================
+;; Transient must not corrupt the persistent base set
+;; Regression test for: shared _keys array between persistent copy and
+;; transient editable path (upstream issue tonsky/persistent-sorted-set#19)
+;; =============================================================================
+
+(defspec transient-does-not-corrupt-persistent 200
+  (prop/for-all [elements (gen/vector gen-int 0 300)
+                 ops (gen/vector gen-operation 0 200)]
+                (let [base (reduce conj (set/sorted-set* {:branching-factor 4}) elements)
+                      ref  (reduce (fn [s [op v]]
+                                     (case op
+                                       :add (clojure.core/conj s v)
+                                       :remove (clojure.core/disj s v)))
+                                   (into (sorted-set) elements) ops)
+                      ;; Transient operates on base FIRST (may corrupt shared arrays)
+                      _transient-result
+                      (persistent!
+                       (reduce (fn [t [op v]]
+                                 (case op :add (conj! t v) :remove (disj! t v)))
+                               (transient base) ops))
+                      ;; Then persistent operates on same base
+                      persistent-result
+                      (reduce (fn [s [op v]]
+                                (case op :add (conj s v) :remove (disj s v)))
+                              base ops)]
+                  (and (= (vec persistent-result) (vec ref))
+                       (validate-tree persistent-result)))))
+
+;; =============================================================================
 ;; Basic deterministic tests
 ;; =============================================================================
 
