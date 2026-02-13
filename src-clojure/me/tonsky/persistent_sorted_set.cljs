@@ -63,11 +63,12 @@
   ([^BTSet set key opts] (btset/$contains? set key opts)))
 
 (defn lookup
-  "key if present, else (or not-found nil)"
+  "Look up key in the set. Returns key if present, else nil.
+   3-arity version accepts a custom comparator."
   ([^BTSet set key]
    (btset/$lookup set key nil {:sync? true}))
-  ([^BTSet set key not-found]
-   (btset/$lookup set key not-found {:sync? true})))
+  ([^BTSet set key cmp]
+   (btset/$lookup set key nil {:sync? true :comparator cmp})))
 
 (defn equiv?
   "Is _other_ a set with the same items?
