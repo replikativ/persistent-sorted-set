@@ -1004,12 +1004,13 @@
                     (throw (js/Error. "get-nth requires measure to be configured")))
                   (when (pos? (node/len root))
                     (let [root-measure (or (node/$measure root)
-                                         (await (node/force-compute-measure root (.-storage set) measure-ops opts)))
-                          total-weight (measure/weight measure-ops root-measure)]
-                      (when (and (>= n 0) (< n total-weight))
-                        ;; Navigate tree
-                        (loop [cur-node root
-                               rank n]
+                                         (await (node/force-compute-measure root (.-storage set) measure-ops opts)))]
+                      (when root-measure
+                        (let [total-weight (measure/weight measure-ops root-measure)]
+                          (when (and (>= n 0) (< n total-weight))
+                            ;; Navigate tree
+                            (loop [cur-node root
+                                   rank n]
                           (if (instance? Branch cur-node)
                             ;; Branch: find child by weight
                             (let [len (node/len cur-node)
@@ -1036,7 +1037,7 @@
                                         key-weight (measure/weight measure-ops key-measure)]
                                     (if (< r key-weight)
                                       [key r]
-                                      (recur (inc i) (- r key-weight)))))))))))))))))
+                                      (recur (inc i) (- r key-weight)))))))))))))))))))
 
 (defn $equivalent?
   [^BTSet set other {:keys [sync?] :or {sync? true} :as opts}]

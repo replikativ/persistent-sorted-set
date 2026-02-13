@@ -176,7 +176,9 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       new Stitch(center._keys, 0)
         .copyAll(_keys, 0, idx)
         .copyAll(_keys, idx + 1, _len);
-      center._measure = center.tryComputeMeasure(storage);
+      if (_measure != null) {
+        center._measure = center.tryComputeMeasure(storage);
+      }
 
       // Process the center leaf (may split into multiple)
       Leaf[] processed = processSingleLeaf(center, storage, settings);
@@ -198,7 +200,9 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         .copyAll(left._keys, 0,       left._len)
         .copyAll(_keys,      0,       idx)
         .copyAll(_keys,      idx + 1, _len);
-      join._measure = join.tryComputeMeasure(storage);
+      if (_measure != null) {
+        join._measure = join.tryComputeMeasure(storage);
+      }
 
       // Process the joined leaf
       Leaf[] processed = processSingleLeaf(join, storage, settings);
@@ -219,7 +223,9 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         .copyAll(_keys,       0,       idx)
         .copyAll(_keys,       idx + 1, _len)
         .copyAll(right._keys, 0,       right._len);
-      join._measure = join.tryComputeMeasure(storage);
+      if (_measure != null) {
+        join._measure = join.tryComputeMeasure(storage);
+      }
 
       // Process the joined leaf
       Leaf[] processed = processSingleLeaf(join, storage, settings);
@@ -250,7 +256,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         ArrayUtil.copy(left._keys, newLeftLen, left._len, _keys, 0);
         _len = newCenterLen;
         // Recompute stats since we borrowed from left
-        if (measureOps != null) {
+        if (measureOps != null && _measure != null) {
           newCenter._measure = newCenter.tryComputeMeasure(storage);
         }
       } else {
@@ -259,7 +265,9 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
           .copyAll(left._keys, newLeftLen, left._len)
           .copyAll(_keys,      0,          idx)
           .copyAll(_keys,      idx+1,      _len);
-        newCenter._measure = newCenter.tryComputeMeasure(storage);
+        if (_measure != null) {
+          newCenter._measure = newCenter.tryComputeMeasure(storage);
+        }
       }
 
       // shrink left
@@ -267,13 +275,15 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         newLeft  = left;
         left._len = newLeftLen;
         // Recompute stats for shrunk left
-        if (measureOps != null) {
+        if (measureOps != null && _measure != null) {
           newLeft._measure = newLeft.tryComputeMeasure(storage);
         }
       } else {
         newLeft = new Leaf(newLeftLen, settings);
         ArrayUtil.copy(left._keys, 0, newLeftLen, newLeft._keys, 0);
-        newLeft._measure = newLeft.tryComputeMeasure(storage);
+        if (_measure != null) {
+          newLeft._measure = newLeft.tryComputeMeasure(storage);
+        }
       }
 
       return new ANode[]{ newLeft, newCenter, right };
@@ -296,7 +306,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
           .copyAll(right._keys, 0,       rightHead);
         _len = newCenterLen;
         // Recompute stats since we borrowed from right
-        if (measureOps != null) {
+        if (measureOps != null && _measure != null) {
           newCenter._measure = newCenter.tryComputeMeasure(storage);
         }
       } else {
@@ -305,7 +315,9 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
           .copyAll(_keys,       0,       idx)
           .copyAll(_keys,       idx + 1, _len)
           .copyAll(right._keys, 0,       rightHead);
-        newCenter._measure = newCenter.tryComputeMeasure(storage);
+        if (_measure != null) {
+          newCenter._measure = newCenter.tryComputeMeasure(storage);
+        }
       }
 
       // cut head from right
@@ -314,13 +326,15 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         ArrayUtil.copy(right._keys, rightHead, right._len, right._keys, 0);
         right._len = newRightLen;
         // Recompute stats for shrunk right
-        if (measureOps != null) {
+        if (measureOps != null && _measure != null) {
           newRight._measure = newRight.tryComputeMeasure(storage);
         }
       } else {
         newRight = new Leaf(newRightLen, settings);
         ArrayUtil.copy(right._keys, rightHead, right._len, newRight._keys, 0);
-        newRight._measure = newRight.tryComputeMeasure(storage);
+        if (_measure != null) {
+          newRight._measure = newRight.tryComputeMeasure(storage);
+        }
       }
 
       return new ANode[]{ left, newCenter, newRight };
@@ -443,7 +457,9 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       for (int i = 0; i < processedSize; i++) {
         newLeaf._keys[i] = processed.get(i);
       }
-      newLeaf._measure = newLeaf.tryComputeMeasure(storage);
+      if (leaf._measure != null) {
+        newLeaf._measure = newLeaf.tryComputeMeasure(storage);
+      }
       return new Leaf[]{ newLeaf };
     } else {
       // Needs to split into multiple leaves
@@ -459,7 +475,9 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         for (int j = 0; j < leafSize; j++) {
           newLeaf._keys[j] = processed.get(offset + j);
         }
-        newLeaf._measure = newLeaf.tryComputeMeasure(storage);
+        if (leaf._measure != null) {
+          newLeaf._measure = newLeaf.tryComputeMeasure(storage);
+        }
         result[i] = newLeaf;
         offset += leafSize;
       }
@@ -545,7 +563,9 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         for (int i = 0; i < processedSize; i++) {
           newLeaf._keys[i] = processed.get(i);
         }
-        newLeaf._measure = newLeaf.tryComputeMeasure(storage);
+        if (leaf._measure != null) {
+          newLeaf._measure = newLeaf.tryComputeMeasure(storage);
+        }
         processedLeaves.add(newLeaf);
       } else {
         // Needs to split into multiple leaves
@@ -561,7 +581,9 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
           for (int j = 0; j < leafSize; j++) {
             newLeaf._keys[j] = processed.get(offset + j);
           }
-          newLeaf._measure = newLeaf.tryComputeMeasure(storage);
+          if (leaf._measure != null) {
+            newLeaf._measure = newLeaf.tryComputeMeasure(storage);
+          }
           processedLeaves.add(newLeaf);
           offset += leafSize;
         }

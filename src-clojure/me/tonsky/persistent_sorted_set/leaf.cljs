@@ -64,8 +64,8 @@
                                    right-leaf (if (> idx middle)
                                                 (Leaf. (util/cut-n-splice keys middle keys-l idx idx (arrays/array key)) settings nil)
                                                 (Leaf. (.slice keys middle keys-l) settings nil))]
-                               ;; Compute measure for split leaves
-                               (when measure-ops
+                               ;; Compute measure for split leaves only if already computed
+                               (when (and measure-ops _measure)
                                  (node/try-compute-measure left-leaf nil measure-ops {:sync? true})
                                  (node/try-compute-measure right-leaf nil measure-ops {:sync? true}))
                                (arrays/array left-leaf right-leaf))

@@ -70,6 +70,11 @@
   (^IStorage [*memory *disk]
    (->Storage *memory *disk (Settings.))))
 
+(defn storage-with-settings
+  "Create storage that uses the given Settings for node creation"
+  ^IStorage [^Settings settings]
+  (->Storage (atom {}) (atom {}) settings))
+
 (defn roundtrip [set]
   (let [storage (storage)
         address (set/store set storage)]

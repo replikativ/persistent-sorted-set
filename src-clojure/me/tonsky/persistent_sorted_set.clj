@@ -344,7 +344,7 @@
    If to is nil, computes to the end.
    Returns nil if no measure-ops configured."
   [^PersistentSortedSet set from to]
-  (let [^ANode root (.-_root set)
+  (let [^ANode root (.root set)
         settings (.-_settings set)
         measure-ops (.measure settings)
         ^Comparator cmp (.comparator set)]

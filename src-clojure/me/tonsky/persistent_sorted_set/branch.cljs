@@ -149,8 +149,8 @@
                                left-children (.slice new-children 0 middle)
                                right-children (.slice new-children middle)
                                measure-ops (:measure (.-settings this))
-                               ;; Compute measure for split branches from their children
-                               left-measure (when measure-ops
+                               ;; Compute measure for split branches from their children only if already computed
+                               left-measure (when (and measure-ops (.-_measure this))
                                             (reduce (fn [acc child]
                                                       (let [cs (node/$measure child)]
                                                         (if cs
@@ -158,7 +158,7 @@
                                                           acc)))
                                                     (measure/identity-measure measure-ops)
                                                     left-children))
-                               right-measure (when measure-ops
+                               right-measure (when (and measure-ops (.-_measure this))
                                              (reduce (fn [acc child]
                                                        (let [cs (node/$measure child)]
                                                          (if cs
@@ -294,7 +294,7 @@
                                  (when (and storage (aget addrs idx))
                                    (storage/markFreed storage (aget addrs idx)))
                                  (aset addrs idx nil))
-                               (when measure-ops
+                               (when (and measure-ops (.-_measure this))
                                  (set! (.-_measure this)
                                        (replace-measure this storage measure-ops)))
                                (arrays/array this))
@@ -311,7 +311,7 @@
                                    _            (aset new-keys idx new-max-key)
                                    _            (aset new-children idx new-node)
                                    new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this))
-                                   new-measure    (when measure-ops
+                                   new-measure    (when (and measure-ops (.-_measure this))
                                                   (replace-measure new-branch storage measure-ops))]
                                (set! (.-_measure new-branch) new-measure)
                                (arrays/array new-branch)))
@@ -325,7 +325,7 @@
                                  (when (and storage (aget addrs idx))
                                    (storage/markFreed storage (aget addrs idx)))
                                  (aset addrs idx nil))
-                               (when measure-ops
+                               (when (and measure-ops (.-_measure this))
                                  (set! (.-_measure this)
                                        (replace-measure this storage measure-ops)))
                                (if last-child?
@@ -342,7 +342,7 @@
                                                     na))
                                    _            (aset new-children idx new-node)
                                    new-branch   (Branch. (.-level this) keys new-children new-addrs (.-subtree-count this) nil (.-settings this))
-                                   new-measure    (when measure-ops
+                                   new-measure    (when (and measure-ops (.-_measure this))
                                                   (replace-measure new-branch storage measure-ops))]
                                (set! (.-_measure new-branch) new-measure)
                                (arrays/array new-branch))))))))))))

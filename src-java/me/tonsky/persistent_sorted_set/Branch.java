@@ -148,11 +148,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   public int count(IStorage storage) {
     if (_subtreeCount < 0) {
       long computed = computeSubtreeCount(storage);
-      // Only cache in transient mode where node is exclusive
-      // In persistent mode, shared nodes would get stale cached values
-      if (_settings.editable()) {
-        _subtreeCount = computed;
-      }
+      // Cache the computed count. Safe for persistent (immutable) nodes since
+      // the count never changes. For transient nodes it's also safe since
+      // add/remove maintain the count incrementally.
+      _subtreeCount = computed;
       return (int) computed;
     }
     return (int) _subtreeCount;
@@ -231,6 +230,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         result = measureOps.merge(result, childMeasure);
       }
     }
+    _measure = result;
     return result;
   }
 

@@ -15,7 +15,7 @@
    #?(:clj [me.tonsky.persistent-sorted-set.test.storage :as storage])
    #?(:cljs [me.tonsky.persistent-sorted-set.test.storage.util :as storage-util])
    #?(:cljs [me.tonsky.persistent-sorted-set.impl.numeric-stats :as numeric-stats]))
-  #?(:clj (:import [me.tonsky.persistent_sorted_set NumericStats NumericStatsOps])))
+  #?(:clj (:import [me.tonsky.persistent_sorted_set NumericStats NumericStatsOps PersistentSortedSet Settings])))
 
 ;; =============================================================================
 ;; Cross-platform helpers
@@ -24,16 +24,25 @@
 #?(:cljs
    (defn roundtrip
      "Store and restore a set via CLJS storage"
-     [s]
-     (let [storage (storage-util/storage)
-           address (set/store s storage)]
-       (set/restore address storage))))
+     ([s] (roundtrip s {}))
+     ([s opts]
+      (let [storage (storage-util/storage)
+            address (set/store s storage)]
+        (set/restore address storage opts)))))
 
 #?(:clj
    (defn roundtrip
-     "Store and restore a set via CLJ storage"
-     [s]
-     (storage/roundtrip s)))
+     "Store and restore a set via CLJ storage.
+      When opts are provided (e.g. {:measure stats-ops}), the storage
+      uses the original set's Settings so restored nodes have correct settings."
+     ([s] (roundtrip s {}))
+     ([s opts]
+      (let [;; Use the set's settings for storage so nodes are created with measure, etc.
+            set-settings (when (instance? PersistentSortedSet s)
+                           (._settings ^PersistentSortedSet s))
+            storage (storage/storage-with-settings (or set-settings (Settings.)))
+            address (set/store s storage)]
+        (set/restore address storage opts)))))
 
 ;; =============================================================================
 ;; Generators
@@ -448,6 +457,123 @@
                                             :remove (disj s val)))
                                         (into #{} elements) ops)
                       filtered (filter #(and (>= % lo) (<= % hi)) final-set)
+                      expected (compute-expected-stats filtered)]
+                  (= actual expected))))
+
+;; =============================================================================
+;; Replace + measure correctness
+;; =============================================================================
+
+(defspec replace-preserves-measure 100
+  (prop/for-all [elements (gen/vector gen-pos-int 10 500)]
+                (let [pss (into (set/sorted-set* {:measure stats-ops :branching-factor 8}) elements)
+                      distinct-elems (vec (sort (distinct elements)))
+                      ;; Replace each element with itself (identity replace)
+                      final-pss (reduce (fn [s k] (set/replace s k k)) pss distinct-elems)
+                      actual (stats->map (set/measure final-pss))
+                      expected (compute-expected-stats distinct-elems)]
+                  (= actual expected))))
+
+;; =============================================================================
+;; get-nth correctness after mutations
+;; =============================================================================
+
+(defspec get-nth-matches-vec-nth 100
+  (prop/for-all [elements (gen/vector gen-pos-int 10 500)
+                 ops (gen/vector gen-operation 0 100)]
+                (let [pss (into (set/sorted-set* {:measure stats-ops :branching-factor 8}) elements)
+                      final-pss (reduce (fn [s [op val]]
+                                          (case op
+                                            :add (conj s val)
+                                            :remove (disj s val)))
+                                        pss ops)
+                      final-vec (vec final-pss)
+                      n (count final-vec)]
+                  (if (zero? n)
+                    true
+                    ;; Check a sample of indices
+                    (every? (fn [i]
+                              (let [[entry _] (set/get-nth final-pss i)]
+                                (= entry (nth final-vec i))))
+                            (take 10 (range n)))))))
+
+;; =============================================================================
+;; Rebalancing preserves measure (small branching factor)
+;; =============================================================================
+
+(defspec rebalancing-preserves-measure 100
+  (prop/for-all [elements (gen/vector gen-int 50 500)]
+                (let [opts {:measure stats-ops :branching-factor 4}
+                      pss (reduce conj (set/sorted-set* opts) elements)
+                      ;; Remove half to trigger merges/borrows
+                      to-remove (take (quot (count elements) 2) (shuffle elements))
+                      result (reduce disj pss to-remove)
+                      expected-set (reduce disj (into (sorted-set) elements) to-remove)
+                      actual (stats->map (set/measure result))
+                      expected (compute-expected-stats expected-set)]
+                  (and (= (count result) (count expected-set))
+                       (= actual expected)))))
+
+;; =============================================================================
+;; Transient operations preserve measure
+;; =============================================================================
+
+(defspec transient-preserves-measure 100
+  (prop/for-all [elements (gen/vector gen-int 10 300)
+                 adds (gen/vector gen-int 0 100)
+                 removes (gen/vector gen-int 0 100)]
+                (let [pss (into (set/sorted-set* {:measure stats-ops :branching-factor 8}) elements)
+                      ;; Apply ops via transient
+                      result (-> (transient pss)
+                                 (#(reduce conj! % adds))
+                                 (#(reduce disj! % removes))
+                                 persistent!)
+                      actual (stats->map (set/measure result))
+                      ;; Expected via regular set
+                      expected-set (-> (into #{} elements)
+                                       (into adds)
+                                       (#(reduce disj % removes)))
+                      expected (compute-expected-stats expected-set)]
+                  (= actual expected))))
+
+;; =============================================================================
+;; Stats after storage roundtrip + modifications
+;; =============================================================================
+
+(defspec stats-after-roundtrip-and-modifications 100
+  (prop/for-all [elements (gen/vector gen-int 10 300)
+                 ops (gen/vector gen-operation 0 100)]
+                (let [opts {:measure stats-ops :branching-factor 8}
+                      pss (into (set/sorted-set* opts) elements)
+                      lazy-pss (roundtrip pss opts)
+                      final-pss (reduce (fn [s [op val]]
+                                          (case op
+                                            :add (conj s val)
+                                            :remove (disj s val)))
+                                        lazy-pss ops)
+                      actual (stats->map (set/measure final-pss))
+                      final-set (reduce (fn [s [op val]]
+                                          (case op
+                                            :add (conj s val)
+                                            :remove (disj s val)))
+                                        (into #{} elements) ops)
+                      expected (compute-expected-stats final-set)]
+                  (= actual expected))))
+
+;; =============================================================================
+;; measure-slice after storage roundtrip
+;; =============================================================================
+
+(defspec measure-slice-after-roundtrip 100
+  (prop/for-all [elements (gen/vector gen-int 10 200)
+                 from gen-int
+                 to gen-int]
+                (let [[lo hi] (sort [from to])
+                      opts {:measure stats-ops :branching-factor 8}
+                      pss (into (set/sorted-set* opts) elements)
+                      lazy-pss (roundtrip pss opts)
+                      actual (stats->map (set/measure-slice lazy-pss lo hi))
+                      filtered (filter #(and (>= % lo) (<= % hi)) (distinct elements))
                       expected (compute-expected-stats filtered)]
                   (= actual expected))))
 
