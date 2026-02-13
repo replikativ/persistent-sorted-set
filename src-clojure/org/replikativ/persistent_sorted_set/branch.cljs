@@ -22,7 +22,7 @@
     (set! (.-addresses this) (make-array (alength (.-keys this)))))
   (.-addresses this))
 
-(defn $child
+(defn child
   [^Branch node storage idx {:keys [sync?] :or {sync? true} :as opts}]
   (assert (and (some? idx) (number? idx)))
   (assert (or (and (some? (.-children node))
@@ -64,7 +64,7 @@
               (async
                (let [*cnt (atom 0)]
                  (dotimes [i (alength (.-keys node))]
-                   (let [c (await ($child node storage i opts))]
+                   (let [c (await (child node storage i opts))]
                      (swap! *cnt + (await (node/$count c storage opts)))))
                  @*cnt))))
 
@@ -80,18 +80,18 @@
                        false
                        (do
                          (assert (and (<= 0 ins) (< ins (alength (.-keys node)))))
-                         (let [c (await ($child node storage ins opts))]
+                         (let [c (await (child node storage ins opts))]
                            (await (node/$contains? c storage key cmp opts)))))))))))
 
-(defn- $lookup
+(defn- lookup
   [^Branch node storage key cmp {:keys [sync?] :or {sync? true} :as opts}]
   (let [idx (garr/binarySearch (.-keys node) key cmp)]
     (async+sync sync?
                 (async
                  (let [ins (if (<= 0 idx) idx (dec (- idx)))]
                    (when (< ins (alength (.-keys node)))
-                     (let [c (await ($child node storage ins opts))]
-                       (await (node/$lookup c storage key cmp opts)))))))))
+                     (let [c (await (child node storage ins opts))]
+                       (await (node/lookup c storage key cmp opts)))))))))
 
 (defn- try-compute-subtree-count-from-children
   "Compute subtree count from in-memory children. Returns -1 if any child unavailable."
@@ -104,12 +104,12 @@
         (let [child (aget children i)]
           (if (nil? child)
             -1
-            (let [cc (node/$subtree-count child)]
+            (let [cc (node/subtree-count child)]
               (if (>= cc 0)
                 (recur (inc i) (+ cnt cc))
                 -1))))))))
 
-(defn $add
+(defn add
   [^Branch this storage key cmp opts]
   (let [{:keys [sync?] :or {sync? true}} opts
         keys  (.-keys this)
@@ -117,8 +117,8 @@
         idx   (util/binary-search-l cmp keys (- (arrays/alength keys) 2) key)]
     (async+sync sync?
                 (async
-                 (let [child-node (await ($child this storage idx opts))
-                       nodes      (await (node/$add child-node storage key cmp opts))]
+                 (let [child-node (await (child this storage idx opts))
+                       nodes      (await (node/add child-node storage key cmp opts))]
                    (when nodes
                      (let [branching-factor (:branching-factor (.-settings this))
                            children         (ensure-children this)
@@ -171,7 +171,7 @@
                                               (reduce (fn [acc child]
                                                         (if (nil? acc)
                                                           (reduced nil)
-                                                          (let [cs (node/$measure child)]
+                                                          (let [cs (node/measure child)]
                                                             (if cs
                                                               (measure/merge-measure measure-ops acc cs)
                                                               (reduced nil)))))
@@ -181,7 +181,7 @@
                                                (reduce (fn [acc child]
                                                          (if (nil? acc)
                                                            (reduced nil)
-                                                           (let [cs (node/$measure child)]
+                                                           (let [cs (node/measure child)]
                                                              (if cs
                                                                (measure/merge-measure measure-ops acc cs)
                                                                (reduced nil)))))
@@ -215,10 +215,10 @@
                    (let [children    (ensure-children this)
                          addrs       (.-addresses this)
                          left-child  (when (> idx 0)
-                                       (await ($child this storage (dec idx) opts)))
+                                       (await (child this storage (dec idx) opts)))
                          right-child (when (< idx (dec (arrays/alength keys)))
-                                       (await ($child this storage (inc idx) opts)))
-                         child       (await ($child this storage idx opts))
+                                       (await (child this storage (inc idx) opts)))
+                         child       (await (child this storage idx opts))
                          disjoined   (await (node/$remove child storage key left-child right-child cmp opts))]
                      (when disjoined
                        (let [left-idx  (if left-child  (dec idx) idx)
@@ -284,7 +284,7 @@
                                 i     (util/binary-search-l cmp keys (dec arr-l) old-key)]
                             (if (== i arr-l) -1 i))]
                  (when-not (== -1 idx)
-                   (let [child  (await ($child this storage idx opts))
+                   (let [child  (await (child this storage idx opts))
                          nodes  (await (node/$replace child storage old-key new-key cmp opts))]
                      (cond
                        ;; Not found in child
@@ -368,7 +368,7 @@
                                (set! (.-_measure new-branch) new-measure)
                                (arrays/array new-branch))))))))))))
 
-(defn $store
+(defn store
   [^Branch this storage {:keys [sync?] :or {sync? true} :as opts}]
   (ensure-addresses this)
   (async+sync sync?
@@ -380,12 +380,12 @@
                        (assert (some? (.-children this)))
                        (assert (some? (aget (.-children this) i)))
                        (assert (implements? node/INode (aget (.-children this) i)))
-                       (let [child-address (await (node/$store (aget (.-children this) i) storage opts))]
+                       (let [child-address (await (node/store (aget (.-children this) i) storage opts))]
                          (address this i child-address)))
                      (recur (inc i))))
                  (await (storage/store storage this opts))))))
 
-(defn $walk-addresses
+(defn walk-addresses
   [^Branch this storage on-address {:keys [sync?] :or {sync? true} :as opts}]
   (async+sync sync?
               (async
@@ -395,9 +395,9 @@
                      (let [addr (when (.-addresses this)
                                   (arrays/aget (.-addresses this) i))]
                        (when (or (nil? addr) (on-address addr))
-                         (let [child (await ($child this storage i opts))]
+                         (let [child (await (child this storage i opts))]
                            (when (instance? Branch child)
-                             (await (node/$walk-addresses child storage on-address opts)))))
+                             (await (node/walk-addresses child storage on-address opts)))))
                        (recur (inc i)))))))))
 
 (defn ^Branch from-map
@@ -411,8 +411,8 @@
   (len [_] (arrays/alength keys))
   (level [_] level)
   (max-key [_] (arrays/alast keys))
-  ($subtree-count [_] subtree-count)
-  ($measure [_] _measure)
+  (subtree-count [_] subtree-count)
+  (measure [_] _measure)
   (try-compute-measure [this storage measure-ops {:keys [sync?] :or {sync? true} :as opts}]
     ;; Try to compute measure from in-memory children only; postpone if any child not loaded
     (if sync?
@@ -424,7 +424,7 @@
                            (let [child (when (some? children) (aget children i))]
                              (if (nil? child)
                                nil ;; child not in memory, postpone
-                               (let [child-measure (node/$measure child)]
+                               (let [child-measure (node/measure child)]
                                  (if child-measure
                                    (recur (inc i)
                                           (measure/merge-measure measure-ops acc child-measure))
@@ -442,7 +442,7 @@
                             (let [child (when (some? children) (aget children i))]
                               (if (nil? child)
                                 nil
-                                (let [child-measure (node/$measure child)]
+                                (let [child-measure (node/measure child)]
                                   (if child-measure
                                     (recur (inc i)
                                            (measure/merge-measure measure-ops acc child-measure))
@@ -459,8 +459,8 @@
                    (let [result (loop [i 0
                                        acc (measure/identity-measure measure-ops)]
                                   (if (< i (arrays/alength keys))
-                                    (let [child (await ($child this storage i opts))
-                                          child-measure (or (node/$measure child)
+                                    (let [child (await (child this storage i opts))
+                                          child-measure (or (node/measure child)
                                                             (await (node/force-compute-measure child storage measure-ops opts)))]
                                       (recur (inc i)
                                              (if child-measure
@@ -510,7 +510,7 @@
                  (reduce (fn [acc child]
                            (if (nil? acc)
                              (reduced nil)
-                             (let [cs (node/$measure child)]
+                             (let [cs (node/measure child)]
                                (if cs
                                  (measure/merge-measure measure-ops acc cs)
                                  (reduced nil)))))
@@ -520,7 +520,7 @@
                  (reduce (fn [acc child]
                            (if (nil? acc)
                              (reduced nil)
-                             (let [cs (node/$measure child)]
+                             (let [cs (node/measure child)]
                                (if cs
                                  (measure/merge-measure measure-ops acc cs)
                                  (reduced nil)))))
@@ -529,19 +529,19 @@
         (util/return-array
          (Branch. level (arrays/aget ks 0) p0 (when as (arrays/aget as 0)) sc0 m0 settings)
          (Branch. level (arrays/aget ks 1) p1 (when as (arrays/aget as 1)) sc1 m1 settings)))))
-  ($add [this storage key cmp opts]
-    ($add this storage key cmp opts))
+  (add [this storage key cmp opts]
+    (add this storage key cmp opts))
   ($contains? [this storage key cmp opts]
     ($contains? this storage key cmp opts))
   ($count [this storage opts]
     ($count this storage opts))
-  ($lookup [this storage key cmp opts]
-    ($lookup this storage key cmp opts))
+  (lookup [this storage key cmp opts]
+    (lookup this storage key cmp opts))
   ($remove [this storage key left right cmp opts]
     ($remove this storage key left right cmp opts))
   ($replace [this storage old-key new-key cmp opts]
     ($replace this storage old-key new-key cmp opts))
-  ($store [this storage opts]
-    ($store this storage opts))
-  ($walk-addresses [this storage on-address opts]
-    ($walk-addresses this storage on-address opts)))
+  (store [this storage opts]
+    (store this storage opts))
+  (walk-addresses [this storage on-address opts]
+    (walk-addresses this storage on-address opts)))

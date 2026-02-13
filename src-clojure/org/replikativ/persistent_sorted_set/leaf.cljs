@@ -15,8 +15,8 @@
   (len [_] (arrays/alength keys))
   (level [_] 0)
   (max-key [_] (arrays/alast keys))
-  ($subtree-count [_] (arrays/alength keys))
-  ($measure [_] _measure)
+  (subtree-count [_] (arrays/alength keys))
+  (measure [_] _measure)
   (try-compute-measure [this storage measure-ops {:keys [sync?] :or {sync? true}}]
     ;; For leaves, try and force are the same - just compute from keys
     (if sync?
@@ -47,7 +47,7 @@
       ;; Measure will be recomputed lazily for new leaves
       (util/return-array (Leaf. (arrays/aget ks 0) settings nil)
                          (Leaf. (arrays/aget ks 1) settings nil))))
-  ($add [this storage key cmp {:keys [sync?] :or {sync? true}}]
+  (add [this storage key cmp {:keys [sync?] :or {sync? true}}]
     (let [branching-factor (:branching-factor settings)
           measure-ops (:measure settings)
           idx              (util/binary-search-l cmp keys (dec (arrays/alength keys)) key)
@@ -89,7 +89,7 @@
     (if sync?
       (alength keys)
       (async (alength keys))))
-  ($lookup [this storage key cmp {:keys [sync?] :or {sync? true}}]
+  (lookup [this storage key cmp {:keys [sync?] :or {sync? true}}]
     (async+sync sync?
                 (async
                  (let [idx (garr/binarySearch keys key cmp)]
@@ -126,9 +126,9 @@
                                ;; Compute from new-leaf which has new-key instead of old-key
                                (node/try-compute-measure new-leaf storage measure-ops {:sync? true})))
                        (arrays/array new-leaf)))))))
-  ($store [this storage {:keys [sync?] :or {sync? true} :as opts}]
+  (store [this storage {:keys [sync?] :or {sync? true} :as opts}]
     (async+sync sync?
                 (async
                  (await (storage/store storage this opts)))))
-  ($walk-addresses [this storage on-address {:keys [sync?] :or {sync? true}}]
+  (walk-addresses [this storage on-address {:keys [sync?] :or {sync? true}}]
     (when-not sync? (async))))
