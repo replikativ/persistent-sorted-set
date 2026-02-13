@@ -279,7 +279,9 @@
   "Rebuild the tree with optimal fill factors from the current elements.
    Useful after heavy insert/delete churn that may have degraded node
    fill ratios. Preserves comparator, settings, and metadata.
-   Returns a new set with the same elements in a freshly built tree."
+   Returns a new set with the same elements in a freshly built tree.
+
+   Note: currently materializes all elements in memory."
   [^BTSet set]
   (let [arr (into-array (btset/$seq set))
         len (alength arr)
