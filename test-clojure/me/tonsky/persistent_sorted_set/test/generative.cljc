@@ -12,6 +12,7 @@
    [clojure.test.check.properties :as prop #?@(:cljs [:include-macros true])]
    [clojure.test.check.clojure-test :refer [defspec] #?@(:cljs [:include-macros true])]
    [me.tonsky.persistent-sorted-set :as set]
+   [me.tonsky.persistent-sorted-set.test.invariants :as inv]
    #?(:clj [me.tonsky.persistent-sorted-set.test.storage :as storage])
    #?(:cljs [me.tonsky.persistent-sorted-set.test.storage.util :as storage-util])
    #?(:cljs [me.tonsky.persistent-sorted-set.impl.numeric-stats :as numeric-stats]))
@@ -90,7 +91,8 @@
                 (let [pss-initial (into (set/sorted-set) initial-elements)
                       clj-initial (into (sorted-set) initial-elements)
                       [pss-final clj-final] (apply-ops pss-initial clj-initial ops)]
-                  (and (= (count pss-final) (count clj-final))
+                  (and (inv/validate-tree pss-final)
+                       (= (count pss-final) (count clj-final))
                        (= (vec pss-final) (vec clj-final))))))
 
 ;; =============================================================================
@@ -162,7 +164,9 @@
                                                     :remove (disj s val)))
                                                 base-set
                                                 ops)]
-                  (and (= (count transient-result) (count persistent-result))
+                  (and (inv/validate-tree transient-result)
+                       (inv/validate-tree persistent-result)
+                       (= (count transient-result) (count persistent-result))
                        (= (vec transient-result) (vec persistent-result))))))
 
 (defspec transient-lazy-set-count 100
@@ -204,7 +208,8 @@
                       opts {:branching-factor 4}
                       pss (reduce conj (set/sorted-set* opts) elements)
                       expected (into (sorted-set) elements)]
-                  (and (= (count pss) (count expected))
+                  (and (inv/validate-tree pss)
+                       (= (count pss) (count expected))
                        (= (vec pss) (vec expected))))))
 
 (defspec merge-heavy-operations 100
@@ -215,7 +220,9 @@
                       to-remove (take (* 3 (quot (count elements) 4)) (shuffle elements))
                       result (reduce disj pss to-remove)
                       expected (reduce disj (into (sorted-set) elements) to-remove)]
-                  (and (= (count result) (count expected))
+                  (and (inv/validate-tree pss)
+                       (inv/validate-tree result)
+                       (= (count result) (count expected))
                        (= (vec result) (vec expected))))))
 
 ;; =============================================================================
@@ -511,7 +518,9 @@
                       expected-set (reduce disj (into (sorted-set) elements) to-remove)
                       actual (stats->map (set/measure result))
                       expected (compute-expected-stats expected-set)]
-                  (and (= (count result) (count expected-set))
+                  (and (inv/validate-tree pss)
+                       (inv/validate-tree result)
+                       (= (count result) (count expected-set))
                        (= actual expected)))))
 
 ;; =============================================================================
@@ -534,7 +543,8 @@
                                        (into adds)
                                        (#(reduce disj % removes)))
                       expected (compute-expected-stats expected-set)]
-                  (= actual expected))))
+                  (and (inv/validate-tree result)
+                       (= actual expected)))))
 
 ;; =============================================================================
 ;; Stats after storage roundtrip + modifications
