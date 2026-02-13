@@ -373,6 +373,17 @@
                  (str/join "\n" (map pr-str (take 10 errors))))))))
 
 ;; =============================================================================
+;; Internal helpers for public API
+;; =============================================================================
+
+(defn- collect-all-keys
+  "Walk tree collecting all leaf keys into a vector."
+  [node]
+  (if (leaf? node)
+    (nkeys node)
+    (into [] (mapcat #(when % (collect-all-keys %))) (children-seq node))))
+
+;; =============================================================================
 ;; Public API
 ;; =============================================================================
 
@@ -400,15 +411,28 @@
         true))))
 
 (defn validate-full
-  "Full integrity check including subtree counts and measures.
+  "Full integrity check including subtree counts, measures, and element-wise
+   navigation. Every key in the tree is re-looked up from the root to verify
+   search paths are correct. Catches separator key corruption, comparator bugs,
+   and any issue where elements are structurally present but unreachable.
    Returns true if valid, throws with structured error data."
   [set]
   (validate set)
   (let [root (get-root set)]
     (when (and root (pos? (nlen root)))
-      (let [errors (concat
-                    (check-subtree-counts root))]
-        (throw-errors errors "B-tree count/measure invariant violations")))
+      (let [errors (check-subtree-counts root)]
+        (throw-errors errors "B-tree count/measure invariant violations"))
+      ;; Element-wise navigation check: every key must be findable via lookup
+      (let [all-keys (collect-all-keys root)
+            errors (reduce
+                    (fn [errs key]
+                      (let [found (set/lookup set key)]
+                        (if (nil? found)
+                          (clojure.core/conj errs {:error :key-not-found-via-lookup :key key})
+                          errs)))
+                    []
+                    all-keys)]
+        (throw-errors errors "Root-descend navigation verification failed")))
     true))
 
 (defn validate-counts-known
@@ -462,13 +486,6 @@
 ;; =============================================================================
 ;; Root-descend verification
 ;; =============================================================================
-
-(defn- collect-all-keys
-  "Walk tree collecting all leaf keys into a vector."
-  [node]
-  (if (leaf? node)
-    (nkeys node)
-    (into [] (mapcat #(when % (collect-all-keys %))) (children-seq node))))
 
 (defn validate-navigation
   "Root-descend verification: re-looks up every element from the root to verify
