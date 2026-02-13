@@ -34,10 +34,4 @@
   :node-repl ;shadow-cljs node-repl
   {:target :node-script
    :main me.tonsky.persistent-sorted-set/sorted-set
-   :output-to "target/repl.js"}
-  :test-stats ;shadow-cljs compile test-stats && node target/test-stats.js
-  {:target :node-script
-   :main test-stats/-main
-   :output-to "target/test-stats.js"
-   :compiler-options {:optimizations :simple}}
-}}
+   :output-to "target/repl.js"}}}
