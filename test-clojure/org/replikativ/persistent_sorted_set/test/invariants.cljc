@@ -275,4 +275,46 @@
     (let [stats (diag/tree-stats (reduce conj (set/sorted-set* {:branching-factor 4}) (range 100)))]
       (is (= 100 (:element-count stats)))
       (is (pos? (:depth stats)))
-      (is (:counts-known? stats)))))
+      (is (:counts-known? stats))))
+  (testing "tree-stats includes fill histograms"
+    (let [stats (diag/tree-stats (reduce conj (set/sorted-set* {:branching-factor 4}) (range 100)))]
+      (is (contains? stats :fill-histogram))
+      (is (contains? stats :leaf-fill-histogram))
+      (is (contains? stats :branch-fill-histogram))
+      (is (contains? (:fill-histogram stats) :p50))
+      (is (pos? (:p50 (:fill-histogram stats))))))
+  (testing "validate-navigation on valid set"
+    (is (diag/validate-navigation
+         (reduce conj (set/sorted-set* {:branching-factor 4}) (range 100)))))
+  (testing "validate-navigation on empty set"
+    (is (diag/validate-navigation (set/sorted-set)))))
+
+;; =============================================================================
+;; Property: compact produces valid tree with same elements
+;; =============================================================================
+
+(defspec compact-preserves-elements 100
+  (prop/for-all [elements (gen/vector gen-int 0 300)
+                 ops gen-operations]
+                (let [pss (reduce conj (set/sorted-set* {:branching-factor 4}) elements)
+                      after-ops (reduce (fn [s [op v]]
+                                          (case op :add (conj s v) :remove (disj s v)))
+                                        pss ops)
+                      compacted (set/compact after-ops)]
+                  (and (= (vec after-ops) (vec compacted))
+                       (= (count after-ops) (count compacted))
+                       (validate-tree compacted)
+                       (diag/validate-counts-known compacted)))))
+
+;; =============================================================================
+;; Property: validate-navigation passes after arbitrary ops
+;; =============================================================================
+
+(defspec navigation-valid-after-ops 100
+  (prop/for-all [elements (gen/vector gen-int 0 200)
+                 ops (gen/vector gen-operation 0 100)]
+                (let [pss (reduce conj (set/sorted-set* {:branching-factor 4}) elements)
+                      final (reduce (fn [s [op v]]
+                                      (case op :add (conj s v) :remove (disj s v)))
+                                    pss ops)]
+                  (diag/validate-navigation final))))

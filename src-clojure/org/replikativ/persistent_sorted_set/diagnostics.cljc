@@ -314,7 +314,9 @@
      :total-fill (nlen node)
      :node-count 1
      :counts-known? true
-     :measure-known? (some? (node-measure node))}
+     :measure-known? (some? (node-measure node))
+     :leaf-fills [(nlen node)]
+     :branch-fills []}
     (let [cs (children-seq node)
           child-stats (map #(when % (collect-stats % (inc depth))) cs)
           child-stats (remove nil? child-stats)]
@@ -328,7 +330,9 @@
                  :total-fill (+ (:total-fill acc) (:total-fill s))
                  :node-count (+ (:node-count acc) (:node-count s))
                  :counts-known? (and (:counts-known? acc) (:counts-known? s))
-                 :measure-known? (and (:measure-known? acc) (:measure-known? s))})
+                 :measure-known? (and (:measure-known? acc) (:measure-known? s))
+                 :leaf-fills (clojure.core/into (:leaf-fills acc) (:leaf-fills s))
+                 :branch-fills (clojure.core/into (:branch-fills acc) (:branch-fills s))})
               {:depth depth
                :branch-count 1
                :leaf-count 0
@@ -338,8 +342,25 @@
                :total-fill (nlen node)
                :node-count 1
                :counts-known? (>= (subtree-count* node) 0)
-               :measure-known? (some? (node-measure node))}
+               :measure-known? (some? (node-measure node))
+               :leaf-fills []
+               :branch-fills [(nlen node)]}
               child-stats))))
+
+(defn- percentiles
+  "Compute percentile distribution from a sorted vector of values, normalized by bf."
+  [fills bf]
+  (if (empty? fills)
+    {:min 0.0 :p25 0.0 :p50 0.0 :p75 0.0 :p90 0.0 :max 0.0}
+    (let [sorted (vec (sort fills))
+          n (count sorted)
+          at (fn [p] (/ (double (nth sorted (min (int (* n p)) (dec n)))) bf))]
+      {:min (/ (double (first sorted)) bf)
+       :p25 (at 0.25)
+       :p50 (at 0.50)
+       :p75 (at 0.75)
+       :p90 (at 0.90)
+       :max (/ (double (peek sorted)) bf)})))
 
 ;; =============================================================================
 ;; Error formatting
@@ -438,10 +459,45 @@
           (throw-errors errors "Content validation failed"))))
     true))
 
+;; =============================================================================
+;; Root-descend verification
+;; =============================================================================
+
+(defn- collect-all-keys
+  "Walk tree collecting all leaf keys into a vector."
+  [node]
+  (if (leaf? node)
+    (nkeys node)
+    (into [] (mapcat #(when % (collect-all-keys %))) (children-seq node))))
+
+(defn validate-navigation
+  "Root-descend verification: re-looks up every element from the root to verify
+   the search path is correct. Catches subtle comparator bugs, collation changes
+   after restore, and navigation corruption that structural checks miss.
+
+   O(n log n) — diagnostic, not a hot path. Returns true if valid, throws with
+   structured error data if any key cannot be found via lookup."
+  [set]
+  (let [root (get-root set)]
+    (when (and root (pos? (nlen root)))
+      (let [all-keys (collect-all-keys root)
+            errors (reduce
+                    (fn [errs key]
+                      (let [found (set/lookup set key)]
+                        (if (nil? found)
+                          (clojure.core/conj errs {:error :key-not-found-via-lookup :key key})
+                          errs)))
+                    []
+                    all-keys)]
+        (throw-errors errors "Root-descend navigation verification failed")))
+    true))
+
 (defn tree-stats
   "Returns diagnostic statistics about the tree structure:
    {:depth N, :branch-count N, :leaf-count N, :element-count N,
     :min-fill-ratio F, :avg-fill-ratio F, :max-fill-ratio F,
+    :fill-histogram {:min F :p25 F :p50 F :p75 F :p90 F :max F},
+    :leaf-fill-histogram {...}, :branch-fill-histogram {...},
     :counts-known? bool, :measure-known? bool}"
   [set]
   (let [root (get-root set)
@@ -449,8 +505,12 @@
     (if (or (nil? root) (zero? (nlen root)))
       {:depth 0 :branch-count 0 :leaf-count 0 :element-count 0
        :min-fill-ratio 0.0 :avg-fill-ratio 0.0 :max-fill-ratio 0.0
+       :fill-histogram {:min 0.0 :p25 0.0 :p50 0.0 :p75 0.0 :p90 0.0 :max 0.0}
+       :leaf-fill-histogram {:min 0.0 :p25 0.0 :p50 0.0 :p75 0.0 :p90 0.0 :max 0.0}
+       :branch-fill-histogram {:min 0.0 :p25 0.0 :p50 0.0 :p75 0.0 :p90 0.0 :max 0.0}
        :counts-known? true :measure-known? true}
-      (let [stats (collect-stats root 0)]
+      (let [stats (collect-stats root 0)
+            all-fills (clojure.core/into (:leaf-fills stats) (:branch-fills stats))]
         {:depth (:depth stats)
          :branch-count (:branch-count stats)
          :leaf-count (:leaf-count stats)
@@ -458,5 +518,8 @@
          :min-fill-ratio (/ (double (:min-fill stats)) bf)
          :avg-fill-ratio (/ (double (:total-fill stats)) (* (:node-count stats) bf))
          :max-fill-ratio (/ (double (:max-fill stats)) bf)
+         :fill-histogram (percentiles all-fills bf)
+         :leaf-fill-histogram (percentiles (:leaf-fills stats) bf)
+         :branch-fill-histogram (percentiles (:branch-fills stats) bf)
          :counts-known? (:counts-known? stats)
          :measure-known? (:measure-known? stats)}))))

@@ -354,3 +354,14 @@
         (if (zero? (.count root (.-_storage set)))
           (.identity measure-ops)
           (measure-slice-node root (.-_storage set) measure-ops from to cmp))))))
+
+(defn compact
+  "Rebuild the tree with optimal fill factors from the current elements.
+   Useful after heavy insert/delete churn that may have degraded node
+   fill ratios. Preserves comparator, settings, and metadata.
+   Returns a new set with the same elements in a freshly built tree."
+  [^PersistentSortedSet set]
+  (let [arr   (to-array (clojure.core/seq set))
+        len   (alength arr)
+        opts  (settings->map (.-_settings set))]
+    (from-sorted-array (.comparator set) arr len opts)))
