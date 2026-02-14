@@ -181,16 +181,15 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         center._measure = center.tryComputeMeasure(storage);
       }
 
-      // Process the center leaf (may split into multiple)
+      // Process the center leaf (compaction may reduce entries)
       Leaf[] processed = processSingleLeaf(center, storage, settings);
       if (processed.length == 1) {
         return new ANode[] { left, processed[0], right };
-      } else if (processed.length > 1) {
-        // Split into multiple - return all (parent will handle re-organization)
-        return (ANode[]) processed;
-      } else {
-        // Empty - removed all entries
+      } else if (processed.length == 0) {
         return new ANode[] { left, null, right };
+      } else {
+        throw new IllegalStateException(
+          "processSingleLeaf returned " + processed.length + " leaves, expected 0 or 1");
       }
     }
 
@@ -205,15 +204,15 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         join._measure = join.tryComputeMeasure(storage);
       }
 
-      // Process the joined leaf
+      // Process the joined leaf (compaction may reduce entries)
       Leaf[] processed = processSingleLeaf(join, storage, settings);
       if (processed.length == 1) {
         return new ANode[] { null, processed[0], right };
-      } else if (processed.length > 1) {
-        // Split into multiple
-        return (ANode[]) processed;
-      } else {
+      } else if (processed.length == 0) {
         return new ANode[] { null, null, right };
+      } else {
+        throw new IllegalStateException(
+          "processSingleLeaf returned " + processed.length + " leaves, expected 0 or 1");
       }
     }
 
@@ -228,15 +227,15 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         join._measure = join.tryComputeMeasure(storage);
       }
 
-      // Process the joined leaf
+      // Process the joined leaf (compaction may reduce entries)
       Leaf[] processed = processSingleLeaf(join, storage, settings);
       if (processed.length == 1) {
         return new ANode[]{ left, processed[0], null };
-      } else if (processed.length > 1) {
-        // Split into multiple
-        return (ANode[]) processed;
-      } else {
+      } else if (processed.length == 0) {
         return new ANode[]{ left, null, null };
+      } else {
+        throw new IllegalStateException(
+          "processSingleLeaf returned " + processed.length + " leaves, expected 0 or 1");
       }
     }
 
@@ -463,26 +462,11 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       }
       return new Leaf[]{ newLeaf };
     } else {
-      // Needs to split into multiple leaves
-      int numLeaves = (processedSize + settings.branchingFactor() - 1) / settings.branchingFactor();
-      int baseSize = processedSize / numLeaves;
-      int remainder = processedSize % numLeaves;
-
-      Leaf[] result = new Leaf[numLeaves];
-      int offset = 0;
-      for (int i = 0; i < numLeaves; i++) {
-        int leafSize = baseSize + (i < remainder ? 1 : 0);
-        Leaf<Key, Address> newLeaf = new Leaf<>(leafSize, settings);
-        for (int j = 0; j < leafSize; j++) {
-          newLeaf._keys[j] = processed.get(offset + j);
-        }
-        if (leaf._measure != null) {
-          newLeaf._measure = newLeaf.tryComputeMeasure(storage);
-        }
-        result[i] = newLeaf;
-        offset += leafSize;
-      }
-      return result;
+      // Processor expanded entries beyond branchingFactor — not supported.
+      // ILeafProcessor is designed for compaction (reducing entries), not expansion.
+      throw new IllegalStateException(
+        "ILeafProcessor returned " + processedSize + " entries, exceeding branchingFactor " +
+        settings.branchingFactor() + ". Processors must not expand entries beyond branchingFactor.");
     }
   }
 
@@ -569,52 +553,15 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         }
         processedLeaves.add(newLeaf);
       } else {
-        // Needs to split into multiple leaves
-        // Split as evenly as possible
-        int numLeaves = (processedSize + settings.branchingFactor() - 1) / settings.branchingFactor();
-        int baseSize = processedSize / numLeaves;
-        int remainder = processedSize % numLeaves;
-
-        int offset = 0;
-        for (int i = 0; i < numLeaves; i++) {
-          int leafSize = baseSize + (i < remainder ? 1 : 0);
-          Leaf<Key, Address> newLeaf = new Leaf<>(leafSize, settings);
-          for (int j = 0; j < leafSize; j++) {
-            newLeaf._keys[j] = processed.get(offset + j);
-          }
-          if (leaf._measure != null) {
-            newLeaf._measure = newLeaf.tryComputeMeasure(storage);
-          }
-          processedLeaves.add(newLeaf);
-          offset += leafSize;
-        }
+        // Processor expanded entries beyond branchingFactor — not supported.
+        // ILeafProcessor is designed for compaction (reducing entries), not expansion.
+        throw new IllegalStateException(
+          "ILeafProcessor returned " + processedSize + " entries, exceeding branchingFactor " +
+          settings.branchingFactor() + ". Processors must not expand entries beyond branchingFactor.");
       }
     }
 
-    // Convert back to array
-    // Handle case where processing caused splits (more leaves than input)
-    int resultSize = processedLeaves.size();
-
-    if (resultSize == nodes.length) {
-      // Same number of nodes, return directly
-      return processedLeaves.toArray(new ANode[resultSize]);
-    } else if (resultSize == 1 && nodes.length == 1) {
-      // Still one node
-      return new ANode[]{ processedLeaves.get(0) };
-    } else if (resultSize > nodes.length) {
-      // Split into more leaves - need to signal this
-      // Return array with all new leaves (parent will handle splits)
-      return processedLeaves.toArray(new ANode[resultSize]);
-    } else {
-      // Merged into fewer leaves
-      // For remove operations, preserve the 3-element [left, center, right] structure
-      if (nodes.length == 3) {
-        // Map back to 3-element structure
-        // This is complex - for now, just return processed nodes
-        // Parent will need to handle this
-        return processedLeaves.toArray(new ANode[resultSize]);
-      }
-      return processedLeaves.toArray(new ANode[resultSize]);
-    }
+    // Each input node produces exactly one entry (leaf or null), so count is preserved
+    return processedLeaves.toArray(new ANode[processedLeaves.size()]);
   }
 }
