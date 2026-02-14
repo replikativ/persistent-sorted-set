@@ -111,10 +111,26 @@
                (async
                 (let [root  (await (-root set opts))
                       nodes (await (node/$replace root (.-storage set) old-key new-key cmp opts))]
-                  (if (nil? nodes)
-                    set
+                  (cond
+                    (nil? nodes) set
+
+                    ;; In-place update (transient) — root modified, just clear address
+                    (= nodes :early-exit)
                     (do
-                      ;; Mark old root address as freed if it exists
+                      (when (and (.-storage set) (.-address set))
+                        (storage/markFreed (.-storage set) (.-address set)))
+                      (BTSet. (.-root set)
+                              (.-cnt set)
+                              (.-comparator set)
+                              (.-meta set)
+                              UNINITIALIZED_HASH
+                              (.-storage set)
+                              nil
+                              (.-settings set)))
+
+                    ;; New root node (persistent or maxKey changed)
+                    :else
+                    (do
                       (when (and (.-storage set) (.-address set))
                         (storage/markFreed (.-storage set) (.-address set)))
                       (BTSet. (arrays/aget nodes 0)

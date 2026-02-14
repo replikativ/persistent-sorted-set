@@ -363,8 +363,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (ins == _len - 1 && node.maxKey() == maxKey()) // TODO why maxKey check?
-        return new ANode[]{ this }; // update maxKey
+      if (ins == _len - 1)
+        return new ANode[]{ this }; // last child changed, propagate maxKey update
       else
         return PersistentSortedSet.EARLY_EXIT;
     }
