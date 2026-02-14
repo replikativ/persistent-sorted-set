@@ -123,16 +123,25 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       return new ANode[]{n};
     }
 
-    // Split into two leaves
-    int half1 = totalLen >>> 1, half2 = totalLen - half1;
-    Leaf n1 = new Leaf(half1, settings), n2 = new Leaf(half2, settings);
-    ArrayUtil.copy(allKeys, 0, half1, n1._keys, 0);
-    ArrayUtil.copy(allKeys, half1, totalLen, n2._keys, 0);
-    if (_measure != null) {
-      n1._measure = n1.tryComputeMeasure(storage);
-      n2._measure = n2.tryComputeMeasure(storage);
+    // Split into ceil(totalLen / BF) leaves (remainder goes to later leaves)
+    int bf = settings.branchingFactor();
+    int numLeaves = (totalLen + bf - 1) / bf;
+    ANode[] result = new ANode[numLeaves];
+    int pos = 0;
+    int baseLen = totalLen / numLeaves;
+    int remainder = totalLen % numLeaves;
+    for (int i = 0; i < numLeaves; i++) {
+      // Remainder distributed to later leaves (matches old half1 = totalLen >>> 1 behavior)
+      int leafLen = baseLen + (i >= numLeaves - remainder ? 1 : 0);
+      Leaf n = new Leaf(leafLen, settings);
+      ArrayUtil.copy(allKeys, pos, pos + leafLen, n._keys, 0);
+      if (_measure != null) {
+        n._measure = n.tryComputeMeasure(storage);
+      }
+      result[i] = n;
+      pos += leafLen;
     }
-    return new ANode[]{n1, n2};
+    return result;
   }
 
   @Override

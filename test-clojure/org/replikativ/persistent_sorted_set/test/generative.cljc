@@ -415,9 +415,9 @@
                   (= actual expected))))
 
 (defspec measure-slice-matches-filter 100
-  (prop/for-all [elements gen-elements
-                 from gen-int
-                 to gen-int]
+  (prop/for-all [elements (gen/no-shrink gen-elements)
+                 from (gen/no-shrink gen-int)
+                 to (gen/no-shrink gen-int)]
                 (let [[lo hi] (sort [from to])
                       pss (into (set/sorted-set* {:measure stats-ops}) elements)
                       actual (stats->map (set/measure-slice pss lo hi))
@@ -426,8 +426,8 @@
                   (= actual expected))))
 
 (defspec stats-after-modifications 100
-  (prop/for-all [elements gen-elements
-                 ops gen-operations]
+  (prop/for-all [elements (gen/no-shrink gen-elements)
+                 ops (gen/no-shrink gen-operations)]
                 (let [pss (into (set/sorted-set* {:measure stats-ops}) elements)
                       final-pss (reduce (fn [s [op val]]
                                           (case op
@@ -445,10 +445,10 @@
                   (= actual expected))))
 
 (defspec measure-slice-after-modifications 100
-  (prop/for-all [elements gen-elements
-                 ops (gen/vector gen-operation 0 50)
-                 from gen-int
-                 to gen-int]
+  (prop/for-all [elements (gen/no-shrink gen-elements)
+                 ops (gen/no-shrink (gen/vector gen-operation 0 50))
+                 from (gen/no-shrink gen-int)
+                 to (gen/no-shrink gen-int)]
                 (let [[lo hi] (sort [from to])
                       pss (into (set/sorted-set* {:measure stats-ops}) elements)
                       final-pss (reduce (fn [s [op val]]
@@ -472,7 +472,7 @@
 ;; =============================================================================
 
 (defspec replace-preserves-measure 100
-  (prop/for-all [elements (gen/vector gen-pos-int 10 500)]
+  (prop/for-all [elements (gen/no-shrink (gen/vector gen-pos-int 10 500))]
                 (let [pss (into (set/sorted-set* {:measure stats-ops :branching-factor 8}) elements)
                       distinct-elems (vec (sort (distinct elements)))
                       ;; Replace each element with itself (identity replace)
@@ -486,8 +486,8 @@
 ;; =============================================================================
 
 (defspec get-nth-matches-vec-nth 100
-  (prop/for-all [elements (gen/vector gen-pos-int 10 500)
-                 ops (gen/vector gen-operation 0 100)]
+  (prop/for-all [elements (gen/no-shrink (gen/vector gen-pos-int 10 500))
+                 ops (gen/no-shrink (gen/vector gen-operation 0 100))]
                 (let [pss (into (set/sorted-set* {:measure stats-ops :branching-factor 8}) elements)
                       final-pss (reduce (fn [s [op val]]
                                           (case op
@@ -509,7 +509,7 @@
 ;; =============================================================================
 
 (defspec rebalancing-preserves-measure 100
-  (prop/for-all [elements (gen/vector gen-int 50 500)]
+  (prop/for-all [elements (gen/no-shrink (gen/vector gen-int 50 500))]
                 (let [opts {:measure stats-ops :branching-factor 4}
                       pss (reduce conj (set/sorted-set* opts) elements)
                       ;; Remove half to trigger merges/borrows
@@ -528,9 +528,9 @@
 ;; =============================================================================
 
 (defspec transient-preserves-measure 100
-  (prop/for-all [elements (gen/vector gen-int 10 300)
-                 adds (gen/vector gen-int 0 100)
-                 removes (gen/vector gen-int 0 100)]
+  (prop/for-all [elements (gen/no-shrink (gen/vector gen-int 10 300))
+                 adds (gen/no-shrink (gen/vector gen-int 0 100))
+                 removes (gen/no-shrink (gen/vector gen-int 0 100))]
                 (let [pss (into (set/sorted-set* {:measure stats-ops :branching-factor 8}) elements)
                       ;; Apply ops via transient
                       result (-> (transient pss)
@@ -551,8 +551,8 @@
 ;; =============================================================================
 
 (defspec stats-after-roundtrip-and-modifications 100
-  (prop/for-all [elements (gen/vector gen-int 10 300)
-                 ops (gen/vector gen-operation 0 100)]
+  (prop/for-all [elements (gen/no-shrink (gen/vector gen-int 10 300))
+                 ops (gen/no-shrink (gen/vector gen-operation 0 100))]
                 (let [opts {:measure stats-ops :branching-factor 8}
                       pss (into (set/sorted-set* opts) elements)
                       lazy-pss (roundtrip pss opts)
@@ -575,9 +575,9 @@
 ;; =============================================================================
 
 (defspec measure-slice-after-roundtrip 100
-  (prop/for-all [elements (gen/vector gen-int 10 200)
-                 from gen-int
-                 to gen-int]
+  (prop/for-all [elements (gen/no-shrink (gen/vector gen-int 10 200))
+                 from (gen/no-shrink gen-int)
+                 to (gen/no-shrink gen-int)]
                 (let [[lo hi] (sort [from to])
                       opts {:measure stats-ops :branching-factor 8}
                       pss (into (set/sorted-set* opts) elements)

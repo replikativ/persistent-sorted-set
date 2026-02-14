@@ -329,14 +329,16 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     int ins = -idx - 1;
     if (ins == _len) ins = _len - 1;
     assert 0 <= ins && ins < _len;
-    ANode[] nodes = child(storage, ins).add(storage, key, cmp, settings);
+    ANode oldChild = child(storage, ins);
+    long oldChildCount = ((ISubtreeCount) oldChild).subtreeCount();
+    ANode[] nodes = oldChild.add(storage, key, cmp, settings);
 
     if (PersistentSortedSet.UNCHANGED == nodes) { // child signalling already in set
       return PersistentSortedSet.UNCHANGED;
     }
 
     if (PersistentSortedSet.EARLY_EXIT == nodes) { // child signalling nothing to update
-      // Still need to update count - we added one element
+      // Editable in-place path: processor didn't fire, exactly one element added
       if (_subtreeCount >= 0) _subtreeCount += 1;
       // Update measure: recompute from children (child's stats were updated in place)
       IMeasure measureOps = _settings.measure();
@@ -345,6 +347,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       }
       return PersistentSortedSet.EARLY_EXIT;
     }
+
+    // Compute new children's total count (accounts for processor expanding/compacting)
+    long newChildrenCount = 0;
+    for (ANode n : nodes) newChildrenCount += ((ISubtreeCount) n).subtreeCount();
 
     IMeasure measureOps = _settings.measure();
 
@@ -357,8 +363,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         storage.markFreed(_addresses[ins]);
       }
       child(ins, node);
-      // Update subtree count: we added one element
-      if (_subtreeCount >= 0) _subtreeCount += 1;
+      // Update subtree count using exact delta from old vs new child
+      if (_subtreeCount >= 0 && oldChildCount >= 0)
+        _subtreeCount = _subtreeCount - oldChildCount + newChildrenCount;
+      else
+        _subtreeCount = -1;
       // Update measure: recompute from children
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
@@ -386,135 +395,68 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       Object[] newChildren = _children == null ? new Object[_keys.length] : Arrays.copyOfRange(_children, 0, _len);
       newChildren[ins] = node;
 
-      // Subtree count = old count + 1 (added one element)
-      // When old count is unknown (-1), leave new count unknown to preserve lazy loading
-      long newCount = _subtreeCount >= 0 ? _subtreeCount + 1 : -1;
+      // Exact subtree count using delta from old vs new child
+      long newCount = (_subtreeCount >= 0 && oldChildCount >= 0)
+          ? _subtreeCount - oldChildCount + newChildrenCount : -1;
       Object newMeasure = tryComputeMeasureFromChildren(newChildren, _len, storage, measureOps);
       return new ANode[]{ new Branch(_level, _len, newKeys, newAddresses, newChildren, newCount, newMeasure, settings) };
     }
 
-    // len + 1
-    if (_len < _settings.branchingFactor()) {
-      Branch n = new Branch(_level, _len + 1, settings);
-      new Stitch(n._keys, 0)
-        .copyAll(_keys, 0, ins)
-        .copyOne(nodes[0].maxKey())
-        .copyOne(nodes[1].maxKey())
-        .copyAll(_keys, ins + 1, _len);
+    // nodes.length >= 2: replace 1 child with N children
+    int extra = nodes.length - 1;
+    int newLen = _len + extra;
 
-      if (_addresses != null) {
-        n.ensureAddresses();
-        new Stitch(n._addresses, 0)
-          .copyAll(_addresses, 0, ins)
-          .copyOne(null)
-          .copyOne(null)
-          .copyAll(_addresses, ins + 1, _len);
-      }
+    // Build full merged arrays
+    Key[] allKeys = (Key[]) new Object[newLen];
+    Stitch ks = new Stitch(allKeys, 0);
+    ks.copyAll(_keys, 0, ins);
+    for (int i = 0; i < nodes.length; i++) ks.copyOne(nodes[i].maxKey());
+    ks.copyAll(_keys, ins + 1, _len);
 
-      n.ensureChildren();
-      new Stitch(n._children, 0)
-        .copyAll(_children, 0, ins)
-        .copyOne(nodes[0])
-        .copyOne(nodes[1])
-        .copyAll(_children, ins + 1, _len);
+    Object[] allChildren = new Object[newLen];
+    Stitch cs = new Stitch(allChildren, 0);
+    cs.copyAll(_children, 0, ins);
+    for (int i = 0; i < nodes.length; i++) cs.copyOne(nodes[i]);
+    cs.copyAll(_children, ins + 1, _len);
 
-      // Subtree count = old count + 1 (added one element)
-      // When old count is unknown (-1), leave new count unknown to preserve lazy loading
-      n._subtreeCount = _subtreeCount >= 0 ? _subtreeCount + 1 : -1;
-      n._measure = tryComputeMeasureFromChildren(n._children, n._len, storage, measureOps);
-      return new ANode[]{n};
+    Address[] allAddresses = null;
+    if (_addresses != null) {
+      allAddresses = (Address[]) new Object[newLen];
+      Stitch as = new Stitch(allAddresses, 0);
+      as.copyAll(_addresses, 0, ins);
+      for (int i = 0; i < nodes.length; i++) as.copyOne(null);
+      as.copyAll(_addresses, ins + 1, _len);
     }
 
-    // split
-    int half1 = (_len + 1) >>> 1;
-    if (ins+1 == half1) ++half1;
-    int half2 = _len + 1 - half1;
-
-    // add to first half
-    if (ins < half1) {
-      Key[] keys1 = (Key[]) new Object[half1];
-      new Stitch(keys1, 0)
-        .copyAll(_keys, 0, ins)
-        .copyOne(nodes[0].maxKey())
-        .copyOne(nodes[1].maxKey())
-        .copyAll(_keys, ins+1, half1-1);
-      Key[] keys2 = (Key[]) new Object[half2];
-      ArrayUtil.copy(_keys, half1 - 1, _len, keys2, 0);
-
-      Address[] addresses1 = null;
-      Address[] addresses2 = null;
-      if (_addresses != null) {
-        addresses1 = (Address[]) new Object[half1];
-        new Stitch(addresses1, 0)
-          .copyAll(_addresses, 0, ins)
-          .copyOne(null)
-          .copyOne(null)
-          .copyAll(_addresses, ins + 1, half1 - 1);
-        addresses2 = (Address[]) new Object[half2];
-        ArrayUtil.copy(_addresses, half1 - 1, _len, addresses2, 0);
-      }
-
-      Object[] children1 = new Object[half1];
-      Object[] children2 = null;
-      new Stitch(children1, 0)
-        .copyAll(_children, 0, ins)
-        .copyOne(nodes[0])
-        .copyOne(nodes[1])
-        .copyAll(_children, ins + 1, half1 - 1);
-      if (_children != null) {
-        children2 = new Object[half2];
-        ArrayUtil.copy(_children, half1 - 1, _len, children2, 0);
-      }
-
-      long count1 = tryComputeSubtreeCountFromChildren(children1, half1, storage);
-      long count2 = tryComputeSubtreeCountFromChildren(children2, half2, storage);
-      Object measure1 = tryComputeMeasureFromChildren(children1, half1, storage, measureOps);
-      Object measure2 = children2 != null ? tryComputeMeasureFromChildren(children2, half2, storage, measureOps) : null;
-      return new ANode[] {
-        new Branch(_level, half1, keys1, addresses1, children1, count1, measure1, settings),
-        new Branch(_level, half2, keys2, addresses2, children2, count2, measure2, settings)
+    // Absorb: fits in single branch
+    if (newLen <= settings.branchingFactor()) {
+      // Use delta formula: exact and O(1), avoids scanning all children
+      long count = (_subtreeCount >= 0 && oldChildCount >= 0)
+          ? _subtreeCount - oldChildCount + newChildrenCount : -1;
+      Object measure = tryComputeMeasureFromChildren(allChildren, newLen, storage, measureOps);
+      return new ANode[]{
+        new Branch(_level, newLen, allKeys, allAddresses, allChildren, count, measure, settings)
       };
     }
 
-    // add to second half
-    Key[] keys1 = (Key[]) new Object[half1];
-    Key[] keys2 = (Key[]) new Object[half2];
-    ArrayUtil.copy(_keys, 0, half1, keys1, 0);
+    // Split into two branches
+    int half1 = newLen >>> 1, half2 = newLen - half1;
 
-    new Stitch(keys2, 0)
-      .copyAll(_keys, half1, ins)
-      .copyOne(nodes[0].maxKey())
-      .copyOne(nodes[1].maxKey())
-      .copyAll(_keys, ins + 1, _len);
+    Key[] keys1 = Arrays.copyOfRange(allKeys, 0, half1);
+    Key[] keys2 = Arrays.copyOfRange(allKeys, half1, newLen);
 
-    Address addresses1[] = null;
-    Address addresses2[] = null;
-    if (_addresses != null) {
-      addresses1 = (Address[]) new Object[half1];
-      ArrayUtil.copy(_addresses, 0, half1, addresses1, 0);
-      addresses2 = (Address[]) new Object[half2];
-      new Stitch(addresses2, 0)
-        .copyAll(_addresses, half1, ins)
-        .copyOne(null)
-        .copyOne(null)
-        .copyAll(_addresses, ins + 1, _len);
+    Object[] children1 = Arrays.copyOfRange(allChildren, 0, half1);
+    Object[] children2 = Arrays.copyOfRange(allChildren, half1, newLen);
+
+    Address[] addresses1 = null, addresses2 = null;
+    if (allAddresses != null) {
+      addresses1 = Arrays.copyOfRange(allAddresses, 0, half1);
+      addresses2 = Arrays.copyOfRange(allAddresses, half1, newLen);
     }
-
-    Object[] children1 = null;
-    Object[] children2 = new Object[half2];
-    if (_children != null) {
-      children1 = new Object[half1];
-      ArrayUtil.copy(_children, 0, half1, children1, 0);
-    }
-    new Stitch(children2, 0)
-      .copyAll(_children, half1, ins)
-      .copyOne(nodes[0])
-      .copyOne(nodes[1])
-      .copyAll(_children, ins + 1, _len);
 
     long count1 = tryComputeSubtreeCountFromChildren(children1, half1, storage);
     long count2 = tryComputeSubtreeCountFromChildren(children2, half2, storage);
-    Object measure1 = children1 != null ? tryComputeMeasureFromChildren(children1, half1, storage, measureOps) : null;
+    Object measure1 = tryComputeMeasureFromChildren(children1, half1, storage, measureOps);
     Object measure2 = tryComputeMeasureFromChildren(children2, half2, storage, measureOps);
     return new ANode[]{
       new Branch(_level, half1, keys1, addresses1, children1, count1, measure1, settings),
@@ -545,7 +487,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       return PersistentSortedSet.UNCHANGED;
 
     if (PersistentSortedSet.EARLY_EXIT == nodes) { // child signalling nothing to update
-      // Still need to update count - we removed one element
+      // Editable in-place path: processor didn't fire, exactly one element removed
       if (_subtreeCount >= 0) _subtreeCount -= 1;
       // Update measure: recompute from children (child's stats were updated in place)
       IMeasure measureOps = _settings.measure();
@@ -613,8 +555,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           cs.copyAll(_children, idx+2, _len);
 
         _len = newLen;
-        // Update subtree count: we removed one element
-        if (_subtreeCount >= 0) _subtreeCount -= 1;
+        // Compute exact subtree count from children (accounts for processor changes)
+        _subtreeCount = tryComputeSubtreeCountFromChildren(_children, newLen, storage);
         // Update measure: recompute from children
         if (measureOps != null && _measure != null) {
           _measure = tryComputeMeasure(storage);
@@ -648,9 +590,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (nodes[2] != null) cs.copyOne(nodes[2]);
       cs.copyAll(_children, idx + 2, _len);
 
-      // Subtree count = old count - 1 (removed one element)
-      // When old count is unknown (-1), leave new count unknown to preserve lazy loading
-      newCenter._subtreeCount = _subtreeCount >= 0 ? _subtreeCount - 1 : -1;
+      // Compute exact subtree count from children (accounts for processor changes)
+      newCenter._subtreeCount = tryComputeSubtreeCountFromChildren(newCenter._children, newLen, storage);
       newCenter._measure = tryComputeMeasureFromChildren(newCenter._children, newLen, storage, measureOps);
       return new ANode[] { left, newCenter, right };
     }
@@ -686,11 +627,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (nodes[2] != null) cs.copyOne(nodes[2]);
       cs.copyAll(_children, idx + 2, _len);
 
-      // Subtree count = left count + this count - 1 (joined and removed one element)
-      // Propagate -1 if either side is unknown to preserve laziness
-      join._subtreeCount = (left._subtreeCount >= 0 && _subtreeCount >= 0)
-          ? left._subtreeCount + _subtreeCount - 1
-          : -1;
+      // Compute exact subtree count from children (accounts for processor changes)
+      join._subtreeCount = tryComputeSubtreeCountFromChildren(join._children, left._len + newLen, storage);
       join._measure = tryComputeMeasureFromChildren(join._children, left._len + newLen, storage, measureOps);
       return new ANode[] { null, join, right };
     }
@@ -726,11 +664,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       cs.copyAll(_children,     idx + 2, _len);
       cs.copyAll(right._children, 0, right._len);
 
-      // Subtree count = this count + right count - 1 (joined and removed one element)
-      // Propagate -1 if either side is unknown to preserve laziness
-      join._subtreeCount = (_subtreeCount >= 0 && right._subtreeCount >= 0)
-          ? _subtreeCount + right._subtreeCount - 1
-          : -1;
+      // Compute exact subtree count from children (accounts for processor changes)
+      join._subtreeCount = tryComputeSubtreeCountFromChildren(join._children, newLen + right._len, storage);
       join._measure = tryComputeMeasureFromChildren(join._children, newLen + right._len, storage, measureOps);
       return new ANode[] { left, join, null };
     }

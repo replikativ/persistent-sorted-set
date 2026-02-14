@@ -76,6 +76,30 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     return -1;
   }
 
+  /**
+   * Create a Branch node from an array of child nodes (N >= 2).
+   * Used when root splits into multiple children.
+   */
+  private ANode makeBranchFromChildren(ANode[] nodes) {
+    int n = nodes.length;
+    Object[] keys = new Object[n];
+    Object[] children = new Object[n];
+    long subtreeCount = 0;
+    boolean countKnown = true;
+    for (int i = 0; i < n; i++) {
+      keys[i] = nodes[i].maxKey();
+      children[i] = nodes[i];
+      if (countKnown) {
+        long c = getSubtreeCount(nodes[i]);
+        if (c >= 0) subtreeCount += c;
+        else countKnown = false;
+      }
+    }
+    Object measure = computeMeasureFromChildren(nodes);
+    return new Branch(nodes[0].level() + 1, n, keys, null, children,
+                      countKnown ? subtreeCount : -1, measure, _settings);
+  }
+
   public boolean editable() {
     return _settings.editable();
   }
@@ -446,32 +470,26 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
 
       if (1 == nodes.length) {
         _root = nodes[0];
-      } else if (2 == nodes.length) {
-        Object[] keys = new Object[] {nodes[0].maxKey(), nodes[1].maxKey()};
-        long c0 = getSubtreeCount(nodes[0]), c1 = getSubtreeCount(nodes[1]);
-        long subtreeCount = (c0 >= 0 && c1 >= 0) ? c0 + c1 : -1;
-        Object measure = computeMeasureFromChildren(nodes);
-        _root = new Branch(nodes[0].level() + 1, 2, keys, null, new Object[] {nodes[0], nodes[1]}, subtreeCount, measure, _settings);
+      } else if (nodes.length >= 2) {
+        _root = makeBranchFromChildren(nodes);
       }
       // EARLY_EXIT case (nodes.length == 0): tree was modified in place, _address already cleared above
+      // Processor never fires on editable path, so exactly 1 element was added
       _count = alterCount(1);
       _version += 1;
       return this;
     }
 
-    // Processor may change entry count — use lazy count (-1) when processor is set
-    int newCount = (_settings.leafProcessor() != null) ? -1 : alterCount(1);
+    ANode newRoot;
+    if (1 == nodes.length) {
+      newRoot = nodes[0];
+    } else {
+      newRoot = makeBranchFromChildren(nodes);
+    }
 
-    if (1 == nodes.length)
-      return new PersistentSortedSet(_meta, _cmp, null, _storage, nodes[0], newCount, _settings, _version + 1);
-
-    Object[] keys = new Object[] {nodes[0].maxKey(), nodes[1].maxKey()};
-    Object[] children = Arrays.copyOf(nodes, nodes.length, new Object[0].getClass());
-    long c0 = getSubtreeCount(nodes[0]), c1 = getSubtreeCount(nodes[1]);
-    long subtreeCount = (c0 >= 0 && c1 >= 0) ? c0 + c1 : -1;
-    // Compute measure for new root
-    Object measure = computeMeasureFromChildren(nodes);
-    ANode newRoot = new Branch(nodes[0].level() + 1, 2, keys, null, children, subtreeCount, measure, _settings);
+    // Use root's subtreeCount for exact count (works correctly even with processor)
+    long rootCount = getSubtreeCount(newRoot);
+    int newCount = (rootCount >= 0) ? (int) rootCount : -1;
     return new PersistentSortedSet(_meta, _cmp, null, _storage, newRoot, newCount, _settings, _version + 1);
   }
 
@@ -511,12 +529,12 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       _version += 1;
       return this;
     }
-    // Processor may change entry count — use lazy count (-1) when processor is set
-    int newCount = (_settings.leafProcessor() != null) ? -1 : alterCount(-1);
     if (newRoot instanceof Branch && newRoot._len == 1) {
       newRoot = ((Branch) newRoot).child(_storage, 0);
-      return new PersistentSortedSet(_meta, _cmp, null, _storage, newRoot, newCount, _settings, _version + 1);
     }
+    // Use root's subtreeCount for exact count (works correctly even with processor)
+    long rootCount = getSubtreeCount(newRoot);
+    int newCount = (rootCount >= 0) ? (int) rootCount : -1;
     return new PersistentSortedSet(_meta, _cmp, null, _storage, newRoot, newCount, _settings, _version + 1);
   }
 
