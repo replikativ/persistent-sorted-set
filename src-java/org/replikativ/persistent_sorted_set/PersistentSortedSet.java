@@ -474,8 +474,13 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
         _root = makeBranchFromChildren(nodes);
       }
       // EARLY_EXIT case (nodes.length == 0): tree was modified in place, _address already cleared above
-      // Processor never fires on editable path, so exactly 1 element was added
-      _count = alterCount(1);
+      // When processor is configured, count may differ from +1
+      if (_settings.leafProcessor() != null) {
+        long rootCount = getSubtreeCount(root());
+        _count = (rootCount >= 0) ? (int) rootCount : -1;
+      } else {
+        _count = alterCount(1);
+      }
       _version += 1;
       return this;
     }
@@ -525,7 +530,13 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       // Clear address
       _address = null;
       _root = newRoot;
-      _count = alterCount(-1);
+      // When processor is configured, count may differ from -1
+      if (_settings.leafProcessor() != null) {
+        long rootCount = getSubtreeCount(newRoot);
+        _count = (rootCount >= 0) ? (int) rootCount : -1;
+      } else {
+        _count = alterCount(-1);
+      }
       _version += 1;
       return this;
     }

@@ -28,8 +28,11 @@ import java.util.*;
  *
  * <h3>Execution context</h3>
  * <ul>
- *   <li>Only runs on persistent (non-transient) code paths. Transient operations
- *       bypass the processor entirely for performance.</li>
+ *   <li>Runs on both persistent and transient code paths. When {@code shouldProcess}
+ *       returns true during a transient operation, the leaf falls through to the
+ *       persistent-style path (allocating new arrays) so the processor can run.
+ *       This ensures batch operations via transients still trigger processing
+ *       (e.g., compaction after bulk deletes).</li>
  *   <li>Zero overhead if no processor is configured (null in Settings).</li>
  *   <li>The processor receives only the current leaf's entries, not neighboring leaves.</li>
  *   <li>Called once per affected leaf per add/remove operation.</li>

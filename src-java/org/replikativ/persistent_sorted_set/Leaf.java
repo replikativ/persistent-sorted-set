@@ -80,8 +80,13 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
 
     IMeasure measureOps = _settings.measure();
 
-    // can modify array in place
-    if (editable() && _len < _keys.length) {
+    // Skip transient shortcut when processor would fire — processor needs the
+    // persistent-style path to create new arrays, run processing, and handle splits
+    ILeafProcessor processor = settings.leafProcessor();
+    boolean processorWillFire = processor != null && processor.shouldProcess(_len + 1, settings);
+
+    // can modify array in place (only if processor won't fire)
+    if (editable() && _len < _keys.length && !processorWillFire) {
       if (ins == _len) {
         _keys[_len] = key;
         _len += 1;
@@ -111,7 +116,6 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     int totalLen = _len + 1;
 
     // Run processor if configured
-    ILeafProcessor processor = settings.leafProcessor();
     if (processor != null && processor.shouldProcess(totalLen, settings)) {
       List<Key> processed = processor.processLeaf(Arrays.asList(allKeys), storage, settings);
       assert processed.size() > 0 : "ILeafProcessor.processLeaf must return at least one entry";
@@ -166,8 +170,12 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     IMeasure measureOps = _settings.measure();
     final Leaf thisLeaf = this;
 
-    // nothing to merge — transient, can edit in place
-    if (editable() && (newLen >= _settings.minBranchingFactor() || (left == null && right == null))) {
+    // Skip transient shortcut when processor would fire
+    ILeafProcessor processor = settings.leafProcessor();
+    boolean processorWillFire = processor != null && processor.shouldProcess(newLen, settings);
+
+    // nothing to merge — transient, can edit in place (only if processor won't fire)
+    if (editable() && !processorWillFire && (newLen >= _settings.minBranchingFactor() || (left == null && right == null))) {
       ArrayUtil.copy(_keys, idx + 1, _len, _keys, idx);
       _len = newLen;
       if (measureOps != null && _measure != null) {
@@ -185,9 +193,8 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       .copyAll(_keys, idx + 1, _len);
     int centerLen = newLen;
 
-    // Run processor if configured (persistent path only)
-    ILeafProcessor processor = settings.leafProcessor();
-    if (!editable() && processor != null && processor.shouldProcess(centerLen, settings)) {
+    // Run processor if configured
+    if (processorWillFire) {
       List<Key> processed = processor.processLeaf(Arrays.asList(centerKeys), storage, settings);
       assert processed.size() > 0 : "ILeafProcessor.processLeaf must return at least one entry";
       assert isSorted(processed, cmp) : "ILeafProcessor.processLeaf must return entries in sorted order";

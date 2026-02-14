@@ -743,3 +743,91 @@
                              :remove (disj! t v)))
                          (transient pss) ops))]
       (validate-tree final))))
+
+;; =============================================================================
+;; Transient + processor correctness (processor fires on transient paths)
+;; =============================================================================
+
+(deftest test-transient-add-fires-processor
+  (testing "Processor fires during transient add operations"
+    (let [call-count (atom 0)
+          counting-proc (reify ILeafProcessor
+                          (shouldProcess [_ _leafSize _settings] true)
+                          (processLeaf [_ entries _storage _settings]
+                            (swap! call-count inc)
+                            entries))
+          ^Comparator cmp (comparator <)
+          settings (Settings. (int 8) nil nil counting-proc)
+          empty (PersistentSortedSet. nil cmp nil settings)
+          s (persistent!
+             (reduce (fn [t item] (conj! t item))
+                     (transient empty)
+                     (range 1 51)))]
+      (is (pos? @call-count) "Processor should have been called during transient adds")
+      (is (= 50 (count s)))
+      (is (= (vec (range 1 51)) (set-seq s)))
+      (is (validate-tree s)))))
+
+(deftest test-transient-remove-fires-processor
+  (testing "Processor fires during transient remove operations"
+    (let [call-count (atom 0)
+          counting-proc (reify ILeafProcessor
+                          (shouldProcess [_ _leafSize _settings] true)
+                          (processLeaf [_ entries _storage _settings]
+                            (swap! call-count inc)
+                            entries))
+          s (make-set (identity-processor) 8 (range 1 51))
+          ;; Replace processor with counting version
+          ^Comparator cmp (comparator <)
+          settings (Settings. (int 8) nil nil counting-proc)
+          s-with-counter (reduce pss-conj
+                                 (PersistentSortedSet. nil cmp nil settings)
+                                 (set-seq s))
+          _ (reset! call-count 0) ;; reset after construction
+          s2 (persistent!
+              (reduce (fn [t item] (disj! t item))
+                      (transient s-with-counter)
+                      (range 1 26)))]
+      (is (pos? @call-count) "Processor should have been called during transient removes")
+      (is (= 25 (count s2)))
+      (is (= (vec (range 26 51)) (set-seq s2)))
+      (is (validate-tree s2)))))
+
+(deftest test-transient-compacting-processor-count-correct
+  (testing "Count is correct after transient ops with compacting processor"
+    (let [s (make-set (compacting-processor 3) 4 (range 1 51))
+          entries (set-seq s)
+          ;; Bulk remove via transient
+          to-remove (take (quot (count entries) 2) entries)
+          s2 (persistent!
+              (reduce (fn [t item] (disj! t item))
+                      (transient s)
+                      to-remove))]
+      ;; Count must match actual elements
+      (let [result (set-seq s2)]
+        (is (= (count result) (count s2))
+            "count must match actual number of elements")
+        (when (seq result)
+          (is (apply < result) "Entries sorted"))
+        (is (validate-tree s2))))))
+
+(defspec transient-ops-with-compacting-processor 100
+  (prop/for-all [elements (gen/vector gen-int 0 100)
+                 ops (gen/vector gen-operation 0 100)]
+    (let [^Comparator cmp (comparator <)
+          settings (Settings. (int 4) nil nil (compacting-processor 2))
+          pss (reduce pss-conj
+                      (PersistentSortedSet. nil cmp nil settings)
+                      elements)
+          final (persistent!
+                 (reduce (fn [t [op v]]
+                           (case op
+                             :add (conj! t v)
+                             :remove (disj! t v)))
+                         (transient pss) ops))
+          result (set-seq final)]
+      (and (validate-tree final)
+           (= (count final) (count (or result [])))
+           (or (nil? result)
+               (empty? result)
+               (apply < result))))))
