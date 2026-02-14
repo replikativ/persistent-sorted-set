@@ -405,14 +405,14 @@
     (let [s (make-set (identity-processor) 8 (range 1 51))]
       ;; Replace entry 25 with 25 (same position, different identity)
       (let [s2 (-> s
-                    (disj 25)
-                    (conj 25))]
+                   (disj 25)
+                   (conj 25))]
         (is (= 50 (count s2)))
         (is (validate-tree s2)))
       ;; Remove 25, add 2500 (different position)
       (let [s3 (-> s
-                    (disj 25)
-                    (conj 2500))]
+                   (disj 25)
+                   (conj 2500))]
         (is (= 50 (count s3)))
         (is (contains? s3 2500))
         (is (not (contains? s3 25)))
@@ -636,38 +636,38 @@
 (defspec structural-invariants-with-identity-processor 100
   (prop/for-all [elements (gen/vector gen-int 0 200)
                  ops (gen/vector gen-operation 0 100)]
-    (let [^Comparator cmp (comparator <)
-          settings (Settings. (int 4) nil nil (identity-processor))
-          pss (reduce pss-conj
-                      (PersistentSortedSet. nil cmp nil settings)
-                      elements)
-          final (reduce (fn [s [op v]]
-                          (case op
-                            :add (pss-conj s v)
-                            :remove (pss-disj s v)))
-                        pss ops)]
-      (validate-tree final))))
+                (let [^Comparator cmp (comparator <)
+                      settings (Settings. (int 4) nil nil (identity-processor))
+                      pss (reduce pss-conj
+                                  (PersistentSortedSet. nil cmp nil settings)
+                                  elements)
+                      final (reduce (fn [s [op v]]
+                                      (case op
+                                        :add (pss-conj s v)
+                                        :remove (pss-disj s v)))
+                                    pss ops)]
+                  (validate-tree final))))
 
 (defspec structural-invariants-with-compacting-processor 100
   (prop/for-all [elements (gen/vector gen-int 0 100)
                  ops (gen/vector gen-operation 0 50)]
-    (let [^Comparator cmp (comparator <)
-          settings (Settings. (int 4) nil nil (compacting-processor 2))
-          pss (reduce pss-conj
-                      (PersistentSortedSet. nil cmp nil settings)
-                      elements)
-          final (reduce (fn [s [op v]]
-                          (case op
-                            :add (pss-conj s v)
-                            :remove (if (.contains ^PersistentSortedSet s v)
-                                      (pss-disj s v)
-                                      s)))
-                        pss ops)]
-      (and (validate-tree final)
-           (let [result (set-seq final)]
-             (or (nil? result)
-                 (empty? result)
-                 (apply < result)))))))
+                (let [^Comparator cmp (comparator <)
+                      settings (Settings. (int 4) nil nil (compacting-processor 2))
+                      pss (reduce pss-conj
+                                  (PersistentSortedSet. nil cmp nil settings)
+                                  elements)
+                      final (reduce (fn [s [op v]]
+                                      (case op
+                                        :add (pss-conj s v)
+                                        :remove (if (.contains ^PersistentSortedSet s v)
+                                                  (pss-disj s v)
+                                                  s)))
+                                    pss ops)]
+                  (and (validate-tree final)
+                       (let [result (set-seq final)]
+                         (or (nil? result)
+                             (empty? result)
+                             (apply < result)))))))
 
 ;; Use spaced values for expanding processor property tests
 (def gen-spaced-int
@@ -679,70 +679,70 @@
 
 (defspec structural-invariants-with-expanding-processor 100
   (prop/for-all [elements (gen/vector gen-spaced-int 0 50)]
-    (let [^Comparator cmp (comparator <)
-          settings (Settings. (int 8) nil nil (expanding-processor 4 2))
-          final (reduce pss-conj
-                        (PersistentSortedSet. nil cmp nil settings)
-                        elements)]
-      (and (validate-tree final)
-           (let [result (set-seq final)]
-             (or (nil? result)
-                 (empty? result)
-                 (apply < result)))))))
+                (let [^Comparator cmp (comparator <)
+                      settings (Settings. (int 8) nil nil (expanding-processor 4 2))
+                      final (reduce pss-conj
+                                    (PersistentSortedSet. nil cmp nil settings)
+                                    elements)]
+                  (and (validate-tree final)
+                       (let [result (set-seq final)]
+                         (or (nil? result)
+                             (empty? result)
+                             (apply < result)))))))
 
 (defspec identity-processor-matches-reference 200
   (prop/for-all [elements (gen/vector gen-int 0 200)
                  ops (gen/vector gen-operation 0 100)]
-    (let [;; Build reference with clojure sorted-set
-          ref-initial (into (sorted-set) elements)
-          ref-final (reduce (fn [s [op v]]
-                              (case op :add (conj s v) :remove (disj s v)))
-                            ref-initial ops)
+                (let [;; Build reference with clojure sorted-set
+                      ref-initial (into (sorted-set) elements)
+                      ref-final (reduce (fn [s [op v]]
+                                          (case op :add (conj s v) :remove (disj s v)))
+                                        ref-initial ops)
           ;; Build processor set
-          ^Comparator cmp (comparator <)
-          settings (Settings. (int 4) nil nil (identity-processor))
-          pss (reduce pss-conj
-                      (PersistentSortedSet. nil cmp nil settings)
-                      elements)
-          pss-final (reduce (fn [s [op v]]
-                              (case op
-                                :add (pss-conj s v)
-                                :remove (pss-disj s v)))
-                            pss ops)]
+                      ^Comparator cmp (comparator <)
+                      settings (Settings. (int 4) nil nil (identity-processor))
+                      pss (reduce pss-conj
+                                  (PersistentSortedSet. nil cmp nil settings)
+                                  elements)
+                      pss-final (reduce (fn [s [op v]]
+                                          (case op
+                                            :add (pss-conj s v)
+                                            :remove (pss-disj s v)))
+                                        pss ops)]
       ;; Identity processor should produce identical results to reference
-      (and (= (vec ref-final) (or (set-seq pss-final) []))
-           (= (count ref-final) (.count ^PersistentSortedSet pss-final))
-           (validate-tree pss-final)))))
+                  (and (= (vec ref-final) (or (set-seq pss-final) []))
+                       (= (count ref-final) (.count ^PersistentSortedSet pss-final))
+                       (validate-tree pss-final)))))
 
 (defspec contains-consistent-after-processor-ops 100
   (prop/for-all [elements (gen/vector gen-int 0 100)
                  test-vals (gen/vector gen-int 0 30)]
-    (let [^Comparator cmp (comparator <)
-          settings (Settings. (int 4) nil nil (identity-processor))
-          pss (reduce pss-conj
-                      (PersistentSortedSet. nil cmp nil settings)
-                      elements)
-          elems-set (set (or (set-seq pss) []))]
-      (every? (fn [v]
-                (= (.contains ^PersistentSortedSet pss v)
-                   (contains? elems-set v)))
-              test-vals))))
+                (let [^Comparator cmp (comparator <)
+                      settings (Settings. (int 4) nil nil (identity-processor))
+                      pss (reduce pss-conj
+                                  (PersistentSortedSet. nil cmp nil settings)
+                                  elements)
+                      elems-set (set (or (set-seq pss) []))]
+                  (every? (fn [v]
+                            (= (.contains ^PersistentSortedSet pss v)
+                               (contains? elems-set v)))
+                          test-vals))))
 
 (defspec transient-on-processor-tree-valid 100
   (prop/for-all [elements (gen/vector gen-int 0 100)
                  ops (gen/vector gen-operation 0 100)]
-    (let [^Comparator cmp (comparator <)
-          settings (Settings. (int 4) nil nil (identity-processor))
-          pss (reduce pss-conj
-                      (PersistentSortedSet. nil cmp nil settings)
-                      elements)
-          final (persistent!
-                 (reduce (fn [t [op v]]
-                           (case op
-                             :add (conj! t v)
-                             :remove (disj! t v)))
-                         (transient pss) ops))]
-      (validate-tree final))))
+                (let [^Comparator cmp (comparator <)
+                      settings (Settings. (int 4) nil nil (identity-processor))
+                      pss (reduce pss-conj
+                                  (PersistentSortedSet. nil cmp nil settings)
+                                  elements)
+                      final (persistent!
+                             (reduce (fn [t [op v]]
+                                       (case op
+                                         :add (conj! t v)
+                                         :remove (disj! t v)))
+                                     (transient pss) ops))]
+                  (validate-tree final))))
 
 ;; =============================================================================
 ;; Transient + processor correctness (processor fires on transient paths)
@@ -814,20 +814,20 @@
 (defspec transient-ops-with-compacting-processor 100
   (prop/for-all [elements (gen/vector gen-int 0 100)
                  ops (gen/vector gen-operation 0 100)]
-    (let [^Comparator cmp (comparator <)
-          settings (Settings. (int 4) nil nil (compacting-processor 2))
-          pss (reduce pss-conj
-                      (PersistentSortedSet. nil cmp nil settings)
-                      elements)
-          final (persistent!
-                 (reduce (fn [t [op v]]
-                           (case op
-                             :add (conj! t v)
-                             :remove (disj! t v)))
-                         (transient pss) ops))
-          result (set-seq final)]
-      (and (validate-tree final)
-           (= (count final) (count (or result [])))
-           (or (nil? result)
-               (empty? result)
-               (apply < result))))))
+                (let [^Comparator cmp (comparator <)
+                      settings (Settings. (int 4) nil nil (compacting-processor 2))
+                      pss (reduce pss-conj
+                                  (PersistentSortedSet. nil cmp nil settings)
+                                  elements)
+                      final (persistent!
+                             (reduce (fn [t [op v]]
+                                       (case op
+                                         :add (conj! t v)
+                                         :remove (disj! t v)))
+                                     (transient pss) ops))
+                      result (set-seq final)]
+                  (and (validate-tree final)
+                       (= (count final) (count (or result [])))
+                       (or (nil? result)
+                           (empty? result)
+                           (apply < result))))))
