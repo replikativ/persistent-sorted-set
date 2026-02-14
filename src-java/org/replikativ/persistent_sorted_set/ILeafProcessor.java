@@ -3,18 +3,17 @@ package org.replikativ.persistent_sorted_set;
 import java.util.*;
 
 /**
- * Optional hook for post-processing leaf contents after add/remove operations.
+ * Optional hook for processing leaf contents during add/remove operations.
  *
- * Allows custom compaction, splitting, or merging of entries based on
- * application-specific logic (e.g., merging small chunks in a columnar index).
+ * The processor is called AFTER the entry is added/removed but BEFORE
+ * the tree's split/merge/borrow decisions. This means the processor
+ * transforms entries, and normal B-tree rebalancing handles the result.
  *
- * The processor is called AFTER normal PSS add/remove logic completes but
- * BEFORE the result is returned to the parent branch. This allows the PSS
- * tree to properly handle any structural changes (splits/merges) that the
- * processor introduces.
+ * Use cases: compacting small adjacent entries, splitting oversized entries
+ * (e.g., chunk management in a columnar index).
  *
- * Performance: If no processor is configured (null), there is ZERO overhead.
- * Only settings with a processor pay the cost of the callback.
+ * Only runs on persistent (non-transient) code paths.
+ * Zero overhead if no processor is configured (null in Settings).
  *
  * @param <Key> The type of keys stored in the set
  */

@@ -95,52 +95,44 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       }
     }
 
-    // simply adding to array
-    if (_len < _settings.branchingFactor()) {
-      Leaf n = new Leaf(_len + 1, settings);
-      new Stitch(n._keys, 0)
-        .copyAll(_keys, 0, ins)
-        .copyOne(key)
-        .copyAll(_keys, ins, _len);
+    // Build complete entries with new key inserted
+    Key[] allKeys = (Key[]) new Object[_len + 1];
+    new Stitch(allKeys, 0)
+      .copyAll(_keys, 0, ins)
+      .copyOne(key)
+      .copyAll(_keys, ins, _len);
+    int totalLen = _len + 1;
+
+    // Run processor if configured
+    ILeafProcessor processor = settings.leafProcessor();
+    if (processor != null && processor.shouldProcess(totalLen, settings)) {
+      List<Key> processed = processor.processLeaf(Arrays.asList(allKeys), storage, settings);
+      totalLen = processed.size();
+      allKeys = (Key[]) new Object[totalLen];
+      for (int i = 0; i < totalLen; i++) {
+        allKeys[i] = processed.get(i);
+      }
+    }
+
+    // Fits in single leaf
+    if (totalLen <= settings.branchingFactor()) {
+      Leaf n = new Leaf(totalLen, allKeys, settings);
       if (_measure != null) {
         n._measure = n.tryComputeMeasure(storage);
       }
-      return processLeafNodes(new ANode[]{n}, storage, settings);
+      return new ANode[]{n};
     }
 
-    // splitting
-    int half1 = (_len + 1) >>> 1,
-        half2 = _len + 1 - half1;
-
-    // goes to first half
-    if (ins < half1) {
-      Leaf n1 = new Leaf(half1, settings),
-           n2 = new Leaf(half2, settings);
-      new Stitch(n1._keys, 0)
-        .copyAll(_keys, 0, ins)
-        .copyOne(key)
-        .copyAll(_keys, ins, half1 - 1);
-      ArrayUtil.copy(_keys, half1 - 1, _len, n2._keys, 0);
-      if (_measure != null) {
-        n1._measure = n1.tryComputeMeasure(storage);
-        n2._measure = n2.tryComputeMeasure(storage);
-      }
-      return processLeafNodes(new ANode[]{n1, n2}, storage, settings);
-    }
-
-    // copy first, insert to second
-    Leaf n1 = new Leaf(half1, settings),
-         n2 = new Leaf(half2, settings);
-    ArrayUtil.copy(_keys, 0, half1, n1._keys, 0);
-    new Stitch(n2._keys, 0)
-      .copyAll(_keys, half1, ins)
-      .copyOne(key)
-      .copyAll(_keys, ins, _len);
+    // Split into two leaves
+    int half1 = totalLen >>> 1, half2 = totalLen - half1;
+    Leaf n1 = new Leaf(half1, settings), n2 = new Leaf(half2, settings);
+    ArrayUtil.copy(allKeys, 0, half1, n1._keys, 0);
+    ArrayUtil.copy(allKeys, half1, totalLen, n2._keys, 0);
     if (_measure != null) {
       n1._measure = n1.tryComputeMeasure(storage);
       n2._measure = n2.tryComputeMeasure(storage);
     }
-    return processLeafNodes(new ANode[]{n1, n2}, storage, settings);
+    return new ANode[]{n1, n2};
   }
 
   @Override
@@ -156,115 +148,92 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     IMeasure measureOps = _settings.measure();
     final Leaf thisLeaf = this;
 
-    // nothing to merge
-    if (newLen >= _settings.minBranchingFactor() || (left == null && right == null)) {
-
-      // transient, can edit in place
-      if (editable()) {
-        ArrayUtil.copy(_keys, idx + 1, _len, _keys, idx);
-        _len = newLen;
-        // Update stats using remove operation only if already computed
-        if (measureOps != null && _measure != null) {
-          _measure = measureOps.remove(_measure, key, () -> thisLeaf.tryComputeMeasure(storage));
-        }
-        if (idx == newLen) // removed last, need to signal new maxKey
-          return new ANode[]{left, this, right};
-        return PersistentSortedSet.EARLY_EXIT;
+    // nothing to merge — transient, can edit in place
+    if (editable() && (newLen >= _settings.minBranchingFactor() || (left == null && right == null))) {
+      ArrayUtil.copy(_keys, idx + 1, _len, _keys, idx);
+      _len = newLen;
+      if (measureOps != null && _measure != null) {
+        _measure = measureOps.remove(_measure, key, () -> thisLeaf.tryComputeMeasure(storage));
       }
+      if (idx == newLen) // removed last, need to signal new maxKey
+        return new ANode[]{left, this, right};
+      return PersistentSortedSet.EARLY_EXIT;
+    }
 
-      // persistent
-      Leaf center = new Leaf(newLen, settings);
-      new Stitch(center._keys, 0)
-        .copyAll(_keys, 0, idx)
-        .copyAll(_keys, idx + 1, _len);
+    // Build center entries (this leaf minus removed key)
+    Key[] centerKeys = (Key[]) new Object[newLen];
+    new Stitch(centerKeys, 0)
+      .copyAll(_keys, 0, idx)
+      .copyAll(_keys, idx + 1, _len);
+    int centerLen = newLen;
+
+    // Run processor if configured (persistent path only)
+    ILeafProcessor processor = settings.leafProcessor();
+    if (!editable() && processor != null && processor.shouldProcess(centerLen, settings)) {
+      List<Key> processed = processor.processLeaf(Arrays.asList(centerKeys), storage, settings);
+      centerLen = processed.size();
+      centerKeys = (Key[]) new Object[centerLen];
+      for (int i = 0; i < centerLen; i++) {
+        centerKeys[i] = processed.get(i);
+      }
+    }
+
+    // nothing to merge
+    if (centerLen >= _settings.minBranchingFactor() || (left == null && right == null)) {
+      Leaf center = new Leaf(Math.max(centerLen, 0), centerKeys, settings);
       if (_measure != null) {
         center._measure = center.tryComputeMeasure(storage);
       }
-
-      // Process the center leaf (compaction may reduce entries)
-      Leaf[] processed = processSingleLeaf(center, storage, settings);
-      if (processed.length == 1) {
-        return new ANode[] { left, processed[0], right };
-      } else if (processed.length == 0) {
-        return new ANode[] { left, null, right };
-      } else {
-        throw new IllegalStateException(
-          "processSingleLeaf returned " + processed.length + " leaves, expected 0 or 1");
-      }
+      return new ANode[] { left, center, right };
     }
 
     // can join with left
-    if (left != null && left._len + newLen <= _settings.branchingFactor()) {
-      Leaf join = new Leaf(left._len + newLen, settings);
+    if (left != null && left._len + centerLen <= _settings.branchingFactor()) {
+      Leaf join = new Leaf(left._len + centerLen, settings);
       new Stitch(join._keys, 0)
-        .copyAll(left._keys, 0,       left._len)
-        .copyAll(_keys,      0,       idx)
-        .copyAll(_keys,      idx + 1, _len);
+        .copyAll(left._keys,  0, left._len)
+        .copyAll(centerKeys,  0, centerLen);
       if (_measure != null) {
         join._measure = join.tryComputeMeasure(storage);
       }
-
-      // Process the joined leaf (compaction may reduce entries)
-      Leaf[] processed = processSingleLeaf(join, storage, settings);
-      if (processed.length == 1) {
-        return new ANode[] { null, processed[0], right };
-      } else if (processed.length == 0) {
-        return new ANode[] { null, null, right };
-      } else {
-        throw new IllegalStateException(
-          "processSingleLeaf returned " + processed.length + " leaves, expected 0 or 1");
-      }
+      return new ANode[] { null, join, right };
     }
 
     // can join with right
-    if (right != null && newLen + right.len() <= _settings.branchingFactor()) {
-      Leaf join = new Leaf(newLen + right._len, settings);
+    if (right != null && centerLen + right.len() <= _settings.branchingFactor()) {
+      Leaf join = new Leaf(centerLen + right._len, settings);
       new Stitch(join._keys, 0)
-        .copyAll(_keys,       0,       idx)
-        .copyAll(_keys,       idx + 1, _len)
-        .copyAll(right._keys, 0,       right._len);
+        .copyAll(centerKeys,  0, centerLen)
+        .copyAll(right._keys, 0, right._len);
       if (_measure != null) {
         join._measure = join.tryComputeMeasure(storage);
       }
-
-      // Process the joined leaf (compaction may reduce entries)
-      Leaf[] processed = processSingleLeaf(join, storage, settings);
-      if (processed.length == 1) {
-        return new ANode[]{ left, processed[0], null };
-      } else if (processed.length == 0) {
-        return new ANode[]{ left, null, null };
-      } else {
-        throw new IllegalStateException(
-          "processSingleLeaf returned " + processed.length + " leaves, expected 0 or 1");
-      }
+      return new ANode[]{ left, join, null };
     }
 
     // borrow from left
     if (left != null && (left.editable() || right == null || left._len >= right._len)) {
-      int totalLen     = left._len + newLen,
+      int totalLen     = left._len + centerLen,
           newLeftLen   = totalLen >>> 1,
-          newCenterLen = totalLen - newLeftLen,
-          leftTail     = left._len - newLeftLen;
+          newCenterLen = totalLen - newLeftLen;
 
       Leaf newLeft, newCenter;
 
-      // prepend to center
+      // prepend left tail to center
       if (editable() && newCenterLen <= _keys.length) {
+        int leftTail = left._len - newLeftLen;
         newCenter = this;
-        ArrayUtil.copy(_keys,      idx + 1,    _len,     _keys, leftTail + idx);
-        ArrayUtil.copy(_keys,      0,          idx,      _keys, leftTail);
+        ArrayUtil.copy(centerKeys,  0, centerLen, _keys, leftTail);
         ArrayUtil.copy(left._keys, newLeftLen, left._len, _keys, 0);
         _len = newCenterLen;
-        // Recompute stats since we borrowed from left
         if (measureOps != null && _measure != null) {
           newCenter._measure = newCenter.tryComputeMeasure(storage);
         }
       } else {
         newCenter = new Leaf(newCenterLen, settings);
         new Stitch(newCenter._keys, 0)
-          .copyAll(left._keys, newLeftLen, left._len)
-          .copyAll(_keys,      0,          idx)
-          .copyAll(_keys,      idx+1,      _len);
+          .copyAll(left._keys,  newLeftLen, left._len)
+          .copyAll(centerKeys,  0,          centerLen);
         if (_measure != null) {
           newCenter._measure = newCenter.tryComputeMeasure(storage);
         }
@@ -274,7 +243,6 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       if (left.editable()) {
         newLeft  = left;
         left._len = newLeftLen;
-        // Recompute stats for shrunk left
         if (measureOps != null && _measure != null) {
           newLeft._measure = newLeft.tryComputeMeasure(storage);
         }
@@ -291,30 +259,27 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
 
     // borrow from right
     if (right != null) {
-      int totalLen     = newLen + right._len,
+      int totalLen     = centerLen + right._len,
           newCenterLen = totalLen >>> 1,
           newRightLen  = totalLen - newCenterLen,
           rightHead    = right._len - newRightLen;
 
       Leaf newCenter, newRight;
 
-      // append to center
+      // append right head to center
       if (editable() && newCenterLen <= _keys.length) {
         newCenter = this;
-        new Stitch(_keys, idx)
-          .copyAll(_keys,       idx + 1, _len)
-          .copyAll(right._keys, 0,       rightHead);
+        ArrayUtil.copy(centerKeys,  0, centerLen, _keys, 0);
+        ArrayUtil.copy(right._keys, 0, rightHead, _keys, centerLen);
         _len = newCenterLen;
-        // Recompute stats since we borrowed from right
         if (measureOps != null && _measure != null) {
           newCenter._measure = newCenter.tryComputeMeasure(storage);
         }
       } else {
         newCenter = new Leaf(newCenterLen, settings);
         new Stitch(newCenter._keys, 0)
-          .copyAll(_keys,       0,       idx)
-          .copyAll(_keys,       idx + 1, _len)
-          .copyAll(right._keys, 0,       rightHead);
+          .copyAll(centerKeys,  0, centerLen)
+          .copyAll(right._keys, 0, rightHead);
         if (_measure != null) {
           newCenter._measure = newCenter.tryComputeMeasure(storage);
         }
@@ -325,7 +290,6 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         newRight = right;
         ArrayUtil.copy(right._keys, rightHead, right._len, right._keys, 0);
         right._len = newRightLen;
-        // Recompute stats for shrunk right
         if (measureOps != null && _measure != null) {
           newRight._measure = newRight.tryComputeMeasure(storage);
         }
@@ -405,163 +369,4 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     sb.append("Leaf   addr: " + address + " len: " + _len + " ");
   }
 
-  /**
-   * Post-process a single leaf through ILeafProcessor if configured.
-   *
-   * Used for remove operations where we only want to process the center node.
-   * Zero overhead if no processor is configured.
-   *
-   * @param leaf The leaf to process
-   * @param storage The storage backend
-   * @param settings The settings (contains processor)
-   * @return Processed leaf (may be split into multiple)
-   */
-  @SuppressWarnings("unchecked")
-  private static <Key, Address> Leaf[] processSingleLeaf(
-      Leaf<Key, Address> leaf,
-      IStorage storage,
-      Settings settings) {
-
-    ILeafProcessor processor = settings.leafProcessor();
-
-    // Zero-cost early exit if no processor configured
-    if (processor == null) {
-      return new Leaf[]{ leaf };
-    }
-
-    // Check if processing is needed (avoid allocation if not)
-    if (!processor.shouldProcess(leaf._len, settings)) {
-      return new Leaf[]{ leaf };
-    }
-
-    // Convert leaf keys to list for processing
-    List<Key> entries = Arrays.asList(Arrays.copyOfRange(leaf._keys, 0, leaf._len));
-
-    // Call processor
-    List<Key> processed = processor.processLeaf(entries, storage, settings);
-
-    // If same size and same content, no changes needed
-    if (processed.size() == leaf._len && processed.equals(entries)) {
-      return new Leaf[]{ leaf };
-    }
-
-    // Rebuild leaf(s) from processed entries
-    int processedSize = processed.size();
-
-    if (processedSize == 0) {
-      // All entries removed
-      return new Leaf[0];
-    } else if (processedSize <= settings.branchingFactor()) {
-      // Fits in single leaf
-      Leaf<Key, Address> newLeaf = new Leaf<>(processedSize, settings);
-      for (int i = 0; i < processedSize; i++) {
-        newLeaf._keys[i] = processed.get(i);
-      }
-      if (leaf._measure != null) {
-        newLeaf._measure = newLeaf.tryComputeMeasure(storage);
-      }
-      return new Leaf[]{ newLeaf };
-    } else {
-      // Processor expanded entries beyond branchingFactor — not supported.
-      // ILeafProcessor is designed for compaction (reducing entries), not expansion.
-      throw new IllegalStateException(
-        "ILeafProcessor returned " + processedSize + " entries, exceeding branchingFactor " +
-        settings.branchingFactor() + ". Processors must not expand entries beyond branchingFactor.");
-    }
-  }
-
-  /**
-   * Post-process leaf nodes through ILeafProcessor if configured.
-   *
-   * This is called AFTER add/remove logic completes but BEFORE returning
-   * to the parent branch. Allows custom compaction/splitting of entries.
-   *
-   * Zero overhead if no processor is configured (_leafProcessor == null).
-   *
-   * @param nodes The result from add/remove (array of 1-3 nodes)
-   * @param storage The storage backend
-   * @param settings The settings (contains processor)
-   * @return Processed nodes (may be split/merged differently)
-   */
-  @SuppressWarnings("unchecked")
-  private static <Key, Address> ANode[] processLeafNodes(
-      ANode[] nodes,
-      IStorage storage,
-      Settings settings) {
-
-    ILeafProcessor processor = settings.leafProcessor();
-
-    // Zero-cost early exit if no processor configured
-    if (processor == null) {
-      return nodes;
-    }
-
-    // Handle special return values (unchanged, early exit)
-    if (nodes == PersistentSortedSet.UNCHANGED || nodes == PersistentSortedSet.EARLY_EXIT) {
-      return nodes;
-    }
-
-    // Process each leaf node
-    List<Leaf<Key, Address>> processedLeaves = new ArrayList<>();
-
-    for (ANode node : nodes) {
-      if (node == null) {
-        // Preserve nulls (used in remove for signaling merges)
-        processedLeaves.add(null);
-        continue;
-      }
-
-      // Only process Leaf nodes (branches are handled separately)
-      if (!(node instanceof Leaf)) {
-        return nodes;  // Shouldn't happen in leaf operations, but be safe
-      }
-
-      Leaf<Key, Address> leaf = (Leaf<Key, Address>) node;
-
-      // Check if processing is needed (avoid allocation if not)
-      if (!processor.shouldProcess(leaf._len, settings)) {
-        processedLeaves.add(leaf);
-        continue;
-      }
-
-      // Convert leaf keys to list for processing
-      List<Key> entries = Arrays.asList(Arrays.copyOfRange(leaf._keys, 0, leaf._len));
-
-      // Call processor
-      List<Key> processed = processor.processLeaf(entries, storage, settings);
-
-      // If same size and same content, no changes needed
-      if (processed.size() == leaf._len && processed.equals(entries)) {
-        processedLeaves.add(leaf);
-        continue;
-      }
-
-      // Rebuild leaf(s) from processed entries
-      int processedSize = processed.size();
-
-      if (processedSize == 0) {
-        // All entries removed - signal by adding null (will be handled by parent)
-        processedLeaves.add(null);
-      } else if (processedSize <= settings.branchingFactor()) {
-        // Fits in single leaf
-        Leaf<Key, Address> newLeaf = new Leaf<>(processedSize, settings);
-        for (int i = 0; i < processedSize; i++) {
-          newLeaf._keys[i] = processed.get(i);
-        }
-        if (leaf._measure != null) {
-          newLeaf._measure = newLeaf.tryComputeMeasure(storage);
-        }
-        processedLeaves.add(newLeaf);
-      } else {
-        // Processor expanded entries beyond branchingFactor — not supported.
-        // ILeafProcessor is designed for compaction (reducing entries), not expansion.
-        throw new IllegalStateException(
-          "ILeafProcessor returned " + processedSize + " entries, exceeding branchingFactor " +
-          settings.branchingFactor() + ". Processors must not expand entries beyond branchingFactor.");
-      }
-    }
-
-    // Each input node produces exactly one entry (leaf or null), so count is preserved
-    return processedLeaves.toArray(new ANode[processedLeaves.size()]);
-  }
 }

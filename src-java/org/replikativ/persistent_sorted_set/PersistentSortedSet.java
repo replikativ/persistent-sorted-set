@@ -459,8 +459,11 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       return this;
     }
 
+    // Processor may change entry count — use lazy count (-1) when processor is set
+    int newCount = (_settings.leafProcessor() != null) ? -1 : alterCount(1);
+
     if (1 == nodes.length)
-      return new PersistentSortedSet(_meta, _cmp, null, _storage, nodes[0], alterCount(1), _settings, _version + 1);
+      return new PersistentSortedSet(_meta, _cmp, null, _storage, nodes[0], newCount, _settings, _version + 1);
 
     Object[] keys = new Object[] {nodes[0].maxKey(), nodes[1].maxKey()};
     Object[] children = Arrays.copyOf(nodes, nodes.length, new Object[0].getClass());
@@ -469,7 +472,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     // Compute measure for new root
     Object measure = computeMeasureFromChildren(nodes);
     ANode newRoot = new Branch(nodes[0].level() + 1, 2, keys, null, children, subtreeCount, measure, _settings);
-    return new PersistentSortedSet(_meta, _cmp, null, _storage, newRoot, alterCount(1), _settings, _version + 1);
+    return new PersistentSortedSet(_meta, _cmp, null, _storage, newRoot, newCount, _settings, _version + 1);
   }
 
   // IPersistentSet
@@ -508,11 +511,13 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       _version += 1;
       return this;
     }
+    // Processor may change entry count — use lazy count (-1) when processor is set
+    int newCount = (_settings.leafProcessor() != null) ? -1 : alterCount(-1);
     if (newRoot instanceof Branch && newRoot._len == 1) {
       newRoot = ((Branch) newRoot).child(_storage, 0);
-      return new PersistentSortedSet(_meta, _cmp, null, _storage, newRoot, alterCount(-1), _settings, _version + 1);
+      return new PersistentSortedSet(_meta, _cmp, null, _storage, newRoot, newCount, _settings, _version + 1);
     }
-    return new PersistentSortedSet(_meta, _cmp, null, _storage, newRoot, alterCount(-1), _settings, _version + 1);
+    return new PersistentSortedSet(_meta, _cmp, null, _storage, newRoot, newCount, _settings, _version + 1);
   }
 
   /**
