@@ -11,8 +11,8 @@
 #?(:cljs
    (defn ^array make-array [size] (js/Array. size))
    :clj
-   (defn make-array ^{:tag "[[Ljava.lang.Object;"} [size]
-     (clojure.core/make-array java.lang.Object size)))
+   (defn make-array ^{:tag "[Ljava.lang.Object;"} [size]
+     (object-array size)))
 
 #?(:cljs
    (defn ^array into-array [aseq]
@@ -46,11 +46,12 @@
               (->
                (list* 'js* (str "[" (str/join "," (repeat (count args) "~{}")) "]") args)
                (vary-meta assoc :tag 'array))
-              (let [len (count args)]
+              (let [len (count args)
+                    arr (with-meta (gensym "arr") {:tag "[Ljava.lang.Object;"})]
                 (if (zero? len)
                   'clojure.lang.RT/EMPTY_ARRAY
-                  `(let [arr# (clojure.core/make-array java.lang.Object ~len)]
-                     (doto ^{:tag "[[Ljava.lang.Object;"} arr#
+                  `(let [~arr (object-array ~len)]
+                     (doto ~arr
                        ~@(map #(list 'aset % (nth args %)) (range len)))))))))
 
 #?(:clj
@@ -83,7 +84,7 @@
      ([f arr]
       (amap f Object arr))
      ([f type arr] ;; TODO check if faster in Java
-      (let [res (clojure.core/make-array type (alength arr))]
+      (let [res (object-array (alength arr))]
         (dotimes [i (alength arr)]
           (aset res i (f (aget arr i))))
         res))))
