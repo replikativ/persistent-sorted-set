@@ -22,6 +22,13 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     this(keys.size(), (Key[]) keys.toArray(), settings);
   }
 
+  private static <K> boolean isSorted(List<K> list, Comparator<K> cmp) {
+    for (int i = 1; i < list.size(); i++) {
+      if (cmp.compare(list.get(i - 1), list.get(i)) >= 0) return false;
+    }
+    return true;
+  }
+
   @Override
   public int level() {
     return 0;
@@ -107,6 +114,8 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     ILeafProcessor processor = settings.leafProcessor();
     if (processor != null && processor.shouldProcess(totalLen, settings)) {
       List<Key> processed = processor.processLeaf(Arrays.asList(allKeys), storage, settings);
+      assert processed.size() > 0 : "ILeafProcessor.processLeaf must return at least one entry";
+      assert isSorted(processed, cmp) : "ILeafProcessor.processLeaf must return entries in sorted order";
       totalLen = processed.size();
       allKeys = (Key[]) new Object[totalLen];
       for (int i = 0; i < totalLen; i++) {
@@ -180,6 +189,11 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     ILeafProcessor processor = settings.leafProcessor();
     if (!editable() && processor != null && processor.shouldProcess(centerLen, settings)) {
       List<Key> processed = processor.processLeaf(Arrays.asList(centerKeys), storage, settings);
+      assert processed.size() > 0 : "ILeafProcessor.processLeaf must return at least one entry";
+      assert isSorted(processed, cmp) : "ILeafProcessor.processLeaf must return entries in sorted order";
+      assert processed.size() <= settings.branchingFactor()
+          : "ILeafProcessor.processLeaf must not expand beyond branchingFactor during remove (got "
+            + processed.size() + ", max " + settings.branchingFactor() + ")";
       centerLen = processed.size();
       centerKeys = (Key[]) new Object[centerLen];
       for (int i = 0; i < centerLen; i++) {

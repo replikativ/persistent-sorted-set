@@ -415,9 +415,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
     Object[] allChildren = new Object[newLen];
     Stitch cs = new Stitch(allChildren, 0);
-    cs.copyAll(_children, 0, ins);
+    Object[] existingChildren = _children != null ? _children : ensureChildren();
+    cs.copyAll(existingChildren, 0, ins);
     for (int i = 0; i < nodes.length; i++) cs.copyOne(nodes[i]);
-    cs.copyAll(_children, ins + 1, _len);
+    cs.copyAll(existingChildren, ins + 1, _len);
 
     Address[] allAddresses = null;
     if (_addresses != null) {
@@ -497,6 +498,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       return PersistentSortedSet.EARLY_EXIT;
     }
 
+    // Child.remove() always returns exactly 3 elements: [left, center, right].
+    // The processor cannot expand during remove (asserted in Leaf.remove), so
+    // the center is always a single node and this convention is safe.
+    assert nodes.length == 3 : "child.remove() must return exactly 3 elements, got " + nodes.length;
     boolean leftChanged = leftChild != nodes[0] || leftChildLen != safeLen(nodes[0]);
     boolean rightChanged = rightChild != nodes[2] || rightChildLen != safeLen(nodes[2]);
 
