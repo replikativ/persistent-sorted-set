@@ -44,12 +44,13 @@ import java.util.*;
 public interface ILeafProcessor<Key> {
 
   /**
-   * Process leaf entries after an add or remove operation.
+   * Process leaf entries after an add or remove operation, with position hint.
    *
-   * <p>The processor can compact (return fewer entries) or, during add only,
-   * expand (return more entries). The tree handles rebalancing automatically:
-   * splits if the result exceeds branchingFactor, merges/borrows if it falls
-   * below minBranchingFactor.
+   * <p>The {@code modifiedIndex} indicates where the modification occurred in the
+   * entries list: for add, it's the position of the newly inserted entry; for remove,
+   * it's the position where the removed entry was (clamped to the last valid index).
+   * Processors can use this to only check the immediate neighbors of the modification
+   * point instead of scanning the entire leaf — turning O(leaf-size) into O(1).
    *
    * <p><b>Contract:</b>
    * <ul>
@@ -57,6 +58,22 @@ public interface ILeafProcessor<Key> {
    *   <li>Entries must be in strictly ascending sorted order per the tree's comparator</li>
    *   <li>During remove: must not return more than {@code settings.branchingFactor()} entries</li>
    * </ul>
+   *
+   * @param entries The leaf entries after add/remove, in sorted order
+   * @param modifiedIndex Index in entries at or near the modification point
+   * @param storage The storage backend (may be null for in-memory sets)
+   * @param settings The settings for this tree (contains branching factor, etc.)
+   * @return List of processed entries in sorted order, never empty
+   */
+  default List<Key> processLeaf(List<Key> entries, int modifiedIndex, IStorage storage, Settings settings) {
+    return processLeaf(entries, storage, settings);
+  }
+
+  /**
+   * Process leaf entries after an add or remove operation.
+   *
+   * <p>Deprecated in favor of the 4-arg overload with {@code modifiedIndex}.
+   * Override the 4-arg version for O(1) targeted processing.
    *
    * @param entries The leaf entries after add/remove, in sorted order
    * @param storage The storage backend (may be null for in-memory sets)

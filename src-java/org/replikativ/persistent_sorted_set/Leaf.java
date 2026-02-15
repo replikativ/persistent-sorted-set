@@ -117,7 +117,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
 
     // Run processor if configured
     if (processor != null && processor.shouldProcess(totalLen, settings)) {
-      List<Key> processed = processor.processLeaf(Arrays.asList(allKeys), storage, settings);
+      List<Key> processed = processor.processLeaf(Arrays.asList(allKeys), ins, storage, settings);
       assert processed.size() > 0 : "ILeafProcessor.processLeaf must return at least one entry";
       assert isSorted(processed, cmp) : "ILeafProcessor.processLeaf must return entries in sorted order";
       totalLen = processed.size();
@@ -195,7 +195,10 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
 
     // Run processor if configured
     if (processorWillFire) {
-      List<Key> processed = processor.processLeaf(Arrays.asList(centerKeys), storage, settings);
+      // For remove, idx is the position in the original array. In centerKeys
+      // (which has the entry removed), the neighbors are at idx-1 and idx.
+      int modifiedIndex = Math.min(idx, centerLen - 1);
+      List<Key> processed = processor.processLeaf(Arrays.asList(centerKeys), modifiedIndex, storage, settings);
       assert processed.size() > 0 : "ILeafProcessor.processLeaf must return at least one entry";
       assert isSorted(processed, cmp) : "ILeafProcessor.processLeaf must return entries in sorted order";
       assert processed.size() <= settings.branchingFactor()
