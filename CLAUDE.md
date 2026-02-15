@@ -82,14 +82,14 @@ rm -rf target
 
 ### Core Components
 
-1. **Java Implementation** (`src-java/me/tonsky/persistent_sorted_set/`)
+1. **Java Implementation** (`src-java/org/replikativ/persistent_sorted_set/`)
    - `APersistentSortedSet.java` - Abstract base class
    - `PersistentSortedSet.java` - Main implementation
    - `ANode.java`, `Branch.java`, `Leaf.java` - B-tree node structure
    - `IStorage.java` - Interface for persistent storage
    - `Settings.java` - Configuration (branching factor, reference types)
 
-2. **Clojure/ClojureScript API** (`src-clojure/me/tonsky/persistent_sorted_set/`)
+2. **Clojure/ClojureScript API** (`src-clojure/org/replikativ/persistent_sorted_set/`)
    - Public API functions: `sorted-set`, `sorted-set-by`, `conj`, `disj`, `slice`, `rslice`, `seek`
    - Storage operations: `store`, `restore`, `walk-addresses`
    - Utility namespace: `arrays.cljc` for cross-platform array operations
@@ -112,7 +112,7 @@ rm -rf target
 
 ### Testing Structure
 
-Tests are located in `test-clojure/me/tonsky/persistent_sorted_set/test/`:
+Tests are located in `test-clojure/org/replikativ/persistent_sorted_set/test/`:
 - `core.cljc` - Main test suite
 - `small.cljc` - Focused tests for specific cases
 - `storage.clj` - Storage interface tests (Clojure only)
@@ -123,3 +123,7 @@ Tests are located in `test-clojure/me/tonsky/persistent_sorted_set/test/`:
 - Java 8 is required for building due to bootclasspath requirements
 - The set cannot store `nil` values (unlike `clojure.core/sorted-set`)
 - ClojureScript version does not yet support the storage/durability features
+
+### Test Failures Are Critical
+
+This is a data structure library — correctness is paramount. **Any test failure that indicates a potential correctness error MUST be investigated and fixed before proceeding.** Do not skip, ignore, or dismiss failing tests. A failing generative/property-based test means the data structure may be producing wrong results, which can silently corrupt user data. If a test hangs during shrinking, that itself indicates a real failure that triggered the shrink. Always wait for tests to complete on both CLJ and CLJS before considering a change done.

@@ -35,7 +35,7 @@ The version follows the pattern `0.3.{commit-count}` and is automatically increm
 Code:
 
 ```clj
-(require '[me.tonsky.persistent-sorted-set :as set])
+(require '[org.replikativ.persistent-sorted-set :as set])
 
 (set/sorted-set 3 2 1)
 ;=> #{1 2 3}
@@ -240,11 +240,215 @@ Last piece of the puzzle: `set/walk-addresses`. Use it to check which nodes are 
   @*alive-addresses)
 ```
 
-See [test_storage.clj](test-clojure/me/tonsky/persistent_sorted_set/test_storage.clj) for more examples.
+See [test_storage.clj](test-clojure/org/replikativ/persistent_sorted_set/test_storage.clj) for more examples.
 
 ### ClojureScript Durability
 
 ClojureScript also supports durable storage with async operations. The `IStorage` interface works the same way, but `store` and `restore` methods return promises/async values instead of direct values. This allows integration with IndexedDB, remote storage APIs, and other async storage backends.
+
+## Efficient Range Counting
+
+Count elements in a range without iterating through them:
+
+```clj
+(def s (into (set/sorted-set) (range 10000)))
+
+;; Count elements in [1000, 2000]
+(set/count-slice s 1000 2000)
+;=> 1001
+
+;; Count from beginning to 500
+(set/count-slice s nil 500)
+;=> 501
+
+;; Count from 9000 to end
+(set/count-slice s 9000 nil)
+;=> 1000
+
+;; Use custom comparator
+(set/count-slice s 1000 2000 my-comparator)
+```
+
+This uses O(log n) traversal by leveraging subtree counts stored in branch nodes.
+
+## Rank-Based Access (getNth)
+
+Access elements by their position (rank) in O(log n) time, enabling efficient percentile and quantile queries:
+
+```clj
+(def s (into (set/sorted-set* {:measure (NumericStatsOps.)})
+             (range 1000)))
+
+;; Get median (50th percentile) - O(log n)
+(set/get-nth s 500)
+;=> [500 0]  ; [value local-offset]
+
+;; Get 95th percentile
+(set/get-nth s 950)
+;=> [950 0]
+
+;; Helper function for percentiles
+(defn percentile [s p]
+  (let [n (count s)
+        rank (long (* n p))]
+    (first (set/get-nth s rank))))
+
+(percentile s 0.5)   ;=> 500  (median)
+(percentile s 0.95)  ;=> 950  (95th percentile)
+(percentile s 0.25)  ;=> 250  (first quartile)
+```
+
+`get-nth` returns `[entry local-offset]` where `local-offset` is useful for weighted statistics (each entry can represent multiple elements). Returns `nil` if the rank is out of bounds.
+
+**Requirements:** Must configure `:measure` with a `weight` implementation. The built-in `NumericStatsOps` uses count as weight (each element has weight 1).
+
+**Use cases:**
+- **Percentile queries:** Median, quartiles, deciles for statistical analysis
+- **Outlier detection:** Use IQR (Q3 - Q1) with Tukey's fences
+- **Quantile regression:** Fit models at different percentiles
+- **Weighted sampling:** Importance sampling for Monte Carlo methods
+- **CDF evaluation:** Empirical cumulative distribution functions
+
+### ClojureScript
+
+ClojureScript provides the same `get-nth` API:
+
+```cljs
+(require '[org.replikativ.persistent-sorted-set :as set])
+(require '[org.replikativ.persistent-sorted-set.impl.numeric-stats :as nstats])
+
+(def s (into (set/sorted-set* {:measure nstats/numeric-stats-ops})
+             (range 1000)))
+
+(set/get-nth s 500)
+;=> [500 0]
+```
+
+Both sync and async modes are supported via the `:sync?` option.
+
+## Aggregate Statistics
+
+PersistentSortedSet can maintain aggregate statistics that update incrementally as elements are added or removed. This enables O(log n) queries for sum, count, min, max, variance, etc. over any range.
+
+### Using Built-in Numeric Statistics
+
+```clj
+(import '[org.replikativ.persistent_sorted_set NumericStatsOps])
+
+;; Create set with numeric stats tracking
+(def s (into (set/sorted-set* {:measure (NumericStatsOps.)})
+             [1 2 3 4 5]))
+
+;; Get measure for entire set
+(set/measure s)
+;=> NumericStats{count=5, sum=15.0, min=1, max=5, ...}
+
+;; Get measure for a range [2, 4]
+(set/measure-slice s 2 4)
+;=> NumericStats{count=3, sum=9.0, min=2, max=4, ...}
+```
+
+The `NumericStats` object provides `count`, `sum`, `sumSq`, `min`, `max`, plus derived `mean()`, `variance()`, and `stdDev()` methods.
+
+### Implementing Custom Statistics
+
+Statistics must form a **monoid** - they need an identity element and an associative merge operation. Implement the `IMeasure` interface:
+
+```java
+public interface IMeasure<Key, S> {
+    // Identity element: merge(identity, x) == x
+    S identity();
+
+    // Extract measure from a single key
+    S extract(Key key);
+
+    // Associative merge: merge(a, merge(b, c)) == merge(merge(a, b), c)
+    S merge(S s1, S s2);
+
+    // Remove a key's contribution (see below)
+    S remove(S current, Key key, Supplier<S> recompute);
+}
+```
+
+**Example: Counting distinct categories**
+
+```java
+public class CategoryStats implements IMeasure<Item, Map<String, Long>> {
+    public Map<String, Long> identity() {
+        return Collections.emptyMap();
+    }
+
+    public Map<String, Long> extract(Item item) {
+        return Map.of(item.category(), 1L);
+    }
+
+    public Map<String, Long> merge(Map<String, Long> a, Map<String, Long> b) {
+        Map<String, Long> result = new HashMap<>(a);
+        b.forEach((k, v) -> result.merge(k, v, Long::sum));
+        return result;
+    }
+
+    public Map<String, Long> remove(Map<String, Long> current, Item item,
+                                     Supplier<Map<String, Long>> recompute) {
+        // For invertible stats, compute directly
+        Map<String, Long> result = new HashMap<>(current);
+        result.computeIfPresent(item.category(), (k, v) -> v > 1 ? v - 1 : null);
+        return result;
+    }
+}
+```
+
+### Handling Non-Invertible Statistics
+
+Some statistics like `min` and `max` can't be updated incrementally when removing elements - if you remove the minimum, you need to scan to find the new one. The `remove` method receives a `recompute` supplier for this:
+
+```java
+public S remove(S current, Key key, Supplier<S> recompute) {
+    if (affectsResult(current, key)) {
+        // Can't compute incrementally, recompute from children
+        return recompute.get();
+    }
+    // Safe to compute incrementally
+    return subtractKey(current, key);
+}
+```
+
+The built-in `NumericStatsOps` handles this automatically for min/max.
+
+### ClojureScript Statistics
+
+For ClojureScript, implement the `IMeasure` protocol from `org.replikativ.persistent-sorted-set.impl.measure`:
+
+```cljs
+(require '[org.replikativ.persistent-sorted-set :as set])
+(require '[org.replikativ.persistent-sorted-set.impl.stats :as stats])
+(require '[org.replikativ.persistent-sorted-set.impl.numeric-stats :as numeric-stats])
+
+;; Use built-in numeric stats
+(def s (into (set/sorted-set* {:measure numeric-stats/numeric-stats-ops})
+             [1 2 3 4 5]))
+
+;; Or implement custom measure via the IMeasure protocol
+(defrecord MyStats [count sum])
+
+(def my-stats-ops
+  (reify measure/IMeasure
+    (identity-measure [_]
+      (->MyStats 0 0))
+
+    (extract [_ key]
+      (->MyStats 1 key))
+
+    (merge-measure [_ s1 s2]
+      (->MyStats (+ (:count s1) (:count s2))
+                 (+ (:sum s1) (:sum s2))))
+
+    (remove-measure [_ current key recompute-fn]
+      (->MyStats (dec (:count current))
+                 (- (:sum current) key)))))
+
+(def s (into (set/sorted-set* {:measure my-stats-ops}) [1 2 3 4 5]))
+```
 
 ## Performance
 
