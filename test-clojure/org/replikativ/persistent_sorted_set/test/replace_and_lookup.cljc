@@ -453,3 +453,64 @@
           s2 (set/replace s 2500 7500)]
       (is (= 5000 (set/count-slice s2 nil nil))))))
 
+(deftest test-lookup-ge
+  (testing "Empty set"
+    (let [s (set/sorted-set)]
+      (is (nil? (set/lookup-ge s 1)))))
+
+  (testing "Single element"
+    (let [s (set/sorted-set 42)]
+      (is (= 42 (set/lookup-ge s 42)))
+      (is (= 42 (set/lookup-ge s 41)))
+      (is (= 42 (set/lookup-ge s 0)))
+      (is (nil? (set/lookup-ge s 43)))))
+
+  (testing "Small set (single leaf)"
+    (let [s (into (set/sorted-set) (range 0 20 2))]
+      ;; exact matches
+      (is (= 0 (set/lookup-ge s 0)))
+      (is (= 10 (set/lookup-ge s 10)))
+      (is (= 18 (set/lookup-ge s 18)))
+      ;; ceiling lookups (no exact match)
+      (is (= 0 (set/lookup-ge s -1)))
+      (is (= 2 (set/lookup-ge s 1)))
+      (is (= 4 (set/lookup-ge s 3)))
+      (is (= 18 (set/lookup-ge s 17)))
+      ;; past the end
+      (is (nil? (set/lookup-ge s 19)))
+      (is (nil? (set/lookup-ge s 100)))))
+
+  (testing "Large set (multiple B-tree levels)"
+    (let [s (into (set/sorted-set) (range 0 10000 2))]
+      ;; exact matches
+      (is (= 0 (set/lookup-ge s 0)))
+      (is (= 5000 (set/lookup-ge s 5000)))
+      (is (= 9998 (set/lookup-ge s 9998)))
+      ;; ceiling lookups
+      (is (= 0 (set/lookup-ge s -1)))
+      (is (= 2 (set/lookup-ge s 1)))
+      (is (= 5002 (set/lookup-ge s 5001)))
+      ;; past the end
+      (is (nil? (set/lookup-ge s 9999)))
+      (is (nil? (set/lookup-ge s 10000)))))
+
+  (testing "With custom comparator"
+    (let [cmp-first (fn [[a _] [b _]] (compare a b))
+          s (-> (set/sorted-set-by cmp-first)
+                (conj [1 :a])
+                (conj [3 :c])
+                (conj [5 :e]))]
+      (is (= [1 :a] (set/lookup-ge s [1 nil])))
+      (is (= [3 :c] (set/lookup-ge s [2 nil])))
+      (is (= [5 :e] (set/lookup-ge s [4 nil])))
+      (is (nil? (set/lookup-ge s [6 nil])))))
+
+  (testing "With small branching factor (deep tree)"
+    (let [s (into (set/sorted-set* {:branching-factor 4})
+                  (range 0 100 2))]
+      (is (= 0 (set/lookup-ge s 0)))
+      (is (= 2 (set/lookup-ge s 1)))
+      (is (= 50 (set/lookup-ge s 49)))
+      (is (= 98 (set/lookup-ge s 98)))
+      (is (nil? (set/lookup-ge s 99))))))
+

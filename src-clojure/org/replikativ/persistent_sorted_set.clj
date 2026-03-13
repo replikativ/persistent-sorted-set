@@ -77,6 +77,32 @@
   ([^PersistentSortedSet set key ^Comparator cmp]
    (.lookup set key cmp)))
 
+(defn lookup-ge
+  "Ceiling lookup: return the first stored element >= key, or nil if none.
+  O(log n) traversal with no allocations.
+  Optionally pass in comparator that will override the one that set uses."
+  ([^PersistentSortedSet set key]
+   (.lookupGE set key))
+  ([^PersistentSortedSet set key ^Comparator cmp]
+   (.lookupGE set key cmp)))
+
+(defn forward-cursor
+  "Create a mutable forward-only cursor for efficient sequential ceiling lookups.
+  Use with `cursor-seek-ge` for amortized O(1) lookups when keys arrive in
+  ascending order. Not thread-safe.
+  Optionally pass in comparator that will override the one that set uses."
+  ([^PersistentSortedSet set]
+   (.forwardCursor set))
+  ([^PersistentSortedSet set ^Comparator cmp]
+   (.forwardCursor set cmp)))
+
+(defn cursor-seek-ge
+  "Seek a forward cursor to the first element >= key. Returns the element or nil.
+  Keys must be presented in ascending order for correct results.
+  Amortized O(1) per call when keys are ascending."
+  [cursor key]
+  (.seekGE ^org.replikativ.persistent_sorted_set.PersistentSortedSet$ForwardCursor cursor key))
+
 (defn replace
   "Replace an existing key with a new key at the same logical position.
   The comparator must return 0 for both old-key and new-key.

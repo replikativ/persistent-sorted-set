@@ -644,6 +644,199 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     }
   }
 
+  /**
+   * Look up the first element >= key (ceiling/GE lookup).
+   * O(log n) with zero allocations — no Seq chain created.
+   * Returns null if no element >= key exists.
+   */
+  public Key lookupGE(Object key) {
+    return lookupGE(key, _cmp);
+  }
+
+  public Key lookupGE(Object key, Comparator<Key> cmp) {
+    ANode<Key, Address> node = root();
+
+    if (node.len() == 0) {
+      return null;
+    }
+
+    while (true) {
+      int idx = node.searchFirst((Key) key, cmp);
+      if (idx >= node._len) {
+        return null;
+      }
+
+      if (node instanceof Branch) {
+        node = ((Branch<Key, Address>) node).child(_storage, idx);
+      } else {
+        return node._keys[idx];
+      }
+    }
+  }
+
+  /**
+   * Mutable forward-only cursor for efficient sequential lookupGE.
+   * For sorted lookup keys, amortized O(1) per lookup instead of O(log n).
+   * Not thread-safe. Must only be used for forward (ascending) seeks.
+   *
+   * Usage:
+   *   ForwardCursor c = pss.forwardCursor();
+   *   Key result1 = c.seekGE(key1);  // O(log n) — first seek
+   *   Key result2 = c.seekGE(key2);  // O(1) if in same leaf, else O(siblings skipped)
+   */
+  public class ForwardCursor {
+    private final Comparator<Key> _cursorCmp;
+    private ANode<Key, Address> _leaf;     // current leaf node
+    private int _leafIdx;                   // current index within leaf
+    // Stack for tree traversal (height levels)
+    // For a tree of height H, we need H-1 branch levels above the leaf.
+    private Branch<Key, Address>[] _branches;
+    private int[] _branchIdxs;
+    private int _depth;                     // number of branch levels (0 for leaf-only)
+
+    @SuppressWarnings("unchecked")
+    ForwardCursor(Comparator<Key> cmp) {
+      _cursorCmp = cmp;
+      ANode<Key, Address> root = root();
+      if (root.len() == 0) {
+        _leaf = null;
+        _depth = 0;
+        return;
+      }
+      // Compute tree height
+      int height = 0;
+      ANode<Key, Address> n = root;
+      while (n instanceof Branch) {
+        height++;
+        n = ((Branch<Key, Address>) n).child(_storage, 0);
+      }
+      _depth = height;
+      _branches = new Branch[height];
+      _branchIdxs = new int[height];
+      // Position at start (leftmost leaf)
+      n = root;
+      for (int level = 0; level < height; level++) {
+        _branches[level] = (Branch<Key, Address>) n;
+        _branchIdxs[level] = 0;
+        n = ((Branch<Key, Address>) n).child(_storage, 0);
+      }
+      _leaf = n;
+      _leafIdx = 0;
+    }
+
+    /**
+     * Seek forward to first element >= key.
+     * Keys MUST be passed in ascending order across calls.
+     * Returns null if no element >= key exists.
+     */
+    public Key seekGE(Key key) {
+      if (_leaf == null) return null;
+
+      // Fast path: key is within current leaf
+      if (_cursorCmp.compare(key, _leaf.maxKey()) <= 0) {
+        // Search from current position — target is always >= _leafIdx since keys are ascending
+        int idx = _leaf.searchFirstFrom(key, _cursorCmp, _leafIdx);
+        if (idx < _leaf._len) {
+          _leafIdx = idx;
+          return _leaf._keys[idx];
+        }
+      }
+
+      // Need to advance to a later leaf.
+      // Walk up the branch stack to find a branch that contains our key,
+      // then walk back down.
+      int level = _depth - 1; // start from immediate parent of leaf
+      while (level >= 0) {
+        Branch<Key, Address> branch = _branches[level];
+        int bi = _branchIdxs[level] + 1; // advance past current child
+        // Linear scan forward through siblings (amortized O(1))
+        while (bi < branch._len) {
+          if (_cursorCmp.compare(key, branch._keys[bi]) <= 0) {
+            // key <= this child's maxKey, so answer is in this subtree
+            _branchIdxs[level] = bi;
+            // Walk down to leaf
+            ANode<Key, Address> node = branch.child(_storage, bi);
+            for (int d = level + 1; d < _depth; d++) {
+              _branches[d] = (Branch<Key, Address>) node;
+              int childIdx = node.searchFirst(key, _cursorCmp);
+              if (childIdx >= node._len) childIdx = node._len - 1;
+              _branchIdxs[d] = childIdx;
+              node = ((Branch<Key, Address>) node).child(_storage, childIdx);
+            }
+            _leaf = node;
+            int idx = _leaf.searchFirst(key, _cursorCmp);
+            if (idx < _leaf._len) {
+              _leafIdx = idx;
+              return _leaf._keys[idx];
+            }
+            // Key exceeds this leaf — continue to next sibling at this level
+            bi++;
+            continue;
+          }
+          bi++;
+        }
+        level--; // go up one level
+      }
+
+      // Exhausted all branches
+      _leaf = null;
+      return null;
+    }
+
+    /**
+     * Advance cursor to the next element and return it.
+     * Returns null if no more elements exist.
+     * O(1) within a leaf, amortized O(1) across leaves.
+     */
+    public Key next() {
+      if (_leaf == null) return null;
+      _leafIdx++;
+      if (_leafIdx < _leaf._len) {
+        return _leaf._keys[_leafIdx];
+      }
+      // Need to advance to next leaf via branch stack
+      for (int level = _depth - 1; level >= 0; level--) {
+        int bi = _branchIdxs[level] + 1;
+        if (bi < _branches[level]._len) {
+          _branchIdxs[level] = bi;
+          ANode<Key, Address> node = _branches[level].child(_storage, bi);
+          for (int d = level + 1; d < _depth; d++) {
+            _branches[d] = (Branch<Key, Address>) node;
+            _branchIdxs[d] = 0;
+            node = ((Branch<Key, Address>) node).child(_storage, 0);
+          }
+          _leaf = node;
+          _leafIdx = 0;
+          return _leaf._keys[0];
+        }
+      }
+      _leaf = null;
+      return null;
+    }
+
+    /**
+     * Return the current element without advancing.
+     * Returns null if the cursor is exhausted or not yet positioned.
+     */
+    public Key current() {
+      if (_leaf == null || _leafIdx < 0 || _leafIdx >= _leaf._len) return null;
+      return _leaf._keys[_leafIdx];
+    }
+
+  }
+
+  /**
+   * Create a forward cursor positioned at the start of the set.
+   * Use for efficient sequential lookupGE with ascending keys.
+   */
+  public ForwardCursor forwardCursor() {
+    return new ForwardCursor(_cmp);
+  }
+
+  public ForwardCursor forwardCursor(Comparator<Key> cmp) {
+    return new ForwardCursor(cmp);
+  }
+
   // IEditableCollection
   public PersistentSortedSet asTransient() {
     if (editable()) {

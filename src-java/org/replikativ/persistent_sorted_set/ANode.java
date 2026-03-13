@@ -117,6 +117,34 @@ public abstract class ANode<Key, Address> {
     return low;
   }
 
+  /**
+   * Like searchFirst but starts from a known lower bound.
+   * For forward cursors where we know the target is at or after startIdx.
+   * Uses linear scan for small distances (<=8), binary search otherwise.
+   */
+  public int searchFirstFrom(Key key, Comparator<Key> cmp, int startIdx) {
+    int remaining = _len - startIdx;
+    if (remaining <= 0) return _len;
+    // Linear scan for small distances — avoids binary search overhead
+    if (remaining <= 8) {
+      for (int i = startIdx; i < _len; i++) {
+        if (cmp.compare(_keys[i], key) >= 0) return i;
+      }
+      return _len;
+    }
+    // Binary search from startIdx
+    int low = startIdx, high = _len;
+    while (low < high) {
+      int mid = (high + low) >>> 1;
+      int d = cmp.compare(_keys[mid], key);
+      if (d < 0)
+        low = mid + 1;
+      else
+        high = mid;
+    }
+    return low;
+  }
+
   public int searchLast(Key key, Comparator<Key> cmp) {
     int low = 0, high = _len;
     while (low < high) {

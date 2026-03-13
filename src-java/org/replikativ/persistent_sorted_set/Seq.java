@@ -13,6 +13,8 @@ public class Seq extends ASeq implements IReduce, Reversible, IChunkedSeq, ISeek
   final Comparator _cmp;
   final boolean _asc;
   final int _version;
+  // True when the entire current leaf is within bounds — skip over() check
+  boolean _leafSafe;
 
   Seq(IPersistentMap meta, PersistentSortedSet set, Seq parent, ANode node, int idx, Object keyTo, Comparator cmp, boolean asc, int version) {
     super(meta);
@@ -24,6 +26,20 @@ public class Seq extends ASeq implements IReduce, Reversible, IChunkedSeq, ISeek
     _cmp    = cmp;
     _asc    = asc;
     _version = version;
+    _leafSafe = computeLeafSafe();
+  }
+
+  // Check if all remaining elements in the current leaf are within bounds.
+  // Avoids per-element comparator calls during within-leaf iteration.
+  boolean computeLeafSafe() {
+    if (_keyTo == null || _cmp == null) return true;
+    if (_asc) {
+      // All elements up to leaf end are valid if maxKey <= _keyTo
+      return _cmp.compare(_node.maxKey(), _keyTo) <= 0;
+    } else {
+      // All elements down to leaf start are valid if minKey >= _keyTo
+      return _cmp.compare(_node.minKey(), _keyTo) >= 0;
+    }
   }
 
   void checkVersion() {
@@ -47,25 +63,27 @@ public class Seq extends ASeq implements IReduce, Reversible, IChunkedSeq, ISeek
     if (_asc) {
       if (_idx < _node._len - 1) {
         _idx++;
-        return !over();
+        return _leafSafe || !over();
       } else if (_parent != null) {
         _parent = _parent.next();
         if (_parent != null) {
           _node = _parent.child();
           _idx = 0;
-          return !over();
+          _leafSafe = computeLeafSafe();
+          return _leafSafe || !over();
         }
       }
     } else { // !_asc
       if (_idx > 0) {
         _idx--;
-        return !over();
+        return _leafSafe || !over();
       } else if (_parent != null) {
         _parent = _parent.next();
         if (_parent != null) {
           _node = _parent.child();
           _idx = _node._len - 1;
-          return !over();
+          _leafSafe = computeLeafSafe();
+          return _leafSafe || !over();
         }
       }
     }

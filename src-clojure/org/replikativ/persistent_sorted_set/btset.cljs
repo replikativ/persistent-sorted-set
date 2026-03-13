@@ -216,6 +216,29 @@
                      cmp  (or cmp (.-comparator set))]
                  (await (node/lookup root (.-storage set) key cmp opts))))))
 
+(defn lookup-ge
+  "Look up the first element >= key (ceiling/GE lookup).
+   Returns nil if no element >= key exists. O(log n)."
+  [^BTSet set key cmp {:keys [sync?] :or {sync? true} :as opts}]
+  (async+sync sync?
+              (async
+               (let [root (await (-root set opts))
+                     cmp  (or cmp (.-comparator set))
+                     storage (.-storage set)]
+                 (loop [node root]
+                   (let [keys (.-keys node)
+                         len  (arrays/alength keys)]
+                     (if (== len 0)
+                       nil
+                       (let [idx (binary-search-l cmp keys (dec len) key)]
+                         (if (>= idx len)
+                           nil
+                           (if (instance? Branch node)
+                             (let [child-node (await (branch/child node storage idx opts))]
+                               (recur child-node))
+                             ;; Leaf — return the key at idx
+                             (arrays/aget keys idx)))))))))))
+
 (defn measure
   "Get the aggregated statistics for the entire set."
   [^BTSet set {:keys [sync?] :or {sync? true} :as opts}]
