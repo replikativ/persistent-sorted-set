@@ -270,11 +270,11 @@
 
 (def ^:const EMPTY_PATH (js* "0n"))
 
-(defn- bits-per-level [set]
+(defn- bits-per-level [^BTSet set]
   (let [bf (get (.-settings set) :branching-factor)]
     (Math/ceil (Math/log2 bf))))
 
-(defn- max-len [set]
+(defn- max-len [^BTSet set]
   (get (.-settings set) :branching-factor))
 
 (defn- min-len [set]
@@ -1406,7 +1406,7 @@
    (assert (some? seq))
    (if (fn? arg)
      (seek seq key arg {:sync? true})
-     (seek seq key (.-comparator (.-set seq)) arg)))
+     (seek seq key (.-comparator ^BTSet (.-set ^js seq)) arg)))
   ([seq key cmp {:keys [sync?] :or {sync? true} :as opts}]
    (assert (some? seq))
    (assert (fn? cmp))
