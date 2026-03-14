@@ -2,8 +2,15 @@
   (:require
    [org.replikativ.persistent-sorted-set :as set]
    [clojure.test :as t :refer [is are deftest testing]]
+   #?(:cljs [org.replikativ.persistent-sorted-set.btset :as btset])
    #?(:cljs [org.replikativ.persistent-sorted-set.impl.numeric-stats :as numeric-stats]))
-  #?(:clj (:import [org.replikativ.persistent_sorted_set NumericStats NumericStatsOps])))
+  #?(:clj (:import [org.replikativ.persistent_sorted_set PersistentSortedSet NumericStats NumericStatsOps])))
+
+(defn- lookup-ge
+  "Test helper — calls lookupGE via interop (CLJ) or btset (CLJS)."
+  [s key]
+  #?(:clj  (.lookupGE ^PersistentSortedSet s key)
+     :cljs (btset/lookup-ge s key nil {:sync? true})))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -452,4 +459,65 @@
                   (range 5000))
           s2 (set/replace s 2500 7500)]
       (is (= 5000 (set/count-slice s2 nil nil))))))
+
+(deftest test-lookup-ge
+  (testing "Empty set"
+    (let [s (set/sorted-set)]
+      (is (nil? (lookup-ge s 1)))))
+
+  (testing "Single element"
+    (let [s (set/sorted-set 42)]
+      (is (= 42 (lookup-ge s 42)))
+      (is (= 42 (lookup-ge s 41)))
+      (is (= 42 (lookup-ge s 0)))
+      (is (nil? (lookup-ge s 43)))))
+
+  (testing "Small set (single leaf)"
+    (let [s (into (set/sorted-set) (range 0 20 2))]
+      ;; exact matches
+      (is (= 0 (lookup-ge s 0)))
+      (is (= 10 (lookup-ge s 10)))
+      (is (= 18 (lookup-ge s 18)))
+      ;; ceiling lookups (no exact match)
+      (is (= 0 (lookup-ge s -1)))
+      (is (= 2 (lookup-ge s 1)))
+      (is (= 4 (lookup-ge s 3)))
+      (is (= 18 (lookup-ge s 17)))
+      ;; past the end
+      (is (nil? (lookup-ge s 19)))
+      (is (nil? (lookup-ge s 100)))))
+
+  (testing "Large set (multiple B-tree levels)"
+    (let [s (into (set/sorted-set) (range 0 10000 2))]
+      ;; exact matches
+      (is (= 0 (lookup-ge s 0)))
+      (is (= 5000 (lookup-ge s 5000)))
+      (is (= 9998 (lookup-ge s 9998)))
+      ;; ceiling lookups
+      (is (= 0 (lookup-ge s -1)))
+      (is (= 2 (lookup-ge s 1)))
+      (is (= 5002 (lookup-ge s 5001)))
+      ;; past the end
+      (is (nil? (lookup-ge s 9999)))
+      (is (nil? (lookup-ge s 10000)))))
+
+  (testing "With custom comparator"
+    (let [cmp-first (fn [[a _] [b _]] (compare a b))
+          s (-> (set/sorted-set-by cmp-first)
+                (conj [1 :a])
+                (conj [3 :c])
+                (conj [5 :e]))]
+      (is (= [1 :a] (lookup-ge s [1 nil])))
+      (is (= [3 :c] (lookup-ge s [2 nil])))
+      (is (= [5 :e] (lookup-ge s [4 nil])))
+      (is (nil? (lookup-ge s [6 nil])))))
+
+  (testing "With small branching factor (deep tree)"
+    (let [s (into (set/sorted-set* {:branching-factor 4})
+                  (range 0 100 2))]
+      (is (= 0 (lookup-ge s 0)))
+      (is (= 2 (lookup-ge s 1)))
+      (is (= 50 (lookup-ge s 49)))
+      (is (= 98 (lookup-ge s 98)))
+      (is (nil? (lookup-ge s 99))))))
 

@@ -467,7 +467,7 @@
                                     acc))]
                      (set! _measure result)
                      result)))))
-  (merge [this next]
+  (merge [this ^Branch next]
     (let [sc1 subtree-count
           sc2 (.-subtree-count next)
           new-sc (if (and (>= sc1 0) (>= sc2 0)) (+ sc1 sc2) -1)
@@ -489,7 +489,7 @@
                new-sc
                new-measure
                settings)))
-  (merge-split [this next]
+  (merge-split [this ^Branch next]
     (let [;; Ensure children arrays exist
           c1 (ensure-children this)
           c2 (ensure-children next)
