@@ -70,15 +70,6 @@
   ([^BTSet set key cmp]
    (btset/lookup set key cmp {:sync? true})))
 
-(defn lookup-ge
-  "Look up the first element >= key (ceiling/GE lookup).
-   Returns nil if no element >= key exists. O(log n).
-   3-arity version accepts a custom comparator."
-  ([^BTSet set key]
-   (btset/lookup-ge set key nil {:sync? true}))
-  ([^BTSet set key cmp]
-   (btset/lookup-ge set key cmp {:sync? true})))
-
 (defn equiv?
   "Is _other_ a set with the same items?
    returns boolean by default

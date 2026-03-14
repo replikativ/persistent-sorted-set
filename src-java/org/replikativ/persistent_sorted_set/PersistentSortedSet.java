@@ -648,6 +648,9 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
    * Look up the first element >= key (ceiling/GE lookup).
    * O(log n) with zero allocations — no Seq chain created.
    * Returns null if no element >= key exists.
+   *
+   * <p><b>Internal API</b> — subject to change without notice.
+   * Not exposed in the public Clojure namespace.
    */
   public Key lookupGE(Object key) {
     return lookupGE(key, _cmp);
@@ -679,10 +682,16 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
    * For sorted lookup keys, amortized O(1) per lookup instead of O(log n).
    * Not thread-safe. Must only be used for forward (ascending) seeks.
    *
-   * Usage:
+   * <p><b>Internal API</b> — this class is subject to change or removal
+   * without notice. It is not exposed in the public Clojure namespace.
+   * External consumers should use {@link #lookupGE} or {@code slice} instead.
+   *
+   * <p>Usage:
+   * <pre>
    *   ForwardCursor c = pss.forwardCursor();
    *   Key result1 = c.seekGE(key1);  // O(log n) — first seek
    *   Key result2 = c.seekGE(key2);  // O(1) if in same leaf, else O(siblings skipped)
+   * </pre>
    */
   public class ForwardCursor {
     private final Comparator<Key> _cursorCmp;
@@ -828,6 +837,8 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   /**
    * Create a forward cursor positioned at the start of the set.
    * Use for efficient sequential lookupGE with ascending keys.
+   *
+   * <p><b>Internal API</b> — subject to change without notice.
    */
   public ForwardCursor forwardCursor() {
     return new ForwardCursor(_cmp);
