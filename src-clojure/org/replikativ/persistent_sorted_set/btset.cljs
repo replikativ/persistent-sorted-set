@@ -262,7 +262,7 @@
                     (:meta opts))
         cmp     (if (map? root-address-or-info)
                   (or (:comparator root-address-or-info) compare)
-                  (or (:comparator opts) compare))
+                  (or (:comparator opts) (:cmp opts) compare))
         settings (select-keys (merge (when (map? root-address-or-info) root-address-or-info) opts) [:branching-factor :measure])]
     (BTSet. nil -1 cmp meta UNINITIALIZED_HASH storage address settings)))
 
@@ -1629,7 +1629,7 @@
    - :meta     Metadata"
   [opts]
   (let [settings (select-keys opts [:branching-factor :measure])]
-    (BTSet. (Leaf. (arrays/array) settings nil) 0 (or (:comparator opts) compare)
+    (BTSet. (Leaf. (arrays/array) settings nil) 0 (or (:comparator opts) (:cmp opts) compare)
             (:meta opts) UNINITIALIZED_HASH (:storage opts) nil settings)))
 
 (defn ^BTSet sorted-set-by
