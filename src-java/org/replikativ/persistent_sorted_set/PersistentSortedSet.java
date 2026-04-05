@@ -100,6 +100,16 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
                       countKnown ? subtreeCount : -1, measure, _settings);
   }
 
+  /**
+   * Check whether all nodes in this tree have precomputed subtree counts.
+   * When true, countSlice is guaranteed O(log n).
+   * When false, countSlice may degrade to O(n) for subtrees missing counts.
+   */
+  public boolean hasSubtreeCounts() {
+    ANode root = root();
+    return getSubtreeCount(root) >= 0;
+  }
+
   public boolean editable() {
     return _settings.editable();
   }

@@ -54,6 +54,13 @@
   ([^PersistentSortedSet set from to ^Comparator cmp]
    (.countSlice set from to cmp)))
 
+(defn has-subtree-counts?
+  "Check whether all nodes in this tree have precomputed subtree counts.
+   When true, count-slice is guaranteed O(log n).
+   When false, count-slice may degrade to O(n) for subtrees missing counts."
+  [^PersistentSortedSet set]
+  (.hasSubtreeCounts set))
+
 (defn seek
   "An efficient way to seek to a specific key in a seq (either returned by [[clojure.core.seq]] or a slice.)
   `(seek (seq set) to)` returns iterator for all Xs where to <= X.
