@@ -431,7 +431,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           ? _subtreeCount - oldChildCount + newChildrenCount : -1;
       Object newMeasure = tryComputeMeasureFromChildren(newChildren, _len, storage, measureOps);
       Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, newCount, newMeasure, settings);
-      if (settings.opBufSize() > 0) nb.carryAndDeposit(storage, _slots, ins, key, key, cmp, anchor0); // content-only: Present(key) / branch marker
+      if (settings.opBufSize() > 0) { nb._rebalanced = _rebalanced; nb._childWritten = _childWritten; // a rebalance earlier this txn must persist (structure ≠ anchor)
+                                      nb.carryAndDeposit(storage, _slots, ins, key, key, cmp, anchor0); } // content-only: Present(key) / branch marker
       return new ANode[]{ nb };
     }
 
@@ -605,8 +606,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         if (newLen != _len)
           cs.copyAll(_children, idx+2, _len);
 
-        if (_settings.opBufSize() > 0 && _slots != null) {       // mirror the address Stitch in place
-          Stitch ss = new Stitch(_slots, Math.max(idx - 1, 0));
+        if (_settings.opBufSize() > 0 && _slots != null
+            && (leftChanged || rightChanged || newLen != _len)) { // structural only: mirror the address Stitch
+          Stitch ss = new Stitch(_slots, Math.max(idx - 1, 0));   // (content-only keeps _slots[idx] so the deposit below accumulates)
           if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(idx - 1));
                                 ss.copyOne(null);
           if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(idx + 1));
@@ -661,18 +663,22 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       newCenter._subtreeCount = tryComputeSubtreeCountFromChildren(newCenter._children, newLen, storage);
       newCenter._measure = tryComputeMeasureFromChildren(newCenter._children, newLen, storage, measureOps);
       if (settings.opBufSize() > 0) {
-        Object[] ns = new Object[newCenter._keys.length];      // mirror the address Stitch above
-        Stitch ss = new Stitch(ns, 0);
-        slotCopyAll(ss, _slots, 0, idx - 1);
-        if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(idx - 1));
-                              ss.copyOne(null);
-        if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(idx + 1));
-        slotCopyAll(ss, _slots, idx + 2, _len);
-        newCenter._slots = ns;
-        if (!leftChanged && !rightChanged && newLen == _len)
-          newCenter.depositInto(storage, idx, key, Slot.ABSENT, cmp, anchor0); // content-only center
-        else
-          newCenter._rebalanced = true; // a child merged/borrowed with a sibling: structural → write in full
+        if (!leftChanged && !rightChanged && newLen == _len) {
+          // content-only: carry slots aligned and ACCUMULATE Absent onto the center's
+          // existing diff (it may already hold buffered Present/Absent for this leaf).
+          newCenter._rebalanced = _rebalanced; newCenter._childWritten = _childWritten; // persist a prior-this-txn rebalance
+          newCenter.carryAndDeposit(storage, _slots, idx, key, Slot.ABSENT, cmp, anchor0);
+        } else {
+          newCenter._rebalanced = true;                        // structural: mirror the address Stitch
+          Object[] ns = new Object[newCenter._keys.length];    // (center/changed siblings materialized → null slot)
+          Stitch ss = new Stitch(ns, 0);
+          slotCopyAll(ss, _slots, 0, idx - 1);
+          if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(idx - 1));
+                                ss.copyOne(null);
+          if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(idx + 1));
+          slotCopyAll(ss, _slots, idx + 2, _len);
+          newCenter._slots = ns;
+        }
       }
       return new ANode[] { left, newCenter, right };
     }
@@ -994,7 +1000,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (measureOps != null && _measure != null) {
       newBranch._measure = newBranch.tryComputeMeasure(storage);
     }
-    if (settings.opBufSize() > 0) newBranch.carryAndDeposit(storage, _slots, idx, newKey, newKey, cmp, anchor0); // content-only: Present(newKey) / branch marker
+    if (settings.opBufSize() > 0) { newBranch._rebalanced = _rebalanced; newBranch._childWritten = _childWritten; // persist a prior-this-txn rebalance
+                                    newBranch.carryAndDeposit(storage, _slots, idx, newKey, newKey, cmp, anchor0); } // content-only: Present(newKey)
 
     return new ANode[]{newBranch};
   }
@@ -1274,7 +1281,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         _childWritten = true;
       }
     }
-    return storage.store(this);
+    Address a = storage.store(this);
+    // Written ⇒ this node now matches its durable object. Clear the per-txn structural marks
+    // so a later content-only op (which carries them forward) doesn't treat it as rebalanced.
+    _rebalanced = false; _childWritten = false;
+    return a;
   }
 
   public String str(IStorage storage, int lvl) {
