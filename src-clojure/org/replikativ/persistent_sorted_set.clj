@@ -133,8 +133,9 @@
      :soft   RefType/SOFT
      :weak   RefType/WEAK
      nil)
-   (:measure m)
-   (:leaf-processor m)))
+   ^IMeasure (:measure m)
+   (:leaf-processor m)
+   (int (or (:op-buf-size m) 0))))
 
 (defn- settings->map [^Settings s]
   {:branching-factor (.branchingFactor s)
@@ -143,7 +144,8 @@
                        RefType/SOFT   :soft
                        RefType/WEAK   :weak)
    :measure          ^IMeasure (.measure s)
-   :leaf-processor   (.leafProcessor s)})
+   :leaf-processor   (.leafProcessor s)
+   :op-buf-size      (.opBufSize s)})
 
 (defn from-sorted-array
   "Fast path to create a set if you already have a sorted array of elements on your hands."

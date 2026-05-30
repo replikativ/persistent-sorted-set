@@ -10,13 +10,23 @@ public class Settings {
   public final AtomicBoolean _edit;
   public final IMeasure _measure;
   public final ILeafProcessor _leafProcessor;
+  // OP_BUF_V5: per-node diff budget B. 0 (default) disables the write-opt path
+  // entirely, so every code path is byte-identical to baseline PSS (invariant I0).
+  public final int _opBufSize;
 
-  public Settings(int branchingFactor, RefType refType, AtomicBoolean edit, IMeasure measure, ILeafProcessor leafProcessor) {
+  // Canonical constructor (does not normalize; callers pass already-normalized values).
+  public Settings(int branchingFactor, RefType refType, AtomicBoolean edit, IMeasure measure, ILeafProcessor leafProcessor, int opBufSize) {
     _branchingFactor = branchingFactor;
     _refType = refType;
     _edit = edit;
     _measure = measure;
     _leafProcessor = leafProcessor;
+    _opBufSize = opBufSize;
+  }
+
+  // Back-compat: previous 5-arg canonical ctor (used by editable()).
+  public Settings(int branchingFactor, RefType refType, AtomicBoolean edit, IMeasure measure, ILeafProcessor leafProcessor) {
+    this(branchingFactor, refType, edit, measure, leafProcessor, defaultOpBufSize());
   }
 
   public Settings() {
@@ -36,6 +46,11 @@ public class Settings {
   }
 
   public Settings(int branchingFactor, RefType refType, IMeasure measure, ILeafProcessor leafProcessor) {
+    this(branchingFactor, refType, measure, leafProcessor, defaultOpBufSize());
+  }
+
+  // Normalizing constructor with explicit opBufSize (used by the Clojure API).
+  public Settings(int branchingFactor, RefType refType, IMeasure measure, ILeafProcessor leafProcessor, int opBufSize) {
     if (branchingFactor <= 0) {
       branchingFactor = 512;
     }
@@ -47,6 +62,15 @@ public class Settings {
     _edit = null;
     _measure = measure;
     _leafProcessor = leafProcessor;
+    _opBufSize = opBufSize < 0 ? 0 : opBufSize;
+  }
+
+  static int defaultOpBufSize() {
+    try {
+      return Integer.parseInt(System.getProperty("pss.opBufSize", "0"));
+    } catch (Exception e) {
+      return 0;
+    }
   }
 
   public int minBranchingFactor() {
@@ -61,6 +85,11 @@ public class Settings {
     return 8;
   }
 
+  // OP_BUF_V5 per-node diff budget; 0 disables the write-opt path (I0: baseline-identical).
+  public int opBufSize() {
+    return _opBufSize;
+  }
+
   public RefType refType() {
     return _refType;
   }
@@ -72,7 +101,7 @@ public class Settings {
   public Settings editable(boolean value) {
     assert !editable();
     assert value == true;
-    return new Settings(_branchingFactor, _refType, new AtomicBoolean(value), _measure, _leafProcessor);
+    return new Settings(_branchingFactor, _refType, new AtomicBoolean(value), _measure, _leafProcessor, _opBufSize);
   }
 
   public IMeasure measure() {
