@@ -23,6 +23,21 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // For lazy computation when restored from old storage format.
   public long _subtreeCount;
 
+  // OP_BUF_V5 (only used when _settings.opBufSize() > 0; null/false otherwise, so
+  // opBufSize==0 is byte-identical to baseline — invariant I0).
+  //
+  // Per-child diff slot: _slots[i], when non-null, is the buffered logical diff of
+  // child i against its durable version (a Slot holding a PersistentTreeMap<Key,Op>
+  // + a cached (count, measure) snapshot ĝ). null == child i has no buffered diff.
+  public Object[] _slots;
+
+  // Store-time bookkeeping (set on the mutation return path, read by store):
+  //   _rebalanced   — a split/merge/borrow happened AT this node this txn.
+  //   _childWritten — set during store when a child of this node was written,
+  //                   making this node structural (its pointers changed).
+  public boolean _rebalanced;
+  public boolean _childWritten;
+
   // For i in [0.._len):
   // 
   // 1. Not stored:       (_addresses == null || _addresses[i] == null) && _children[i] == ANode

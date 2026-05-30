@@ -391,3 +391,46 @@ Never flip a default before the gate plus audit (#40), cljs (#41), migration
   "key lifting" (strip the separator-implied prefix from buffered keys) is a future
   slot-compaction optimization — biggest win near leaves, potentially large for
   datahike datoms with shared e/a prefixes.
+
+---
+
+## 11. Java build sequence (#48)
+
+Each step is a self-contained change with a **mandatory gate**: recompile
+(`clojure -T:build java`) + full suite (`clojure -M:test`) green, with the suite
+running at `opBufSize=0` so it asserts **I0** (baseline-identical) at every step.
+A separate opBufSize>0 probe (the reference's gate, ported to drive the real PSS)
+validates the new behavior. All new behavior forks on `_settings.opBufSize() > 0`.
+
+- **M1 — Settings gate. DONE** (commit a745d8c). `_opBufSize` + `opBufSize()` +
+  `pss.opBufSize` sysprop + Clojure `:op-buf-size`; no behavior forks ⇒ I0.
+- **M2 — data model.** `Branch._slots` (nullable `Object[]`; a slot is a per-child
+  diff: a `PersistentTreeMap<Key, Op>` under `_cmp` where `Op ∈ {ADD, REMOVE}`,
+  plus a cached `(count, measure)` snapshot) + accessors + the two dirty bits
+  (`_rebalanced`, `_childWritten`) used only by store. Null/unset at opBufSize=0.
+  Gate: inert ⇒ suite green.
+- **M3 — deposit on the return path.** In `cons`/`disjoin`/`replace`, when
+  `opBufSize>0`, on the content-only return (`EARLY_EXIT` / single-`{node}` with
+  no rebalance) record the op into the parent's `_slots[i]` for the descended
+  child and refresh its `ĝ`; on a structural return set `_rebalanced`. Persistent
+  path copies slots forward; transient mutates in place. *No store/restore change
+  yet* — so opBufSize>0 just accumulates ignored slots; suite green at 0, and an
+  opBufSize>0 run still behaves correctly (slots unused). Gate: suite green; add a
+  probe that slots match the expected diff for a few ops.
+- **M4 — store (the write decision).** `Branch.store` / `PersistentSortedSet.store`:
+  a dirty child is **buffered** (its slot serialized into this node's object, child
+  not written) iff `!_rebalanced && !_childWritten && embedded-diff ≤ B`; else
+  written (recurse; set `_childWritten`; `markFreed`). Extend the node
+  serialization to carry slots **only when present** (so opBufSize=0 is the old
+  format byte-for-byte). Gate: suite green at 0; opBufSize>0 store roundtrip
+  probe (store→restore content/count exact).
+- **M5 — restore (projection).** `restore` / `Branch.child`: when a loaded node's
+  slot has a diff, apply it to the lazily-loaded child via `add`/`remove`/`replace`;
+  set branch aggregates from `ĝ`. Gate: the full ported probe — multi-cycle,
+  generative, AGG cold-child, recency, rebalance-correctness (valid B-tree,
+  structurally equal to writer), writes/commit≈1 (0 reads on store), all green;
+  suite green at 0.
+- **M6 — benchmark + B sweep.** Throughput vs baseline (W1); PUT-count probe via
+  the konserve-s3 instrumentation; `B` sweep; confirm I0 speed-parity.
+
+Then audit (#40), cljs (#41), format-flip (#42), e2e (#43).
