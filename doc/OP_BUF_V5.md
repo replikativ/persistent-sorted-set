@@ -42,16 +42,25 @@ point at keeps its hash.
   carries, per child, a **diff** (the child's logical changes since it was last
   written) and an **aggregate snapshot** `ĝ = (count, measure)` of the child's
   *current* subtree.
-- The two **diverge between flushes**: the in-memory tree may have split/merged
-  while the durable anchored structure has not. They are **reconciled at flush**,
-  when the touched (resident) nodes are written and the durable structure catches
-  up. Diffs bridge the gap; reads never see them.
+- **The buffer-vs-write decision rides the existing PSS return protocol.** A
+  mutation's return value already says whether a level changed *content-only*
+  (`EARLY_EXIT` / single `{node}`, incl. a maxKey bump) or *structurally* (split
+  `{a,b,…}` / merge / borrow). On the return path each node accumulates the op's
+  logical diff (`key → Present|Absent`) + refreshes `ĝ`; at `store` a node that
+  only changed content (no rebalance below it, no child written) is **buffered**
+  as a diff in its parent, while a node that **rebalanced** (or any node a child
+  was written under) is **written** in full — cascading to the root.
+- **A buffered node has the *same structure* as its durable anchor** (only its
+  content differs), so the in-memory and durable structures **never diverge**:
+  rebalancing is materialized on write the instant it happens. This is baseline
+  PSS's store with one change — content-only dirty nodes buffer instead of being
+  written. (Earlier drafts let structure diverge and reconciled at flush; that
+  "W0" problem is gone, and so is any merge-on-read sibling load.)
 
 A commit deposits its logical changes into diff slots along the path (constructed
-recursively on the mutation's return path); `store` writes the resident touched
-children and buffers the rest; `restore` projects diffs back on descent. Between
-flushes a node accrues diff; when a node's total diff exceeds the budget `B`, a
-flush peels one level down by writing the resident dirty children.
+recursively on the mutation's return path); `store` buffers content-only dirty
+nodes and writes rebalanced ones (and, to honor `B`, any buffered child whose diff
+would overflow the parent's budget); `restore` projects diffs back on descent.
 
 ```
             logical content (one truth)
@@ -132,35 +141,37 @@ slots (built recursively), bottoming out at leaf key-states.
 
 ### 4.2 Store — write the resident touched children, buffer the rest
 
-A node is **dirty** iff modified since its last write (`_address == null`, the
-existing PSS mechanism), which implies it is **resident**.
+A dirty node carries two bits set on the mutation return path:
+**rebalanced?** (a split/merge/borrow happened at this node) and **child-written?**
+(set at store when any child gets written). A node is **bufferable** iff it is
+dirty, *not* rebalanced, and no child of it was written — i.e. only its content
+changed, so its structure equals its durable anchor's.
 
 ```
 store(node):
-  if clean (has _address): return _address          # unchanged → reuse durable object
-  while Σ|node.slots| > B:                           # BI overflow → peel one level
-     for each dirty (resident) child cᵢ:             # the children this commit touched
-        aᵢ := store(cᵢ)                              # write cᵢ (materialize its current structure),
-                                                     # absorbing slotᵢ's diff into cᵢ's own object
-        markFreed(old aᵢ); child_refᵢ := aᵢ; slotᵢ := (∅, ĝᵢ)
-  for each remaining dirty child cⱼ (under budget):
-     slotⱼ := (cⱼ's accumulated nested diff, refresh ĝⱼ)   # buffer; do NOT write cⱼ, do NOT markFreed
-  write node (base + slots); return new _address
+  if clean (has _address): return _address              # unchanged → reuse durable object
+  child-written? := false
+  for each dirty child cᵢ:
+     if cᵢ.rebalanced? or cᵢ.child-written? or (Σ embedded diff would exceed B):
+        aᵢ := store(cᵢ); markFreed(old aᵢ); child_refᵢ := aᵢ; slotᵢ := (∅, ĝᵢ)
+        child-written? := true                          # cᵢ's address changed → I am structural
+     else:
+        slotᵢ := (cᵢ's accumulated nested diff, ĝᵢ)      # BUFFER: do NOT write cᵢ, do NOT markFreed
+  write node (base + slots); return new _address         # written because rebalanced/child-written/root
 ```
 
-- The **root is always dirty** ⇒ always written ⇒ ≥1 PUT.
-- **Flush victim = the resident dirty children** (the ones the commit just
-  touched) — never a possibly-cold "heaviest" child, so **flush never does a
-  read**. Writing a child *reconciles* its durable slot structure to the current
-  in-memory structure (a buffered range that split in memory becomes several
-  durable children; one that merged becomes fewer).
-- **Structural changes do not force a write.** Splits/merges/borrows that happened
-  in memory are absorbed into the logical diff and either re-derived on read (§4.3)
-  or materialized when a flush writes that node. Even split-causing commits stay
-  ~1 PUT.
-- **`markFreed` only on flush** — a buffered child keeps its durable address as
-  the anchor its diff is against; only a flush obsoletes the prior version. The
-  diff is replaced each commit and reset on flush ⇒ apply-once, never a chain.
+- The **root is always written** ⇒ ≥1 PUT.
+- **Structural changes (split/merge/borrow) are written**, materializing the new
+  structure immediately, so the durable structure always matches in-memory — no
+  divergence, no re-derive, no merge-on-read sibling load. A rebalancing commit
+  writes the affected path (~depth PUTs); rebalances are ~1/BF of ops, so
+  amortized ≈ 1 + depth/BF ≈ 1.01 PUT/commit. Bulk-then-store writes once.
+- **`BI` is enforced here too**: if buffering a child would push this node's
+  embedded diff over `B`, write that child instead (materializing its diff). So
+  every stored object keeps `Σ embedded diff ≤ B`.
+- **`markFreed` only when a node is written** — a buffered child keeps its durable
+  address as the anchor its diff is against; its diff is replaced each commit and
+  reset when it is written ⇒ apply-once, never a chain.
 
 ### 4.3 Restore — project diffs on descent
 
@@ -176,46 +187,48 @@ child(node, i):                                      # lazy, on first descent in
   cache mat ; return mat
 ```
 
-Application is **IO-free except merges**:
-- **Splits are local** — an overflow divides the node's own keys; no sibling, no
-  IO; the re-split re-derives exactly what the writer did. Splits never need
-  structural encoding or a forced write, at any depth.
-- **Merges/borrows may load a sibling.** An underflow calls `Leaf`/`Branch`
-  merge/borrow, which needs the adjacent sibling (a child of the same parent). If
-  it is not resident we **load it (1 GET) and merge properly**, faithfully
-  re-deriving the writer's structure. This sibling-read is **bounded and counted**
-  (merges are rare, esp. for datahike's insert-heavy workload); it is the
-  deliberate price of faithful reconstruction (vs. leaving under-full nodes).
+Application is **IO-free and never restructures on read**:
+- A buffered child changed *content only* (its structure equals the durable
+  anchor), so applying its diff inserts/removes keys within the **same** node
+  shape — a buffered insert/delete may push a leaf transiently over/under the
+  fill bounds, but it is **not** split/merged on read (rebalancing was already
+  materialized on the writer's store). So no sibling load, no local restructure.
 - **Aggregates never force IO** — a materialized branch takes its `(count,
   measure)` from `ĝ`; children are not summed.
 
-### 4.4 Flush detail
+(Because structure is materialized on write, a reconstructed tree is structurally
+identical to the writer's, not merely content-equal.)
 
-Writing child *i* of `N` serializes the in-memory subtree for slot *i*'s range in
-full (its current structure, incl. re-derived splits/merges), with the still-
-buffered deeper changes pushed one level into *that* node's own slots; sets
-`aᵢ := addr(written)`, `slotᵢ.diff := ∅`. If the written child itself exceeds
-`B`, recurse (cascade one more level). One PUT per peeled level; resident, so no
-reads. A flush reconciles the durable slot structure to the in-memory structure
-(slots split or merge to match).
+### 4.4 Writing a child
+
+When `store` writes child *i* of `N` (because it rebalanced, a grandchild was
+written, or its buffered diff would overflow `B`), it serializes the in-memory
+subtree rooted at *i* in full — its current (already-correct) structure — pushing
+*its* still-buffered, content-only descendants one level down into *that* node's
+slots. `aᵢ := addr(written)`, `slotᵢ.diff := ∅`. All written nodes are resident
+(they are the dirty in-memory nodes), so writing never reads. Because structure is
+always materialized on write, there is no slot-structure reconciliation to do.
 
 ---
 
 ## 5. Cost
 
 **Writes (PUT/commit).**
-- Common (write-locality; datahike monotonic eids → hot EAVT segment): **~1**
-  (root); occasional **+1..k** on a flush that peels touched children one level.
-- Splits/merges do **not** add forced writes — re-derived on read or materialized
-  on a normal flush. So even structural-change commits stay ~1 PUT.
-- Flush writes only **resident** touched children ⇒ **zero read IO on flush**.
+- Common (content-only commit, no rebalance): **~1 PUT** (root); the changed path
+  is buffered as diffs in the root's object.
+- A **rebalancing commit** (split/merge/borrow) writes the affected path
+  (~depth PUTs). Rebalances are ~1/BF of ops ⇒ amortized ≈ 1 + depth/BF ≈ 1.01
+  PUT/commit. Bulk-then-store writes the tree once (like baseline).
+- A **BI-overflow** commit writes the over-budget buffered children to materialize
+  their diffs (keeps every object's embedded diff ≤ B).
 - Composes with datahike **root fusion**: index-root slots ride inside the fused
   db-record → a small commit can be ~1 PUT *total* across indexes.
 
 **Reads.** Warm = normal materialized B-tree, `O(log_B N)`, no 1/ε penalty (full
-fanout; projection paid once on load, then cached). Cold = load path + level-by-
-level projection (bounded by `B`); **merges on the path may add bounded sibling
-GETs** (rare). `ĝ` answers cold rank/count for a child without loading it.
+fanout; projection paid once on load, then cached). Cold = load path + applying
+each node's buffered logical diff (bounded by `B`); **no read-path restructuring
+and no sibling loads** (rebalancing was materialized on write). `ĝ` answers cold
+rank/count for a child without loading it.
 
 **`B` tension.** Larger `B` buffers more commits (fewer flushes) but bloats every
 object and raises cold-reconstruction cost; smaller `B` the reverse. Start
@@ -248,16 +261,16 @@ in-memory node already maintains `count`/`measure`).
 
 ### 6.2 Why logical states suffice — no structural encoding
 
-A buffered subtree writes **no** node, so nothing in it gets a new durable
-address — there is **nothing structural to record**. The split/merge/borrow that
-happened in memory is **re-derived** on read by replaying the logical states
-through the ordinary `add`/`remove`/`replace` (the same code that splits/merges
-in normal operation — so structural correctness is inherited, not re-implemented).
-When a node *is* written (flush), it is serialized in full and needs no diff. So:
-**buffered ⇒ logical node-diff; written ⇒ full node.** No structural diff, no
-base-delta, no cascade. (Writing structural changes would be worse: a written
-split's new addresses can't be buffered by logical diffs, forcing the parent —
-and so the whole path — to be written. Logical re-derivation avoids this.)
+A node is buffered **only when its structure equals its durable anchor's** (it
+changed content only). So its slot needs to record just the logical key changes —
+there is no structural delta to express. A node that **rebalanced** (split/merge/
+borrow) is **written** in full, materializing the new structure, so it too needs
+no structural diff. So: **content-only ⇒ logical node-diff; rebalanced ⇒ full
+node.** No structural diff language, no base-delta. The cost is that a rebalance
+forces writing its path (W3), but rebalances are rare (~1/BF) and this is exactly
+baseline PSS's write behavior for those nodes — so structural correctness is
+inherited from existing, tested code, and the durable structure never diverges
+from the in-memory one.
 
 ### 6.3 Construction, application, recency
 
@@ -271,12 +284,10 @@ and so the whole path — to be written. Logical re-derivation avoids this.)
 
 ### 6.4 Determinism note
 
-Reconstruction replays states through the real mutation code (incl. sibling loads
-for merges), so it produces a valid B-tree with **exact content/count/measure**;
-its *shape* may differ slightly from the writer's (B-trees are non-canonical;
-batch-replay vs incremental). One writer produces durable objects (W5); its
-in-memory shape is what a flush writes. The probe asserts content/count/measure
-equality, never shape.
+Because rebalancing is materialized on write, a reconstructed tree is
+**structurally identical** to the writer's, not merely content-equal — applying a
+buffered node's logical diff only changes keys within an unchanged node shape. The
+probe asserts content + count + measure; structure equality holds as a bonus.
 
 ---
 
@@ -290,13 +301,15 @@ port against the **same** gate. Assert, every cycle:
    (read `ĝᵢ` from a parent without materializing the child). (AGG)
 3. **Cold-retouch recency**: `add k → store/flush (k baked deep) → remove k
    (deposited shallow) → store → restore` ⇒ *k absent*. (Recency)
-4. **Merge-on-load correctness**: a delete batch that triggers leaf/branch merges,
-   then `store → restore`, reconstructs exact content (exercises the sibling-load
-   path); assert the reconstructed tree is a **valid** B-tree (min-fill respected).
-5. **Writes-per-commit** behavioral: ~1 PUT/commit between flushes; flushes write
-   only resident children (assert **0 reads during flush**).
-6. **CI structural**: after each store+restore, content/count/measure equal `M`;
-   shape may differ.
+4. **Rebalance correctness**: a delete batch that triggers leaf/branch merges/
+   borrows, then `store → restore`, reconstructs exact content **and structure**
+   (merges were written, not re-derived); assert the reconstructed tree is a valid
+   B-tree (min-fill respected) and equals `M` structurally.
+5. **Writes-per-commit** behavioral: content-only commits ~1 PUT; a rebalancing
+   commit writes only the affected path (~depth); assert no extra writes; assert
+   reads during store are 0 (all written nodes are resident).
+6. **CI structural**: after each store+restore, the reconstructed tree equals `M`
+   in content, count, measure **and structure**.
 7. **I0**: feature off ⇒ full existing PSS suite byte-identical to baseline.
 8. **Generative**: random conj/disj/replace/store/restore/flush over a small key
    range (frequent collisions) vs a reference set; 0 failures.
@@ -308,23 +321,21 @@ Never flip a default before the gate plus audit (#40), cljs (#41), migration
 
 ## 8. Known risks / weak spots (explicit)
 
-- **W0 — in-memory ↔ durable structure reconciliation (the central
-  implementation challenge).** The in-memory tree (normal, possibly split/merged)
-  and the durable anchored structure (last-written, keyed by its own separators)
-  diverge between flushes. The implementation must: route each op's logical state
-  into the correct durable slot(s) along the durable path; maintain per-node
-  diff + `ĝ` incrementally on the return path; and on flush *reconcile* the durable
-  slot structure to the in-memory structure (slots split/merge to match). This is
-  where the reference model must be precise; it is the thing most likely to harbor
-  a subtle bug, so it gets the most probe attention (cases 3, 4, 6).
-- **W1 — write-path bookkeeping cost.** Maintaining per-child diffs + `ĝ` on every
-  mutation's return path is the main throughput risk. In-place on transients;
+- **W0 — RESOLVED.** Earlier drafts let the in-memory and durable structures
+  diverge (frozen durable + re-derive). The structural-vs-content store rule (§1,
+  §4.2) materializes every rebalance on write, so structures **never diverge** —
+  no frozen-slot reconciliation, no re-split/re-merge on read. The decision rides
+  the existing return protocol, which the existing suite already exercises.
+- **W1 — write-path bookkeeping cost.** Maintaining per-child diffs + `ĝ` on the
+  mutation return path is the main throughput risk. In-place on transients;
   benchmark small-`B` overhead; `I0` must be speed-identical, not just byte-
   identical.
-- **W2 — bounded merge-read on cold reconstruction.** A merge on the read path may
-  load a sibling (1 GET). Bounded and counted; rare for insert-heavy datahike.
-  Accepted (the alternative — leaving under-full nodes — was rejected in favor of
-  faithful structure).
+- **W2 — RESOLVED.** Merges are written (structural), so a cold read loads the
+  already-merged durable structure and never loads a sibling to re-derive a merge.
+  No read-path IO beyond the lazy node loads a baseline read would do.
+- **W3 — rebalance write-amp.** A rebalancing commit writes the affected path
+  (~depth PUTs) instead of buffering it. Amortized ≈ 1 + depth/BF ≈ negligible for
+  steady small commits; bulk-then-store writes once. The trade for dropping W0/W2.
 - **W4 — audit/merkle determinism.** A durable object embeds diffs whose
   distribution depends on flush history, so two representations of the same set
   hash differently (plain B-trees already vary by insertion order; diffs amplify
@@ -347,11 +358,12 @@ Never flip a default before the gate plus audit (#40), cljs (#41), migration
   flush re-snapshot on budget, materialize-on-restore, `ĝ` snapshots. **PASSES**
   the probe gate it can cover: multi-cycle content+count exact (8 cycles),
   generative (6×1500, 0 fails), AGG cold-child-count, within-leaf recency, BI.
-  *Deferred to the Java port* (need the real PSS split/merge): cross-level
-  recency, peel-one-level write-count (~1 PUT/commit), and merge-sibling-load
-  mechanics. **(#47 done)**
+  *Deferred to the Java port* (need the real PSS split/merge): the
+  structural-vs-content store decision via the return protocol, rebalance-writes-
+  the-path, structurally-identical reconstruction, and the ~1-PUT/commit
+  write-count. **(#47 done)**
 - **B** — Java port against the same gate; throughput benchmark vs baseline; `B`
-  sweep; `I0` byte+speed parity.
+  sweep; `I0` byte+speed parity. **(#48, in progress — M1 done: Settings gate)**
 - **C** — audit/merkle (diff in hashed node form). [#40]
 - **D** — cljs (BTSet) parity. [#41]
 - **E** — format flip + back-compat, no per-db flag. [#42]
@@ -369,7 +381,8 @@ Never flip a default before the gate plus audit (#40), cljs (#41), migration
   reduction → no taller tree / 1/ε read penalty; projection paid once on load),
   (b) commit == checkpoint with the root hash as the durability point (no separate
   WAL → avoids BetrFS's ≥2× write-amp and Toku's checkpoint-serialization stalls),
-  (c) flush only resident touched children (zero read-amp on flush), (d)
+  (c) rebalancing is written (not re-derived), so structures never diverge and
+  reads never restructure or load siblings, (d)
   **aggregate state in the diff** — exact subtree counts/rank under buffering,
   which is *unsolved* in that literature (they keep message counts, not order
   statistics); we get it free by materializing in memory and snapshotting `ĝ`.
