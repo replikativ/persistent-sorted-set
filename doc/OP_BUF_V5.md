@@ -425,16 +425,21 @@ Never flip a default before the gate plus audit (#40), cljs (#41), migration
   (model A — "per-node slots everywhere") with no merge cost: structurally the diff
   nests down a single object (diffs-of-diffs); temporally it stays one flat complete
   diff per buffered subtree.
-- **W7 — RESOLVED: leaf-diffs at leaf-parents + assemble at store.** During mutation
-  the branch-level nesting + ĝ are **redundant with the live tree** (a branch's
-  node-diff is just its children's state; ĝ is already `_subtreeCount`/`_measure`).
-  The only *irreducible* explicit state is the **leaf-diffs at leaf-parents** (a leaf
-  stores keys, not its delta-vs-anchor, and we refuse store-time IO to recompute it).
-  So `_slots` are populated only at leaf-parents during mutation; the nested object +
-  ĝ are assembled by a tree walk at store; restore reconstructs the nested `_slots`
-  for not-yet-materialized children, which move down on descent (a leaf-parent's slot
-  is kept until the leaf is rewritten; a branch-slot is moved into the child). Live
-  tree = single source of truth, no aliasing. (Done in M3.)
+- **W7 — REVISED (M4b): anchor marker at every level + leaf-diff at leaf-parents.**
+  *Earlier "leaf-parents only" was incomplete:* to hit ~1 PUT/commit we must buffer
+  the **branch** nodes on a content-only path, and buffering branch child C at store
+  needs C's durable **anchor** — which the mutation nulls and (under leaf-parents-only)
+  was never captured. Fix: on the content-only return path, every level deposits a
+  Slot — a **leaf-parent** slot carries the leaf-diff `{cmp-key→op}` + anchor + ĝ; a
+  **branch** slot is an *anchor marker* (`diff=null`) holding the child's durable
+  address + ĝ. The anchor is captured at the top of `add`/`remove`/`replace`
+  (`anchor0 = _addresses[i]`, before the mutation nulls it). The nested diff for a
+  buffered branch child is then **derived at store** by recursing the live subtree
+  (its leaf-parents' leaf-diffs) / **passed through** from `_slots` for a
+  not-yet-materialized restored child. This also keeps in-memory ≈ stored (slot at
+  every buffered level), the stated preference. Structural (rebalanced) nodes don't
+  deposit (written; they re-store dirty children). `Slot.diff` is `Object`
+  (PersistentTreeMap leaf-diff | null marker | nested map post-restore).
 - **Eviction safety (resolved):** diffs are durable-after-commit (embedded in
   committed ancestor objects), so evicting a node after a commit loses nothing;
   between commits they hold the volatile open txn (expected).

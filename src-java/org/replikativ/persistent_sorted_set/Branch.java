@@ -348,7 +348,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     long oldChildCount = ((ISubtreeCount) oldChild).subtreeCount();
     // OP_BUF_V5: capture child ins's durable address BEFORE the mutation nulls it,
     // so a leaf-parent deposit can record it as the buffer anchor (M4a).
-    Object anchor0 = (_settings.opBufSize() > 0 && _level == 1 && _addresses != null) ? _addresses[ins] : null;
+    Object anchor0 = (_settings.opBufSize() > 0 && _addresses != null) ? _addresses[ins] : null;
     ANode[] nodes = oldChild.add(storage, key, cmp, settings);
 
     if (PersistentSortedSet.UNCHANGED == nodes) { // child signalling already in set
@@ -363,7 +363,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.opBufSize() > 0 && _level == 1) depositInto(storage, ins, key, key, cmp, anchor0); // leaf-parent: Present(key)
+      if (_settings.opBufSize() > 0) depositInto(storage, ins, key, key, cmp, anchor0); // content-only: Present(key) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
     }
 
@@ -391,7 +391,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.opBufSize() > 0 && _level == 1) depositInto(storage, ins, key, key, cmp, anchor0); // leaf-parent: Present(key)
+      if (_settings.opBufSize() > 0) depositInto(storage, ins, key, key, cmp, anchor0); // content-only: Present(key) / branch marker
       if (ins == _len - 1)
         return new ANode[]{ this }; // last child changed, propagate maxKey update
       else
@@ -420,7 +420,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           ? _subtreeCount - oldChildCount + newChildrenCount : -1;
       Object newMeasure = tryComputeMeasureFromChildren(newChildren, _len, storage, measureOps);
       Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, newCount, newMeasure, settings);
-      if (settings.opBufSize() > 0 && _level == 1) nb.carryAndDeposit(storage, _slots, ins, key, key, cmp, anchor0); // leaf-parent: Present(key)
+      if (settings.opBufSize() > 0) nb.carryAndDeposit(storage, _slots, ins, key, key, cmp, anchor0); // content-only: Present(key) / branch marker
       return new ANode[]{ nb };
     }
 
@@ -501,7 +501,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     assert 0 <= idx && idx < _len;
     
     // OP_BUF_V5: capture child idx's durable address before the mutation nulls it (M4a).
-    Object anchor0 = (_settings.opBufSize() > 0 && _level == 1 && _addresses != null) ? _addresses[idx] : null;
+    Object anchor0 = (_settings.opBufSize() > 0 && _addresses != null) ? _addresses[idx] : null;
     ANode leftChild  = idx > 0      ? child(storage, idx - 1) : null,
           rightChild = idx < _len-1 ? child(storage, idx + 1) : null;
     int leftChildLen = safeLen(leftChild);
@@ -519,7 +519,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.opBufSize() > 0 && _level == 1) depositInto(storage, idx, key, Slot.ABSENT, cmp, anchor0); // leaf-parent: Absent(key)
+      if (_settings.opBufSize() > 0) depositInto(storage, idx, key, Slot.ABSENT, cmp, anchor0); // content-only: Absent(key) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
     }
 
@@ -593,7 +593,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         }
         if (_settings.opBufSize() > 0) {
           if (!leftChanged && !rightChanged && newLen == _len) {
-            if (_level == 1) depositInto(storage, idx, key, Slot.ABSENT, cmp, anchor0); // leaf-parent: Absent(key)
+            depositInto(storage, idx, key, Slot.ABSENT, cmp, anchor0); // content-only: Absent(key) / branch marker
           } else {
             _rebalanced = true; // a child merged/borrowed with a sibling: structural → write in full
           }
@@ -632,7 +632,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       newCenter._measure = tryComputeMeasureFromChildren(newCenter._children, newLen, storage, measureOps);
       if (settings.opBufSize() > 0) {
         if (!leftChanged && !rightChanged && newLen == _len) {
-          if (_level == 1) newCenter.carryAndDeposit(storage, _slots, idx, key, Slot.ABSENT, cmp, anchor0); // leaf-parent: Absent(key)
+          newCenter.carryAndDeposit(storage, _slots, idx, key, Slot.ABSENT, cmp, anchor0); // content-only: Absent(key) / branch marker
         } else {
           newCenter._rebalanced = true; // a child merged/borrowed with a sibling: structural → write in full
         }
@@ -841,7 +841,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     assert 0 <= idx && idx < _len;
 
     // OP_BUF_V5: capture child idx's durable address before the mutation nulls it (M4a).
-    Object anchor0 = (_settings.opBufSize() > 0 && _level == 1 && _addresses != null) ? _addresses[idx] : null;
+    Object anchor0 = (_settings.opBufSize() > 0 && _addresses != null) ? _addresses[idx] : null;
     // Recursively replace in child
     ANode[] nodes = child(storage, idx).replace(storage, oldKey, newKey, cmp, settings);
 
@@ -854,7 +854,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.opBufSize() > 0 && _level == 1) depositInto(storage, idx, newKey, newKey, cmp, anchor0); // leaf-parent: Present(newKey)
+      if (_settings.opBufSize() > 0) depositInto(storage, idx, newKey, newKey, cmp, anchor0); // content-only: Present(newKey) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
     }
 
@@ -877,7 +877,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.opBufSize() > 0 && _level == 1) depositInto(storage, idx, newKey, newKey, cmp, anchor0); // leaf-parent: Present(newKey)
+      if (_settings.opBufSize() > 0) depositInto(storage, idx, newKey, newKey, cmp, anchor0); // content-only: Present(newKey) / branch marker
       if (maxKeyChanged)
         return new ANode[]{this};
       else
@@ -903,7 +903,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (measureOps != null && _measure != null) {
       newBranch._measure = newBranch.tryComputeMeasure(storage);
     }
-    if (settings.opBufSize() > 0 && _level == 1) newBranch.carryAndDeposit(storage, _slots, idx, newKey, newKey, cmp, anchor0); // leaf-parent: Present(newKey)
+    if (settings.opBufSize() > 0) newBranch.carryAndDeposit(storage, _slots, idx, newKey, newKey, cmp, anchor0); // content-only: Present(newKey) / branch marker
 
     return new ANode[]{newBranch};
   }
@@ -950,11 +950,19 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       _slots = new Object[_keys.length];
     }
     Slot prev = (Slot) _slots[i];
-    PersistentTreeMap d = (prev == null) ? Slot.emptyDiff(cmp) : prev.diff;
-    d = (PersistentTreeMap) d.assoc(mapKey, val);
-    ANode child = child(storage, i);
     Object anchor = (prev != null && prev.anchor != null) ? prev.anchor : anchor0;
-    _slots[i] = new Slot(d, childCount(storage, i), child.measure(), anchor);
+    ANode child = child(storage, i);
+    Object diff;
+    if (_level == 1) {
+      // leaf child: accumulate the leaf-op (net latest-wins)
+      PersistentTreeMap d = (prev != null && prev.diff instanceof PersistentTreeMap)
+          ? (PersistentTreeMap) prev.diff : Slot.emptyDiff(cmp);
+      diff = d.assoc(mapKey, val);
+    } else {
+      // branch child: anchor marker; its nested diff is derived from the live subtree at store
+      diff = null;
+    }
+    _slots[i] = new Slot(diff, childCount(storage, i), child.measure(), anchor);
   }
 
   // For persistent (non-editable) returns: carry the source branch's slots into

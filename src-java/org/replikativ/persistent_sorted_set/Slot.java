@@ -31,8 +31,12 @@ public class Slot {
   /** Sentinel marking a removed key (an <em>Absent</em> entry). */
   public static final Object ABSENT = new Object();
 
-  /** cmp-key -&gt; element (Present) | ABSENT (remove). */
-  public final PersistentTreeMap diff;
+  /** The child's node-diff. One of:
+   *   - a {@link PersistentTreeMap} cmp-key -&gt; element (Present) | ABSENT (remove) — a LEAF child's leaf-diff;
+   *   - null — a BRANCH anchor marker (the nested diff is derived from the live subtree at store,
+   *            or reconstructed into the child's own _slots on restore push-down);
+   *   - a nested slots structure — a restored, not-yet-materialized BRANCH child's diff. */
+  public final Object diff;
 
   /** ĝ.count — element count of the child's current subtree. */
   public final long count;
@@ -45,16 +49,17 @@ public class Slot {
    *  At store, a buffered child's parent re-points addresses[i] := anchor. */
   public final Object anchor;
 
-  public Slot(PersistentTreeMap diff, long count, Object measure, Object anchor) {
+  public Slot(Object diff, long count, Object measure, Object anchor) {
     this.diff = diff;
     this.count = count;
     this.measure = measure;
     this.anchor = anchor;
   }
 
-  /** Number of buffered entries (contributes to the per-node budget B). */
+  /** Number of buffered leaf entries directly in this slot (leaf-diff size; 0 for a branch marker).
+   *  The full subtree entry count for budgeting is computed at store by recursion. */
   public int size() {
-    return diff == null ? 0 : diff.count();
+    return (diff instanceof PersistentTreeMap) ? ((PersistentTreeMap) diff).count() : 0;
   }
 
   static PersistentTreeMap emptyDiff(Comparator cmp) {
