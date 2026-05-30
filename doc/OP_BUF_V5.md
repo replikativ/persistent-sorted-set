@@ -556,13 +556,25 @@ validates the new behavior. All new behavior forks on `_settings.opBufSize() > 0
     `{idx → {:count :measure :diff}}` (diffs pre-assembled; sparse). `Slot.ABSENT`
     is a namespaced **keyword** so leaf-diffs are edn-serializable directly. Storage
     emits `:slots` only when non-null (opBufSize=0 ⇒ absent ⇒ old format).
-- **M5 — restore (projection).** `restore` / `Branch.child`: when a loaded node's
-  slot has a diff, apply it to the lazily-loaded child via `add`/`remove`/`replace`;
-  set branch aggregates from `ĝ`. Gate: the full ported probe — multi-cycle,
-  generative, AGG cold-child, recency, rebalance-correctness (valid B-tree,
-  structurally equal to writer), writes/commit≈1 (0 reads on store), all green;
-  suite green at 0.
+- **M5 — restore (projection). DONE (core).** `Branch.child` projects at the lazy
+  materialization boundary: a **leaf** child is rebuilt in one pass from durable keys
+  ⊕ leaf-diff (`projectLeaf`, no restructure); a **branch** child has the nested diff
+  installed as its own `_slots` + aggregates set from `ĝ` (`projectBranch`), pushing
+  one level down. The set's comparator is threaded via `Settings._comparator` (set in
+  `map->settings`, preserved by `editable()`). `depositInto` accumulates onto a
+  restored (plain-edn) leaf-diff by rebuilding it under `cmp`. Test storage `restore`
+  reconstructs `_slots`. Gate green: I0 (142 tests); probe `store→FRESH restore content
+  exact` (P-roundtrip) and **8-cycle fresh-restore→mutate→store** (P-multicycle).
+  - **Slot-carry through rebuild (add DONE; remove TODO).** When a node rebalances it is
+    written but still buffers surviving siblings, so a structural `Stitch` rebuild must
+    carry `_slots` (a child's slot travels with its address; new split/merge nodes get
+    none). `add` absorb+split do this (`stitchSlots`); **`remove` join/borrow/in-place
+    do NOT yet → committed-buffered siblings lose their diff across a later merge.**
+    Confirmed repro: store(buffer evens) → restore → remove(odds, merges) → store →
+    restore ⇒ `[4 9]` reverts to `[4 0]`. **Fix (next): mirror each remove address-Stitch
+    with a parallel `_slots` Stitch** (`_addresses`/`left._addresses`/`right._addresses`
+    → `_slots`/`left._slots`/`right._slots`; nulls → null slots).
 - **M6 — benchmark + B sweep.** Throughput vs baseline (W1); PUT-count probe via
   the konserve-s3 instrumentation; `B` sweep; confirm I0 speed-parity.
 
-Then audit (#40), cljs (#41), format-flip (#42), e2e (#43).
+Then remove-path slot-carry, audit (#40), cljs (#41), format-flip (#42), e2e (#43).

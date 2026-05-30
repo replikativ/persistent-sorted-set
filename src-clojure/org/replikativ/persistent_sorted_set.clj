@@ -126,16 +126,20 @@
            (conj! (array-from-indexed coll type (+ from (quot len 2)) to)))))))
 
 (defn- map->settings ^Settings [m]
-  (Settings.
-   (int (or (:branching-factor m) 0))
-   (case (:ref-type m)
-     :strong RefType/STRONG
-     :soft   RefType/SOFT
-     :weak   RefType/WEAK
-     nil)
-   ^IMeasure (:measure m)
-   (:leaf-processor m)
-   (int (or (:op-buf-size m) 0))))
+  (let [s (Settings.
+           (int (or (:branching-factor m) 0))
+           (case (:ref-type m)
+             :strong RefType/STRONG
+             :soft   RefType/SOFT
+             :weak   RefType/WEAK
+             nil)
+           ^IMeasure (:measure m)
+           (:leaf-processor m)
+           (int (or (:op-buf-size m) 0)))]
+    ;; OP_BUF_V5: thread the set's comparator into Settings so buffered leaf-diffs can
+    ;; be projected onto restored leaves (Branch.child). Defaults to compare.
+    (set! (.-_comparator s) ^java.util.Comparator (or (:comparator m) (:cmp m) compare))
+    s))
 
 (defn- settings->map [^Settings s]
   {:branching-factor (.branchingFactor s)

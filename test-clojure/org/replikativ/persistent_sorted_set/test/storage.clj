@@ -8,7 +8,7 @@
    [clojure.lang RT]
    [java.lang.ref Reference]
    [java.util Comparator Arrays]
-   [org.replikativ.persistent_sorted_set ANode ArrayUtil Branch IStorage Leaf PersistentSortedSet Settings]))
+   [org.replikativ.persistent_sorted_set ANode ArrayUtil Branch IStorage Leaf PersistentSortedSet Settings Slot]))
 
 (set! *warn-on-reflection* true)
 
@@ -50,10 +50,20 @@
      (@*memory address)
      (let [{:keys [level
                    ^java.util.List keys
-                   ^java.util.List addresses]} (edn/read-string (@*disk address))
+                   ^java.util.List addresses
+                   slots]} (edn/read-string (@*disk address))
            node (if addresses
                   (Branch. (int level) ^java.util.List keys ^java.util.List addresses settings)
                   (Leaf. keys settings))]
+       ;; OP_BUF_V5: reconstruct per-child buffered diffs into _slots (anchor = the child's
+       ;; durable address). Branch.child projects them on descent (M5). Absent when opBufSize=0.
+       (when (and slots (instance? Branch node))
+         (let [^Branch b node
+               arr (object-array (alength (.-_keys b)))]
+           (doseq [[idx entry] slots]
+             (aset arr (int idx)
+                   (Slot. (:diff entry) (long (:count entry)) (:measure entry) (nth addresses (int idx)))))
+           (set! (.-_slots b) arr)))
        (swap! *stats update :reads inc)
        (swap! *memory assoc address node)
        node)))

@@ -1,6 +1,7 @@
 package org.replikativ.persistent_sorted_set;
 
 import java.lang.ref.*;
+import java.util.*;
 import java.util.concurrent.atomic.*;
 
 @SuppressWarnings("rawtypes")
@@ -13,6 +14,11 @@ public class Settings {
   // OP_BUF_V5: per-node diff budget B. 0 (default) disables the write-opt path
   // entirely, so every code path is byte-identical to baseline PSS (invariant I0).
   public final int _opBufSize;
+  // OP_BUF_V5: the set's comparator, needed to PROJECT buffered leaf-diffs onto a
+  // restored leaf at the lazy-load boundary (Branch.child). Set by the Clojure API;
+  // null when opBufSize==0 (projection never runs). Not final so the various ctors
+  // need not all thread it; editable() preserves it.
+  public Comparator _comparator;
 
   // Canonical constructor (does not normalize; callers pass already-normalized values).
   public Settings(int branchingFactor, RefType refType, AtomicBoolean edit, IMeasure measure, ILeafProcessor leafProcessor, int opBufSize) {
@@ -101,7 +107,14 @@ public class Settings {
   public Settings editable(boolean value) {
     assert !editable();
     assert value == true;
-    return new Settings(_branchingFactor, _refType, new AtomicBoolean(value), _measure, _leafProcessor, _opBufSize);
+    Settings s = new Settings(_branchingFactor, _refType, new AtomicBoolean(value), _measure, _leafProcessor, _opBufSize);
+    s._comparator = _comparator;  // preserve for diff projection during transient mutation
+    return s;
+  }
+
+  // OP_BUF_V5: the set's comparator (for projecting buffered leaf-diffs on restore).
+  public Comparator comparator() {
+    return _comparator;
   }
 
   public IMeasure measure() {

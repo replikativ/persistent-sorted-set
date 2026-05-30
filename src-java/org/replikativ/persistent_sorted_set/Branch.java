@@ -140,7 +140,18 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
     if (child == null) {
       assert _addresses[idx] != null;
-      child = storage.restore(_addresses[idx]);
+      ANode base = storage.restore(_addresses[idx]);
+      Slot sl = (_slots != null) ? (Slot) _slots[idx] : null;
+      // OP_BUF_V5 push-down (M5): project this parent's buffered diff onto the freshly
+      // loaded child — leaf: batch-rebuild keys; branch: install the nested diff as the
+      // child's own _slots + set its aggregates from ĝ. Runs once, here, at materialization
+      // (reads stay baseline). Parent's slot supersedes any diff baked in the child's object.
+      if (_settings.opBufSize() > 0 && sl != null && sl.diff != null) {
+        child = (base instanceof Leaf) ? (ANode) projectLeaf((Leaf) base, sl.diff)
+                                       : (ANode) projectBranch((Branch) base, sl);
+      } else {
+        child = base;
+      }
       ensureChildren()[idx] = _settings.makeReference(child);
     } else {
       if (_addresses != null && _addresses[idx] != null) {
@@ -458,7 +469,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           ? _subtreeCount - oldChildCount + newChildrenCount : -1;
       Object measure = tryComputeMeasureFromChildren(allChildren, newLen, storage, measureOps);
       Branch<Key, Address> nb = new Branch(_level, newLen, allKeys, allAddresses, allChildren, count, measure, settings);
-      if (settings.opBufSize() > 0) nb._rebalanced = true; // absorbed a child split: structural → write in full
+      if (settings.opBufSize() > 0) {
+        nb._rebalanced = true; // absorbed a child split: structural → written, but it still buffers surviving siblings
+        nb._slots = stitchSlots(ins, nodes.length, newLen); // carry buffered siblings' slots through the rebuild
+      }
       return new ANode[]{ nb };
     }
 
@@ -483,7 +497,14 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     Object measure2 = tryComputeMeasureFromChildren(children2, half2, storage, measureOps);
     Branch<Key, Address> sb1 = new Branch(_level, half1, keys1, addresses1, children1, count1, measure1, settings);
     Branch<Key, Address> sb2 = new Branch(_level, half2, keys2, addresses2, children2, count2, measure2, settings);
-    if (settings.opBufSize() > 0) { sb1._rebalanced = true; sb2._rebalanced = true; } // split: structural → write in full
+    if (settings.opBufSize() > 0) {
+      sb1._rebalanced = true; sb2._rebalanced = true; // split: structural → written, still buffer surviving siblings
+      Object[] all = stitchSlots(ins, nodes.length, newLen); // carry buffered siblings' slots through the split
+      if (all != null) {
+        sb1._slots = Arrays.copyOfRange(all, 0, half1);
+        sb2._slots = Arrays.copyOfRange(all, half1, newLen);
+      }
+    }
     return new ANode[]{ sb1, sb2 };
   }
 
@@ -954,15 +975,41 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     ANode child = child(storage, i);
     Object diff;
     if (_level == 1) {
-      // leaf child: accumulate the leaf-op (net latest-wins)
-      PersistentTreeMap d = (prev != null && prev.diff instanceof PersistentTreeMap)
-          ? (PersistentTreeMap) prev.diff : Slot.emptyDiff(cmp);
+      // leaf child: accumulate the leaf-op (net latest-wins) onto the existing diff.
+      PersistentTreeMap d;
+      if (prev != null && prev.diff instanceof PersistentTreeMap) {
+        d = (PersistentTreeMap) prev.diff;                         // already sorted under cmp
+      } else if (prev != null && prev.diff instanceof java.util.Map) {
+        // restored leaf-diff (plain edn map): rebuild a cmp-sorted map so accumulation
+        // (net latest-wins on cmp-equal keys) and projection stay correct vs the anchor.
+        d = Slot.emptyDiff(cmp);
+        for (ISeq s = RT.seq(prev.diff); s != null; s = s.next()) {
+          IMapEntry e = (IMapEntry) s.first();
+          d = (PersistentTreeMap) d.assoc(e.key(), e.val());
+        }
+      } else {
+        d = Slot.emptyDiff(cmp);
+      }
       diff = d.assoc(mapKey, val);
     } else {
       // branch child: anchor marker; its nested diff is derived from the live subtree at store
       diff = null;
     }
     _slots[i] = new Slot(diff, childCount(storage, i), child.measure(), anchor);
+  }
+
+  // Carry _slots through a structural rebuild where child `ins` was replaced by `nNodes`
+  // new nodes (split/absorb), producing a slots array of length newLen laid out exactly
+  // like the rebuilt _children: surviving siblings keep their slot; the new nodes get none
+  // (they are materialized/written, no durable anchor). Null if this node has no slots.
+  private Object[] stitchSlots(int ins, int nNodes, int newLen) {
+    if (_slots == null) return null;
+    Object[] out = new Object[newLen];
+    Stitch s = new Stitch(out, 0);
+    s.copyAll(_slots, 0, ins);
+    for (int k = 0; k < nNodes; k++) s.copyOne(null);
+    s.copyAll(_slots, ins + 1, _len);
+    return out;
   }
 
   // For persistent (non-editable) returns: carry the source branch's slots into
@@ -983,16 +1030,20 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // Entry count of an already-assembled slot diff: a leaf-diff's size, or the
   // recursive sum over a nested {idx -> {:count :measure :diff}} map.
   private static int diffSize(Object diff) {
-    if (diff instanceof PersistentTreeMap) return ((PersistentTreeMap) diff).count();
-    if (diff instanceof IPersistentMap) {
+    if (!(diff instanceof java.util.Map)) return 0;
+    java.util.Map m = (java.util.Map) diff;
+    if (m.isEmpty()) return 0;
+    // Distinguish a nested branch-diff (values are {:count :measure :diff} maps) from a
+    // leaf-diff (values are elements / ABSENT) — needed because a RESTORED leaf-diff is a
+    // plain edn map, not a PersistentTreeMap, so we can't tell by type alone.
+    Object firstVal = m.values().iterator().next();
+    boolean branch = (firstVal instanceof Associative) && ((Associative) firstVal).containsKey(KW_DIFF);
+    if (branch) {
       int t = 0;
-      for (ISeq s = RT.seq(diff); s != null; s = s.next()) {
-        Object entry = ((IMapEntry) s.first()).val();           // {:count :measure :diff}
-        t += diffSize(((IPersistentMap) entry).valAt(KW_DIFF));
-      }
+      for (Object v : m.values()) t += diffSize(((IPersistentMap) v).valAt(KW_DIFF));
       return t;
     }
-    return 0;
+    return m.size();                                            // leaf-diff entry count
   }
 
   // Total content-only diff size of c's dirty subtree, or -1 if any dirty descendant
@@ -1050,6 +1101,48 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       m = (IPersistentMap) m.assoc((long) i, entry);
     }
     return m.count() == 0 ? null : m;
+  }
+
+  // ---- OP_BUF_V5 restore-side projection (M5) ----
+
+  // Apply a leaf-diff to a durable leaf in ONE pass (no split/merge): merge the durable
+  // keys with the diff (Present upserts the element, Absent removes) under the set's
+  // comparator, emitting the result elements in key order. The net diff keeps the leaf
+  // within [min, BF] (else the writer would have rebalanced and written it), so this is IO-free.
+  private Leaf<Key, Address> projectLeaf(Leaf<Key, Address> base, Object diff) {
+    Comparator cmp = _settings.comparator();
+    PersistentTreeMap m = (PersistentTreeMap) PersistentTreeMap.create(cmp, (ISeq) null);
+    for (int i = 0; i < base._len; ++i) m = (PersistentTreeMap) m.assoc(base._keys[i], base._keys[i]);
+    for (ISeq s = RT.seq(diff); s != null; s = s.next()) {
+      IMapEntry e = (IMapEntry) s.first();
+      if (Slot.ABSENT.equals(e.val())) m = (PersistentTreeMap) m.without(e.key());
+      else                             m = (PersistentTreeMap) m.assoc(e.val(), e.val()); // upsert: value carries current element
+    }
+    int n = m.count();
+    Object[] keys = new Object[n];
+    int i = 0;
+    for (ISeq s = RT.seq(m); s != null; s = s.next()) keys[i++] = ((IMapEntry) s.first()).val();
+    return new Leaf(n, (Key[]) keys, _settings);
+  }
+
+  // Push one level down: install the nested diff as base's own _slots (each grandchild's
+  // diff + ĝ, anchored at base's durable child address) and set base's aggregates from ĝ.
+  // Grandchildren project lazily on their own descent.
+  private Branch<Key, Address> projectBranch(Branch<Key, Address> base, Slot sl) {
+    Object[] slots = new Object[base._keys.length];
+    for (ISeq s = RT.seq(sl.diff); s != null; s = s.next()) {
+      IMapEntry e = (IMapEntry) s.first();
+      int i = ((Number) e.key()).intValue();
+      IPersistentMap entry = (IPersistentMap) e.val();
+      long cnt = ((Number) entry.valAt(KW_COUNT)).longValue();
+      Object measure = entry.valAt(KW_MEASURE);
+      Object d = entry.valAt(KW_DIFF);
+      slots[i] = new Slot(d, cnt, measure, base._addresses[i]);   // anchor = grandchild's durable address
+    }
+    base._slots = slots;
+    base._subtreeCount = sl.count;        // ĝ.count — no child summing
+    base._measure = sl.measure;           // ĝ.measure
+    return base;
   }
 
   @Override

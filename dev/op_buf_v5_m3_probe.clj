@@ -12,7 +12,7 @@
        -M -e \"(require 'op-buf-v5-m3-probe)(op-buf-v5-m3-probe/run-all)\""
   (:require [org.replikativ.persistent-sorted-set :as ss]
             [org.replikativ.persistent-sorted-set.test.storage :as tstore])
-  (:import [org.replikativ.persistent_sorted_set Branch Leaf ANode Slot PersistentSortedSet IStorage]
+  (:import [org.replikativ.persistent_sorted_set Branch Leaf ANode Slot PersistentSortedSet IStorage Settings]
            [clojure.lang PersistentTreeMap]
            [java.lang.ref Reference]))
 
@@ -220,9 +220,70 @@
                      (count leaf-diffs) "leaf-diff(s) at the bottom; sample:" (first (remove empty? leaf-diffs)))
             true))))
 
+;; --- M5: store → FRESH restore → content exact (push-down projection) ----------
+(defn opbuf-settings ^Settings [bf b]
+  ;; node settings used by the storage on restore: opBufSize>0 + the set's comparator,
+  ;; so Branch.child projects buffered diffs.
+  (let [s (Settings. (int bf) nil nil nil (int b))]
+    (set! (.-_comparator s) ^java.util.Comparator cmp)
+    s))
+
+(defn fresh-restore
+  "Re-open the set from disk with an EMPTY node cache, forcing durable reads + projection."
+  [addr disk bf b]
+  (ss/restore-by cmp addr
+                 (tstore/->Storage (atom {}) disk (opbuf-settings bf b))
+                 {:branching-factor bf :op-buf-size b :comparator cmp}))
+
+(defn probe-roundtrip []
+  (let [n 200, bf 4, b 100
+        st  (tstore/storage-with-settings (opbuf-settings bf b))
+        ref (atom (sorted-set-by cmp))
+        s0  (reduce (fn [s i] (swap! ref conj [i 0]) (conj s [i 0]))
+                    (ss/sorted-set* {:comparator cmp :branching-factor bf :op-buf-size b}) (range n))
+        _   (ss/store s0 st)
+        ;; content-only commit: replace 1/3, remove 1/7 (mix of buffered + maybe rebalanced)
+        s1  (reduce (fn [s i] (swap! ref #(-> % (disj [i 0]) (conj [i 1]))) (ss/replace s [i 0] [i 1]))
+                    s0 (range 0 n 3))
+        s1  (reduce (fn [s i] (swap! ref disj [i 0]) (disj s [i 0])) s1 (range 2 n 7))
+        addr (ss/store s1 st)
+        loaded (fresh-restore addr (:*disk st) bf b)
+        got (vec (seq loaded))
+        exp (vec (seq @ref))]
+    (if (= got exp)
+      (do (println "  P-roundtrip: store→FRESH restore content exact:" (count got) "elems") true)
+      (fails "roundtrip mismatch: got " (count got) " exp " (count exp)
+             " firstdiff " (first (remove (fn [[a bb]] (= a bb)) (map vector got exp)))))))
+
+(defn probe-multicycle []
+  ;; restore → mutate → store, repeated; each cycle starts from a FRESH durable reload.
+  (let [bf 4, b 60, n 150
+        disk (atom {})
+        st0  (tstore/storage-with-settings (opbuf-settings bf b))
+        ref  (atom (sorted-set-by cmp))
+        s0   (reduce (fn [s i] (swap! ref conj [i 0]) (conj s [i 0]))
+                     (ss/sorted-set* {:comparator cmp :branching-factor bf :op-buf-size b}) (range n))
+        addr0 (let [st (tstore/->Storage (atom {}) disk (opbuf-settings bf b))] (ss/store s0 st))]
+    (loop [cyc 0, addr addr0]
+      (if (= cyc 8)
+        (do (println "  P-multicycle: 8 cycles of fresh-restore→mutate→store, content exact each:" (count @ref)) true)
+        (let [loaded (fresh-restore addr disk bf b)
+              got (vec (seq loaded))
+              exp (vec (seq @ref))]
+          (if (not= got exp)
+            (fails "cycle " cyc " mismatch: got " (count got) " exp " (count exp)
+                   " firstdiff " (first (remove (fn [[a bb]] (= a bb)) (map vector got exp))))
+            (let [;; mutate: replace some, add some new, remove some
+                  s1 (reduce (fn [s i] (swap! ref #(-> % (disj [i 0]) (conj [i (inc cyc)]))) (ss/replace s [i 0] [i (inc cyc)]))
+                             loaded (range cyc n 11))
+                  s1 (reduce (fn [s i] (swap! ref conj [i 0]) (conj s [i 0])) s1 (range (+ n cyc) (+ n cyc 5)))
+                  st (tstore/->Storage (atom {}) disk (opbuf-settings bf b))
+                  addr' (ss/store s1 st)]
+              (recur (inc cyc) addr'))))))))
+
 (defn run-all []
-  (println "=== OP_BUF_V5 M3+M4a+M4b probe ===")
+  (println "=== OP_BUF_V5 M3+M4a+M4b+M5 probe ===")
   (let [rs [(probe-content) (probe-deposit) (probe-absent) (probe-markers) (probe-anchor)
-            (probe-writes) (probe-serialized)]]
+            (probe-writes) (probe-serialized) (probe-roundtrip) (probe-multicycle)]]
     (println (if (every? true? rs) "ALL PROBES PASSED" "PROBE FAILURES"))
     (every? true? rs)))
