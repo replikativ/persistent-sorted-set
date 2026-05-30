@@ -173,28 +173,50 @@ store(node):
   address as the anchor its diff is against; its diff is replaced each commit and
   reset when it is written ⇒ apply-once, never a chain.
 
-### 4.3 Restore — project diffs on descent
+### 4.3 Restore — push the diff down, one level per (lazy) deserialization
+
+Projection is a **deserialization** concern, confined to node materialization
+(`Branch.child(node, i)` / `restore`). **Reads stay baseline**:
+`lookup`/`contains`/`slice`/`seek` binary-search already-materialized nodes and
+never see a diff. Materialization is lazy and per-node, so a read merely
+*triggers* it; the projection lives at the restore boundary, runs **once** per
+node, then is cached (warm reads = plain `O(log_B N)`, no re-projection).
 
 ```
-child(node, i):                                      # lazy, on first descent into child i
-  if loaded: return cached
-  base := load(aᵢ)                                   # 1 GET (durable object)
-  mat  := reconstruct(base)                          # recursively materialize, applying base's OWN slots
-  for (k, st) in diffᵢ (this parent's slot — newer — on top):   # recency by depth
-     Absent(k)     → mat.remove k     # underflow → merge/borrow: may load a sibling (see below)
-     Present(k,e)  → mat.add/replace e # overflow → split: LOCAL, no IO
-  set mat's per-child aggregates from ĝ (no re-summing); recompute pivots locally
-  cache mat ; return mat
+materialize(node, i):                        # runs once, when child i is first descended into
+  if cached: return cached
+  base   := load(child-ref aᵢ)               # 1 GET; aᵢ is a DURABLE address (the anchor)
+  (d, ĝ) := node._slots[i]                    # parent's slot for child i; null ⇒ load base verbatim
+  if base is a Leaf:                          # bottom: apply the leaf-diff in ONE pass
+     mat := rebuild base.keys with d          #   net Present(upsert) / Absent(delete); no split/merge
+  else:                                       # branch: push ONE level down, stay lazy
+     mat := base ; mat._slots := d ; mat.(count,measure) := ĝ   # grandchildren project on their OWN descent
+  cache and return mat
 ```
 
-Application is **IO-free and never restructures on read**:
-- A buffered child changed *content only* (its structure equals the durable
-  anchor), so applying its diff inserts/removes keys within the **same** node
-  shape — a buffered insert/delete may push a leaf transiently over/under the
-  fill bounds, but it is **not** split/merged on read (rebalancing was already
-  materialized on the writer's store). So no sibling load, no local restructure.
-- **Aggregates never force IO** — a materialized branch takes its `(count,
-  measure)` from `ĝ`; children are not summed.
+- **One level per deserialization.** Materializing child *i* consumes exactly
+  `node._slots[i]`: at a branch it *installs* the nested remainder as the child's
+  own `_slots`; grandchildren are untouched until separately descended. (Eager
+  full push-down would materialize the whole changed subtree and defeat laziness.)
+- **Leaf application is batch, never op-by-op.** A buffered child changed content
+  only ⇒ its *net* diff keeps every leaf within `[min, BF]` (else the writer would
+  have rebalanced and *written* it). So rebuilding `durable-keys ⊕ net-diff` in one
+  pass yields that in-bounds leaf with **no split/merge and no sibling load**.
+  Replaying op-by-op could transiently overflow → forbidden.
+- **Aggregates from `ĝ`, never summed.** A materialized branch takes
+  `(count, measure)` from the slot's `ĝ`; children are not loaded to re-sum.
+  Optional `ĝ`-without-load: a `count`/`rank`/`measure` query may read
+  `node._slots[i].ĝ` without materializing child *i* — the lone read that consults
+  a slot; opt-in, and omitting it (materialize, then baseline) is still correct.
+- **OPEN — composition (W6/§8).** `mat._slots := d` *installs* the parent's diff
+  as the child's slots. That is correct only if `base` is itself **slot-free**. If
+  a *written* node is allowed to buffer its own descendants (slots in non-root
+  objects), `base` can carry stored slots `S` and materialization must **merge**
+  `S` with `d` (d newer — recency by depth) rather than install — a bounded,
+  IO-free merge of two nested diff maps. The alternative (a written node fully
+  materializes its dirty subtree ⇒ every anchor is slot-free ⇒ plain install, no
+  merge) trades a few extra PUTs on flush/rebalance for a composition-free restore.
+  Decided at M4/M5.
 
 (Because structure is materialized on write, a reconstructed tree is structurally
 identical to the writer's, not merely content-equal.)
@@ -289,6 +311,50 @@ Because rebalancing is materialized on write, a reconstructed tree is
 buffered node's logical diff only changes keys within an unchanged node shape. The
 probe asserts content + count + measure; structure equality holds as a bonus.
 
+### 6.5 Two ops; replace folds into Present
+
+The language has exactly **two** ops, not three. `Present(element)` is "this
+cmp-key should be present holding *this* element" — applied to a leaf it *upserts*
+(insert if absent, overwrite if a `cmp`-equal element is present), so **add =
+Present(key absent), replace = Present(key present)**. `Absent(key)` is delete.
+Replace is not a third op and is never delete-then-add (which could transiently
+restructure); it rides inside the leaf rebuild.
+
+### 6.6 Worked example (depth 3) and serialization shape
+
+Tree (BF 4; pivots = each child's max key):
+
+```
+R(level 2) keys[6,16,31] → B0,B1,B2
+B0 keys[2,6]  → L0[1,2]  L1[5,6]
+B1 keys[11,16]→ L2[10,11] L3[15,16]
+B2 keys[22,31]→ L4[20,21,22] L5[30,31]
+```
+
+One content-only commit — `add 3`(→L1), `add 12`(→L3), `delete 20`(→L4),
+`replace 30→30*`(→L5). No node crosses a fill bound ⇒ B0,B1,B2 all buffered; only
+R is written (1 PUT). R's stored object:
+
+```clojure
+{:level 2 :keys [6 16 31]
+ :addresses [aB0 aB1 aB2]              ; all three = children's UNCHANGED durable anchors
+ :slots {0 {:count 5 :measure mB0       ; ĝ_B0
+            :diff {1 {:count 3 :measure mL1 :diff {3 3}}}}        ; Present(3)
+         1 {:count 5 :measure mB1
+            :diff {1 {:count 3 :measure mL3 :diff {12 12}}}}      ; Present(12)
+         2 {:count 4 :measure mB2
+            :diff {0 {:count 2 :measure mL4 :diff {20 :ABSENT}}   ; Absent(20)
+                   1 {:count 2 :measure mL5 :diff {30 30*}}}}}}   ; Present(30*) = replace
+```
+
+A slot is `{:count :measure :diff}` (ĝ + the child's node-diff). `:diff` is keyed
+by **child-index** at a branch level and by **cmp-key** at a leaf level; which one
+is known from the child's level (tracked on descent). **Sparse**: unchanged
+children (L0, L2, …) have no entry — their durable objects and ĝ stand. `:slots`
+absent/empty ⇒ exactly the baseline format (I0, back-compat). A branch's `:diff`
+*is* that branch's `_slots`; the whole nested thing lives only in the topmost
+written object (here R), so no duplication.
+
 ---
 
 ## 7. Probe gate (soundness spec)
@@ -345,6 +411,30 @@ Never flip a default before the gate plus audit (#40), cljs (#41), migration
   readers reconstruct read-only" requires one writer producing durable objects.
   Consistent with the datahike single-writer + failover model; the index depends
   on it.
+- **W6 — RESOLVED: install, single source, no merge.** Restore materializes a node
+  by applying **exactly one** diff: the parent's slot for it if present, else the
+  node's own durable slots (used only when restoring at the very commit the node
+  was written). They never need composing, because the diff that reaches the
+  nearest written ancestor is the **complete, accumulated** delta of the subtree
+  vs its children's current anchors — it *supersedes* (is a superset of) any older
+  diff baked in the node's durable object, rather than stacking on it. This holds
+  because (1) leaf-diffs accumulate in their leaf-parent until the leaf is actually
+  rewritten, and (2) the `_childWritten` cascade guarantees a *buffered* node has no
+  rewritten descendant, so its durable child-pointers stay valid and only the
+  complete diff floats up. So a *written* node **may** still buffer its descendants
+  (model A — "per-node slots everywhere") with no merge cost: structurally the diff
+  nests down a single object (diffs-of-diffs); temporally it stays one flat complete
+  diff per buffered subtree.
+- **W7 — RESOLVED: leaf-diffs at leaf-parents + assemble at store.** During mutation
+  the branch-level nesting + ĝ are **redundant with the live tree** (a branch's
+  node-diff is just its children's state; ĝ is already `_subtreeCount`/`_measure`).
+  The only *irreducible* explicit state is the **leaf-diffs at leaf-parents** (a leaf
+  stores keys, not its delta-vs-anchor, and we refuse store-time IO to recompute it).
+  So `_slots` are populated only at leaf-parents during mutation; the nested object +
+  ĝ are assembled by a tree walk at store; restore reconstructs the nested `_slots`
+  for not-yet-materialized children, which move down on descent (a leaf-parent's slot
+  is kept until the leaf is rewritten; a branch-slot is moved into the child). Live
+  tree = single source of truth, no aliasing. (Done in M3.)
 - **Eviction safety (resolved):** diffs are durable-after-commit (embedded in
   committed ancestor objects), so evicting a node after a commit loses nothing;
   between commits they hold the volatile open txn (expected).
@@ -409,14 +499,19 @@ validates the new behavior. All new behavior forks on `_settings.opBufSize() > 0
   plus a cached `(count, measure)` snapshot) + accessors + the two dirty bits
   (`_rebalanced`, `_childWritten`) used only by store. Null/unset at opBufSize=0.
   Gate: inert ⇒ suite green.
-- **M3 — deposit on the return path.** In `cons`/`disjoin`/`replace`, when
-  `opBufSize>0`, on the content-only return (`EARLY_EXIT` / single-`{node}` with
-  no rebalance) record the op into the parent's `_slots[i]` for the descended
-  child and refresh its `ĝ`; on a structural return set `_rebalanced`. Persistent
-  path copies slots forward; transient mutates in place. *No store/restore change
-  yet* — so opBufSize>0 just accumulates ignored slots; suite green at 0, and an
-  opBufSize>0 run still behaves correctly (slots unused). Gate: suite green; add a
-  probe that slots match the expected diff for a few ops.
+- **M3 — deposit at leaf-parents. DONE.** In `cons`/`disjoin`/`replace`, when
+  `opBufSize>0` and `_level == 1` (the changed child is a leaf), on the
+  content-only return (`EARLY_EXIT` / single-`{node}` with no rebalance) record the
+  leaf-op into the leaf-parent's `_slots[i]` (`{cmp-key → element|ABSENT}`, net
+  latest-wins) + refresh its `ĝ`. Higher branches (`_level > 1`) do **not** deposit
+  — their nesting + ĝ are derivable from the live tree and are assembled at store
+  (W7). On any structural return set `_rebalanced` (all levels — store needs it).
+  Persistent path copies the leaf-parent's slot array forward then deposits;
+  transient mutates in place. *No store/restore change yet* — slots accumulate and
+  are ignored; suite green at 0 (I0), and opBufSize>0 stays correct (slots unused).
+  Gate (met): compile + suite green; `dev/op_buf_v5_m3_probe.clj` — content exact,
+  deposit fires at level 1 with exact ĝ, latest-wins, Absent recorded, **and slots
+  appear only at level-1 leaf-parents (0 higher-level slots)**.
 - **M4 — store (the write decision).** `Branch.store` / `PersistentSortedSet.store`:
   a dirty child is **buffered** (its slot serialized into this node's object, child
   not written) iff `!_rebalanced && !_childWritten && embedded-diff ≤ B`; else

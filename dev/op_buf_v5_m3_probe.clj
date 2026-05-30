@@ -79,9 +79,10 @@
             child   (deref-child (aget ^objects (.-_children b) i))
             cnt-ok  (= (.-count sl) (.count ^ANode child nil))
             pres-ok (= v [k 111])]
-        (println "  P2 deposit fired: slot[" i "] Present=" v
+        (println "  P2 deposit fired: level=" (.-_level b) " slot[" i "] Present=" v
                  " ĝ.count=" (.-count sl) " child.count=" (.count ^ANode child nil))
-        (cond (not pres-ok) (fails "Present payload " v " != expected " [k 111])
+        (cond (not= 1 (.-_level b)) (fails "slot at level " (.-_level b) " — must be a leaf-parent (level 1)")
+              (not pres-ok) (fails "Present payload " v " != expected " [k 111])
               (not cnt-ok)  (fails "ĝ.count " (.-count sl) " != child subtree count " (.count ^ANode child nil))
               :else
               ;; P3: replace again -> latest-wins within the same slot
@@ -124,8 +125,26 @@
       ;; which correctly skip deposit). Report so we notice if it's ALWAYS the case.
       (do (println "  P-absent: (no content-only remove among" ks "— all rebalanced; OK)") true))))
 
+;; --- leaf-parents-only: the M3 rework invariant -------------------------------
+(defn probe-leaf-parent-only []
+  ;; after the nested rework, slots live ONLY at leaf-parents (level 1);
+  ;; higher branches carry no slots in memory (their nesting/ĝ is assembled at store).
+  (let [s   (reduce (fn [s i] (conj s [i 0]))
+                    (ss/sorted-set* {:comparator cmp :branching-factor 4 :op-buf-size 100})
+                    (range 256))
+        s   (reduce (fn [s i] (ss/replace s [i 0] [i 1])) s (range 0 256 3))
+        brs (walk-branches (.root ^org.replikativ.persistent_sorted_set.PersistentSortedSet s))
+        depth (apply max (map (fn [^Branch b] (.-_level b)) brs))
+        bad   (filter (fn [^Branch b] (and (> (.-_level b) 1) (some? (.-_slots b)))) brs)
+        l1ok  (filter (fn [^Branch b] (and (= 1 (.-_level b)) (some? (.-_slots b)))) brs)]
+    (cond (< depth 2) (fails "tree too shallow (max level " depth ") — need ≥2 to test")
+          (seq bad)   (fails (count bad) " branch(es) at level>1 carry slots (must be none)")
+          (empty? l1ok) (fails "no level-1 branch carries slots (deposit not firing)")
+          :else (do (println "  P-leaf-parent-only: depth" depth "; slots only at level-1 ("
+                             (count l1ok) "leaf-parents), 0 higher-level slots") true))))
+
 (defn run-all []
-  (println "=== OP_BUF_V5 M3 probe (deposit on return path) ===")
-  (let [rs [(probe-content) (probe-deposit) (probe-absent)]]
+  (println "=== OP_BUF_V5 M3 probe (nested deposit at leaf-parents) ===")
+  (let [rs [(probe-content) (probe-deposit) (probe-absent) (probe-leaf-parent-only)]]
     (println (if (every? true? rs) "ALL M3 PROBES PASSED" "M3 PROBE FAILURES"))
     (every? true? rs)))

@@ -360,7 +360,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.opBufSize() > 0) depositInto(storage, ins, key, key, cmp); // content-only: Present(key)
+      if (_settings.opBufSize() > 0 && _level == 1) depositInto(storage, ins, key, key, cmp); // leaf-parent: Present(key)
       return PersistentSortedSet.EARLY_EXIT;
     }
 
@@ -388,7 +388,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.opBufSize() > 0) depositInto(storage, ins, key, key, cmp); // content-only: Present(key)
+      if (_settings.opBufSize() > 0 && _level == 1) depositInto(storage, ins, key, key, cmp); // leaf-parent: Present(key)
       if (ins == _len - 1)
         return new ANode[]{ this }; // last child changed, propagate maxKey update
       else
@@ -417,7 +417,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           ? _subtreeCount - oldChildCount + newChildrenCount : -1;
       Object newMeasure = tryComputeMeasureFromChildren(newChildren, _len, storage, measureOps);
       Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, newCount, newMeasure, settings);
-      if (settings.opBufSize() > 0) nb.carryAndDeposit(storage, _slots, ins, key, key, cmp); // content-only: Present(key)
+      if (settings.opBufSize() > 0 && _level == 1) nb.carryAndDeposit(storage, _slots, ins, key, key, cmp); // leaf-parent: Present(key)
       return new ANode[]{ nb };
     }
 
@@ -514,7 +514,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.opBufSize() > 0) depositInto(storage, idx, key, Slot.ABSENT, cmp); // content-only: Absent(key)
+      if (_settings.opBufSize() > 0 && _level == 1) depositInto(storage, idx, key, Slot.ABSENT, cmp); // leaf-parent: Absent(key)
       return PersistentSortedSet.EARLY_EXIT;
     }
 
@@ -587,10 +587,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           _measure = tryComputeMeasure(storage);
         }
         if (_settings.opBufSize() > 0) {
-          if (!leftChanged && !rightChanged && newLen == _len)
-            depositInto(storage, idx, key, Slot.ABSENT, cmp); // content-only: center replaced 1-for-1
-          else
+          if (!leftChanged && !rightChanged && newLen == _len) {
+            if (_level == 1) depositInto(storage, idx, key, Slot.ABSENT, cmp); // leaf-parent: Absent(key)
+          } else {
             _rebalanced = true; // a child merged/borrowed with a sibling: structural → write in full
+          }
         }
         return PersistentSortedSet.EARLY_EXIT;
       }
@@ -625,10 +626,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       newCenter._subtreeCount = tryComputeSubtreeCountFromChildren(newCenter._children, newLen, storage);
       newCenter._measure = tryComputeMeasureFromChildren(newCenter._children, newLen, storage, measureOps);
       if (settings.opBufSize() > 0) {
-        if (!leftChanged && !rightChanged && newLen == _len)
-          newCenter.carryAndDeposit(storage, _slots, idx, key, Slot.ABSENT, cmp); // content-only: center replaced 1-for-1
-        else
+        if (!leftChanged && !rightChanged && newLen == _len) {
+          if (_level == 1) newCenter.carryAndDeposit(storage, _slots, idx, key, Slot.ABSENT, cmp); // leaf-parent: Absent(key)
+        } else {
           newCenter._rebalanced = true; // a child merged/borrowed with a sibling: structural → write in full
+        }
       }
       return new ANode[] { left, newCenter, right };
     }
@@ -845,7 +847,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.opBufSize() > 0) depositInto(storage, idx, newKey, newKey, cmp); // content-only: Present(newKey)
+      if (_settings.opBufSize() > 0 && _level == 1) depositInto(storage, idx, newKey, newKey, cmp); // leaf-parent: Present(newKey)
       return PersistentSortedSet.EARLY_EXIT;
     }
 
@@ -868,7 +870,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.opBufSize() > 0) depositInto(storage, idx, newKey, newKey, cmp); // content-only: Present(newKey)
+      if (_settings.opBufSize() > 0 && _level == 1) depositInto(storage, idx, newKey, newKey, cmp); // leaf-parent: Present(newKey)
       if (maxKeyChanged)
         return new ANode[]{this};
       else
@@ -894,7 +896,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (measureOps != null && _measure != null) {
       newBranch._measure = newBranch.tryComputeMeasure(storage);
     }
-    if (settings.opBufSize() > 0) newBranch.carryAndDeposit(storage, _slots, idx, newKey, newKey, cmp); // content-only: Present(newKey)
+    if (settings.opBufSize() > 0 && _level == 1) newBranch.carryAndDeposit(storage, _slots, idx, newKey, newKey, cmp); // leaf-parent: Present(newKey)
 
     return new ANode[]{newBranch};
   }
