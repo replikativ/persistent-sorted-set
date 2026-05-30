@@ -605,6 +605,15 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         if (newLen != _len)
           cs.copyAll(_children, idx+2, _len);
 
+        if (_settings.opBufSize() > 0 && _slots != null) {       // mirror the address Stitch in place
+          Stitch ss = new Stitch(_slots, Math.max(idx - 1, 0));
+          if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(idx - 1));
+                                ss.copyOne(null);
+          if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(idx + 1));
+          if (newLen != _len)
+            ss.copyAll(_slots, idx+2, _len);
+        }
+
         _len = newLen;
         // Compute exact subtree count from children (accounts for processor changes)
         _subtreeCount = tryComputeSubtreeCountFromChildren(_children, newLen, storage);
@@ -652,11 +661,18 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       newCenter._subtreeCount = tryComputeSubtreeCountFromChildren(newCenter._children, newLen, storage);
       newCenter._measure = tryComputeMeasureFromChildren(newCenter._children, newLen, storage, measureOps);
       if (settings.opBufSize() > 0) {
-        if (!leftChanged && !rightChanged && newLen == _len) {
-          newCenter.carryAndDeposit(storage, _slots, idx, key, Slot.ABSENT, cmp, anchor0); // content-only: Absent(key) / branch marker
-        } else {
+        Object[] ns = new Object[newCenter._keys.length];      // mirror the address Stitch above
+        Stitch ss = new Stitch(ns, 0);
+        slotCopyAll(ss, _slots, 0, idx - 1);
+        if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(idx - 1));
+                              ss.copyOne(null);
+        if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(idx + 1));
+        slotCopyAll(ss, _slots, idx + 2, _len);
+        newCenter._slots = ns;
+        if (!leftChanged && !rightChanged && newLen == _len)
+          newCenter.depositInto(storage, idx, key, Slot.ABSENT, cmp, anchor0); // content-only center
+        else
           newCenter._rebalanced = true; // a child merged/borrowed with a sibling: structural → write in full
-        }
       }
       return new ANode[] { left, newCenter, right };
     }
@@ -695,7 +711,18 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // Compute exact subtree count from children (accounts for processor changes)
       join._subtreeCount = tryComputeSubtreeCountFromChildren(join._children, left._len + newLen, storage);
       join._measure = tryComputeMeasureFromChildren(join._children, left._len + newLen, storage, measureOps);
-      if (settings.opBufSize() > 0) join._rebalanced = true; // merged with left: structural → write in full
+      if (settings.opBufSize() > 0) {
+        join._rebalanced = true; // merged with left: structural → written, still buffers surviving siblings
+        Object[] ns = new Object[join._keys.length];           // mirror the address Stitch above
+        Stitch ss = new Stitch(ns, 0);
+        slotCopyAll(ss, left._slots, 0, left._len);
+        slotCopyAll(ss, _slots,      0, idx - 1);
+        if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(idx - 1));
+                              ss.copyOne(null);
+        if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(idx + 1));
+        slotCopyAll(ss, _slots, idx + 2, _len);
+        join._slots = ns;
+      }
       return new ANode[] { null, join, right };
     }
 
@@ -733,7 +760,18 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // Compute exact subtree count from children (accounts for processor changes)
       join._subtreeCount = tryComputeSubtreeCountFromChildren(join._children, newLen + right._len, storage);
       join._measure = tryComputeMeasureFromChildren(join._children, newLen + right._len, storage, measureOps);
-      if (settings.opBufSize() > 0) join._rebalanced = true; // merged with right: structural → write in full
+      if (settings.opBufSize() > 0) {
+        join._rebalanced = true; // merged with right: structural → written, still buffers surviving siblings
+        Object[] ns = new Object[join._keys.length];           // mirror the address Stitch above
+        Stitch ss = new Stitch(ns, 0);
+        slotCopyAll(ss, _slots, 0, idx - 1);
+        if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(idx - 1));
+                              ss.copyOne(null);
+        if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(idx + 1));
+        slotCopyAll(ss, _slots, idx + 2, _len);
+        slotCopyAll(ss, right._slots, 0, right._len);
+        join._slots = ns;
+      }
       return new ANode[] { left, join, null };
     }
 
@@ -788,7 +826,23 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       }
       newCenter._subtreeCount = tryComputeSubtreeCountFromChildren(newCenter._children, newCenterLen, storage);
       newCenter._measure = tryComputeMeasureFromChildren(newCenter._children, newCenterLen, storage, measureOps);
-      if (settings.opBufSize() > 0) { if (newLeft != null) newLeft._rebalanced = true; newCenter._rebalanced = true; } // borrowed from left: structural
+      if (settings.opBufSize() > 0) {
+        newLeft._rebalanced = true; newCenter._rebalanced = true; // borrowed from left: structural
+        if (left._slots != null) {                               // newLeft keeps left's first newLeftLen slots
+          Object[] nl = new Object[newLeft._keys.length];
+          ArrayUtil.copy(left._slots, 0, newLeftLen, nl, 0);
+          newLeft._slots = nl;
+        }
+        Object[] nc = new Object[newCenter._keys.length];        // mirror the newCenter address Stitch above
+        Stitch ss = new Stitch(nc, 0);
+        slotCopyAll(ss, left._slots, newLeftLen, left._len);
+        slotCopyAll(ss, _slots, 0, idx - 1);
+        if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(idx - 1));
+                              ss.copyOne(null);
+        if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(idx + 1));
+        slotCopyAll(ss, _slots, idx + 2, _len);
+        newCenter._slots = nc;
+      }
       return new ANode[] { newLeft, newCenter, right };
     }
 
@@ -844,7 +898,23 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         newRight._subtreeCount = tryComputeSubtreeCountFromChildren(newRight._children, newRightLen, storage);
         newRight._measure = tryComputeMeasureFromChildren(newRight._children, newRightLen, storage, measureOps);
       }
-      if (settings.opBufSize() > 0) { newCenter._rebalanced = true; newRight._rebalanced = true; } // borrowed from right: structural
+      if (settings.opBufSize() > 0) {
+        newCenter._rebalanced = true; newRight._rebalanced = true; // borrowed from right: structural
+        Object[] nc = new Object[newCenter._keys.length];        // mirror the newCenter address Stitch above
+        Stitch ss = new Stitch(nc, 0);
+        slotCopyAll(ss, _slots, 0, idx - 1);
+        if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(idx - 1));
+                              ss.copyOne(null);
+        if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(idx + 1));
+        slotCopyAll(ss, _slots, idx + 2, _len);
+        slotCopyAll(ss, right._slots, 0, rightHead);
+        newCenter._slots = nc;
+        if (right._slots != null) {                              // newRight keeps right's tail slots
+          Object[] nr = new Object[newRight._keys.length];
+          ArrayUtil.copy(right._slots, rightHead, right._len, nr, 0);
+          newRight._slots = nr;
+        }
+      }
       return new ANode[] { left, newCenter, newRight };
     }
 
@@ -996,6 +1066,15 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       diff = null;
     }
     _slots[i] = new Slot(diff, childCount(storage, i), child.measure(), anchor);
+  }
+
+  // OP_BUF_V5: a child's slot travels with its address. These mirror the per-element /
+  // bulk copies of the address Stitch so a structural REMOVE rebuild carries surviving
+  // siblings' buffered slots (null-source tolerant: a sibling branch may have no _slots).
+  private Object slotAt(int i) { return (_slots != null) ? _slots[i] : null; }
+  private static void slotCopyAll(Stitch ss, Object[] src, int from, int to) {
+    if (src == null) { for (int i = from; i < to; ++i) ss.copyOne(null); }
+    else ss.copyAll(src, from, to);
   }
 
   // Carry _slots through a structural rebuild where child `ins` was replaced by `nNodes`

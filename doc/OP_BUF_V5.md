@@ -565,15 +565,22 @@ validates the new behavior. All new behavior forks on `_settings.opBufSize() > 0
   restored (plain-edn) leaf-diff by rebuilding it under `cmp`. Test storage `restore`
   reconstructs `_slots`. Gate green: I0 (142 tests); probe `store→FRESH restore content
   exact` (P-roundtrip) and **8-cycle fresh-restore→mutate→store** (P-multicycle).
-  - **Slot-carry through rebuild (add DONE; remove TODO).** When a node rebalances it is
-    written but still buffers surviving siblings, so a structural `Stitch` rebuild must
-    carry `_slots` (a child's slot travels with its address; new split/merge nodes get
-    none). `add` absorb+split do this (`stitchSlots`); **`remove` join/borrow/in-place
-    do NOT yet → committed-buffered siblings lose their diff across a later merge.**
-    Confirmed repro: store(buffer evens) → restore → remove(odds, merges) → store →
-    restore ⇒ `[4 9]` reverts to `[4 0]`. **Fix (next): mirror each remove address-Stitch
-    with a parallel `_slots` Stitch** (`_addresses`/`left._addresses`/`right._addresses`
-    → `_slots`/`left._slots`/`right._slots`; nulls → null slots).
+  - **Slot-carry through rebuild — DONE (add + remove).** When a node rebalances it is
+    written but still buffers surviving siblings, so a structural `Stitch` rebuild carries
+    `_slots` (a child's slot travels with its address; new split/merge nodes get none).
+    `add` absorb+split (`stitchSlots`) and all `remove` paths (no-rebalance in-place &
+    newCenter, join-left, join-right, borrow-left, borrow-right) now mirror their
+    address-Stitch with a parallel `_slots` Stitch (`slotCopyAll`, null-source tolerant).
+    Probe **P-remove-merge** (committed-buffer survives a later merge) passes.
+  - **OPEN — flush-path bugs (next frontier).** A generative probe (random conj/disj/
+    replace + small `B` forcing frequent flushes + completely fresh reload each cycle)
+    EXPOSES remaining bugs in the **budget-overflow write** path: a replace's buffered
+    diff reverting (`[16 2]→[16 0]`) or an element lost. These appear only under flushing
+    (small `B`); the large-`B` probes (roundtrip, multicycle, remove-merge) and the suite
+    (I0) are green. Likely suspects: passthroughs never being flushed (so `embedded` can
+    exceed `B`), interaction of `child.store` flush with already-buffered siblings, or
+    assembleNested/diffSize under nested flushing. This is the immediate next debug target
+    (`dev/op_buf_v5_m3_probe.clj` → `probe-generative`).
 - **M6 — benchmark + B sweep.** Throughput vs baseline (W1); PUT-count probe via
   the konserve-s3 instrumentation; `B` sweep; confirm I0 speed-parity.
 
