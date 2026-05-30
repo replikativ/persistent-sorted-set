@@ -40,10 +40,16 @@ public class Slot {
   /** ĝ.measure — measure of the child's current subtree (may be null). */
   public final Object measure;
 
-  public Slot(PersistentTreeMap diff, long count, Object measure) {
+  /** Durable address of the child this diff is against (the buffer anchor).
+   *  null ⇒ the child has no durable base yet (created this txn) ⇒ must be written, not buffered.
+   *  At store, a buffered child's parent re-points addresses[i] := anchor. */
+  public final Object anchor;
+
+  public Slot(PersistentTreeMap diff, long count, Object measure, Object anchor) {
     this.diff = diff;
     this.count = count;
     this.measure = measure;
+    this.anchor = anchor;
   }
 
   /** Number of buffered entries (contributes to the per-node budget B). */

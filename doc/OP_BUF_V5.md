@@ -512,13 +512,24 @@ validates the new behavior. All new behavior forks on `_settings.opBufSize() > 0
   Gate (met): compile + suite green; `dev/op_buf_v5_m3_probe.clj` — content exact,
   deposit fires at level 1 with exact ĝ, latest-wins, Absent recorded, **and slots
   appear only at level-1 leaf-parents (0 higher-level slots)**.
-- **M4 — store (the write decision).** `Branch.store` / `PersistentSortedSet.store`:
-  a dirty child is **buffered** (its slot serialized into this node's object, child
-  not written) iff `!_rebalanced && !_childWritten && embedded-diff ≤ B`; else
-  written (recurse; set `_childWritten`; `markFreed`). Extend the node
-  serialization to carry slots **only when present** (so opBufSize=0 is the old
-  format byte-for-byte). Gate: suite green at 0; opBufSize>0 store roundtrip
-  probe (store→restore content/count exact).
+- **M4 — store (the write decision).** Sub-stepped:
+  - **M4a — anchor capture. DONE.** `Slot` gains `anchor` (the buffered child's
+    durable address). Captured at deposit from `_addresses[i]` *before* the mutation
+    nulls it (`anchor0` read at the top of `add`/`remove`/`replace`, `_level==1`);
+    a slot keeps its first-captured anchor as ops accumulate. Purely additive
+    (anchor unused until M4b) ⇒ I0. Probe: the slot's anchor restores to the
+    pre-mutation durable leaf.
+  - **M4b — write decision + serialization.** `Branch.store`/`PSS.store`: a dirty
+    child is **buffered** (no write; `addresses[i] := slot.anchor`; nested diff
+    assembled from the live subtree + ĝ; serialized into this node's object) iff
+    content-only (`!_rebalanced && !_childWritten`, leaf child has a slot) **and**
+    under budget (`Σ embedded entries ≤ B`); else **written** — fall back to the
+    baseline recursive store of the `address==null` children (set `_childWritten`,
+    `markFreed` the anchor). `markFreed` is deferred from mutation to store (a
+    buffered child's anchor must survive). Serialize `:slots` **only when present**
+    (opBufSize=0 = old format byte-for-byte). Slot-aware test storage.
+  - Gate: suite green at 0 (I0); opBufSize>0 store→restore (with M5) content/count
+    exact.
 - **M5 — restore (projection).** `restore` / `Branch.child`: when a loaded node's
   slot has a diff, apply it to the lazily-loaded child via `add`/`remove`/`replace`;
   set branch aggregates from `ĝ`. Gate: the full ported probe — multi-cycle,

@@ -6,8 +6,9 @@
    Run (src-clojure MUST precede target/classes — the latter holds a stale .clj copy):
      clojure -Sdeps '{:paths [\"src-clojure\" \"target/classes\" \"dev\"]}' \\
        -M -e \"(require 'op-buf-v5-m3-probe)(op-buf-v5-m3-probe/run-all)\""
-  (:require [org.replikativ.persistent-sorted-set :as ss])
-  (:import [org.replikativ.persistent_sorted_set Branch Leaf ANode Slot]
+  (:require [org.replikativ.persistent-sorted-set :as ss]
+            [org.replikativ.persistent-sorted-set.test.storage :as tstore])
+  (:import [org.replikativ.persistent_sorted_set Branch Leaf ANode Slot PersistentSortedSet IStorage]
            [java.lang.ref Reference]))
 
 ;; elements are pairs [k v]; comparator keys on the first element, so
@@ -143,8 +144,39 @@
           :else (do (println "  P-leaf-parent-only: depth" depth "; slots only at level-1 ("
                              (count l1ok) "leaf-parents), 0 higher-level slots") true))))
 
+;; --- M4a: the slot captures the child's durable anchor -----------------------
+(defn probe-anchor []
+  ;; store (assigns durable addresses), then a content-only replace; the leaf-parent
+  ;; slot must capture the leaf's durable address, and restoring it must yield the
+  ;; pre-mutation durable leaf (the buffered child keeps its old anchor).
+  (let [st (tstore/storage)
+        s0 (reduce (fn [s i] (conj s [i 0]))
+                   (ss/sorted-set* {:comparator cmp :branching-factor 4 :op-buf-size 100})
+                   (range 64))
+        _  (ss/store s0 st)                       ; assigns _addresses to all nodes + writes durable
+        k  17
+        s1 (ss/replace s0 [k 0] [k 999])          ; content-only ⇒ leaf buffered, keeps its anchor
+        brs (walk-branches (.root ^PersistentSortedSet s1))
+        hit (some (fn [^Branch b]
+                    (when (and (= 1 (.-_level b)) (.-_slots b))
+                      (some (fn [i]
+                              (when-let [^Slot sl (aget ^objects (.-_slots b) i)]
+                                (when (not= ::miss (.valAt (.-diff sl) [k nil] ::miss)) sl)))
+                            (range (.-_len b)))))
+                  brs)]
+    (cond
+      (not hit) (fails "no leaf-parent slot carries k=" k)
+      (nil? (.-anchor ^Slot hit)) (fails "slot.anchor is nil (expected the leaf's durable address)")
+      :else
+      (let [anchor (.-anchor ^Slot hit)
+            restored (.restore ^IStorage st anchor)
+            ks (vec (take (.-_len ^ANode restored) (.-_keys ^ANode restored)))]
+        (if (some #(= [k 0] %) ks)
+          (do (println "  P-anchor: slot.anchor →" anchor "= durable leaf still holding [" k "0] (pre-replace), keys" (count ks)) true)
+          (fails "anchor leaf doesn't hold pre-replace [" k "0]; keys=" ks))))))
+
 (defn run-all []
-  (println "=== OP_BUF_V5 M3 probe (nested deposit at leaf-parents) ===")
-  (let [rs [(probe-content) (probe-deposit) (probe-absent) (probe-leaf-parent-only)]]
+  (println "=== OP_BUF_V5 M3+M4a probe (nested deposit at leaf-parents; anchor capture) ===")
+  (let [rs [(probe-content) (probe-deposit) (probe-absent) (probe-leaf-parent-only) (probe-anchor)]]
     (println (if (every? true? rs) "ALL M3 PROBES PASSED" "M3 PROBE FAILURES"))
     (every? true? rs)))
