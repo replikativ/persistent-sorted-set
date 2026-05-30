@@ -32,13 +32,15 @@
   (store [_ node]
     (swap! *stats update :writes inc)
     (let [node    ^ANode node
-          address (gen-addr)]
-      (swap! *disk assoc address
-             (pr-str
-              {:level     (.level node)
-               :keys      (.keys node)
-               :addresses (when (instance? Branch node)
-                            (.addresses ^Branch node))}))
+          address (gen-addr)
+          ;; OP_BUF_V5: per-child buffered diffs, only present when opBufSize>0 (else nil ⇒
+          ;; the map is byte-identical to baseline, so opBufSize=0 is unaffected — I0).
+          slots   (when (instance? Branch node) (.slotsForStorage ^Branch node))
+          m       {:level     (.level node)
+                   :keys      (.keys node)
+                   :addresses (when (instance? Branch node)
+                                (.addresses ^Branch node))}]
+      (swap! *disk assoc address (pr-str (if slots (assoc m :slots slots) m)))
       address))
   (accessed [_ address]
     (swap! *stats update :accessed inc)

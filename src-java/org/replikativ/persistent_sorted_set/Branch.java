@@ -975,15 +975,131 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     depositInto(storage, i, mapKey, val, cmp, anchor0);
   }
 
+  // ---- OP_BUF_V5 store-side helpers (M4b) ----
+  private static final Keyword KW_COUNT   = Keyword.intern(null, "count");
+  private static final Keyword KW_MEASURE = Keyword.intern(null, "measure");
+  private static final Keyword KW_DIFF    = Keyword.intern(null, "diff");
+
+  // Entry count of an already-assembled slot diff: a leaf-diff's size, or the
+  // recursive sum over a nested {idx -> {:count :measure :diff}} map.
+  private static int diffSize(Object diff) {
+    if (diff instanceof PersistentTreeMap) return ((PersistentTreeMap) diff).count();
+    if (diff instanceof IPersistentMap) {
+      int t = 0;
+      for (ISeq s = RT.seq(diff); s != null; s = s.next()) {
+        Object entry = ((IMapEntry) s.first()).val();           // {:count :measure :diff}
+        t += diffSize(((IPersistentMap) entry).valAt(KW_DIFF));
+      }
+      return t;
+    }
+    return 0;
+  }
+
+  // Total content-only diff size of c's dirty subtree, or -1 if any dirty descendant
+  // REBALANCED (⇒ c is not bufferable — the affected path must be written; W3). The
+  // recursive check is needed because a deep rebalance leaves intermediate nodes
+  // content-only (a single-{node} return up), so _rebalanced alone at c is insufficient.
+  private int contentOnlyDiffSize(IStorage storage, Branch c) {
+    if (c._rebalanced) return -1;
+    if (c._slots == null) return 0;
+    int total = 0;
+    for (int j = 0; j < c._len; j++) {
+      Slot sl = (Slot) c._slots[j];
+      if (sl == null) continue;
+      if (sl.diff == null) {                                    // branch marker -> recurse live child
+        ANode gc = c.child(storage, j);
+        if (!(gc instanceof Branch)) return -1;
+        int s = contentOnlyDiffSize(storage, (Branch) gc);
+        if (s < 0) return -1;
+        total += s;
+      } else {
+        total += diffSize(sl.diff);                             // leaf-diff or restored-nested
+      }
+    }
+    return total;
+  }
+
+  // Assemble c's serializable nested diff {Long idx -> {:count :measure :diff}}, recursing
+  // markers into the (resident) live subtree. Called once when c is first buffered, so the
+  // result can be written back into the parent's slot (survives eviction / passthrough).
+  private Object assembleNested(IStorage storage, Branch c) {
+    IPersistentMap m = PersistentHashMap.EMPTY;
+    if (c._slots != null) {
+      for (int j = 0; j < c._len; j++) {
+        Slot sl = (Slot) c._slots[j];
+        if (sl == null) continue;
+        Object d = (sl.diff != null) ? sl.diff : assembleNested(storage, (Branch) c.child(storage, j));
+        IPersistentMap entry = (IPersistentMap) PersistentHashMap.EMPTY
+            .assoc(KW_COUNT, sl.count).assoc(KW_MEASURE, sl.measure).assoc(KW_DIFF, d);
+        m = (IPersistentMap) m.assoc((long) j, entry);
+      }
+    }
+    return m;
+  }
+
+  // Serializable slots for THIS node (diffs already assembled during store); null if none.
+  // Storage backends call this to persist the per-child buffered diffs alongside addresses.
+  public Object slotsForStorage() {
+    if (_slots == null) return null;
+    IPersistentMap m = PersistentHashMap.EMPTY;
+    for (int i = 0; i < _len; ++i) {
+      Slot sl = (Slot) _slots[i];
+      if (sl == null) continue;
+      IPersistentMap entry = (IPersistentMap) PersistentHashMap.EMPTY
+          .assoc(KW_COUNT, sl.count).assoc(KW_MEASURE, sl.measure).assoc(KW_DIFF, sl.diff);
+      m = (IPersistentMap) m.assoc((long) i, entry);
+    }
+    return m.count() == 0 ? null : m;
+  }
+
   @Override
   public Address store(IStorage<Key, Address> storage) {
+    if (_settings.opBufSize() <= 0) {                           // baseline ⇒ byte-identical (I0)
+      ensureAddresses();
+      for (int i = 0; i < _len; ++i) {
+        if (_addresses[i] == null) {
+          assert _children != null && _children[i] != null && _children[i] instanceof ANode;
+          address(i, ((ANode<Key, Address>) _children[i]).store(storage));
+        }
+      }
+      return storage.store(this);
+    }
+
+    // OP_BUF_V5: buffer content-only dirty children (record their diff in THIS object,
+    // re-point the address to the child's durable anchor) up to the budget B; write the rest.
     ensureAddresses();
+    final int budget = _settings.opBufSize();
+    int embedded = 0;
     for (int i = 0; i < _len; ++i) {
-      if (_addresses[i] == null) {
-        assert _children != null;
-        assert _children[i] != null;
-        assert _children[i] instanceof ANode;
-        address(i, ((ANode<Key, Address>) _children[i]).store(storage));
+      Slot sl = (_slots != null) ? (Slot) _slots[i] : null;
+      if (_addresses[i] != null) {
+        if (sl != null) embedded += diffSize(sl.diff);          // passthrough (do NOT touch child)
+        continue;                                                // clean or buffered-passthrough
+      }
+      // _addresses[i] == null: dirty this commit ⇒ child is resident
+      ANode child = (ANode) _settings.readReference(_children[i]);
+      boolean canBuffer;
+      int sz;
+      Object nested;
+      if (sl == null || sl.anchor == null) {                    // no durable anchor ⇒ must write
+        canBuffer = false; sz = 0; nested = null;
+      } else if (child instanceof Leaf) {
+        canBuffer = true; sz = diffSize(sl.diff); nested = sl.diff;
+      } else {
+        int s = contentOnlyDiffSize(storage, (Branch) child);   // -1 if subtree rebalanced
+        canBuffer = (s >= 0);
+        sz = (s >= 0) ? s : 0;
+        nested = (s >= 0) ? ((sl.diff != null) ? sl.diff : assembleNested(storage, (Branch) child)) : null;
+      }
+      if (canBuffer && embedded + sz <= budget) {
+        _addresses[i] = (Address) sl.anchor;                    // re-point to durable anchor (no write)
+        _slots[i] = new Slot(nested, sl.count, sl.measure, sl.anchor); // write back assembled diff
+        embedded += sz;
+      } else {
+        if (sl != null && sl.anchor != null) storage.markFreed((Address) sl.anchor);
+        _addresses[i] = ((ANode<Key, Address>) child).store(storage);
+        if (_slots != null) _slots[i] = null;
+        _childWritten = true;
       }
     }
     return storage.store(this);

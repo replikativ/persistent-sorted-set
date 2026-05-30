@@ -2,6 +2,7 @@ package org.replikativ.persistent_sorted_set;
 
 import java.util.Comparator;
 import clojure.lang.ISeq;
+import clojure.lang.Keyword;
 import clojure.lang.PersistentTreeMap;
 
 /**
@@ -28,8 +29,9 @@ import clojure.lang.PersistentTreeMap;
  */
 @SuppressWarnings({"unchecked", "rawtypes"})
 public class Slot {
-  /** Sentinel marking a removed key (an <em>Absent</em> entry). */
-  public static final Object ABSENT = new Object();
+  /** Marks a removed key (an <em>Absent</em> entry). A namespaced keyword so leaf-diffs
+   *  are directly edn/fressian-serializable (interned ⇒ identity comparison still works). */
+  public static final Object ABSENT = Keyword.intern("org.replikativ.persistent-sorted-set", "absent");
 
   /** The child's node-diff. One of:
    *   - a {@link PersistentTreeMap} cmp-key -&gt; element (Present) | ABSENT (remove) — a LEAF child's leaf-diff;

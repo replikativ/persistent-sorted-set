@@ -173,8 +173,56 @@
           (do (println "  P-anchor: leaf slot.anchor →" anchor "= durable leaf still holding [" k "0]") true)
           (fails "anchor leaf doesn't hold pre-replace [" k "0]; keys=" ks))))))
 
+;; --- M4b: store buffers content-only children ⇒ ~1 PUT/commit, 0 reads ----------
+(defn tree-depth [^PersistentSortedSet s]
+  (loop [n (root-of s) d 0]
+    (if (instance? Branch n) (recur (first (branch-children n)) (inc d)) d)))
+
+(defn probe-writes []
+  (let [st (tstore/storage)
+        s0 (reduce (fn [s i] (conj s [i 0]))
+                   (ss/sorted-set* {:comparator cmp :branching-factor 4 :op-buf-size 100})
+                   (range 200))
+        _  (ss/store s0 st)
+        depth (tree-depth s0)
+        ;; a content-only commit (single replace), then store and count
+        _  (reset! tstore/*stats {:reads 0 :writes 0 :accessed 0})
+        s1 (ss/replace s0 [37 0] [37 1])
+        _  (ss/store s1 st)
+        {:keys [reads writes]} @tstore/*stats]
+    (println "  P-writes: content-only commit → writes=" writes ", reads=" reads
+             " (depth" depth ", baseline would write ~" (inc depth) ")")
+    (cond (pos? reads) (fails "store did " reads " reads — must be 0 (written nodes are resident)")
+          (> writes 1) (fails "writes=" writes " — expected 1 (root only) for a content-only commit under budget")
+          :else (do (println "  P-writes: ✓ 1 PUT (root) vs ~" (inc depth) " baseline; 0 reads") true))))
+
+(defn probe-serialized []
+  ;; the stored root object must carry a nested :slots map (so the diff is durable)
+  (let [st (tstore/storage)
+        s0 (reduce (fn [s i] (conj s [i 0]))
+                   (ss/sorted-set* {:comparator cmp :branching-factor 4 :op-buf-size 100})
+                   (range 64))
+        _  (ss/store s0 st)
+        s1 (ss/replace s0 [17 0] [17 1])
+        addr (ss/store s1 st)
+        obj  (clojure.edn/read-string (get @(:*disk st) addr))
+        slots (:slots obj)]
+    (cond (nil? slots) (fails "stored root has no :slots")
+          :else
+          (let [;; descend the nested :slots to a leaf-diff
+                leaf-diffs (letfn [(walk [m] (mapcat (fn [[_ {:keys [diff]}]]
+                                                       (if (and (map? diff) (every? number? (keys diff)))
+                                                         (walk diff)  ; nested branch-diff (idx keys)
+                                                         [diff]))      ; leaf-diff
+                                                     m))]
+                             (walk slots))]
+            (println "  P-serialized: root :slots present;" (count slots) "child entries;"
+                     (count leaf-diffs) "leaf-diff(s) at the bottom; sample:" (first (remove empty? leaf-diffs)))
+            true))))
+
 (defn run-all []
-  (println "=== OP_BUF_V5 M3+M4a probe (every-level deposit; anchor markers) ===")
-  (let [rs [(probe-content) (probe-deposit) (probe-absent) (probe-markers) (probe-anchor)]]
+  (println "=== OP_BUF_V5 M3+M4a+M4b probe ===")
+  (let [rs [(probe-content) (probe-deposit) (probe-absent) (probe-markers) (probe-anchor)
+            (probe-writes) (probe-serialized)]]
     (println (if (every? true? rs) "ALL PROBES PASSED" "PROBE FAILURES"))
     (every? true? rs)))

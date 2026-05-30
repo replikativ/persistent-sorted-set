@@ -535,6 +535,27 @@ validates the new behavior. All new behavior forks on `_settings.opBufSize() > 0
     (opBufSize=0 = old format byte-for-byte). Slot-aware test storage.
   - Gate: suite green at 0 (I0); opBufSize>0 store→restore (with M5) content/count
     exact.
+  - **Store decision (worked out).** `Branch.store`, per child `i`:
+    - `_addresses[i] != null && slot == null` → **clean**, reuse.
+    - `_addresses[i] != null && slot != null` → **passthrough** (buffered in a prior
+      commit / restored, untouched this commit): keep address + slot, add its diff to
+      `embedded`. *Does not touch the child* (it may be evicted) — works because the
+      slot's diff was **written back** in full when it was first buffered (below).
+    - `_addresses[i] == null` (dirty, child resident) → **buffer** iff it has an
+      anchor and its whole dirty subtree is content-only (no `_rebalanced` anywhere —
+      a recursive check, since a deep rebalance leaves intermediate nodes
+      content-only) **and** `embedded + size ≤ B`; then set `_addresses[i] := anchor`,
+      **write the assembled nested diff back into the slot** (`assembleNested`
+      recurses the live subtree once, turning branch markers into the full nested
+      map so passthrough/eviction works), `embedded += size`. Else **write**: recurse
+      `child.store` (which itself buffers its content-only children — W6), `markFreed`
+      the anchor, clear the slot, set `_childWritten`.
+    - Root always reaches `storage.store(this)` ⇒ ≥1 PUT. A rebalance makes the whole
+      affected path non-bufferable (recursive check) ⇒ that path is written (W3).
+  - **Serialization.** `slotsForStorage` wraps `_slots` into
+    `{idx → {:count :measure :diff}}` (diffs pre-assembled; sparse). `Slot.ABSENT`
+    is a namespaced **keyword** so leaf-diffs are edn-serializable directly. Storage
+    emits `:slots` only when non-null (opBufSize=0 ⇒ absent ⇒ old format).
 - **M5 — restore (projection).** `restore` / `Branch.child`: when a loaded node's
   slot has a diff, apply it to the lazily-loaded child via `add`/`remove`/`replace`;
   set branch aggregates from `ĝ`. Gate: the full ported probe — multi-cycle,
