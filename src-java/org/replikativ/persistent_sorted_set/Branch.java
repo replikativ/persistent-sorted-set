@@ -360,6 +360,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
+      if (_settings.opBufSize() > 0) depositInto(storage, ins, key, key, cmp); // content-only: Present(key)
       return PersistentSortedSet.EARLY_EXIT;
     }
 
@@ -387,6 +388,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
+      if (_settings.opBufSize() > 0) depositInto(storage, ins, key, key, cmp); // content-only: Present(key)
       if (ins == _len - 1)
         return new ANode[]{ this }; // last child changed, propagate maxKey update
       else
@@ -414,7 +416,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       long newCount = (_subtreeCount >= 0 && oldChildCount >= 0)
           ? _subtreeCount - oldChildCount + newChildrenCount : -1;
       Object newMeasure = tryComputeMeasureFromChildren(newChildren, _len, storage, measureOps);
-      return new ANode[]{ new Branch(_level, _len, newKeys, newAddresses, newChildren, newCount, newMeasure, settings) };
+      Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, newCount, newMeasure, settings);
+      if (settings.opBufSize() > 0) nb.carryAndDeposit(storage, _slots, ins, key, key, cmp); // content-only: Present(key)
+      return new ANode[]{ nb };
     }
 
     // nodes.length >= 2: replace 1 child with N children
@@ -450,9 +454,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       long count = (_subtreeCount >= 0 && oldChildCount >= 0)
           ? _subtreeCount - oldChildCount + newChildrenCount : -1;
       Object measure = tryComputeMeasureFromChildren(allChildren, newLen, storage, measureOps);
-      return new ANode[]{
-        new Branch(_level, newLen, allKeys, allAddresses, allChildren, count, measure, settings)
-      };
+      Branch<Key, Address> nb = new Branch(_level, newLen, allKeys, allAddresses, allChildren, count, measure, settings);
+      if (settings.opBufSize() > 0) nb._rebalanced = true; // absorbed a child split: structural → write in full
+      return new ANode[]{ nb };
     }
 
     // Split into two branches
@@ -474,10 +478,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     long count2 = tryComputeSubtreeCountFromChildren(children2, half2, storage);
     Object measure1 = tryComputeMeasureFromChildren(children1, half1, storage, measureOps);
     Object measure2 = tryComputeMeasureFromChildren(children2, half2, storage, measureOps);
-    return new ANode[]{
-      new Branch(_level, half1, keys1, addresses1, children1, count1, measure1, settings),
-      new Branch(_level, half2, keys2, addresses2, children2, count2, measure2, settings)
-    };
+    Branch<Key, Address> sb1 = new Branch(_level, half1, keys1, addresses1, children1, count1, measure1, settings);
+    Branch<Key, Address> sb2 = new Branch(_level, half2, keys2, addresses2, children2, count2, measure2, settings);
+    if (settings.opBufSize() > 0) { sb1._rebalanced = true; sb2._rebalanced = true; } // split: structural → write in full
+    return new ANode[]{ sb1, sb2 };
   }
 
   @Override
@@ -510,6 +514,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
+      if (_settings.opBufSize() > 0) depositInto(storage, idx, key, Slot.ABSENT, cmp); // content-only: Absent(key)
       return PersistentSortedSet.EARLY_EXIT;
     }
 
@@ -581,6 +586,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         if (measureOps != null && _measure != null) {
           _measure = tryComputeMeasure(storage);
         }
+        if (_settings.opBufSize() > 0) {
+          if (!leftChanged && !rightChanged && newLen == _len)
+            depositInto(storage, idx, key, Slot.ABSENT, cmp); // content-only: center replaced 1-for-1
+          else
+            _rebalanced = true; // a child merged/borrowed with a sibling: structural → write in full
+        }
         return PersistentSortedSet.EARLY_EXIT;
       }
 
@@ -613,6 +624,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // Compute exact subtree count from children (accounts for processor changes)
       newCenter._subtreeCount = tryComputeSubtreeCountFromChildren(newCenter._children, newLen, storage);
       newCenter._measure = tryComputeMeasureFromChildren(newCenter._children, newLen, storage, measureOps);
+      if (settings.opBufSize() > 0) {
+        if (!leftChanged && !rightChanged && newLen == _len)
+          newCenter.carryAndDeposit(storage, _slots, idx, key, Slot.ABSENT, cmp); // content-only: center replaced 1-for-1
+        else
+          newCenter._rebalanced = true; // a child merged/borrowed with a sibling: structural → write in full
+      }
       return new ANode[] { left, newCenter, right };
     }
 
@@ -650,6 +667,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // Compute exact subtree count from children (accounts for processor changes)
       join._subtreeCount = tryComputeSubtreeCountFromChildren(join._children, left._len + newLen, storage);
       join._measure = tryComputeMeasureFromChildren(join._children, left._len + newLen, storage, measureOps);
+      if (settings.opBufSize() > 0) join._rebalanced = true; // merged with left: structural → write in full
       return new ANode[] { null, join, right };
     }
 
@@ -687,6 +705,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // Compute exact subtree count from children (accounts for processor changes)
       join._subtreeCount = tryComputeSubtreeCountFromChildren(join._children, newLen + right._len, storage);
       join._measure = tryComputeMeasureFromChildren(join._children, newLen + right._len, storage, measureOps);
+      if (settings.opBufSize() > 0) join._rebalanced = true; // merged with right: structural → write in full
       return new ANode[] { left, join, null };
     }
 
@@ -741,6 +760,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       }
       newCenter._subtreeCount = tryComputeSubtreeCountFromChildren(newCenter._children, newCenterLen, storage);
       newCenter._measure = tryComputeMeasureFromChildren(newCenter._children, newCenterLen, storage, measureOps);
+      if (settings.opBufSize() > 0) { if (newLeft != null) newLeft._rebalanced = true; newCenter._rebalanced = true; } // borrowed from left: structural
       return new ANode[] { newLeft, newCenter, right };
     }
 
@@ -796,6 +816,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         newRight._subtreeCount = tryComputeSubtreeCountFromChildren(newRight._children, newRightLen, storage);
         newRight._measure = tryComputeMeasureFromChildren(newRight._children, newRightLen, storage, measureOps);
       }
+      if (settings.opBufSize() > 0) { newCenter._rebalanced = true; newRight._rebalanced = true; } // borrowed from right: structural
       return new ANode[] { left, newCenter, newRight };
     }
 
@@ -824,6 +845,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
+      if (_settings.opBufSize() > 0) depositInto(storage, idx, newKey, newKey, cmp); // content-only: Present(newKey)
       return PersistentSortedSet.EARLY_EXIT;
     }
 
@@ -846,6 +868,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
+      if (_settings.opBufSize() > 0) depositInto(storage, idx, newKey, newKey, cmp); // content-only: Present(newKey)
       if (maxKeyChanged)
         return new ANode[]{this};
       else
@@ -871,6 +894,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (measureOps != null && _measure != null) {
       newBranch._measure = newBranch.tryComputeMeasure(storage);
     }
+    if (settings.opBufSize() > 0) newBranch.carryAndDeposit(storage, _slots, idx, newKey, newKey, cmp); // content-only: Present(newKey)
 
     return new ANode[]{newBranch};
   }
@@ -888,6 +912,46 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         child(storage, i).walkAddresses(storage, onAddress);
       }
     }
+  }
+
+  // ---- OP_BUF_V5 deposit (active only when _settings.opBufSize() > 0) ----
+  //
+  // On the mutation return path, a content-only change to child i is recorded
+  // into _slots[i] as Present(element) | Absent, with ĝ refreshed from the
+  // (already-mutated, in-memory) child's count/measure. Structural returns
+  // (split/merge/borrow) instead set _rebalanced and never deposit — that node
+  // will be written in full, materializing the new structure (see store(), M4).
+
+  // Exact subtree count of the in-memory child i (cheap: maintained by add/remove).
+  private long childCount(IStorage storage, int i) {
+    ANode child = child(storage, i);
+    if (child instanceof ISubtreeCount) {
+      long c = ((ISubtreeCount) child).subtreeCount();
+      if (c >= 0) return c;
+    }
+    return child.count(storage);
+  }
+
+  // In-place deposit into this branch's slot for child i.
+  private void depositInto(IStorage storage, int i, Object mapKey, Object val, Comparator cmp) {
+    if (_slots == null) {
+      _slots = new Object[_keys.length];
+    }
+    Slot prev = (Slot) _slots[i];
+    PersistentTreeMap d = (prev == null) ? Slot.emptyDiff(cmp) : prev.diff;
+    d = (PersistentTreeMap) d.assoc(mapKey, val);
+    ANode child = child(storage, i);
+    _slots[i] = new Slot(d, childCount(storage, i), child.measure());
+  }
+
+  // For persistent (non-editable) returns: carry the source branch's slots into
+  // this freshly-built branch, then deposit at i. (1-for-1 child replacement, so
+  // indices are aligned with the source.)
+  private void carryAndDeposit(IStorage storage, Object[] srcSlots, int i, Object mapKey, Object val, Comparator cmp) {
+    if (srcSlots != null) {
+      _slots = Arrays.copyOf(srcSlots, _keys.length);
+    }
+    depositInto(storage, i, mapKey, val, cmp);
   }
 
   @Override
