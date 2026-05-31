@@ -23,7 +23,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // For lazy computation when restored from old storage format.
   public long _subtreeCount;
 
-  // DIFF_BUF_V5 (only used when _settings.diffBufSize() > 0; null/false otherwise, so
+  // diff-buf (only used when _settings.diffBufSize() > 0; null/false otherwise, so
   // diffBufSize==0 is byte-identical to baseline — invariant I0).
   //
   // Per-child diff slot: _slots[i], when non-null, is the buffered logical diff of
@@ -140,7 +140,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       assert _addresses[idx] != null;
       ANode base = storage.restore(_addresses[idx]);
       Slot sl = (_slots != null) ? (Slot) _slots[idx] : null;
-      // DIFF_BUF_V5 push-down (M5): project this parent's buffered diff onto the freshly
+      // diff-buf push-down: project this parent's buffered diff onto the freshly
       // loaded child — leaf: batch-rebuild keys; branch: install the nested diff as the
       // child's own _slots + set its aggregates from ĝ. Runs once, here, at materialization
       // (reads stay baseline). Parent's slot supersedes any diff baked in the child's object.
@@ -358,7 +358,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     assert 0 <= ins && ins < _len;
     ANode oldChild = child(storage, ins);
     long oldChildCount = ((ISubtreeCount) oldChild).subtreeCount();
-    // DIFF_BUF_V5: capture child ins's durable address BEFORE the mutation nulls it,
+    // diff-buf: capture child ins's durable address BEFORE the mutation nulls it,
     // so a deposit at this level can record it as the buffer anchor.
     Object anchor0 = (_settings.diffBufSize() > 0 && _addresses != null) ? _addresses[ins] : null;
     ANode[] nodes = oldChild.add(storage, key, cmp, settings);
@@ -389,7 +389,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (1 == nodes.length && editable()) {
       ANode<Key, Address> node = nodes[0];
       _keys[ins] = node.maxKey();
-      // Mark old child address as freed before clearing. DIFF_BUF_V5: under diff-buf the old
+      // Mark old child address as freed before clearing. diff-buf: under diff-buf the old
       // address may be re-pointed as a buffered anchor at store, so freeing is DEFERRED to
       // store (which frees the old root + any flushed anchors) — else GC frees a live node.
       if (_settings.diffBufSize() <= 0 && storage != null && _addresses != null && _addresses[ins] != null) {
@@ -525,7 +525,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
     assert 0 <= idx && idx < _len;
     
-    // DIFF_BUF_V5: capture child idx's durable address before the mutation nulls it (M4a).
+    // diff-buf: capture child idx's durable address before the mutation nulls it.
     Object anchor0 = (_settings.diffBufSize() > 0 && _addresses != null) ? _addresses[idx] : null;
     ANode leftChild  = idx > 0      ? child(storage, idx - 1) : null,
           rightChild = idx < _len-1 ? child(storage, idx + 1) : null;
@@ -569,7 +569,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (newLen >= _settings.minBranchingFactor() || (left == null && right == null)) {
       // can update in place
       if (editable() && idx < _len-2) {
-        // Mark freed addresses before clearing them. DIFF_BUF_V5: deferred to store under
+        // Mark freed addresses before clearing them. diff-buf: deferred to store under
         // diff-buf (old addresses may be re-pointed as buffered anchors — see add()).
         if (_settings.diffBufSize() <= 0 && storage != null && _addresses != null) {
           // The child at idx is always being replaced
@@ -941,7 +941,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (idx == _len) idx = _len - 1; // key might be in last child
     assert 0 <= idx && idx < _len;
 
-    // DIFF_BUF_V5: capture child idx's durable address before the mutation nulls it (M4a).
+    // diff-buf: capture child idx's durable address before the mutation nulls it.
     Object anchor0 = (_settings.diffBufSize() > 0 && _addresses != null) ? _addresses[idx] : null;
     // Recursively replace in child
     ANode[] nodes = child(storage, idx).replace(storage, oldKey, newKey, cmp, settings);
@@ -968,7 +968,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // Transient: can modify in place
     if (editable()) {
       _keys[idx] = newMaxKey;
-      // Mark old child address as freed before clearing. DIFF_BUF_V5: deferred to store
+      // Mark old child address as freed before clearing. diff-buf: deferred to store
       // under diff-buf (old address may be re-pointed as a buffered anchor — see add()).
       if (_settings.diffBufSize() <= 0 && storage != null && _addresses != null && _addresses[idx] != null) {
         storage.markFreed(_addresses[idx]);
@@ -1026,7 +1026,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     }
   }
 
-  // ---- DIFF_BUF_V5 deposit (active only when _settings.diffBufSize() > 0) ----
+  // ---- diff-buf deposit (active only when _settings.diffBufSize() > 0) ----
   //
   // On the mutation return path, a content-only change to child i is recorded
   // into _slots[i] as Present(element) | Absent, with ĝ refreshed from the
@@ -1080,7 +1080,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     _slots[i] = new Slot(diff, childCount(storage, i), child.measure(), anchor);
   }
 
-  // DIFF_BUF_V5: a child's slot travels with its address. These mirror the per-element /
+  // diff-buf: a child's slot travels with its address. These mirror the per-element /
   // bulk copies of the address Stitch so a structural REMOVE rebuild carries surviving
   // siblings' buffered slots (null-source tolerant: a sibling branch may have no _slots).
   private Object slotAt(int i) { return (_slots != null) ? _slots[i] : null; }
@@ -1113,7 +1113,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     depositInto(storage, i, mapKey, val, cmp, anchor0);
   }
 
-  // ---- DIFF_BUF_V5 store-side helpers (M4b) ----
+  // ---- diff-buf store-side helpers ----
   private static final Keyword KW_COUNT   = Keyword.intern(null, "count");
   private static final Keyword KW_MEASURE = Keyword.intern(null, "measure");
   private static final Keyword KW_DIFF    = Keyword.intern(null, "diff");
@@ -1136,7 +1136,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   }
 
   // Total content-only diff size of c's dirty subtree, or -1 if any dirty descendant
-  // REBALANCED (⇒ c is not bufferable — the affected path must be written; W3). The
+  // REBALANCED (⇒ c is not bufferable — the affected path must be written). The
   // recursive check is needed because a deep rebalance leaves intermediate nodes
   // content-only (a single-{node} return up), so _rebalanced alone at c is insufficient.
   private int contentOnlyDiffSize(IStorage storage, Branch c) {
@@ -1196,7 +1196,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     return m.count() == 0 ? null : m;
   }
 
-  // ---- DIFF_BUF_V5 restore-side projection (M5) ----
+  // ---- diff-buf restore-side projection ----
 
   // Apply a leaf-diff to a durable leaf in ONE pass (no split/merge): merge the durable
   // keys with the diff (Present upserts the element, Absent removes) under the set's
@@ -1255,7 +1255,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       return storage.store(this);
     }
 
-    // DIFF_BUF_V5: buffer content-only dirty children (record their diff in THIS object,
+    // diff-buf: buffer content-only dirty children (record their diff in THIS object,
     // re-point the address to the child's durable anchor) up to the budget B; write the rest.
     ensureAddresses();
     final int budget = _settings.diffBufSize();

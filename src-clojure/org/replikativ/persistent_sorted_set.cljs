@@ -7,7 +7,7 @@
   (:require [org.replikativ.persistent-sorted-set.arrays :as arrays]
             [org.replikativ.persistent-sorted-set.btset :as btset :refer [BTSet]]))
 
-;; DIFF_BUF_V5: diff-buffering is OFF by default (0 ⇒ byte-identical baseline) so existing
+;; diff-buf: diff-buffering is OFF by default (0 ⇒ byte-identical baseline) so existing
 ;; storages (which don't serialize Branch._slots) are unaffected — enabling it without a
 ;; slots-aware storage would silently drop buffered diffs on write. Mirrors the JVM default
 ;; (Settings.defaultDiffBufSize). Consumers serializing :slots (e.g. datahike) pass an

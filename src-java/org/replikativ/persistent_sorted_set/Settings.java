@@ -11,10 +11,11 @@ public class Settings {
   public final AtomicBoolean _edit;
   public final IMeasure _measure;
   public final ILeafProcessor _leafProcessor;
-  // DIFF_BUF_V5: per-node diff budget B. 0 (default) disables the write-opt path
+  // diff-buf: per-node diff budget B. 0 (default) disables the write-opt path
   // entirely, so every code path is byte-identical to baseline PSS (invariant I0).
+  // Design + the IStorage slots contract: doc/diff-buffering.md.
   public final int _diffBufSize;
-  // DIFF_BUF_V5: the set's comparator, needed to PROJECT buffered leaf-diffs onto a
+  // diff-buf: the set's comparator, needed to PROJECT buffered leaf-diffs onto a
   // restored leaf at the lazy-load boundary (Branch.child). Set by the Clojure API;
   // null when diffBufSize==0 (projection never runs). Not final so the various ctors
   // need not all thread it; editable() preserves it.
@@ -71,7 +72,7 @@ public class Settings {
     _diffBufSize = diffBufSize < 0 ? 0 : diffBufSize;
   }
 
-  // DIFF_BUF_V5: diff-buffering is OFF by default (0 ⇒ byte-identical baseline, invariant
+  // diff-buf: diff-buffering is OFF by default (0 ⇒ byte-identical baseline, invariant
   // I0) so existing IStorage impls — which don't serialize Branch._slots — are unaffected;
   // enabling it without a slots-aware storage would silently drop buffered diffs on write.
   // Consumers that serialize :slots (e.g. datahike) opt in via Settings/the config, or set
@@ -97,7 +98,7 @@ public class Settings {
     return 8;
   }
 
-  // DIFF_BUF_V5 per-node diff budget; 0 disables the write-opt path (I0: baseline-identical).
+  // diff-buf per-node diff budget; 0 disables the write-opt path (I0: baseline-identical).
   public int diffBufSize() {
     return _diffBufSize;
   }
@@ -118,7 +119,7 @@ public class Settings {
     return s;
   }
 
-  // DIFF_BUF_V5: the set's comparator (for projecting buffered leaf-diffs on restore).
+  // diff-buf: the set's comparator (for projecting buffered leaf-diffs on restore).
   public Comparator comparator() {
     return _comparator;
   }

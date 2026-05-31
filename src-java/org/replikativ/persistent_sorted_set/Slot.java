@@ -6,7 +6,7 @@ import clojure.lang.Keyword;
 import clojure.lang.PersistentTreeMap;
 
 /**
- * DIFF_BUF_V5 per-child buffered diff (only allocated when Settings.diffBufSize() &gt; 0;
+ * diff-buf per-child buffered diff (only allocated when Settings.diffBufSize() &gt; 0;
  * at diffBufSize==0 Branch._slots stays null, so everything is byte-identical to
  * baseline PSS — invariant I0).
  *

@@ -11,7 +11,7 @@
 
 (declare Branch)
 
-;; DIFF_BUF_V5 read/projection parity with the JVM Branch.java.
+;; diff-buf read/projection parity with the JVM Branch.java.
 ;;
 ;; cljs `_slots` mirrors the JVM Branch._slots: a JS array indexed by child idx whose
 ;; entries are nil or a slot-map {:diff D :count N :measure M :anchor A}. Slots are
@@ -111,7 +111,7 @@
                          _    (assert (some? addr) "expected address to restore child")
                          _    (assert (some? storage) "expected storage")
                          base (await (storage/restore storage addr opts))
-                         ;; DIFF_BUF_V5: project this parent's buffered diff onto the freshly
+                         ;; diff-buf: project this parent's buffered diff onto the freshly
                          ;; loaded child (leaf: rebuild keys; branch: install nested _slots).
                          c    (project-child node storage idx base)]
                      (reset! *child c)
@@ -184,7 +184,7 @@
                 (recur (inc i) (+ cnt cc))
                 -1))))))))
 
-;; ---- DIFF_BUF_V5 write-side diff tracking (mirrors JVM Branch) ----
+;; ---- diff-buf write-side diff tracking (mirrors JVM Branch) ----
 
 (defn- diff-buf?
   "Is diff-buf buffering enabled for this node's set? (settings :diff-buf-size > 0)."
@@ -311,7 +311,7 @@
         addrs (.-addresses this)
         diff-buf? (diff-buf? this)
         idx   (util/binary-search-l cmp keys (- (arrays/alength keys) 2) key)
-        ;; DIFF_BUF_V5: capture child idx's durable address BEFORE the mutation nulls it,
+        ;; diff-buf: capture child idx's durable address BEFORE the mutation nulls it,
         ;; so a deposit at this level can record it as the buffer anchor.
         anchor0 (when (and diff-buf? addrs) (aget addrs idx))]
     (async+sync sync?
@@ -330,7 +330,7 @@
                                  (if (= nodes-len 1)
                                    (let [na (arrays/make-array (arrays/alength addrs))]
                                      (arrays/acopy addrs 0 (arrays/alength addrs) na 0)
-                                     ;; Mark old child address as freed before clearing. DIFF_BUF_V5:
+                                     ;; Mark old child address as freed before clearing. diff-buf:
                                      ;; under diff-buf the old address may be re-pointed as a buffered
                                      ;; anchor at store, so freeing is DEFERRED to store.
                                      (when (and (not diff-buf?) storage (aget addrs idx))
@@ -349,7 +349,7 @@
                                new-measure (when (and measure-ops (.-_measure this))
                                              (measure/merge-measure measure-ops (.-_measure this) (measure/extract measure-ops key)))
                                nb (Branch. (.-level this) new-keys new-children new-addrs new-sc new-measure (.-settings this) nil false)]
-                           ;; DIFF_BUF_V5: nodes-len==1 ⇒ content-only ⇒ carry the source slots and
+                           ;; diff-buf: nodes-len==1 ⇒ content-only ⇒ carry the source slots and
                            ;; deposit Present(key) (matches JVM persistent path). nodes-len>=2 ⇒ a child
                            ;; split was absorbed ⇒ structural: mark rebalanced + stitch surviving siblings.
                            (when diff-buf?
@@ -408,7 +408,7 @@
                                                 (try-compute-subtree-count-from-children right-children (arrays/alength right-children))
                                                 right-measure
                                                 (.-settings this) nil false)]
-                           ;; DIFF_BUF_V5: a child split overflowed this branch → split: structural on both
+                           ;; diff-buf: a child split overflowed this branch → split: structural on both
                            ;; halves → written, but each still buffers its surviving siblings' slots.
                            (when diff-buf?
                              (set! (.-_rebalanced left-b) true)
@@ -427,7 +427,7 @@
                                 i     (util/binary-search-l cmp keys (dec arr-l) key)]
                             (if (== i arr-l) -1 i))
                      diff-buf? (diff-buf? this)
-                     ;; DIFF_BUF_V5: capture child idx's durable address before the mutation nulls it.
+                     ;; diff-buf: capture child idx's durable address before the mutation nulls it.
                      anchor0 (when (and diff-buf? (.-addresses this) (not= -1 idx)) (aget (.-addresses this) idx))]
                  (when-not (== -1 idx)
                    (let [children    (ensure-children this)
@@ -442,7 +442,7 @@
                        (let [left-idx  (if left-child  (dec idx) idx)
                              right-idx (if right-child (+ idx 2) (inc idx))
                              alen      (arrays/alength disjoined)
-                             ;; DIFF_BUF_V5: a surviving sibling is "unchanged" when the child's remove
+                             ;; diff-buf: a surviving sibling is "unchanged" when the child's remove
                              ;; returned it identical (no borrow/merge touched it).
                              left-unchanged  (and left-child (> alen 1)
                                                   (identical? (arrays/aget disjoined 0) left-child))
@@ -460,7 +460,7 @@
                                          (let [repl  (arrays/make-array alen)
                                                laddr (when left-child  (arrays/aget addrs left-idx))
                                                raddr (when right-child (arrays/aget addrs (dec right-idx)))]
-                                           ;; Mark freed addresses before clearing. DIFF_BUF_V5: under diff-buf
+                                           ;; Mark freed addresses before clearing. diff-buf: under diff-buf
                                            ;; the old addresses may be re-pointed as buffered anchors at store,
                                            ;; so freeing is DEFERRED to store.
                                            (when (and (not diff-buf?) storage)
@@ -487,7 +487,7 @@
                                                                      (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this) nil false)
                                                                      storage measure-ops {:sync? true})))
                              center (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-measure (.-settings this) nil false)]
-                         ;; DIFF_BUF_V5: install the center's slots BEFORE rotate (so a subsequent
+                         ;; diff-buf: install the center's slots BEFORE rotate (so a subsequent
                          ;; rotate merge/merge-split with this node's siblings carries them).
                          ;; content-only ⇒ carry source slots + deposit Absent(key) at idx (1-for-1).
                          ;; structural ⇒ _rebalanced + stitch surviving siblings (the rebuilt range is nulled).
@@ -524,7 +524,7 @@
                                 i     (util/binary-search-l cmp keys (dec arr-l) old-key)]
                             (if (== i arr-l) -1 i))
                      diff-buf? (diff-buf? this)
-                     ;; DIFF_BUF_V5: capture child idx's durable address before the mutation nulls it.
+                     ;; diff-buf: capture child idx's durable address before the mutation nulls it.
                      anchor0 (when (and diff-buf? (.-addresses this) (not= -1 idx)) (aget (.-addresses this) idx))]
                  (when-not (== -1 idx)
                    (let [child  (await (child this storage idx opts))
@@ -534,7 +534,7 @@
                        (nil? nodes)
                        nil
 
-                       ;; Early exit from child (transient, no maxKey change). DIFF_BUF_V5: still
+                       ;; Early exit from child (transient, no maxKey change). diff-buf: still
                        ;; deposit Present(new-key) at this level (mirrors JVM EARLY_EXIT path).
                        (= nodes :early-exit)
                        (do
@@ -582,7 +582,7 @@
                                    new-measure    (when (and measure-ops (.-_measure this))
                                                     (replace-measure new-branch storage measure-ops))]
                                (set! (.-_measure new-branch) new-measure)
-                               ;; DIFF_BUF_V5: content-only replace ⇒ carry source slots + deposit Present(new-key).
+                               ;; diff-buf: content-only replace ⇒ carry source slots + deposit Present(new-key).
                                (when diff-buf?
                                  (set! (.-_rebalanced new-branch) (.-_rebalanced this))
                                  (await (carry-and-deposit new-branch storage (.-_slots this) idx new-key new-key cmp anchor0 opts)))
@@ -620,13 +620,13 @@
                                    new-measure    (when (and measure-ops (.-_measure this))
                                                     (replace-measure new-branch storage measure-ops))]
                                (set! (.-_measure new-branch) new-measure)
-                               ;; DIFF_BUF_V5: content-only replace ⇒ carry source slots + deposit Present(new-key).
+                               ;; diff-buf: content-only replace ⇒ carry source slots + deposit Present(new-key).
                                (when diff-buf?
                                  (set! (.-_rebalanced new-branch) (.-_rebalanced this))
                                  (await (carry-and-deposit new-branch storage (.-_slots this) idx new-key new-key cmp anchor0 opts)))
                                (arrays/array new-branch))))))))))))
 
-;; ---- DIFF_BUF_V5 store-side helpers (mirror JVM Branch) ----
+;; ---- diff-buf store-side helpers (mirror JVM Branch) ----
 
 (defn- diff-size
   "Entry count of an already-assembled slot diff describing a child at `child-level`: a leaf-diff
@@ -737,7 +737,7 @@
                            (address this i child-address)))
                        (recur (inc i))))
                    (await (storage/store storage this opts)))
-                 ;; DIFF_BUF_V5: buffer content-only dirty children (record their diff in THIS object,
+                 ;; diff-buf: buffer content-only dirty children (record their diff in THIS object,
                  ;; re-point the address to the child's durable anchor) up to the budget B; write the rest.
                  (let [addrs  (.-addresses this)
                        budget (or (:diff-buf-size (.-settings this)) 0)
@@ -810,7 +810,7 @@
   [{:keys [level keys addresses subtree-count measure settings]}]
   (Branch. level keys nil addresses (or subtree-count -1) measure settings nil false))
 
-;; DIFF_BUF_V5 (mirrors JVM Branch):
+;; diff-buf (mirrors JVM Branch):
 ;;   `_slots`      — per-child buffered diff (nil unless diff-buf-size > 0). Read/projection
 ;;                   parity with clj; written-back on restore by the storage layer.
 ;;   `_rebalanced` — per-txn flag: this node's structure differs from its durable anchor
@@ -904,7 +904,7 @@
                       new-sc
                       new-measure
                       settings nil false)]
-      ;; DIFF_BUF_V5: a merged node's structure differs from any anchor ⇒ it must be WRITTEN
+      ;; diff-buf: a merged node's structure differs from any anchor ⇒ it must be WRITTEN
       ;; (_rebalanced), but it still buffers the surviving children's slots (concatenated).
       (when (pos? (or (:diff-buf-size settings) 0))
         (set! (.-_rebalanced nb) true)
@@ -947,7 +947,7 @@
                          p1))
             b0 (Branch. level (arrays/aget ks 0) p0 (when as (arrays/aget as 0)) sc0 m0 settings nil false)
             b1 (Branch. level (arrays/aget ks 1) p1 (when as (arrays/aget as 1)) sc1 m1 settings nil false)]
-        ;; DIFF_BUF_V5: redistribution is structural on both halves (_rebalanced); split the
+        ;; diff-buf: redistribution is structural on both halves (_rebalanced); split the
         ;; concatenated slots at the same child boundary so each half buffers its own children.
         (when (pos? (or (:diff-buf-size settings) 0))
           (set! (.-_rebalanced b0) true)

@@ -135,10 +135,11 @@
              nil)
            ^IMeasure (:measure m)
            (:leaf-processor m)
-           ;; DIFF_BUF_V5: default ON — fall back to the shared Settings default (256, or the
-           ;; pss.diffBufSize sysprop) when the caller doesn't specify. 0 = baseline (I0).
+           ;; diff-buf: fall back to the shared Settings default (Settings/defaultDiffBufSize,
+           ;; 0/off unless the pss.diffBufSize sysprop is set) when the caller doesn't specify.
+           ;; 0 = baseline (I0). See doc/diff-buffering.md.
            (int (or (:diff-buf-size m) (Settings/defaultDiffBufSize))))]
-    ;; DIFF_BUF_V5: thread the set's comparator into Settings so buffered leaf-diffs can
+    ;; diff-buf: thread the set's comparator into Settings so buffered leaf-diffs can
     ;; be projected onto restored leaves (Branch.child). Defaults to compare.
     (set! (.-_comparator s) ^java.util.Comparator (or (:comparator m) (:cmp m) compare))
     s))
