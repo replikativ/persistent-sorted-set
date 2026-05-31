@@ -339,7 +339,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   public boolean contains(IStorage storage, Key key, Comparator<Key> cmp) {
     int idx = search(key, cmp);
     if (idx >= 0) return true;
-    int ins = -idx - 1; 
+    int ins = -idx - 1;
     if (ins == _len) return false;
     assert 0 <= ins && ins < _len;
     return child(storage, ins).contains(storage, key, cmp);
@@ -1072,7 +1072,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // branch child: anchor marker; its nested diff is derived from the live subtree at store
       diff = null;
     }
-    _slots[i] = new Slot(diff, childCount(storage, i), child.measure(), anchor);
+    _slots[i] = new Slot(diff, childCount(storage, i), child.measure(), anchor, _keys[i]);
   }
 
   // OP_BUF_V5: a child's slot travels with its address. These mirror the per-element /
@@ -1112,6 +1112,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   private static final Keyword KW_COUNT   = Keyword.intern(null, "count");
   private static final Keyword KW_MEASURE = Keyword.intern(null, "measure");
   private static final Keyword KW_DIFF    = Keyword.intern(null, "diff");
+  private static final Keyword KW_MAXKEY  = Keyword.intern(null, "max-key");
 
   // Entry count of an already-assembled slot diff: a leaf-diff's size, or the
   // recursive sum over a nested {idx -> {:count :measure :diff}} map.
@@ -1166,8 +1167,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         Slot sl = (Slot) c._slots[j];
         if (sl == null) continue;
         Object d = (sl.diff != null) ? sl.diff : assembleNested(storage, (Branch) c.child(storage, j));
+        // c._keys[j] = grandchild j's CURRENT (post-diff) separator; carry it so a reconstructed
+        // (buffered) c restores its separators instead of keeping the anchor's stale ones.
         IPersistentMap entry = (IPersistentMap) PersistentHashMap.EMPTY
-            .assoc(KW_COUNT, sl.count).assoc(KW_MEASURE, sl.measure).assoc(KW_DIFF, d);
+            .assoc(KW_COUNT, sl.count).assoc(KW_MEASURE, sl.measure).assoc(KW_DIFF, d)
+            .assoc(KW_MAXKEY, c._keys[j]);
         m = (IPersistentMap) m.assoc((long) j, entry);
       }
     }
@@ -1183,7 +1187,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       Slot sl = (Slot) _slots[i];
       if (sl == null) continue;
       IPersistentMap entry = (IPersistentMap) PersistentHashMap.EMPTY
-          .assoc(KW_COUNT, sl.count).assoc(KW_MEASURE, sl.measure).assoc(KW_DIFF, sl.diff);
+          .assoc(KW_COUNT, sl.count).assoc(KW_MEASURE, sl.measure).assoc(KW_DIFF, sl.diff)
+          .assoc(KW_MAXKEY, _keys[i]);   // child i's current (post-diff) separator
       m = (IPersistentMap) m.assoc((long) i, entry);
     }
     return m.count() == 0 ? null : m;
@@ -1223,7 +1228,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       long cnt = ((Number) entry.valAt(KW_COUNT)).longValue();
       Object measure = entry.valAt(KW_MEASURE);
       Object d = entry.valAt(KW_DIFF);
-      slots[i] = new Slot(d, cnt, measure, base._addresses[i]);   // anchor = grandchild's durable address
+      Object mk = entry.valAt(KW_MAXKEY);
+      slots[i] = new Slot(d, cnt, measure, base._addresses[i], mk);   // anchor = grandchild's durable address
+      // Restore the separator: base came from the anchor (old durable object) whose _keys[i] is
+      // the PRE-diff max. The diff changed child i's max, so fix the separator here — otherwise
+      // search/contains route against a phantom max-key (the verified op-buf-v5 read bug).
+      if (mk != null) base._keys[i] = (Key) mk;
     }
     base._slots = slots;
     base._subtreeCount = sl.count;        // ĝ.count — no child summing
@@ -1272,7 +1282,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       }
       if (canBuffer && embedded + sz <= budget) {
         _addresses[i] = (Address) sl.anchor;                    // re-point to durable anchor (no write)
-        _slots[i] = new Slot(nested, sl.count, sl.measure, sl.anchor); // write back assembled diff
+        _slots[i] = new Slot(nested, sl.count, sl.measure, sl.anchor, _keys[i]); // write back assembled diff
         embedded += sz;
       } else {
         if (sl != null && sl.anchor != null) storage.markFreed((Address) sl.anchor);

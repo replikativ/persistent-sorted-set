@@ -330,15 +330,16 @@
                              loaded (range ops))]
               (recur (inc c) (ss/store s2 (mkst))))))))))
 
-;; NOTE: probe-generative (random ops + small B + fresh reload) currently EXPOSES
-;; remaining flush-path bugs (budget-overflow write interacting with buffer/passthrough/
-;; projection) — e.g. a replace's diff reverting or an element lost. It is the next
-;; debugging frontier and is intentionally NOT in the gated run-all below until fixed.
-;; Run it directly: (op-buf-v5-m3-probe/probe-generative)
+;; probe-generative (random ops + small B + fresh reload) is now GATED: it passed once
+;; the diff was completed to carry each modified child's new maxKey (separator), so a
+;; reconstructed buffered branch restores its separators instead of the anchor's stale
+;; ones. (Previously it exposed the separator-staleness read bug.) Cross-validated by
+;; dev/op_buf_v5_flush_debug.clj scan (1400+ seeded runs incl. B=1).
 
 (defn run-all []
   (println "=== OP_BUF_V5 M3+M4a+M4b+M5 probe ===")
   (let [rs [(probe-content) (probe-deposit) (probe-absent) (probe-markers) (probe-anchor)
-            (probe-writes) (probe-serialized) (probe-roundtrip) (probe-multicycle) (probe-remove-merge)]]
+            (probe-writes) (probe-serialized) (probe-roundtrip) (probe-multicycle) (probe-remove-merge)
+            (probe-generative)]]
     (println (if (every? true? rs) "ALL PROBES PASSED" "PROBE FAILURES"))
     (every? true? rs)))
