@@ -269,6 +269,41 @@
                    (set! (.-_slots node) arr)))
                (await (deposit-into node storage i map-key val cmp anchor0 opts)))))
 
+(defn- concat-slots
+  "Concatenate two branches' _slots (this ++ next), 1-per-child, padding nils for a slot-less
+  branch. Returns nil if neither has slots. Used by merge/merge-split to carry buffered children
+  through a structural rebalance (the cljs analogue of JVM's per-case slot Stitch)."
+  [^Branch a ^Branch b]
+  (let [sa (.-_slots a) sb (.-_slots b)]
+    (when (or sa sb)
+      (let [na  (arrays/alength (.-keys a))
+            nb  (arrays/alength (.-keys b))
+            out (make-array (+ na nb))]
+        (when sa (dotimes [i na] (aset out i (aget sa i))))
+        (when sb (dotimes [i nb] (aset out (+ na i) (aget sb i))))
+        out))))
+
+(defn- remove-stitch-slots
+  "Build the slots array for the spliced center node of a STRUCTURAL $remove (a borrow/merge
+  happened one level down): carry the surviving siblings outside the rebuilt range, keep an
+  unchanged left/right sibling's slot, and null the center + any changed sibling. Mirrors the
+  JVM remove slot Stitch (Branch.java 679-683)."
+  [^Branch this left-idx right-idx alen left-child right-child left-unchanged right-unchanged new-len]
+  (let [src (.-_slots this)
+        out (make-array new-len)
+        len (arrays/alength (.-keys this))]
+    (when src
+      (dotimes [i left-idx] (aset out i (aget src i)))                 ; prefix [0, left-idx)
+      (when (and left-child left-unchanged)                            ; unchanged left sibling keeps its slot
+        (aset out left-idx (aget src left-idx)))
+      (when (and right-child right-unchanged)                          ; unchanged right sibling keeps its slot
+        (aset out (+ left-idx (dec alen)) (aget src (dec right-idx))))
+      (loop [i right-idx, dst (+ left-idx alen)]                       ; suffix [right-idx, len) shifted
+        (when (< i len)
+          (aset out dst (aget src i))
+          (recur (inc i) (inc dst)))))
+    out))
+
 (defn add
   [^Branch this storage key cmp opts]
   (let [{:keys [sync?] :or {sync? true}} opts
@@ -390,7 +425,10 @@
                (let [keys (.-keys this)
                      idx  (let [arr-l (arrays/alength keys)
                                 i     (util/binary-search-l cmp keys (dec arr-l) key)]
-                            (if (== i arr-l) -1 i))]
+                            (if (== i arr-l) -1 i))
+                     op-buf? (op-buf? this)
+                     ;; OP_BUF_V5: capture child idx's durable address before the mutation nulls it.
+                     anchor0 (when (and op-buf? (.-addresses this) (not= -1 idx)) (aget (.-addresses this) idx))]
                  (when-not (== -1 idx)
                    (let [children    (ensure-children this)
                          addrs       (.-addresses this)
@@ -403,20 +441,29 @@
                      (when disjoined
                        (let [left-idx  (if left-child  (dec idx) idx)
                              right-idx (if right-child (+ idx 2) (inc idx))
+                             alen      (arrays/alength disjoined)
+                             ;; OP_BUF_V5: a surviving sibling is "unchanged" when the child's remove
+                             ;; returned it identical (no borrow/merge touched it).
+                             left-unchanged  (and left-child (> alen 1)
+                                                  (identical? (arrays/aget disjoined 0) left-child))
+                             right-unchanged (and right-child (> alen 1)
+                                                  (identical? (arrays/aget disjoined (dec alen)) right-child))
+                             ;; content-only ⇔ this node's child count unchanged (no merge: alen == range)
+                             ;; AND no sibling borrowed (both unchanged) ⇒ only child idx's content changed.
+                             content-only? (and (== alen (- right-idx left-idx))
+                                                (or (nil? left-child)  left-unchanged)
+                                                (or (nil? right-child) right-unchanged))
                              new-keys  (util/check-n-splice cmp keys left-idx right-idx
                                                             (arrays/amap node/max-key disjoined))
                              new-kids  (util/splice children left-idx right-idx disjoined)
                              new-addrs (when addrs
-                                         (let [alen  (arrays/alength disjoined)
-                                               repl  (arrays/make-array alen)
+                                         (let [repl  (arrays/make-array alen)
                                                laddr (when left-child  (arrays/aget addrs left-idx))
-                                               raddr (when right-child (arrays/aget addrs (dec right-idx)))
-                                               left-unchanged  (and left-child (> alen 1)
-                                                                    (identical? (arrays/aget disjoined 0) left-child))
-                                               right-unchanged (and right-child (> alen 1)
-                                                                    (identical? (arrays/aget disjoined (dec alen)) right-child))]
-                                           ;; Mark freed addresses before clearing
-                                           (when storage
+                                               raddr (when right-child (arrays/aget addrs (dec right-idx)))]
+                                           ;; Mark freed addresses before clearing. OP_BUF_V5: under op-buf
+                                           ;; the old addresses may be re-pointed as buffered anchors at store,
+                                           ;; so freeing is DEFERRED to store.
+                                           (when (and (not op-buf?) storage)
                                              (dotimes [i (- right-idx left-idx)]
                                                (let [addr-idx (+ left-idx i)
                                                      old-addr (arrays/aget addrs addr-idx)]
@@ -438,8 +485,21 @@
                                            (measure/remove-measure measure-ops (.-_measure this) key
                                                                    #(node/try-compute-measure
                                                                      (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this) nil false)
-                                                                     storage measure-ops {:sync? true})))]
-                         (util/rotate (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-measure (.-settings this) nil false)
+                                                                     storage measure-ops {:sync? true})))
+                             center (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-measure (.-settings this) nil false)]
+                         ;; OP_BUF_V5: install the center's slots BEFORE rotate (so a subsequent
+                         ;; rotate merge/merge-split with this node's siblings carries them).
+                         ;; content-only ⇒ carry source slots + deposit Absent(key) at idx (1-for-1).
+                         ;; structural ⇒ _rebalanced + stitch surviving siblings (the rebuilt range is nulled).
+                         (when op-buf?
+                           (if content-only?
+                             (do (set! (.-_rebalanced center) (.-_rebalanced this))
+                                 (await (carry-and-deposit center storage (.-_slots this) idx key ABSENT cmp anchor0 opts)))
+                             (do (set! (.-_rebalanced center) true)
+                                 (set! (.-_slots center)
+                                       (remove-stitch-slots this left-idx right-idx alen left-child right-child
+                                                            left-unchanged right-unchanged (arrays/alength new-kids))))))
+                         (util/rotate center
                                       (and (nil? left) (nil? right))
                                       left
                                       right
@@ -836,14 +896,20 @@
           ;; Merge addresses too if present
           new-addrs (when (or addresses (.-addresses next))
                       (arrays/aconcat (or (ensure-addresses this) (arrays/make-array (arrays/alength keys)))
-                                      (or (ensure-addresses next) (arrays/make-array (arrays/alength (.-keys next))))))]
-      (Branch. level
-               (arrays/aconcat keys (.-keys next))
-               (arrays/aconcat c1 c2)
-               new-addrs
-               new-sc
-               new-measure
-               settings nil false)))
+                                      (or (ensure-addresses next) (arrays/make-array (arrays/alength (.-keys next))))))
+          nb (Branch. level
+                      (arrays/aconcat keys (.-keys next))
+                      (arrays/aconcat c1 c2)
+                      new-addrs
+                      new-sc
+                      new-measure
+                      settings nil false)]
+      ;; OP_BUF_V5: a merged node's structure differs from any anchor ⇒ it must be WRITTEN
+      ;; (_rebalanced), but it still buffers the surviving children's slots (concatenated).
+      (when (pos? (or (:op-buf-size settings) 0))
+        (set! (.-_rebalanced nb) true)
+        (set! (.-_slots nb) (concat-slots this next)))
+      nb))
   (merge-split [this ^Branch next]
     (let [;; Ensure children arrays exist
           c1 (ensure-children this)
@@ -878,10 +944,19 @@
                                  (measure/merge-measure measure-ops acc cs)
                                  (reduced nil)))))
                          (measure/identity-measure measure-ops)
-                         p1))]
-        (util/return-array
-         (Branch. level (arrays/aget ks 0) p0 (when as (arrays/aget as 0)) sc0 m0 settings nil false)
-         (Branch. level (arrays/aget ks 1) p1 (when as (arrays/aget as 1)) sc1 m1 settings nil false)))))
+                         p1))
+            b0 (Branch. level (arrays/aget ks 0) p0 (when as (arrays/aget as 0)) sc0 m0 settings nil false)
+            b1 (Branch. level (arrays/aget ks 1) p1 (when as (arrays/aget as 1)) sc1 m1 settings nil false)]
+        ;; OP_BUF_V5: redistribution is structural on both halves (_rebalanced); split the
+        ;; concatenated slots at the same child boundary so each half buffers its own children.
+        (when (pos? (or (:op-buf-size settings) 0))
+          (set! (.-_rebalanced b0) true)
+          (set! (.-_rebalanced b1) true)
+          (when-let [all (concat-slots this next)]
+            (let [n0 (arrays/alength p0)]
+              (set! (.-_slots b0) (.slice all 0 n0))
+              (set! (.-_slots b1) (.slice all n0)))))
+        (util/return-array b0 b1))))
   (add [this storage key cmp opts]
     (add this storage key cmp opts))
   ($contains? [this storage key cmp opts]
