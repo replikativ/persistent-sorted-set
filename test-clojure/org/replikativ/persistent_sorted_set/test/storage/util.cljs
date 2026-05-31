@@ -56,7 +56,8 @@
   (accessed [_ address] (swap! *stats update :accessed inc) nil)
   (markFreed [_ address] nil)
   (isFreed [_ address] false)
-  (freedInfo [_ address] nil))
+  (freedInfo [_ address] nil)
+  (comparator [_] (:comparator settings)))
 
 (defn storage
   ([] (storage (atom {}) (atom {})))
@@ -98,7 +99,8 @@
   (accessed [_ address] (swap! *stats update :accessed inc) nil)
   (markFreed [_ address] nil)
   (isFreed [_ address] false)
-  (freedInfo [_ address] nil))
+  (freedInfo [_ address] nil)
+  (comparator [_] (:comparator settings)))
 
 (defn async-storage
   ([] (async-storage (atom {}) (atom {})))

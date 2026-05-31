@@ -6,9 +6,81 @@
             [org.replikativ.persistent-sorted-set.impl.node :as node :refer [INode]]
             [org.replikativ.persistent-sorted-set.impl.measure :as measure]
             [org.replikativ.persistent-sorted-set.impl.storage :as storage]
+            [org.replikativ.persistent-sorted-set.leaf :refer [Leaf]]
             [org.replikativ.persistent-sorted-set.util :as util]))
 
 (declare Branch)
+
+;; OP_BUF_V5 read/projection parity with the JVM Branch.java.
+;;
+;; cljs `_slots` mirrors the JVM Branch._slots: a JS array indexed by child idx whose
+;; entries are nil or a slot-map {:diff D :count N :measure M :anchor A}. Slots are
+;; reconstructed on restore by the storage/serializer layer (datahike's cljs read
+;; handler) and projected here, lazily, when a child is first materialized in `child`.
+;;
+;; `:diff` is one of:
+;;   - a leaf-diff map {cmp-key -> element (Present) | ABSENT (remove)} — a LEAF child;
+;;   - a nested branch-diff {idx -> {:count :measure :diff :max-key}} — a BRANCH child.
+
+;; Marks a removed key in a leaf-diff (an <em>Absent</em> entry). Must match the JVM
+;; Slot.ABSENT keyword exactly so JVM-written diffs project identically on cljs frontends.
+(def ^:const ABSENT :org.replikativ.persistent-sorted-set/absent)
+
+(defn- project-leaf
+  "Apply a leaf-diff to a durable leaf in one pass: merge the durable keys with the diff
+  (Present upserts the element, ABSENT removes) under the set's comparator, emitting the
+  result elements in key order. Mirrors JVM Branch.projectLeaf. IO-free (no split/merge)."
+  [base diff cmp]
+  (let [bkeys (.-keys base)
+        n     (arrays/alength bkeys)
+        m0    (loop [i 0, acc (sorted-map-by cmp)]
+                (if (< i n)
+                  (recur (inc i) (assoc acc (arrays/aget bkeys i) (arrays/aget bkeys i)))
+                  acc))
+        m1    (reduce (fn [acc e]
+                        (let [k (key e), v (val e)]
+                          (if (= v ABSENT)
+                            (dissoc acc k)
+                            (assoc acc v v))))   ; upsert: value carries the current element
+                      m0 (seq diff))]
+    (Leaf. (into-array (vals m1)) (.-settings base) nil)))
+
+(defn- project-branch
+  "Push one level down: install the nested diff as base's own _slots (each grandchild's
+  diff + ĝ, anchored at base's durable child address) and set base's aggregates from ĝ.
+  Grandchildren project lazily on their own descent. Mirrors JVM Branch.projectBranch."
+  [^Branch base sl]
+  (let [diff      (:diff sl)
+        base-keys (.-keys base)
+        base-addr (.-addresses base)
+        slots     (make-array (arrays/alength base-keys))]
+    (doseq [[k entry] (seq diff)]
+      (let [i  (int k)
+            mk (:max-key entry)]
+        (aset slots i {:diff    (:diff entry)
+                       :count   (long (:count entry))
+                       :measure (:measure entry)
+                       :anchor  (arrays/aget base-addr i)})   ; anchor = grandchild's durable address
+        ;; Restore the separator: base came from the anchor whose _keys[i] is the PRE-diff
+        ;; max; the diff changed child i's max, so fix the separator here (the verified read bug).
+        (when (some? mk)
+          (arrays/aset base-keys i mk))))
+    (set! (.-_slots base) slots)
+    (set! (.-subtree-count base) (long (:count sl)))   ; ĝ.count — no child summing
+    (set! (.-_measure base) (:measure sl))             ; ĝ.measure
+    base))
+
+(defn- project-child
+  "Project a freshly-restored child against this parent's buffered slot (if any). Returns
+  `base` unchanged when there is no diff to apply. Mirrors the JVM Branch.child push-down."
+  [^Branch node storage idx base]
+  (let [sl (when (some? (.-_slots node)) (aget (.-_slots node) idx))]
+    (if (and sl (some? (:diff sl)))
+      (let [pcmp (storage/comparator storage)]
+        (if (instance? Leaf base)
+          (project-leaf base (:diff sl) pcmp)
+          (project-branch base sl)))
+      base)))
 
 (defn ensure-children
   [^Branch node]
@@ -38,7 +110,10 @@
                    (let [addr (aget (.-addresses node) idx)
                          _    (assert (some? addr) "expected address to restore child")
                          _    (assert (some? storage) "expected storage")
-                         c    (await (storage/restore storage addr opts))]
+                         base (await (storage/restore storage addr opts))
+                         ;; OP_BUF_V5: project this parent's buffered diff onto the freshly
+                         ;; loaded child (leaf: rebuild keys; branch: install nested _slots).
+                         c    (project-child node storage idx base)]
                      (reset! *child c)
                      (aset (ensure-children node) idx c))
                    (when (and (some? (.-addresses node)) (some? (aget (.-addresses node) idx)))
@@ -109,12 +184,101 @@
                 (recur (inc i) (+ cnt cc))
                 -1))))))))
 
+;; ---- OP_BUF_V5 write-side diff tracking (mirrors JVM Branch) ----
+
+(defn- op-buf?
+  "Is op-buf buffering enabled for this node's set? (settings :op-buf-size > 0)."
+  [^Branch node]
+  (pos? (or (:op-buf-size (.-settings node)) 0)))
+
+(defn- slot-at
+  "This branch's buffered slot for child i (nil if none). Mirrors JVM slotAt."
+  [^Branch node i]
+  (when-some [slots (.-_slots node)] (aget slots i)))
+
+(defn- child-count
+  "Exact subtree count of in-memory child i (cheap; maintained by add/remove). Mirrors
+  JVM childCount. Async because cljs `child` is async."
+  [^Branch node storage i {:keys [sync?] :or {sync? true} :as opts}]
+  (async+sync sync?
+              (async
+               (let [c  (await (child node storage i opts))
+                     sc (node/subtree-count c)]
+                 (if (>= sc 0) sc (await (node/$count c storage opts)))))))
+
+(defn- deposit-into
+  "In-place deposit into this branch's slot for child i (mirrors JVM depositInto). anchor0 is
+  child i's pre-mutation durable address; the slot keeps a previously-captured anchor if it
+  already has one (first capture of the txn wins). Leaf child ⇒ accumulate the leaf-op (net
+  latest-wins) onto the existing diff; branch child ⇒ nil marker. ĝ refreshed from the
+  (already-mutated, in-memory) child's count/measure."
+  [^Branch node storage i map-key val cmp anchor0 {:keys [sync?] :or {sync? true} :as opts}]
+  (async+sync sync?
+              (async
+               (when (nil? (.-_slots node))
+                 (set! (.-_slots node) (make-array (arrays/alength (.-keys node)))))
+               (let [slots  (.-_slots node)
+                     prev   (aget slots i)
+                     anchor (if (and prev (some? (:anchor prev))) (:anchor prev) anchor0)
+                     c      (await (child node storage i opts))
+                     diff   (if (== (.-level node) 1)
+                              ;; leaf child: accumulate net-latest-wins onto the existing diff,
+                              ;; rebuilding a cmp-sorted map from a restored (unsorted) diff.
+                              (let [pd (when prev (:diff prev))
+                                    d  (cond
+                                         (sorted? pd) pd
+                                         (map? pd)    (into (sorted-map-by cmp) pd)
+                                         :else        (sorted-map-by cmp))]
+                                (assoc d map-key val))
+                              ;; branch child: anchor marker (nested diff derived at store)
+                              nil)
+                     cnt     (await (child-count node storage i opts))
+                     measure (node/measure c)]
+                 (aset slots i {:diff diff :count cnt :measure measure :anchor anchor})
+                 nil))))
+
+(defn- stitch-slots
+  "Carry _slots through a structural rebuild where child `ins` was replaced by `n-nodes` new
+  nodes, producing a slots array of length new-len laid out like the rebuilt children: surviving
+  siblings keep their slot; the new nodes get none. nil if this node has no slots. Mirrors JVM
+  stitchSlots."
+  [^Branch node ins n-nodes new-len]
+  (when-some [slots (.-_slots node)]
+    (let [out (make-array new-len)
+          len (arrays/alength (.-keys node))]
+      (dotimes [i ins] (aset out i (aget slots i)))   ; [0, ins)
+      ;; the n-nodes new slots stay nil (make-array)
+      (loop [src (inc ins), dst (+ ins n-nodes)]      ; [ins+1, len)
+        (when (< src len)
+          (aset out dst (aget slots src))
+          (recur (inc src) (inc dst))))
+      out)))
+
+(defn- carry-and-deposit
+  "For persistent (non-editable) returns: carry the source branch's slots into this freshly-built
+  branch, then deposit at i (1-for-1 child replacement, so indices align). Mirrors JVM
+  carryAndDeposit."
+  [^Branch node storage src-slots i map-key val cmp anchor0 {:keys [sync?] :or {sync? true} :as opts}]
+  (async+sync sync?
+              (async
+               (when (some? src-slots)
+                 (let [n   (arrays/alength (.-keys node))
+                       arr (make-array n)
+                       m   (min n (alength src-slots))]
+                   (dotimes [k m] (aset arr k (aget src-slots k)))
+                   (set! (.-_slots node) arr)))
+               (await (deposit-into node storage i map-key val cmp anchor0 opts)))))
+
 (defn add
   [^Branch this storage key cmp opts]
   (let [{:keys [sync?] :or {sync? true}} opts
         keys  (.-keys this)
         addrs (.-addresses this)
-        idx   (util/binary-search-l cmp keys (- (arrays/alength keys) 2) key)]
+        op-buf? (op-buf? this)
+        idx   (util/binary-search-l cmp keys (- (arrays/alength keys) 2) key)
+        ;; OP_BUF_V5: capture child idx's durable address BEFORE the mutation nulls it,
+        ;; so a deposit at this level can record it as the buffer anchor.
+        anchor0 (when (and op-buf? addrs) (aget addrs idx))]
     (async+sync sync?
                 (async
                  (let [child-node (await (child this storage idx opts))
@@ -131,14 +295,15 @@
                                  (if (= nodes-len 1)
                                    (let [na (arrays/make-array (arrays/alength addrs))]
                                      (arrays/acopy addrs 0 (arrays/alength addrs) na 0)
-                                     ;; Mark old child address as freed before clearing
-                                     (when (and storage (aget addrs idx))
+                                     ;; Mark old child address as freed before clearing. OP_BUF_V5:
+                                     ;; under op-buf the old address may be re-pointed as a buffered
+                                     ;; anchor at store, so freeing is DEFERRED to store.
+                                     (when (and (not op-buf?) storage (aget addrs idx))
                                        (storage/markFreed storage (aget addrs idx)))
                                      (aset na idx nil)
                                      na)
                                    (let [old-addr (aget addrs idx)]
-                                     ;; Mark old child address as freed before clearing
-                                     (when (and storage old-addr)
+                                     (when (and (not op-buf?) storage old-addr)
                                        (storage/markFreed storage old-addr))
                                      (util/splice addrs idx (inc idx) (arrays/array nil nil)))))
                                ;; After adding one element, increment count if known
@@ -147,13 +312,23 @@
                                ;; Update measure incrementally only if already computed
                                measure-ops (:measure (.-settings this))
                                new-measure (when (and measure-ops (.-_measure this))
-                                             (measure/merge-measure measure-ops (.-_measure this) (measure/extract measure-ops key)))]
-                           (arrays/array (Branch. (.-level this) new-keys new-children new-addrs new-sc new-measure (.-settings this) nil)))
+                                             (measure/merge-measure measure-ops (.-_measure this) (measure/extract measure-ops key)))
+                               nb (Branch. (.-level this) new-keys new-children new-addrs new-sc new-measure (.-settings this) nil false)]
+                           ;; OP_BUF_V5: nodes-len==1 ⇒ content-only ⇒ carry the source slots and
+                           ;; deposit Present(key) (matches JVM persistent path). nodes-len>=2 ⇒ a child
+                           ;; split was absorbed ⇒ structural: mark rebalanced + stitch surviving siblings.
+                           (when op-buf?
+                             (if (= nodes-len 1)
+                               (do (set! (.-_rebalanced nb) (.-_rebalanced this))
+                                   (await (carry-and-deposit nb storage (.-_slots this) idx key key cmp anchor0 opts)))
+                               (do (set! (.-_rebalanced nb) true)
+                                   (set! (.-_slots nb) (stitch-slots this idx nodes-len (arrays/alength new-children))))))
+                           (arrays/array nb))
                          (let [middle      (arrays/half (arrays/alength new-children))
                                tmp-addrs   (when addrs
                                              (let [old-addr (aget addrs idx)]
-                                               ;; Mark old child address as freed before clearing
-                                               (when (and storage old-addr)
+                                               ;; Mark old child address as freed before clearing (deferred under op-buf)
+                                               (when (and (not op-buf?) storage old-addr)
                                                  (storage/markFreed storage old-addr))
                                                (util/splice addrs idx (inc idx) (arrays/array nil nil))))
                                left-addrs  (when tmp-addrs (.slice tmp-addrs 0 middle))
@@ -182,22 +357,31 @@
                                                                (measure/merge-measure measure-ops acc cs)
                                                                (reduced nil)))))
                                                        (measure/identity-measure measure-ops)
-                                                       right-children))]
-                           (arrays/array
-                            (Branch. (.-level this)
-                                     (.slice new-keys 0 middle)
-                                     left-children
-                                     left-addrs
-                                     (try-compute-subtree-count-from-children left-children (arrays/alength left-children))
-                                     left-measure
-                                     (.-settings this) nil)
-                            (Branch. (.-level this)
-                                     (.slice new-keys middle)
-                                     right-children
-                                     right-addrs
-                                     (try-compute-subtree-count-from-children right-children (arrays/alength right-children))
-                                     right-measure
-                                     (.-settings this) nil)))))))))))
+                                                       right-children))
+                               new-len (arrays/alength new-children)
+                               left-b  (Branch. (.-level this)
+                                                (.slice new-keys 0 middle)
+                                                left-children
+                                                left-addrs
+                                                (try-compute-subtree-count-from-children left-children (arrays/alength left-children))
+                                                left-measure
+                                                (.-settings this) nil false)
+                               right-b (Branch. (.-level this)
+                                                (.slice new-keys middle)
+                                                right-children
+                                                right-addrs
+                                                (try-compute-subtree-count-from-children right-children (arrays/alength right-children))
+                                                right-measure
+                                                (.-settings this) nil false)]
+                           ;; OP_BUF_V5: a child split overflowed this branch → split: structural on both
+                           ;; halves → written, but each still buffers its surviving siblings' slots.
+                           (when op-buf?
+                             (set! (.-_rebalanced left-b) true)
+                             (set! (.-_rebalanced right-b) true)
+                             (when-let [all (stitch-slots this idx nodes-len new-len)]
+                               (set! (.-_slots left-b)  (.slice all 0 middle))
+                               (set! (.-_slots right-b) (.slice all middle))))
+                           (arrays/array left-b right-b))))))))))
 
 (defn $remove
   [^Branch this storage key left right cmp {:keys [sync?] :or {sync? true} :as opts}]
@@ -253,9 +437,9 @@
                              new-measure (when (and measure-ops (.-_measure this))
                                            (measure/remove-measure measure-ops (.-_measure this) key
                                                                    #(node/try-compute-measure
-                                                                     (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this) nil)
+                                                                     (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this) nil false)
                                                                      storage measure-ops {:sync? true})))]
-                         (util/rotate (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-measure (.-settings this) nil)
+                         (util/rotate (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-measure (.-settings this) nil false)
                                       (and (nil? left) (nil? right))
                                       left
                                       right
@@ -278,7 +462,10 @@
                      measure-ops (:measure settings)
                      idx  (let [arr-l (arrays/alength keys)
                                 i     (util/binary-search-l cmp keys (dec arr-l) old-key)]
-                            (if (== i arr-l) -1 i))]
+                            (if (== i arr-l) -1 i))
+                     op-buf? (op-buf? this)
+                     ;; OP_BUF_V5: capture child idx's durable address before the mutation nulls it.
+                     anchor0 (when (and op-buf? (.-addresses this) (not= -1 idx)) (aget (.-addresses this) idx))]
                  (when-not (== -1 idx)
                    (let [child  (await (child this storage idx opts))
                          nodes  (await (node/$replace child storage old-key new-key cmp opts))]
@@ -287,9 +474,12 @@
                        (nil? nodes)
                        nil
 
-                       ;; Early exit from child (transient, no maxKey change)
+                       ;; Early exit from child (transient, no maxKey change). OP_BUF_V5: still
+                       ;; deposit Present(new-key) at this level (mirrors JVM EARLY_EXIT path).
                        (= nodes :early-exit)
-                       :early-exit
+                       (do
+                         (when op-buf? (await (deposit-into this storage idx new-key new-key cmp anchor0 opts)))
+                         :early-exit)
 
                        ;; Child returned updated node
                        :else
@@ -307,30 +497,35 @@
                                (aset keys idx new-max-key)
                                (aset children idx new-node)
                                (when addrs
-                                 ;; Mark old child address as freed before clearing
-                                 (when (and storage (aget addrs idx))
+                                 ;; Mark old child address as freed before clearing (deferred under op-buf)
+                                 (when (and (not op-buf?) storage (aget addrs idx))
                                    (storage/markFreed storage (aget addrs idx)))
                                  (aset addrs idx nil))
                                (when (and measure-ops (.-_measure this))
                                  (set! (.-_measure this)
                                        (replace-measure this storage measure-ops)))
+                               (when op-buf? (await (deposit-into this storage idx new-key new-key cmp anchor0 opts)))
                                (arrays/array this))
                              ;; Persistent: clone arrays
                              (let [new-keys     (arrays/aclone keys)
                                    new-children (arrays/aclone children)
                                    new-addrs    (when addrs
                                                   (let [na (arrays/aclone addrs)]
-                                                    ;; Mark old child address as freed before clearing
-                                                    (when (and storage (aget addrs idx))
+                                                    ;; Mark old child address as freed before clearing (deferred under op-buf)
+                                                    (when (and (not op-buf?) storage (aget addrs idx))
                                                       (storage/markFreed storage (aget addrs idx)))
                                                     (aset na idx nil)
                                                     na))
                                    _            (aset new-keys idx new-max-key)
                                    _            (aset new-children idx new-node)
-                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil)
+                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil false)
                                    new-measure    (when (and measure-ops (.-_measure this))
                                                     (replace-measure new-branch storage measure-ops))]
                                (set! (.-_measure new-branch) new-measure)
+                               ;; OP_BUF_V5: content-only replace ⇒ carry source slots + deposit Present(new-key).
+                               (when op-buf?
+                                 (set! (.-_rebalanced new-branch) (.-_rebalanced this))
+                                 (await (carry-and-deposit new-branch storage (.-_slots this) idx new-key new-key cmp anchor0 opts)))
                                (arrays/array new-branch)))
                            ;; maxKey unchanged - reuse keys array
                            (if editable?
@@ -338,13 +533,14 @@
                              (do
                                (aset children idx new-node)
                                (when addrs
-                                 ;; Mark old child address as freed before clearing
-                                 (when (and storage (aget addrs idx))
+                                 ;; Mark old child address as freed before clearing (deferred under op-buf)
+                                 (when (and (not op-buf?) storage (aget addrs idx))
                                    (storage/markFreed storage (aget addrs idx)))
                                  (aset addrs idx nil))
                                (when (and measure-ops (.-_measure this))
                                  (set! (.-_measure this)
                                        (replace-measure this storage measure-ops)))
+                               (when op-buf? (await (deposit-into this storage idx new-key new-key cmp anchor0 opts)))
                                (if last-child?
                                  (arrays/array this)  ; Last child, need to propagate
                                  :early-exit))        ; Not last child, early exit
@@ -354,34 +550,186 @@
                                    new-children (arrays/aclone children)
                                    new-addrs    (when addrs
                                                   (let [na (arrays/aclone addrs)]
-                                                    ;; Mark old child address as freed before clearing
-                                                    (when (and storage (aget addrs idx))
+                                                    ;; Mark old child address as freed before clearing (deferred under op-buf)
+                                                    (when (and (not op-buf?) storage (aget addrs idx))
                                                       (storage/markFreed storage (aget addrs idx)))
                                                     (aset na idx nil)
                                                     na))
                                    _            (aset new-children idx new-node)
-                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil)
+                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil false)
                                    new-measure    (when (and measure-ops (.-_measure this))
                                                     (replace-measure new-branch storage measure-ops))]
                                (set! (.-_measure new-branch) new-measure)
+                               ;; OP_BUF_V5: content-only replace ⇒ carry source slots + deposit Present(new-key).
+                               (when op-buf?
+                                 (set! (.-_rebalanced new-branch) (.-_rebalanced this))
+                                 (await (carry-and-deposit new-branch storage (.-_slots this) idx new-key new-key cmp anchor0 opts)))
                                (arrays/array new-branch))))))))))))
+
+;; ---- OP_BUF_V5 store-side helpers (mirror JVM Branch) ----
+
+(defn- diff-size
+  "Entry count of an already-assembled slot diff describing a child at `child-level`: a leaf-diff
+  (child-level == 0) returns its element count; a nested branch-diff sums diff-size over each
+  entry's child (at child-level-1). Discriminated by structural level, not by probing values
+  (a leaf-diff's values are the set's ELEMENTS, which may themselves be maps — e.g. Datoms).
+  Mirrors JVM diffSize."
+  [diff child-level]
+  (if-not (map? diff)
+    0
+    (let [n (count diff)]
+      (if (zero? n)
+        0
+        (if (== child-level 0)
+          n
+          (reduce (fn [t v] (+ t (diff-size (:diff v) (dec child-level)))) 0 (vals diff)))))))
+
+(defn- content-only-diff-size
+  "Total content-only diff size of c's dirty subtree, or -1 if any dirty descendant REBALANCED
+  (⇒ c is not bufferable — the affected path must be written). Mirrors JVM contentOnlyDiffSize."
+  [storage ^Branch c {:keys [sync?] :or {sync? true} :as opts}]
+  (async+sync sync?
+              (async
+               (cond
+                 (.-_rebalanced c)   -1
+                 (nil? (.-_slots c)) 0
+                 :else
+                 (let [slots (.-_slots c)
+                       len   (arrays/alength (.-keys c))
+                       clvl  (.-level c)]
+                   (loop [j 0, total 0]
+                     (if (>= j len)
+                       total
+                       (let [sl (aget slots j)]
+                         (cond
+                           (nil? sl)
+                           (recur (inc j) total)
+
+                           (nil? (:diff sl))           ;; branch marker → recurse live child
+                           (let [gc (await (child c storage j opts))]
+                             (if-not (instance? Branch gc)
+                               -1
+                               (let [s (await (content-only-diff-size storage gc opts))]
+                                 (if (neg? s) -1 (recur (inc j) (+ total s))))))
+
+                           :else
+                           (recur (inc j) (+ total (diff-size (:diff sl) (dec clvl)))))))))))))
+
+(defn- assemble-nested
+  "Assemble c's serializable nested diff {idx -> {:count :measure :diff :max-key}}, recursing
+  markers into the (resident) live subtree. Mirrors JVM assembleNested."
+  [storage ^Branch c {:keys [sync?] :or {sync? true} :as opts}]
+  (async+sync sync?
+              (async
+               (let [slots (.-_slots c)]
+                 (if (nil? slots)
+                   {}
+                   (let [len (arrays/alength (.-keys c))]
+                     (loop [j 0, m {}]
+                       (if (>= j len)
+                         m
+                         (let [sl (aget slots j)]
+                           (if (nil? sl)
+                             (recur (inc j) m)
+                             (let [gc     (when (nil? (:diff sl)) (await (child c storage j opts)))
+                                   d      (if (some? (:diff sl))
+                                            (:diff sl)
+                                            (await (assemble-nested storage gc opts)))
+                                   entry  {:count   (:count sl)
+                                           :measure (:measure sl)
+                                           :diff    d
+                                           :max-key (arrays/aget (.-keys c) j)}]
+                               (recur (inc j) (assoc m j entry)))))))))))))
+
+(defn slots-for-storage
+  "Serializable slots for THIS node (diffs already assembled during store); nil if none.
+  Storage backends call this to persist the per-child buffered diffs alongside addresses.
+  Mirrors JVM slotsForStorage."
+  [^Branch node]
+  (when-some [slots (.-_slots node)]
+    (let [len (arrays/alength (.-keys node))]
+      (loop [i 0, m {}]
+        (if (>= i len)
+          (when (pos? (count m)) m)
+          (let [sl (aget slots i)]
+            (if (nil? sl)
+              (recur (inc i) m)
+              (recur (inc i) (assoc m i {:count   (:count sl)
+                                         :measure (:measure sl)
+                                         :diff    (:diff sl)
+                                         :max-key (arrays/aget (.-keys node) i)})))))))))
 
 (defn store
   [^Branch this storage {:keys [sync?] :or {sync? true} :as opts}]
   (ensure-addresses this)
   (async+sync sync?
               (async
-               (let [keys-l (arrays/alength (.-keys this))]
-                 (loop [i 0]
-                   (when (< i keys-l)
-                     (when (nil? (aget (.-addresses this) i))
-                       (assert (some? (.-children this)))
-                       (assert (some? (aget (.-children this) i)))
-                       (assert (implements? node/INode (aget (.-children this) i)))
-                       (let [child-address (await (node/store (aget (.-children this) i) storage opts))]
-                         (address this i child-address)))
-                     (recur (inc i))))
-                 (await (storage/store storage this opts))))))
+               (if-not (op-buf? this)
+                 ;; baseline ⇒ byte-identical (I0): store every dirty child, then this node.
+                 (let [keys-l (arrays/alength (.-keys this))]
+                   (loop [i 0]
+                     (when (< i keys-l)
+                       (when (nil? (aget (.-addresses this) i))
+                         (assert (some? (.-children this)))
+                         (assert (some? (aget (.-children this) i)))
+                         (assert (implements? node/INode (aget (.-children this) i)))
+                         (let [child-address (await (node/store (aget (.-children this) i) storage opts))]
+                           (address this i child-address)))
+                       (recur (inc i))))
+                   (await (storage/store storage this opts)))
+                 ;; OP_BUF_V5: buffer content-only dirty children (record their diff in THIS object,
+                 ;; re-point the address to the child's durable anchor) up to the budget B; write the rest.
+                 (let [addrs  (.-addresses this)
+                       budget (or (:op-buf-size (.-settings this)) 0)
+                       len    (arrays/alength (.-keys this))
+                       level  (.-level this)]
+                   (loop [i 0, embedded 0]
+                     (if-not (< i len)
+                       (let [a (await (storage/store storage this opts))]
+                         ;; Written ⇒ this node now matches its durable object; clear the per-txn mark.
+                         (set! (.-_rebalanced this) false)
+                         a)
+                       (let [slots (.-_slots this)
+                             sl    (when slots (aget slots i))]
+                         (if (some? (aget addrs i))
+                           ;; clean or buffered-passthrough — do NOT touch child
+                           (recur (inc i) (if sl (+ embedded (diff-size (:diff sl) (dec level))) embedded))
+                           ;; _addresses[i] == nil ⇒ dirty this commit ⇒ child resident
+                           (let [child (aget (.-children this) i)]
+                             (if (or (nil? sl) (nil? (:anchor sl)))
+                               ;; no durable anchor ⇒ must write
+                               (let [a (await (node/store child storage opts))]
+                                 (aset addrs i a)
+                                 (when slots (aset slots i nil))
+                                 (recur (inc i) embedded))
+                               (if (instance? Leaf child)
+                                 ;; leaf child ⇒ leaf-diff
+                                 (let [sz (diff-size (:diff sl) 0)]
+                                   (if (<= (+ embedded sz) budget)
+                                     (do (aset addrs i (:anchor sl))
+                                         (aset slots i {:diff (:diff sl) :count (:count sl) :measure (:measure sl) :anchor (:anchor sl)})
+                                         (recur (inc i) (+ embedded sz)))
+                                     (do (storage/markFreed storage (:anchor sl))
+                                         (aset addrs i (await (node/store child storage opts)))
+                                         (aset slots i nil)
+                                         (recur (inc i) embedded))))
+                                 ;; branch child ⇒ -1 if subtree rebalanced, else nested diff
+                                 (let [s (await (content-only-diff-size storage child opts))]
+                                   (if (neg? s)
+                                     (do (storage/markFreed storage (:anchor sl))
+                                         (aset addrs i (await (node/store child storage opts)))
+                                         (when slots (aset slots i nil))
+                                         (recur (inc i) embedded))
+                                     (let [assembled (when (nil? (:diff sl)) (await (assemble-nested storage child opts)))
+                                           nested    (if (some? (:diff sl)) (:diff sl) assembled)]
+                                       (if (<= (+ embedded s) budget)
+                                         (do (aset addrs i (:anchor sl))
+                                             (aset slots i {:diff nested :count (:count sl) :measure (:measure sl) :anchor (:anchor sl)})
+                                             (recur (inc i) (+ embedded s)))
+                                         (do (storage/markFreed storage (:anchor sl))
+                                             (aset addrs i (await (node/store child storage opts)))
+                                             (when slots (aset slots i nil))
+                                             (recur (inc i) embedded))))))))))))))))))
 
 (defn walk-addresses
   [^Branch this storage on-address {:keys [sync?] :or {sync? true} :as opts}]
@@ -400,12 +748,16 @@
 
 (defn ^Branch from-map
   [{:keys [level keys addresses subtree-count measure settings]}]
-  (Branch. level keys nil addresses (or subtree-count -1) measure settings nil))
+  (Branch. level keys nil addresses (or subtree-count -1) measure settings nil false))
 
-;; OP_BUF_V5: `_slots` mirrors the JVM Branch._slots — a per-child buffered diff
-;; (nil unless op-buf-size > 0). Read/projection parity with clj; written-back on
-;; restore by the storage layer (e.g. datahike's cljs read handler).
-(deftype Branch [^number level keys ^:mutable children ^:mutable addresses ^:mutable ^number subtree-count ^:mutable _measure settings ^:mutable _slots]
+;; OP_BUF_V5 (mirrors JVM Branch):
+;;   `_slots`      — per-child buffered diff (nil unless op-buf-size > 0). Read/projection
+;;                   parity with clj; written-back on restore by the storage layer.
+;;   `_rebalanced` — per-txn flag: this node's structure differs from its durable anchor
+;;                   (a split/merge/borrow happened on it this txn) ⇒ it must be WRITTEN,
+;;                   not buffered. Default false; set on structural rebuilds; propagated to
+;;                   persistent successors; cleared after store(). Matches JVM Branch._rebalanced.
+(deftype Branch [^number level keys ^:mutable children ^:mutable addresses ^:mutable ^number subtree-count ^:mutable _measure settings ^:mutable _slots ^:mutable _rebalanced]
   Object
   (toString [_] (pr-str* {:level level :keys (vec keys)}))
   INode
@@ -491,7 +843,7 @@
                new-addrs
                new-sc
                new-measure
-               settings nil)))
+               settings nil false)))
   (merge-split [this ^Branch next]
     (let [;; Ensure children arrays exist
           c1 (ensure-children this)
@@ -528,8 +880,8 @@
                          (measure/identity-measure measure-ops)
                          p1))]
         (util/return-array
-         (Branch. level (arrays/aget ks 0) p0 (when as (arrays/aget as 0)) sc0 m0 settings nil)
-         (Branch. level (arrays/aget ks 1) p1 (when as (arrays/aget as 1)) sc1 m1 settings nil)))))
+         (Branch. level (arrays/aget ks 0) p0 (when as (arrays/aget as 0)) sc0 m0 settings nil false)
+         (Branch. level (arrays/aget ks 1) p1 (when as (arrays/aget as 1)) sc1 m1 settings nil false)))))
   (add [this storage key cmp opts]
     (add this storage key cmp opts))
   ($contains? [this storage key cmp opts]
