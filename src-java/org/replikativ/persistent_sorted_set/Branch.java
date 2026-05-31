@@ -389,8 +389,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (1 == nodes.length && editable()) {
       ANode<Key, Address> node = nodes[0];
       _keys[ins] = node.maxKey();
-      // Mark old child address as freed before clearing
-      if (storage != null && _addresses != null && _addresses[ins] != null) {
+      // Mark old child address as freed before clearing. OP_BUF_V5: under op-buf the old
+      // address may be re-pointed as a buffered anchor at store, so freeing is DEFERRED to
+      // store (which frees the old root + any flushed anchors) — else GC frees a live node.
+      if (_settings.opBufSize() <= 0 && storage != null && _addresses != null && _addresses[ins] != null) {
         storage.markFreed(_addresses[ins]);
       }
       child(ins, node);
@@ -567,8 +569,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (newLen >= _settings.minBranchingFactor() || (left == null && right == null)) {
       // can update in place
       if (editable() && idx < _len-2) {
-        // Mark freed addresses before clearing them
-        if (storage != null && _addresses != null) {
+        // Mark freed addresses before clearing them. OP_BUF_V5: deferred to store under
+        // op-buf (old addresses may be re-pointed as buffered anchors — see add()).
+        if (_settings.opBufSize() <= 0 && storage != null && _addresses != null) {
           // The child at idx is always being replaced
           if (_addresses[idx] != null) {
             storage.markFreed(_addresses[idx]);
@@ -965,8 +968,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // Transient: can modify in place
     if (editable()) {
       _keys[idx] = newMaxKey;
-      // Mark old child address as freed before clearing
-      if (storage != null && _addresses != null && _addresses[idx] != null) {
+      // Mark old child address as freed before clearing. OP_BUF_V5: deferred to store
+      // under op-buf (old address may be re-pointed as a buffered anchor — see add()).
+      if (_settings.opBufSize() <= 0 && storage != null && _addresses != null && _addresses[idx] != null) {
         storage.markFreed(_addresses[idx]);
       }
       child(idx, newChild);
