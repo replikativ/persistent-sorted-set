@@ -35,6 +35,9 @@
   {:extra-paths ["test-clojure"]
    :extra-deps  {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}
                  org.clojure/test.check {:mvn/version "1.1.1"}}
+   ;; DIFF_BUF_V5: library default is 0 (baseline). Run the suite with diff-buf ON so it
+   ;; gates the buffering path; baseline-only invariant tests pin {:diff-buf-size 0} to override.
+   :jvm-opts    ["-Dpss.diffBufSize=256"]
    :main-opts   ["-m" "cognitect.test-runner"
                   "-d" "test-clojure"
                   "-r" "org\\.replikativ\\.persistent-sorted-set\\.test.*"]

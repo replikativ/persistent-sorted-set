@@ -7,11 +7,16 @@
   (:require [org.replikativ.persistent-sorted-set.arrays :as arrays]
             [org.replikativ.persistent-sorted-set.btset :as btset :refer [BTSet]]))
 
+;; DIFF_BUF_V5: diff-buffering is OFF by default (0 ⇒ byte-identical baseline) so existing
+;; storages (which don't serialize Branch._slots) are unaffected — enabling it without a
+;; slots-aware storage would silently drop buffered diffs on write. Mirrors the JVM default
+;; (Settings.defaultDiffBufSize). Consumers serializing :slots (e.g. datahike) pass an
+;; explicit :diff-buf-size; the cljs test build overrides this define to 256 to gate the path.
+(goog-define default-diff-buf-size 0)
+
 (def ^:private default-opts
-  ;; DIFF_BUF_V5: diff-buffering ON by default (budget 256) to match the JVM default, so a
-  ;; cljs-created set behaves like a JVM one cross-host. 0 disables (byte-identical baseline).
   {:branching-factor 512
-   :diff-buf-size 256})
+   :diff-buf-size default-diff-buf-size})
 
 (defn- with-defaults [opts]
   (merge default-opts opts))

@@ -71,14 +71,17 @@ public class Settings {
     _diffBufSize = diffBufSize < 0 ? 0 : diffBufSize;
   }
 
-  // DIFF_BUF_V5: diff-buffering is ON by default (budget 256). Override with the
-  // pss.diffBufSize system property; 0 disables it (byte-identical baseline, invariant I0).
+  // DIFF_BUF_V5: diff-buffering is OFF by default (0 ⇒ byte-identical baseline, invariant
+  // I0) so existing IStorage impls — which don't serialize Branch._slots — are unaffected;
+  // enabling it without a slots-aware storage would silently drop buffered diffs on write.
+  // Consumers that serialize :slots (e.g. datahike) opt in via Settings/the config, or set
+  // the pss.diffBufSize system property (the test suite uses -Dpss.diffBufSize=256).
   // Public so the Clojure API (map->settings) shares this single default source.
   public static int defaultDiffBufSize() {
     try {
-      return Integer.parseInt(System.getProperty("pss.diffBufSize", "256"));
+      return Integer.parseInt(System.getProperty("pss.diffBufSize", "0"));
     } catch (Exception e) {
-      return 256;
+      return 0;
     }
   }
 
