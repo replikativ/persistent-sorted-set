@@ -51,25 +51,11 @@ public class Slot {
    *  At store, a buffered child's parent re-points addresses[i] := anchor. */
   public final Object anchor;
 
-  /** The child's CURRENT maxKey (= the parent separator <code>_keys[i]</code>) after the diff.
-   *  A child's diff changes its contents AND can change its max element, which is stored a level
-   *  up as the parent's separator. The anchor's serialized separators are stale (pre-diff), so on
-   *  restore a reconstructed (buffered) branch must restore each modified child's separator from
-   *  here — otherwise routing/contains use a phantom max-key (see projectBranch). */
-  public final Object maxKey;
-
-  public Slot(Object diff, long count, Object measure, Object anchor, Object maxKey) {
+  public Slot(Object diff, long count, Object measure, Object anchor) {
     this.diff = diff;
     this.count = count;
     this.measure = measure;
     this.anchor = anchor;
-    this.maxKey = maxKey;
-  }
-
-  /** Number of buffered leaf entries directly in this slot (leaf-diff size; 0 for a branch marker).
-   *  The full subtree entry count for budgeting is computed at store by recursion. */
-  public int size() {
-    return (diff instanceof PersistentTreeMap) ? ((PersistentTreeMap) diff).count() : 0;
   }
 
   static PersistentTreeMap emptyDiff(Comparator cmp) {

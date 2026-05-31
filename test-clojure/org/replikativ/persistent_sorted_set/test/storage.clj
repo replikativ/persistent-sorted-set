@@ -62,7 +62,7 @@
                arr (object-array (alength (.-_keys b)))]
            (doseq [[idx entry] slots]
              (aset arr (int idx)
-                   (Slot. (:diff entry) (long (:count entry)) (:measure entry) (nth addresses (int idx)) (:max-key entry))))
+                   (Slot. (:diff entry) (long (:count entry)) (:measure entry) (nth addresses (int idx)))))
            (set! (.-_slots b) arr)))
        (swap! *stats update :reads inc)
        (swap! *memory assoc address node)

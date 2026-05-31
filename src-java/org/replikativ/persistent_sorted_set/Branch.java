@@ -31,12 +31,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // + a cached (count, measure) snapshot ĝ). null == child i has no buffered diff.
   public Object[] _slots;
 
-  // Store-time bookkeeping (set on the mutation return path, read by store):
-  //   _rebalanced   — a split/merge/borrow happened AT this node this txn.
-  //   _childWritten — set during store when a child of this node was written,
-  //                   making this node structural (its pointers changed).
+  // Store-time bookkeeping: a split/merge/borrow happened AT this node this txn. Carried
+  // forward through content-only ops and cleared at store. A rebalanced node's structure
+  // differs from its anchor, so it (and its dirty spine) must be written, not buffered.
   public boolean _rebalanced;
-  public boolean _childWritten;
 
   // For i in [0.._len):
   // 
@@ -358,7 +356,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     ANode oldChild = child(storage, ins);
     long oldChildCount = ((ISubtreeCount) oldChild).subtreeCount();
     // OP_BUF_V5: capture child ins's durable address BEFORE the mutation nulls it,
-    // so a leaf-parent deposit can record it as the buffer anchor (M4a).
+    // so a deposit at this level can record it as the buffer anchor.
     Object anchor0 = (_settings.opBufSize() > 0 && _addresses != null) ? _addresses[ins] : null;
     ANode[] nodes = oldChild.add(storage, key, cmp, settings);
 
@@ -431,7 +429,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           ? _subtreeCount - oldChildCount + newChildrenCount : -1;
       Object newMeasure = tryComputeMeasureFromChildren(newChildren, _len, storage, measureOps);
       Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, newCount, newMeasure, settings);
-      if (settings.opBufSize() > 0) { nb._rebalanced = _rebalanced; nb._childWritten = _childWritten; // a rebalance earlier this txn must persist (structure ≠ anchor)
+      if (settings.opBufSize() > 0) { nb._rebalanced = _rebalanced; // a rebalance earlier this txn must persist (structure ≠ anchor)
                                       nb.carryAndDeposit(storage, _slots, ins, key, key, cmp, anchor0); } // content-only: Present(key) / branch marker
       return new ANode[]{ nb };
     }
@@ -666,7 +664,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         if (!leftChanged && !rightChanged && newLen == _len) {
           // content-only: carry slots aligned and ACCUMULATE Absent onto the center's
           // existing diff (it may already hold buffered Present/Absent for this leaf).
-          newCenter._rebalanced = _rebalanced; newCenter._childWritten = _childWritten; // persist a prior-this-txn rebalance
+          newCenter._rebalanced = _rebalanced; // persist a prior-this-txn rebalance
           newCenter.carryAndDeposit(storage, _slots, idx, key, Slot.ABSENT, cmp, anchor0);
         } else {
           newCenter._rebalanced = true;                        // structural: mirror the address Stitch
@@ -1000,7 +998,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (measureOps != null && _measure != null) {
       newBranch._measure = newBranch.tryComputeMeasure(storage);
     }
-    if (settings.opBufSize() > 0) { newBranch._rebalanced = _rebalanced; newBranch._childWritten = _childWritten; // persist a prior-this-txn rebalance
+    if (settings.opBufSize() > 0) { newBranch._rebalanced = _rebalanced; // persist a prior-this-txn rebalance
                                     newBranch.carryAndDeposit(storage, _slots, idx, newKey, newKey, cmp, anchor0); } // content-only: Present(newKey)
 
     return new ANode[]{newBranch};
@@ -1072,7 +1070,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // branch child: anchor marker; its nested diff is derived from the live subtree at store
       diff = null;
     }
-    _slots[i] = new Slot(diff, childCount(storage, i), child.measure(), anchor, _keys[i]);
+    _slots[i] = new Slot(diff, childCount(storage, i), child.measure(), anchor);
   }
 
   // OP_BUF_V5: a child's slot travels with its address. These mirror the per-element /
@@ -1229,7 +1227,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       Object measure = entry.valAt(KW_MEASURE);
       Object d = entry.valAt(KW_DIFF);
       Object mk = entry.valAt(KW_MAXKEY);
-      slots[i] = new Slot(d, cnt, measure, base._addresses[i], mk);   // anchor = grandchild's durable address
+      slots[i] = new Slot(d, cnt, measure, base._addresses[i]);   // anchor = grandchild's durable address
       // Restore the separator: base came from the anchor (old durable object) whose _keys[i] is
       // the PRE-diff max. The diff changed child i's max, so fix the separator here — otherwise
       // search/contains route against a phantom max-key (the verified op-buf-v5 read bug).
@@ -1282,19 +1280,18 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       }
       if (canBuffer && embedded + sz <= budget) {
         _addresses[i] = (Address) sl.anchor;                    // re-point to durable anchor (no write)
-        _slots[i] = new Slot(nested, sl.count, sl.measure, sl.anchor, _keys[i]); // write back assembled diff
+        _slots[i] = new Slot(nested, sl.count, sl.measure, sl.anchor); // write back assembled diff
         embedded += sz;
       } else {
         if (sl != null && sl.anchor != null) storage.markFreed((Address) sl.anchor);
         _addresses[i] = ((ANode<Key, Address>) child).store(storage);
         if (_slots != null) _slots[i] = null;
-        _childWritten = true;
       }
     }
     Address a = storage.store(this);
-    // Written ⇒ this node now matches its durable object. Clear the per-txn structural marks
-    // so a later content-only op (which carries them forward) doesn't treat it as rebalanced.
-    _rebalanced = false; _childWritten = false;
+    // Written ⇒ this node now matches its durable object. Clear the per-txn rebalance mark
+    // so a later content-only op (which carries it forward) doesn't treat it as rebalanced.
+    _rebalanced = false;
     return a;
   }
 
