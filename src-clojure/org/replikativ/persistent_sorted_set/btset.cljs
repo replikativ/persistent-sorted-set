@@ -90,7 +90,7 @@
                                                          (measure/merge-measure measure-ops acc cs))
                                                        (measure/identity-measure measure-ops)
                                                        child-measure))]
-                            (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count root-measure (.-settings set))
+                            (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count root-measure (.-settings set) nil)
                                     new-cnt
                                     (.-comparator set)
                                     (.-meta set)
@@ -1614,7 +1614,7 @@
                                            nil
                                            subtree-count
                                            child-measure
-                                           settings))))
+                                           settings nil))))
          (inc shift))))))
 
 (defn ^BTSet from-sequential [cmp seq opts]

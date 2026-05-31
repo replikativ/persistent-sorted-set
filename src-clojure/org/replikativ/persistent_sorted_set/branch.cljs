@@ -148,7 +148,7 @@
                                measure-ops (:measure (.-settings this))
                                new-measure (when (and measure-ops (.-_measure this))
                                              (measure/merge-measure measure-ops (.-_measure this) (measure/extract measure-ops key)))]
-                           (arrays/array (Branch. (.-level this) new-keys new-children new-addrs new-sc new-measure (.-settings this))))
+                           (arrays/array (Branch. (.-level this) new-keys new-children new-addrs new-sc new-measure (.-settings this) nil)))
                          (let [middle      (arrays/half (arrays/alength new-children))
                                tmp-addrs   (when addrs
                                              (let [old-addr (aget addrs idx)]
@@ -190,14 +190,14 @@
                                      left-addrs
                                      (try-compute-subtree-count-from-children left-children (arrays/alength left-children))
                                      left-measure
-                                     (.-settings this))
+                                     (.-settings this) nil)
                             (Branch. (.-level this)
                                      (.slice new-keys middle)
                                      right-children
                                      right-addrs
                                      (try-compute-subtree-count-from-children right-children (arrays/alength right-children))
                                      right-measure
-                                     (.-settings this))))))))))))
+                                     (.-settings this) nil)))))))))))
 
 (defn $remove
   [^Branch this storage key left right cmp {:keys [sync?] :or {sync? true} :as opts}]
@@ -253,9 +253,9 @@
                              new-measure (when (and measure-ops (.-_measure this))
                                            (measure/remove-measure measure-ops (.-_measure this) key
                                                                    #(node/try-compute-measure
-                                                                     (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this))
+                                                                     (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this) nil)
                                                                      storage measure-ops {:sync? true})))]
-                         (util/rotate (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-measure (.-settings this))
+                         (util/rotate (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-measure (.-settings this) nil)
                                       (and (nil? left) (nil? right))
                                       left
                                       right
@@ -327,7 +327,7 @@
                                                     na))
                                    _            (aset new-keys idx new-max-key)
                                    _            (aset new-children idx new-node)
-                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this))
+                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil)
                                    new-measure    (when (and measure-ops (.-_measure this))
                                                     (replace-measure new-branch storage measure-ops))]
                                (set! (.-_measure new-branch) new-measure)
@@ -360,7 +360,7 @@
                                                     (aset na idx nil)
                                                     na))
                                    _            (aset new-children idx new-node)
-                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this))
+                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil)
                                    new-measure    (when (and measure-ops (.-_measure this))
                                                     (replace-measure new-branch storage measure-ops))]
                                (set! (.-_measure new-branch) new-measure)
@@ -400,9 +400,12 @@
 
 (defn ^Branch from-map
   [{:keys [level keys addresses subtree-count measure settings]}]
-  (Branch. level keys nil addresses (or subtree-count -1) measure settings))
+  (Branch. level keys nil addresses (or subtree-count -1) measure settings nil))
 
-(deftype Branch [^number level keys ^:mutable children ^:mutable addresses ^:mutable ^number subtree-count ^:mutable _measure settings]
+;; OP_BUF_V5: `_slots` mirrors the JVM Branch._slots — a per-child buffered diff
+;; (nil unless op-buf-size > 0). Read/projection parity with clj; written-back on
+;; restore by the storage layer (e.g. datahike's cljs read handler).
+(deftype Branch [^number level keys ^:mutable children ^:mutable addresses ^:mutable ^number subtree-count ^:mutable _measure settings ^:mutable _slots]
   Object
   (toString [_] (pr-str* {:level level :keys (vec keys)}))
   INode
@@ -488,7 +491,7 @@
                new-addrs
                new-sc
                new-measure
-               settings)))
+               settings nil)))
   (merge-split [this ^Branch next]
     (let [;; Ensure children arrays exist
           c1 (ensure-children this)
@@ -525,8 +528,8 @@
                          (measure/identity-measure measure-ops)
                          p1))]
         (util/return-array
-         (Branch. level (arrays/aget ks 0) p0 (when as (arrays/aget as 0)) sc0 m0 settings)
-         (Branch. level (arrays/aget ks 1) p1 (when as (arrays/aget as 1)) sc1 m1 settings)))))
+         (Branch. level (arrays/aget ks 0) p0 (when as (arrays/aget as 0)) sc0 m0 settings nil)
+         (Branch. level (arrays/aget ks 1) p1 (when as (arrays/aget as 1)) sc1 m1 settings nil)))))
   (add [this storage key cmp opts]
     (add this storage key cmp opts))
   ($contains? [this storage key cmp opts]
