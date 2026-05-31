@@ -5,7 +5,7 @@
   {:target    :node-test  ;shadow-cljs release node-tests && node target/pss/tests.min.js
    :output-to "target/pss/tests.min.js"
    :ns-regexp "^(?!org.replikativ.persistent-sorted-set.test.stress|org.replikativ.persistent-sorted-set.test.structural-invariants|org.replikativ.persistent-sorted-set.test.generative)"
-   ;; DIFF_BUF_V5: library default is 0 (baseline); run the test suite with diff-buf ON so
+   ;; diff-buf: library default is 0 (baseline); run the test suite with diff-buf ON so
    ;; it gates the buffering path (the cljs analogue of -Dpss.diffBufSize=256 on the JVM).
    :closure-defines {org.replikativ.persistent-sorted-set/default-diff-buf-size 256}
    :compiler-options {:infer-externs true

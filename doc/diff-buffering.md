@@ -15,6 +15,12 @@ to baseline PSS. See **Configuration** below — enabling it places a requiremen
 The in-memory tree stays an ordinary B-tree: all `lookup`/`slice`/`seek`/`add`/`remove`/
 `replace` logic is unchanged. Diffs exist only at the `store`/`restore` boundary.
 
+> **Background.** Diff buffering rides two existing mechanisms documented separately:
+> the mutation **return-value protocol** that distinguishes content-only from structural
+> changes (see [`btree-operations.md`](btree-operations.md)), and the per-node **aggregate
+> statistics** `(count, measure)` that `ĝ` snapshots (see
+> [`statistical-queries.md`](statistical-queries.md)). This document assumes both.
+
 ## Motivation and the hard constraint
 
 On immutable content-addressed storage, persisting any one node changes its hash → changes
@@ -60,6 +66,36 @@ log.
   materializes each child *i* lazily as `apply(diffᵢ, reconstruct(aᵢ))`, sets the branch's
   per-child `(count, measure)` from `ĝᵢ` (no re-summing), and its separator `pᵢ` from
   `maxKeyᵢ`.
+
+### Durable layout
+
+Each box below is one content-addressed object — one `PUT`, one `GET`. A branch object lays
+out three parallel arrays plus a *sparse* slot map keyed by child index:
+
+```
+  ┌ branch object  @aR  ─────────────────────────────────────────────┐
+  │ level    2                                                       │
+  │ pivots   [  p0     p1     p2  ]   child max keys (high-key sep.) │
+  │ addrs    [  a0     a1     a2  ]   children's DURABLE addresses   │
+  │ slots    {  0:S0          2:S2 }  per-child diff — SPARSE        │
+  └────────┬────────────────────┬────────────────────┬───────────────┘
+       a0  │                a1  │                a2  │    (child 1 has no slot →
+           ▼                    ▼                    ▼     load @a1 verbatim)
+   ┌ @a0 ──────────┐    ┌ @a1 ──────────┐    ┌ @a2 ──────────┐
+   │ child 0's     │    │ child 1's     │    │ child 2's     │  each aᵢ points at the child's
+   │ last-WRITTEN  │    │ last-WRITTEN  │    │ last-WRITTEN  │  last-written object (its *anchor*),
+   │ object        │    │ object        │    │ object        │  unchanged even when Sᵢ holds a diff
+   └───────────────┘    └───────────────┘    └───────────────┘
+```
+
+- `slotᵢ = Sᵢ = (diffᵢ, ĝᵢ = (count, measure), maxKeyᵢ)`. A child with no pending change has
+  **no entry** (child 1 above) → it is loaded verbatim from `aᵢ`.
+- `aᵢ` is the child's *anchor* — the address of its last fully-written object. Buffering a
+  change to child *i* leaves `aᵢ` untouched and records the change in `Sᵢ`; the anchor is only
+  replaced (and the old one `markFreed`) when the child is itself written.
+- The arrays/slots are stored verbatim only in *written* nodes; a *buffered* branch has no
+  object of its own this commit — it lives entirely inside its parent's slot (see the
+  lifecycle below).
 
 ### Separators must travel in the diff (a correctness subtlety)
 
@@ -184,22 +220,45 @@ delete-then-add (which could transiently restructure). `Absent` expresses **remo
 aggregate is *absolute state*, not a delta, so non-invertible measures (min/max) are fine and
 it is free to collect (the in-memory node already maintains `count`/`measure`).
 
-### Worked example (BF 4, depth 3)
+## Worked lifecycle (BF 4, depth 3)
+
+One tree carried through the three write regimes — **content-only** (buffer), **rebalance**
+(write the path), **budget overflow** (flush a child) — and one **read** in between. `*`
+marks a changed value; addresses written as `@x`.
+
+**Stage 0 — initial durable tree** (after a full write; no slots yet):
 
 ```
-R(level 2) keys[6,16,31] → B0,B1,B2
-B0 keys[2,6]   → L0[1,2]     L1[5,6]
-B1 keys[11,16] → L2[10,11]   L3[15,16]
-B2 keys[22,31] → L4[20,21,22] L5[30,31]
+R  level 2  keys[6,16,31]   → B0,B1,B2            @R
+B0 level 1  keys[2,6]       → L0[1,2]   L1[5,6]   @B0
+B1 level 1  keys[11,16]     → L2[10,11] L3[15,16] @B1
+B2 level 1  keys[22,31]     → L4[20,21,22] L5[30,31] @B2
 ```
 
-One content-only commit — `add 3`(→L1), `add 12`(→L3), `delete 20`(→L4),
-`replace 30→30*`(→L5). No node crosses a fill bound ⇒ B0,B1,B2 are all buffered and only R
-is written (1 PUT). R's stored object:
+Every node clean (each has its own address); `lookup k` descends `R → Bᵢ → Lⱼ` as in
+baseline. 10 objects on disk (1 root + 3 branches + 6 leaves).
+
+### Stage 1 — content-only commit (buffer up → 1 PUT)
+
+Batch: `add 3`(→L1), `add 12`(→L3), `delete 20`(→L4), `replace 30→30*`(→L5). No leaf crosses
+a fill bound, so nothing rebalances. On the return path each op deposits into its parent's
+slot (`L1: Present(3)`, `L3: Present(12)`, `L4: Absent(20)`, `L5: Present(30*)`) and refreshes
+`ĝ`. At `store`, walking the dirty children of each node:
+
+```
+store(R):
+  B0 dirty, subtree content-only, under budget  → BUFFER: addr[0]:=@B0, slot[0]:=nested(B0)
+  B1 dirty, subtree content-only, under budget  → BUFFER: addr[1]:=@B1, slot[1]:=nested(B1)
+  B2 dirty, subtree content-only, under budget  → BUFFER: addr[2]:=@B2, slot[2]:=nested(B2)
+  R is the root                                 → WRITE  (base + slots) ⇒ @R'   ← the only PUT
+```
+
+`B0,B1,B2,L1,L3,L4,L5` are **not written**; their addresses still point at the Stage-0
+anchors. No `markFreed` (no anchor was superseded). **1 PUT.** `@R'`'s stored object:
 
 ```clojure
 {:level 2 :keys [6 16 31]
- :addresses [aB0 aB1 aB2]                 ; all three = children's UNCHANGED durable anchors
+ :addresses [@B0 @B1 @B2]                  ; all three = children's UNCHANGED Stage-0 anchors
  :slots {0 {:count 5 :measure mB0 :max-key 6
             :diff {1 {:count 3 :measure mL1 :max-key 6  :diff {3 3}}}}      ; Present(3)
          1 {:count 5 :measure mB1 :max-key 16
@@ -210,10 +269,70 @@ is written (1 PUT). R's stored object:
 ```
 
 `:diff` is keyed by **child-index** at a branch level and by **cmp-key** at a leaf level
-(known from the child's level). The `:max-key` on nested entries repairs each reconstructed
-grandchild's separator on restore. Unchanged children (L0, L2, …) have **no entry** — their
-durable objects and `ĝ` stand. The whole nested structure lives only in the topmost written
-object (here R), so there is no duplication.
+(known from the child's level). The whole nested structure lives only in the topmost written
+object (`@R'`); unchanged children (L0, L2) have **no entry** — their objects and `ĝ` stand.
+
+### Reading Stage 1 back — project down (lazy, one level per load)
+
+Fresh process, `lookup 30*`. Diffs flow back **down** the path actually traversed:
+
+```
+restore @R'              1 GET → a normal in-memory branch that happens to carry _slots
+descend R→child 2:       materialize(R,2):
+   load @B2              1 GET → STALE anchor  keys[22,31] → L4[20,21,22], L5[30,31]
+   install R.slots[2]    onto B2:  B2.slots[0]=(Absent 20, ĝ), B2.slots[1]=(Present 30*, ĝ)
+   repair separators     B2.keys[1] := 30  (from :max-key — anchor said 31)   ← the v5 read fix
+                         B2.(count,measure) := ĝ   (no child summing)
+descend B2→child 1:      materialize(B2,1):
+   load @L5             1 GET → [30,31]
+   project leaf          [30,31] ⊕ {30→30*} in ONE pass → [30*,31]
+lookup 30* in [30*,31]   → found
+```
+
+L0, L1, L2, L3, L4 are **never loaded**. Each visited node projects exactly once, then is
+cached as an ordinary materialized node — later `lookup`s on this path see no diff.
+
+### Stage 2 — rebalancing commit (write the affected path)
+
+Starting from the Stage-1 in-memory tree, batch `add 7, add 8, add 9` (all →L1). `L1[5,6]`
+grows to `[5,6,7,8]` (full at BF 4), then `add 9` **overflows → splits** into `[5,6]` and
+`[7,8,9]`. B0 absorbs the split child: `keys[2,6] → keys[2,6,9]`, now 3 children. That is a
+**structural** return — B0's `_rebalanced` is set:
+
+```
+store(R):
+  B0._rebalanced = true                          → WRITE B0 in full ⇒ @B0'  (new structure,
+                                                     keys[2,6,9] → L0,[5,6],[7,8,9]);
+                                                     markFreed(@B0)     ← Stage-1 anchor
+  B1 still content-only-dirty / clean            → BUFFER (addr[1]:=@B1, slot re-emitted)
+  B2 still content-only-dirty / clean            → BUFFER (addr[2]:=@B2, slot re-emitted)
+  R points at a new child address (@B0')         → WRITE ⇒ @R''
+```
+
+**2 PUTs** (`@B0'`, `@R''`) — the path from the rebalanced node to the root, exactly baseline
+PSS for those nodes. The new leaves `[5,6]`, `[7,8,9]` are written as part of `@B0'`'s subtree
+(structure is materialized, never buffered), and `B0`'s slots are reset (it now *is* its
+durable object). B1/B2 keep buffering. Rebalances are ~1/BF of ops, so amortized cost stays
+≈ `1 + depth/BF`.
+
+### Stage 3 — budget overflow (flush an over-budget child)
+
+Suppose B2 has accumulated, over several content-only commits, a buffered diff whose size
+would exceed the per-node budget `B` if folded into R again. `store(R)` detects
+`embedded + size(slot[2]) > B` and **flushes** that child instead of buffering it:
+
+```
+store(R):
+  ...
+  B2: embedded + size(nested(B2)) > B            → WRITE B2 in full ⇒ @B2'  (its diff is
+                                                     MATERIALIZED into the rewritten subtree);
+                                                     markFreed(@B2); slot[2] := ∅
+  R                                              → WRITE ⇒ @R'''
+```
+
+The flush turns accumulated buffered diffs back into a compact written subtree, bounding every
+stored object to `Σ embedded diff ≤ B`. Cost is the flushed child's path (here `@B2'`,`@R'''`);
+the budget chooses how many cheap content-only commits ride between such flushes.
 
 ## Serialized format and the storage contract
 

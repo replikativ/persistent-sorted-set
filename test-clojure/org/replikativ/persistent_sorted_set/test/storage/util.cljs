@@ -40,7 +40,7 @@
                        :addresses (when (branch? node) (.-addresses node))
                        :subtree-count (when (branch? node) (.-subtree-count node))
                        :measure   (.-_measure node)}
-                ;; DIFF_BUF_V5: persist per-child buffered diffs so diff-buf round-trips here.
+                ;; diff-buf: persist per-child buffered diffs so diff-buf round-trips here.
                 (branch? node) (assoc :slots (branch/slots-for-storage node)))))
       address))
   (restore [_ address opts]
@@ -51,7 +51,7 @@
            node (if addresses
                   (branch/from-map (assoc m :settings settings))
                   (Leaf. keys settings measure))
-           ;; DIFF_BUF_V5: reconstruct per-child buffered diffs (anchor = child address);
+           ;; diff-buf: reconstruct per-child buffered diffs (anchor = child address);
            ;; Branch.child projects them on descent. Absent ⇒ baseline.
            _    (when (and slots addresses)
                   (let [arr (make-array (count keys))]
@@ -94,7 +94,7 @@
                        :addresses (when (branch? node) (.-addresses node))
                        :subtree-count (when (branch? node) (.-subtree-count node))
                        :measure   (.-_measure node)}
-                ;; DIFF_BUF_V5: persist per-child buffered diffs so diff-buf round-trips here.
+                ;; diff-buf: persist per-child buffered diffs so diff-buf round-trips here.
                 (branch? node) (assoc :slots (branch/slots-for-storage node)))))
       (async address)))
   (restore [_ address opts]

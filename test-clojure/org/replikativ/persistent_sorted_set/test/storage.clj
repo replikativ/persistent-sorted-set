@@ -33,7 +33,7 @@
     (swap! *stats update :writes inc)
     (let [node    ^ANode node
           address (gen-addr)
-          ;; DIFF_BUF_V5: per-child buffered diffs, only present when diffBufSize>0 (else nil ⇒
+          ;; diff-buf: per-child buffered diffs, only present when diffBufSize>0 (else nil ⇒
           ;; the map is byte-identical to baseline, so diffBufSize=0 is unaffected — I0).
           slots   (when (instance? Branch node) (.slotsForStorage ^Branch node))
           m       {:level     (.level node)
@@ -55,7 +55,7 @@
            node (if addresses
                   (Branch. (int level) ^java.util.List keys ^java.util.List addresses settings)
                   (Leaf. keys settings))]
-       ;; DIFF_BUF_V5: reconstruct per-child buffered diffs into _slots (anchor = the child's
+       ;; diff-buf: reconstruct per-child buffered diffs into _slots (anchor = the child's
        ;; durable address). Branch.child projects them on descent (M5). Absent when diffBufSize=0.
        (when (and slots (instance? Branch node))
          (let [^Branch b node
@@ -156,7 +156,7 @@
          (recur tail#)))))
 
 (deftest stresstest-stable-addresses
-  ;; DIFF_BUF_V5: this asserts a BASELINE structural-sharing invariant — that the durable
+  ;; diff-buf: this asserts a BASELINE structural-sharing invariant — that the durable
   ;; node at each address byte-matches the in-memory child. Under diff-buffering a buffered
   ;; child's address re-points to its (pre-diff) ANCHOR while the diff lives in the parent's
   ;; slot, so the on-disk node intentionally differs from the post-diff child. Pin diff-buf
@@ -234,7 +234,7 @@
       (is (= (- @*stored 4) @*stored')))))
 
 (deftest test-lazyness
-  ;; DIFF_BUF_V5: asserts BASELINE lazy-loading invariants (loaded-ratio after partial
+  ;; diff-buf: asserts BASELINE lazy-loading invariants (loaded-ratio after partial
   ;; traversal; conj into an already-loaded area loads no extra nodes). Diff-buffering
   ;; changes which nodes are touched/written on conj (buffering + projection), so these
   ;; exact loaded-ratio equalities are a baseline property — pin diff-buf OFF here.
