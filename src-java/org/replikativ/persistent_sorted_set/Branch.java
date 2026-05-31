@@ -1115,23 +1115,20 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   private static final Keyword KW_DIFF    = Keyword.intern(null, "diff");
   private static final Keyword KW_MAXKEY  = Keyword.intern(null, "max-key");
 
-  // Entry count of an already-assembled slot diff: a leaf-diff's size, or the
-  // recursive sum over a nested {idx -> {:count :measure :diff}} map.
-  private static int diffSize(Object diff) {
+  // Entry count of an already-assembled slot diff describing a child at `childLevel`:
+  // a leaf-diff (childLevel == 0) returns its element count; a nested branch-diff
+  // {idx -> {:count :measure :diff :max-key}} sums diffSize over each entry's child
+  // (at childLevel-1). We discriminate by the structural level rather than by probing
+  // values, because a leaf-diff's values are the set's ELEMENTS — which may themselves
+  // be Associative (e.g. datahike Datoms), so a value.containsKey(:diff) probe is unsafe.
+  private static int diffSize(Object diff, int childLevel) {
     if (!(diff instanceof java.util.Map)) return 0;
     java.util.Map m = (java.util.Map) diff;
     if (m.isEmpty()) return 0;
-    // Distinguish a nested branch-diff (values are {:count :measure :diff} maps) from a
-    // leaf-diff (values are elements / ABSENT) — needed because a RESTORED leaf-diff is a
-    // plain edn map, not a PersistentTreeMap, so we can't tell by type alone.
-    Object firstVal = m.values().iterator().next();
-    boolean branch = (firstVal instanceof Associative) && ((Associative) firstVal).containsKey(KW_DIFF);
-    if (branch) {
-      int t = 0;
-      for (Object v : m.values()) t += diffSize(((IPersistentMap) v).valAt(KW_DIFF));
-      return t;
-    }
-    return m.size();                                            // leaf-diff entry count
+    if (childLevel == 0) return m.size();                       // leaf-diff entry count
+    int t = 0;                                                  // nested branch-diff
+    for (Object v : m.values()) t += diffSize(((IPersistentMap) v).valAt(KW_DIFF), childLevel - 1);
+    return t;
   }
 
   // Total content-only diff size of c's dirty subtree, or -1 if any dirty descendant
@@ -1152,7 +1149,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         if (s < 0) return -1;
         total += s;
       } else {
-        total += diffSize(sl.diff);                             // leaf-diff or restored-nested
+        total += diffSize(sl.diff, c._level - 1);               // leaf-diff or restored-nested (child at c._level-1)
       }
     }
     return total;
@@ -1262,7 +1259,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     for (int i = 0; i < _len; ++i) {
       Slot sl = (_slots != null) ? (Slot) _slots[i] : null;
       if (_addresses[i] != null) {
-        if (sl != null) embedded += diffSize(sl.diff);          // passthrough (do NOT touch child)
+        if (sl != null) embedded += diffSize(sl.diff, _level - 1); // passthrough (do NOT touch child)
         continue;                                                // clean or buffered-passthrough
       }
       // _addresses[i] == null: dirty this commit ⇒ child is resident
@@ -1273,7 +1270,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (sl == null || sl.anchor == null) {                    // no durable anchor ⇒ must write
         canBuffer = false; sz = 0; nested = null;
       } else if (child instanceof Leaf) {
-        canBuffer = true; sz = diffSize(sl.diff); nested = sl.diff;
+        canBuffer = true; sz = diffSize(sl.diff, 0); nested = sl.diff;   // leaf child ⇒ leaf-diff
       } else {
         int s = contentOnlyDiffSize(storage, (Branch) child);   // -1 if subtree rebalanced
         canBuffer = (s >= 0);
