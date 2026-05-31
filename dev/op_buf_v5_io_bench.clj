@@ -54,6 +54,37 @@
           (let [a2 (ss/store s2 (mkst))]
             (recur (inc c) s2 a2 (conj! wp (:writes @tstore/*stats)))))))))
 
+;; Pure-insert split rate: only conj of FRESH keys (mode :seq = append at right edge,
+;; :rand = scattered). Isolates how often an insert triggers a structural spine write,
+;; with no delete/replace noise. Reports structural commits per 1000 inserts.
+(defn measure-insert [seed bf b M C K mode]
+  (let [rng (Random. seed)
+        disk (atom {})
+        mkst #(tstore/->Storage (atom {}) disk (opbuf-settings bf b))
+        s0 (reduce (fn [s i] (conj s [i 0]))
+                   (ss/sorted-set* {:comparator cmp :branching-factor bf :op-buf-size b})
+                   (range M))
+        nxt (atom M)                                   ; next sequential key
+        ckpt (ss/store s0 (mkst))]
+    (loop [c 0, s s0, wp (transient [])]
+      (if (= c C)
+        (let [wpv (persistent! wp), multi (filter #(> % 1) wpv)]
+          {:bf bf :b b :mode mode
+           :puts-per-commit (double (/ (reduce + wpv) C))
+           :one-put-frac (double (/ (count (filter #(<= % 1) wpv)) C))
+           :structural-commits (count multi)
+           :struct-per-1k-inserts (double (/ (* 1000 (count multi)) (* C K)))
+           :inserts-per-split (if (seq multi) (double (/ (* C K) (count multi))) ##Inf)
+           :mean-structural-puts (if (seq multi) (double (/ (reduce + multi) (count multi))) 0.0)})
+        (let [s2 (reduce (fn [s _]
+                           (let [k (if (= mode :seq) (swap! nxt inc)
+                                       (+ M (.nextInt rng (* 50 M))))]
+                             (conj s [k 0])))
+                         s (range K))]
+          (tstore/with-stats nil)
+          (ss/store s2 (mkst))
+          (recur (inc c) s2 (conj! wp (:writes @tstore/*stats))))))))
+
 (defn measure [seed bf b M C K keyrange]
   (let [rng (Random. seed)
         ri (fn [n] (.nextInt rng n))
@@ -75,13 +106,19 @@
               _ (dorun (seq l2))
               read-amp (:reads @tstore/*stats)
               wp (persistent! writes-per)]
-          {:bf bf :b b :ok ok
-           :commits C :ops-per-commit K
-           :puts-total (reduce + wp)
-           :puts-per-commit (double (/ (reduce + wp) C))
-           :min-puts (apply min wp) :max-puts (apply max wp)
-           :objects (count @disk) :bytes (disk-bytes disk)
-           :restore-reads read-amp})
+          (let [one (count (filter #(<= % 1) wp))      ; content-only commits (≤1 PUT = buffered root)
+                multi (filter #(> % 1) wp)]            ; split/merge-triggered spine writes
+            {:bf bf :b b :ok ok
+             :commits C :ops-per-commit K
+             :puts-total (reduce + wp)
+             :puts-per-commit (double (/ (reduce + wp) C))
+             :min-puts (apply min wp) :max-puts (apply max wp)
+             :one-put-frac (double (/ one C))           ; fraction of commits that cost ≤1 PUT
+             :structural-commits (count multi)          ; commits that triggered a spine write
+             :struct-per-1k-ops (double (/ (* 1000 (count multi)) (* C K)))
+             :mean-structural-puts (if (seq multi) (double (/ (reduce + multi) (count multi))) 0.0)
+             :objects (count @disk) :bytes (disk-bytes disk)
+             :restore-reads read-amp}))
         (let [s2 (reduce (fn [s _]
                            (let [k (ri keyrange), r (ri 100)]
                              (cond
