@@ -1,6 +1,23 @@
 package org.replikativ.persistent_sorted_set;
 
+import java.util.Comparator;
+
 public interface IStorage<Key, Address> {
+    /**
+     * The comparator of the set whose traversal is using this storage, or null.
+     *
+     * OP_BUF_V5: projecting a buffered leaf-diff onto a durable leaf (Branch.child)
+     * needs the set's comparator. A node is deserialized by address with no knowledge
+     * of which set/index it belongs to, so embeddings that share one node deserializer
+     * across several comparators (e.g. datahike's per-index sets sharing a fressian
+     * serializer) cannot stamp it onto Settings. The storage object, by contrast, flows
+     * with the traversal, so it is the natural carrier. Returns null ⇒ projection falls
+     * back to Settings.comparator().
+     */
+    default Comparator<Key> comparator() {
+        return null;
+    }
+
     /**
      * Given address, reconstruct and (optionally) cache the node.
      * Set itself would not store any strong references to nodes and

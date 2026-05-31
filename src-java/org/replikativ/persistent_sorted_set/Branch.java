@@ -145,7 +145,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // child's own _slots + set its aggregates from ĝ. Runs once, here, at materialization
       // (reads stay baseline). Parent's slot supersedes any diff baked in the child's object.
       if (_settings.opBufSize() > 0 && sl != null && sl.diff != null) {
-        child = (base instanceof Leaf) ? (ANode) projectLeaf((Leaf) base, sl.diff)
+        // Projection comparator: prefer the traversing storage's (per-set/index) comparator;
+        // fall back to Settings (single-comparator embeddings, e.g. the test storage).
+        Comparator pcmp = (storage.comparator() != null) ? storage.comparator() : _settings.comparator();
+        child = (base instanceof Leaf) ? (ANode) projectLeaf((Leaf) base, sl.diff, pcmp)
                                        : (ANode) projectBranch((Branch) base, sl);
       } else {
         child = base;
@@ -1198,8 +1201,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // keys with the diff (Present upserts the element, Absent removes) under the set's
   // comparator, emitting the result elements in key order. The net diff keeps the leaf
   // within [min, BF] (else the writer would have rebalanced and written it), so this is IO-free.
-  private Leaf<Key, Address> projectLeaf(Leaf<Key, Address> base, Object diff) {
-    Comparator cmp = _settings.comparator();
+  private Leaf<Key, Address> projectLeaf(Leaf<Key, Address> base, Object diff, Comparator cmp) {
     PersistentTreeMap m = (PersistentTreeMap) PersistentTreeMap.create(cmp, (ISeq) null);
     for (int i = 0; i < base._len; ++i) m = (PersistentTreeMap) m.assoc(base._keys[i], base._keys[i]);
     for (ISeq s = RT.seq(diff); s != null; s = s.next()) {
