@@ -35,20 +35,32 @@
     (let [address (gen-addr)]
       (swap! *disk assoc address
              (pr-str
-              {:level     (node/level node)
-               :keys      (.-keys node)
-               :addresses (when (branch? node) (.-addresses node))
-               :subtree-count (when (branch? node) (.-subtree-count node))
-               :measure   (.-_measure node)}))
+              (cond-> {:level     (node/level node)
+                       :keys      (.-keys node)
+                       :addresses (when (branch? node) (.-addresses node))
+                       :subtree-count (when (branch? node) (.-subtree-count node))
+                       :measure   (.-_measure node)}
+                ;; DIFF_BUF_V5: persist per-child buffered diffs so diff-buf round-trips here.
+                (branch? node) (assoc :slots (branch/slots-for-storage node)))))
       address))
   (restore [_ address opts]
     (assert (not (false? (:sync? opts))))
     (or
      (@*memory address)
-     (let [{:keys [keys addresses level measure] :as m} (edn/read-string (@*disk address))
+     (let [{:keys [keys addresses level measure slots] :as m} (edn/read-string (@*disk address))
            node (if addresses
                   (branch/from-map (assoc m :settings settings))
-                  (Leaf. keys settings measure))]
+                  (Leaf. keys settings measure))
+           ;; DIFF_BUF_V5: reconstruct per-child buffered diffs (anchor = child address);
+           ;; Branch.child projects them on descent. Absent ⇒ baseline.
+           _    (when (and slots addresses)
+                  (let [arr (make-array (count keys))]
+                    (doseq [[idx entry] slots]
+                      (aset arr (int idx) {:diff    (:diff entry)
+                                           :count   (:count entry)
+                                           :measure (:measure entry)
+                                           :anchor  (nth (vec addresses) (int idx))}))
+                    (set! (.-_slots node) arr)))]
        (dbg "restored<" (type node) ">")
        (swap! *stats update :reads inc)
        (swap! *memory assoc address node)
@@ -77,11 +89,13 @@
     (let [address (gen-addr)]
       (swap! *disk assoc address
              (pr-str
-              {:level     (node/level node)
-               :keys      (.-keys node)
-               :addresses (when (branch? node) (.-addresses node))
-               :subtree-count (when (branch? node) (.-subtree-count node))
-               :measure   (.-_measure node)}))
+              (cond-> {:level     (node/level node)
+                       :keys      (.-keys node)
+                       :addresses (when (branch? node) (.-addresses node))
+                       :subtree-count (when (branch? node) (.-subtree-count node))
+                       :measure   (.-_measure node)}
+                ;; DIFF_BUF_V5: persist per-child buffered diffs so diff-buf round-trips here.
+                (branch? node) (assoc :slots (branch/slots-for-storage node)))))
       (async address)))
   (restore [_ address opts]
     (assert (false? (:sync? opts)))

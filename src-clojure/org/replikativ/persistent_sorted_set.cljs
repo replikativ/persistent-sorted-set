@@ -8,7 +8,10 @@
             [org.replikativ.persistent-sorted-set.btset :as btset :refer [BTSet]]))
 
 (def ^:private default-opts
-  {:branching-factor 512})
+  ;; DIFF_BUF_V5: diff-buffering ON by default (budget 256) to match the JVM default, so a
+  ;; cljs-created set behaves like a JVM one cross-host. 0 disables (byte-identical baseline).
+  {:branching-factor 512
+   :diff-buf-size 256})
 
 (defn- with-defaults [opts]
   (merge default-opts opts))
