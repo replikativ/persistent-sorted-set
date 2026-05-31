@@ -1,5 +1,5 @@
-(ns op-buf-v5-reference
-  "Executable spec for OP_BUF_V5 (doc/OP_BUF_V5.md): per-node nested diffs at the
+(ns diff-buf-v5-reference
+  "Executable spec for DIFF_BUF_V5 (doc/DIFF_BUF_V5.md): per-node nested diffs at the
    serialization boundary.
 
    Self-contained small B-tree + diff layer. The durable representation is the
@@ -19,7 +19,7 @@
    Cross-level recency, peel-one-level write counts, and real split/merge sibling
    loads are validated in the Java port (they don't affect content soundness).
 
-   Run: (op-buf-v5-reference/run-all)")
+   Run: (diff-buf-v5-reference/run-all)")
 
 (def ^:dynamic *bf* 4)   ; branching factor
 (def ^:dynamic *B* 6)    ; per-stored-object embedded op budget

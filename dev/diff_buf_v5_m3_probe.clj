@@ -1,15 +1,15 @@
-(ns op-buf-v5-m3-probe
-  "M3 + M4a gate (opBufSize>0): nested deposit on the return path + anchor capture.
+(ns diff-buf-v5-m3-probe
+  "M3 + M4a gate (diffBufSize>0): nested deposit on the return path + anchor capture.
    The diff is recursive per-child: a LEAF-parent slot holds a leaf-diff
    {cmp-key → element|ABSENT} + anchor + ĝ; a BRANCH slot is an anchor marker
    (diff=null) holding the child's durable address + ĝ (its nested diff is derived
    from the live subtree at store / reconstructed on restore). Store/restore are
-   still baseline here, so slots are accumulated and ignored (opBufSize>0 stays
-   correct; opBufSize=0 is byte-identical = I0).
+   still baseline here, so slots are accumulated and ignored (diffBufSize>0 stays
+   correct; diffBufSize=0 is byte-identical = I0).
    Run (src-clojure MUST precede target/classes — the latter holds a stale .clj copy;
    test-clojure provides the storage):
      clojure -Sdeps '{:paths [\"src-clojure\" \"target/classes\" \"dev\" \"test-clojure\"]}' \\
-       -M -e \"(require 'op-buf-v5-m3-probe)(op-buf-v5-m3-probe/run-all)\""
+       -M -e \"(require 'diff-buf-v5-m3-probe)(diff-buf-v5-m3-probe/run-all)\""
   (:require [org.replikativ.persistent-sorted-set :as ss]
             [org.replikativ.persistent-sorted-set.test.storage :as tstore])
   (:import [org.replikativ.persistent_sorted_set Branch Leaf ANode Slot PersistentSortedSet IStorage Settings]
@@ -59,7 +59,7 @@
   (let [n   200
         ref (atom (sorted-set-by cmp))
         s   (reduce (fn [s i] (swap! ref conj [i 0]) (conj s [i 0]))
-                    (ss/sorted-set* {:comparator cmp :branching-factor 4 :op-buf-size 100})
+                    (ss/sorted-set* {:comparator cmp :branching-factor 4 :diff-buf-size 100})
                     (shuffle (range n)))
         s   (reduce (fn [s i] (swap! ref #(-> % (disj [i 0]) (conj [i (inc i)])))
                       (ss/replace s [i 0] [i (inc i)]))
@@ -69,13 +69,13 @@
         got (vec (seq s))
         exp (vec (seq @ref))]
     (if (= got exp)
-      (do (println "  P1 content exact (conj/replace/disj, opBufSize>0):" (count got) "elems") true)
+      (do (println "  P1 content exact (conj/replace/disj, diffBufSize>0):" (count got) "elems") true)
       (fails "content mismatch; got " (count got) " exp " (count exp)))))
 
 ;; --- P2: leaf deposit fires at a leaf-parent w/ exact ĝ; P3: latest-wins ------
 (defn probe-deposit []
   (let [s0 (reduce (fn [s i] (conj s [i 0]))
-                   (ss/sorted-set* {:comparator cmp :branching-factor 4 :op-buf-size 100})
+                   (ss/sorted-set* {:comparator cmp :branching-factor 4 :diff-buf-size 100})
                    (range 64))
         k  17
         s1 (ss/replace s0 [k 0] [k 111])
@@ -104,7 +104,7 @@
 ;; --- Absent deposit -----------------------------------------------------------
 (defn probe-absent []
   (let [s0 (reduce (fn [s i] (conj s [i 0]))
-                   (ss/sorted-set* {:comparator cmp :branching-factor 8 :op-buf-size 100})
+                   (ss/sorted-set* {:comparator cmp :branching-factor 8 :diff-buf-size 100})
                    (range 200))
         ks [73 74 75]
         s1 (reduce (fn [s k] (disj s [k 0])) s0 ks)
@@ -125,7 +125,7 @@
 (defn probe-markers []
   (let [st (tstore/storage)
         s  (reduce (fn [s i] (conj s [i 0]))
-                   (ss/sorted-set* {:comparator cmp :branching-factor 4 :op-buf-size 100})
+                   (ss/sorted-set* {:comparator cmp :branching-factor 4 :diff-buf-size 100})
                    (range 256))
         _  (ss/store s st)                       ; assigns durable addresses so anchors exist
         s  (reduce (fn [s i] (ss/replace s [i 0] [i 1])) s (range 0 256 5))
@@ -156,7 +156,7 @@
 (defn probe-anchor []
   (let [st (tstore/storage)
         s0 (reduce (fn [s i] (conj s [i 0]))
-                   (ss/sorted-set* {:comparator cmp :branching-factor 4 :op-buf-size 100})
+                   (ss/sorted-set* {:comparator cmp :branching-factor 4 :diff-buf-size 100})
                    (range 64))
         _  (ss/store s0 st)
         k  17
@@ -181,7 +181,7 @@
 (defn probe-writes []
   (let [st (tstore/storage)
         s0 (reduce (fn [s i] (conj s [i 0]))
-                   (ss/sorted-set* {:comparator cmp :branching-factor 4 :op-buf-size 100})
+                   (ss/sorted-set* {:comparator cmp :branching-factor 4 :diff-buf-size 100})
                    (range 200))
         _  (ss/store s0 st)
         depth (tree-depth s0)
@@ -200,7 +200,7 @@
   ;; the stored root object must carry a nested :slots map (so the diff is durable)
   (let [st (tstore/storage)
         s0 (reduce (fn [s i] (conj s [i 0]))
-                   (ss/sorted-set* {:comparator cmp :branching-factor 4 :op-buf-size 100})
+                   (ss/sorted-set* {:comparator cmp :branching-factor 4 :diff-buf-size 100})
                    (range 64))
         _  (ss/store s0 st)
         s1 (ss/replace s0 [17 0] [17 1])
@@ -222,7 +222,7 @@
 
 ;; --- M5: store → FRESH restore → content exact (push-down projection) ----------
 (defn opbuf-settings ^Settings [bf b]
-  ;; node settings used by the storage on restore: opBufSize>0 + the set's comparator,
+  ;; node settings used by the storage on restore: diffBufSize>0 + the set's comparator,
   ;; so Branch.child projects buffered diffs.
   (let [s (Settings. (int bf) nil nil nil (int b))]
     (set! (.-_comparator s) ^java.util.Comparator cmp)
@@ -233,14 +233,14 @@
   [addr disk bf b]
   (ss/restore-by cmp addr
                  (tstore/->Storage (atom {}) disk (opbuf-settings bf b))
-                 {:branching-factor bf :op-buf-size b :comparator cmp}))
+                 {:branching-factor bf :diff-buf-size b :comparator cmp}))
 
 (defn probe-roundtrip []
   (let [n 200, bf 4, b 100
         st  (tstore/storage-with-settings (opbuf-settings bf b))
         ref (atom (sorted-set-by cmp))
         s0  (reduce (fn [s i] (swap! ref conj [i 0]) (conj s [i 0]))
-                    (ss/sorted-set* {:comparator cmp :branching-factor bf :op-buf-size b}) (range n))
+                    (ss/sorted-set* {:comparator cmp :branching-factor bf :diff-buf-size b}) (range n))
         _   (ss/store s0 st)
         ;; content-only commit: replace 1/3, remove 1/7 (mix of buffered + maybe rebalanced)
         s1  (reduce (fn [s i] (swap! ref #(-> % (disj [i 0]) (conj [i 1]))) (ss/replace s [i 0] [i 1]))
@@ -262,7 +262,7 @@
         st0  (tstore/storage-with-settings (opbuf-settings bf b))
         ref  (atom (sorted-set-by cmp))
         s0   (reduce (fn [s i] (swap! ref conj [i 0]) (conj s [i 0]))
-                     (ss/sorted-set* {:comparator cmp :branching-factor bf :op-buf-size b}) (range n))
+                     (ss/sorted-set* {:comparator cmp :branching-factor bf :diff-buf-size b}) (range n))
         addr0 (let [st (tstore/->Storage (atom {}) disk (opbuf-settings bf b))] (ss/store s0 st))]
     (loop [cyc 0, addr addr0]
       (if (= cyc 8)
@@ -287,7 +287,7 @@
   (let [bf 4, b 200, n 200, disk (atom {})
         mkst #(tstore/->Storage (atom {}) disk (opbuf-settings bf b))
         ref (atom (apply sorted-set-by cmp (map (fn [i] [i 0]) (range n))))
-        s0 (reduce (fn [s i] (conj s [i 0])) (ss/sorted-set* {:comparator cmp :branching-factor bf :op-buf-size b}) (range n))
+        s0 (reduce (fn [s i] (conj s [i 0])) (ss/sorted-set* {:comparator cmp :branching-factor bf :diff-buf-size b}) (range n))
         a0 (ss/store s0 (mkst))
         ;; COMMIT buffered diffs: replace evens, store (now committed-buffered, address=anchor)
         l1 (fresh-restore a0 disk bf b)
@@ -312,7 +312,7 @@
         mkst #(tstore/->Storage (atom {}) disk (opbuf-settings bf b))
         ref (atom (sorted-set-by cmp))
         s0 (reduce (fn [s i] (swap! ref conj [i 0]) (conj s [i 0]))
-                   (ss/sorted-set* {:comparator cmp :branching-factor bf :op-buf-size b}) (range 0 keyrange 2))]
+                   (ss/sorted-set* {:comparator cmp :branching-factor bf :diff-buf-size b}) (range 0 keyrange 2))]
     (loop [c 0, addr (ss/store s0 (mkst))]
       (if (= c cycles)
         (do (println "  P-generative:" cycles "cycles ×" ops "random ops @ B=" b "(flush+fresh-reload): exact") true)
@@ -334,10 +334,10 @@
 ;; the diff was completed to carry each modified child's new maxKey (separator), so a
 ;; reconstructed buffered branch restores its separators instead of the anchor's stale
 ;; ones. (Previously it exposed the separator-staleness read bug.) Cross-validated by
-;; dev/op_buf_v5_flush_debug.clj scan (1400+ seeded runs incl. B=1).
+;; dev/diff_buf_v5_flush_debug.clj scan (1400+ seeded runs incl. B=1).
 
 (defn run-all []
-  (println "=== OP_BUF_V5 M3+M4a+M4b+M5 probe ===")
+  (println "=== DIFF_BUF_V5 M3+M4a+M4b+M5 probe ===")
   (let [rs [(probe-content) (probe-deposit) (probe-absent) (probe-markers) (probe-anchor)
             (probe-writes) (probe-serialized) (probe-roundtrip) (probe-multicycle) (probe-remove-merge)
             (probe-generative)]]

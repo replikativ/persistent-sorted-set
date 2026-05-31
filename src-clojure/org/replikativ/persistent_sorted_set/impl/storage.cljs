@@ -9,6 +9,6 @@
   (markFreed [this address])
   (isFreed [this address])
   (freedInfo [this address])
-  ;; OP_BUF_V5: per-set/index comparator used to project buffered leaf-diffs on
+  ;; DIFF_BUF_V5: per-set/index comparator used to project buffered leaf-diffs on
   ;; restore (mirrors JVM IStorage.comparator()). nil ⇒ no per-index comparator.
   (comparator [this]))

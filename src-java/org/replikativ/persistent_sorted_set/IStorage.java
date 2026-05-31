@@ -6,7 +6,7 @@ public interface IStorage<Key, Address> {
     /**
      * The comparator of the set whose traversal is using this storage, or null.
      *
-     * OP_BUF_V5: projecting a buffered leaf-diff onto a durable leaf (Branch.child)
+     * DIFF_BUF_V5: projecting a buffered leaf-diff onto a durable leaf (Branch.child)
      * needs the set's comparator. A node is deserialized by address with no knowledge
      * of which set/index it belongs to, so embeddings that share one node deserializer
      * across several comparators (e.g. datahike's per-index sets sharing a fressian

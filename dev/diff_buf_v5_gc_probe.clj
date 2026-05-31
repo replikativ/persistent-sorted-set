@@ -1,5 +1,5 @@
-(ns op-buf-v5-gc-probe
-  "Does markFreed stay correct under OP_BUF_V5? A buffered child re-points to its
+(ns diff-buf-v5-gc-probe
+  "Does markFreed stay correct under DIFF_BUF_V5? A buffered child re-points to its
    durable anchor, but the mutation path calls markFreed on that anchor. If the
    anchor is still reachable from the final root yet sits in the freed-set, an
    online GC would delete a LIVE node. This probe intersects the reachable set
@@ -32,10 +32,10 @@
         freed (atom #{})
         mkst #(recording-storage disk bf b freed)
         s0 (reduce (fn [s i] (conj s [i 0]))
-                   (ss/sorted-set* {:comparator cmp :branching-factor bf :op-buf-size b}) (range 0 keyrange 2))]
+                   (ss/sorted-set* {:comparator cmp :branching-factor bf :diff-buf-size b}) (range 0 keyrange 2))]
     (loop [c 0 addr (ss/store s0 (mkst))]
       (if (= c cycles)
-        (let [loaded (ss/restore-by cmp addr (mkst) {:branching-factor bf :op-buf-size b :comparator cmp})
+        (let [loaded (ss/restore-by cmp addr (mkst) {:branching-factor bf :diff-buf-size b :comparator cmp})
               reachable (atom #{})
               _ (ss/walk-addresses loaded (fn [a] (swap! reachable conj a)))
               live-freed (clojure.set/intersection @reachable @freed)
@@ -45,7 +45,7 @@
           {:b b :reachable (count @reachable) :freed (count @freed) :written (count all)
            :LIVE-but-FREED (count live-freed)   ;; over-free (GC deletes live data) — must be 0
            :LEAKED (count leaked)})              ;; under-free (orphans never collected) — should be ~0
-        (let [loaded (ss/restore-by cmp addr (mkst) {:branching-factor bf :op-buf-size b :comparator cmp})
+        (let [loaded (ss/restore-by cmp addr (mkst) {:branching-factor bf :diff-buf-size b :comparator cmp})
               ;; TRANSIENT batch (bulk-import style) → exercises the editable in-place
               ;; markFreed paths (Branch.java 394/574) that the persistent path skips.
               s2 (persistent! (reduce (fn [t _] (conj! t [(.nextInt rng keyrange) 0]))
@@ -54,4 +54,4 @@
 
 (defn go []
   (doseq [b [0 64 512]]
-    (println (format "opBufSize=%-4d %s" b (pr-str (run 1 16 b 12 20 400))))))
+    (println (format "diffBufSize=%-4d %s" b (pr-str (run 1 16 b 12 20 400))))))

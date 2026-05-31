@@ -1,9 +1,9 @@
-(ns op-buf-v5-overhead
-  "Isolate the CPU/byte OVERHEAD of OP_BUF_V5 vs baseline (opBufSize=0) using an
+(ns diff-buf-v5-overhead
+  "Isolate the CPU/byte OVERHEAD of DIFF_BUF_V5 vs baseline (diffBufSize=0) using an
    in-process EDN storage, so the IO is ~free and only the buffer machinery
    (deposit / assembleNested / contentOnlyDiffSize / slotsForStorage / projection)
    and the serialized-size delta show up. Real backends (datahike :mem / S3) net the
-   IO saving on top; here we want the cost the op-buffer adds."
+   IO saving on top; here we want the cost the diff-buffer adds."
   (:require [org.replikativ.persistent-sorted-set :as ss]
             [org.replikativ.persistent-sorted-set.test.storage :as tstore])
   (:import [org.replikativ.persistent_sorted_set Settings IStorage Branch ANode]
@@ -15,7 +15,7 @@
     (set! (.-_comparator s) ^java.util.Comparator cmp) s))
 (defn fresh-restore [addr disk bf b]
   (ss/restore-by cmp addr (tstore/->Storage (atom {}) disk (opbuf-settings bf b))
-                 {:branching-factor bf :op-buf-size b :comparator cmp}))
+                 {:branching-factor bf :diff-buf-size b :comparator cmp}))
 (defn disk-bytes [disk] (reduce + 0 (map (comp count str) (vals @disk))))
 (defn ms [ns] (/ ns 1e6))
 
@@ -26,7 +26,7 @@
                 disk (atom {})
                 mkst #(tstore/->Storage (atom {}) disk (opbuf-settings bf b))
                 s0 (reduce (fn [s i] (conj s [i 0]))
-                           (ss/sorted-set* {:comparator cmp :branching-factor bf :op-buf-size b}) (range M))
+                           (ss/sorted-set* {:comparator cmp :branching-factor bf :diff-buf-size b}) (range M))
                 addr0 (ss/store s0 (mkst))
                 mut-ns (atom 0) store-ns (atom 0)
                 _ (loop [c 0 s s0]
@@ -82,7 +82,7 @@
                 ctr (java.util.concurrent.atomic.AtomicLong.)
                 mkst #(fast-store ctr cmp)
                 s0 (reduce (fn [s i] (conj s [i 0]))
-                           (ss/sorted-set* {:comparator cmp :branching-factor bf :op-buf-size b :storage (mkst)}) (range M))
+                           (ss/sorted-set* {:comparator cmp :branching-factor bf :diff-buf-size b :storage (mkst)}) (range M))
                 _ (ss/store s0 (mkst))
                 store-ns (atom 0) calls0 (.get ctr)
                 _ (loop [c 0 s s0]

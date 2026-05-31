@@ -11,28 +11,28 @@ public class Settings {
   public final AtomicBoolean _edit;
   public final IMeasure _measure;
   public final ILeafProcessor _leafProcessor;
-  // OP_BUF_V5: per-node diff budget B. 0 (default) disables the write-opt path
+  // DIFF_BUF_V5: per-node diff budget B. 0 (default) disables the write-opt path
   // entirely, so every code path is byte-identical to baseline PSS (invariant I0).
-  public final int _opBufSize;
-  // OP_BUF_V5: the set's comparator, needed to PROJECT buffered leaf-diffs onto a
+  public final int _diffBufSize;
+  // DIFF_BUF_V5: the set's comparator, needed to PROJECT buffered leaf-diffs onto a
   // restored leaf at the lazy-load boundary (Branch.child). Set by the Clojure API;
-  // null when opBufSize==0 (projection never runs). Not final so the various ctors
+  // null when diffBufSize==0 (projection never runs). Not final so the various ctors
   // need not all thread it; editable() preserves it.
   public Comparator _comparator;
 
   // Canonical constructor (does not normalize; callers pass already-normalized values).
-  public Settings(int branchingFactor, RefType refType, AtomicBoolean edit, IMeasure measure, ILeafProcessor leafProcessor, int opBufSize) {
+  public Settings(int branchingFactor, RefType refType, AtomicBoolean edit, IMeasure measure, ILeafProcessor leafProcessor, int diffBufSize) {
     _branchingFactor = branchingFactor;
     _refType = refType;
     _edit = edit;
     _measure = measure;
     _leafProcessor = leafProcessor;
-    _opBufSize = opBufSize;
+    _diffBufSize = diffBufSize;
   }
 
   // Back-compat: previous 5-arg canonical ctor (used by editable()).
   public Settings(int branchingFactor, RefType refType, AtomicBoolean edit, IMeasure measure, ILeafProcessor leafProcessor) {
-    this(branchingFactor, refType, edit, measure, leafProcessor, defaultOpBufSize());
+    this(branchingFactor, refType, edit, measure, leafProcessor, defaultDiffBufSize());
   }
 
   public Settings() {
@@ -52,11 +52,11 @@ public class Settings {
   }
 
   public Settings(int branchingFactor, RefType refType, IMeasure measure, ILeafProcessor leafProcessor) {
-    this(branchingFactor, refType, measure, leafProcessor, defaultOpBufSize());
+    this(branchingFactor, refType, measure, leafProcessor, defaultDiffBufSize());
   }
 
-  // Normalizing constructor with explicit opBufSize (used by the Clojure API).
-  public Settings(int branchingFactor, RefType refType, IMeasure measure, ILeafProcessor leafProcessor, int opBufSize) {
+  // Normalizing constructor with explicit diffBufSize (used by the Clojure API).
+  public Settings(int branchingFactor, RefType refType, IMeasure measure, ILeafProcessor leafProcessor, int diffBufSize) {
     if (branchingFactor <= 0) {
       branchingFactor = 512;
     }
@@ -68,14 +68,17 @@ public class Settings {
     _edit = null;
     _measure = measure;
     _leafProcessor = leafProcessor;
-    _opBufSize = opBufSize < 0 ? 0 : opBufSize;
+    _diffBufSize = diffBufSize < 0 ? 0 : diffBufSize;
   }
 
-  static int defaultOpBufSize() {
+  // DIFF_BUF_V5: diff-buffering is ON by default (budget 256). Override with the
+  // pss.diffBufSize system property; 0 disables it (byte-identical baseline, invariant I0).
+  // Public so the Clojure API (map->settings) shares this single default source.
+  public static int defaultDiffBufSize() {
     try {
-      return Integer.parseInt(System.getProperty("pss.opBufSize", "0"));
+      return Integer.parseInt(System.getProperty("pss.diffBufSize", "256"));
     } catch (Exception e) {
-      return 0;
+      return 256;
     }
   }
 
@@ -91,9 +94,9 @@ public class Settings {
     return 8;
   }
 
-  // OP_BUF_V5 per-node diff budget; 0 disables the write-opt path (I0: baseline-identical).
-  public int opBufSize() {
-    return _opBufSize;
+  // DIFF_BUF_V5 per-node diff budget; 0 disables the write-opt path (I0: baseline-identical).
+  public int diffBufSize() {
+    return _diffBufSize;
   }
 
   public RefType refType() {
@@ -107,12 +110,12 @@ public class Settings {
   public Settings editable(boolean value) {
     assert !editable();
     assert value == true;
-    Settings s = new Settings(_branchingFactor, _refType, new AtomicBoolean(value), _measure, _leafProcessor, _opBufSize);
+    Settings s = new Settings(_branchingFactor, _refType, new AtomicBoolean(value), _measure, _leafProcessor, _diffBufSize);
     s._comparator = _comparator;  // preserve for diff projection during transient mutation
     return s;
   }
 
-  // OP_BUF_V5: the set's comparator (for projecting buffered leaf-diffs on restore).
+  // DIFF_BUF_V5: the set's comparator (for projecting buffered leaf-diffs on restore).
   public Comparator comparator() {
     return _comparator;
   }

@@ -6,8 +6,8 @@ import clojure.lang.Keyword;
 import clojure.lang.PersistentTreeMap;
 
 /**
- * OP_BUF_V5 per-child buffered diff (only allocated when Settings.opBufSize() &gt; 0;
- * at opBufSize==0 Branch._slots stays null, so everything is byte-identical to
+ * DIFF_BUF_V5 per-child buffered diff (only allocated when Settings.diffBufSize() &gt; 0;
+ * at diffBufSize==0 Branch._slots stays null, so everything is byte-identical to
  * baseline PSS — invariant I0).
  *
  * <p>A Slot is the logical diff of one branch child against its durable

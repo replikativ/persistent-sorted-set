@@ -1,6 +1,6 @@
 # Write-optimized PSS — v5 (per-node diffs at the serialization boundary)
 
-Status: design, converged. Supersedes v4 (`OP_BUF_V4.md`, materialized-root
+Status: design, converged. Supersedes v4 (`DIFF_BUF_V4.md`, materialized-root
 overlay) and v3. Branch: TBD (off `main`).
 
 The in-memory tree stays an ordinary B-tree (all query/mutate logic unchanged).
@@ -464,7 +464,7 @@ Never flip a default before the gate plus audit (#40), cljs (#41), migration
 ## 9. Phasing
 
 - **A** — core transport soundness on the reference model
-  (`dev/op_buf_v5_reference.clj`): per-node nested diffs (frozen base + leaf ops),
+  (`dev/diff_buf_v5_reference.clj`): per-node nested diffs (frozen base + leaf ops),
   flush re-snapshot on budget, materialize-on-restore, `ĝ` snapshots. **PASSES**
   the probe gate it can cover: multi-cycle content+count exact (8 cycles),
   generative (6×1500, 0 fails), AGG cold-child-count, within-leaf recency, BI.
@@ -511,18 +511,18 @@ Never flip a default before the gate plus audit (#40), cljs (#41), migration
 
 Each step is a self-contained change with a **mandatory gate**: recompile
 (`clojure -T:build java`) + full suite (`clojure -M:test`) green, with the suite
-running at `opBufSize=0` so it asserts **I0** (baseline-identical) at every step.
-A separate opBufSize>0 probe (the reference's gate, ported to drive the real PSS)
-validates the new behavior. All new behavior forks on `_settings.opBufSize() > 0`.
+running at `diffBufSize=0` so it asserts **I0** (baseline-identical) at every step.
+A separate diffBufSize>0 probe (the reference's gate, ported to drive the real PSS)
+validates the new behavior. All new behavior forks on `_settings.diffBufSize() > 0`.
 
-- **M1 — Settings gate. DONE** (commit a745d8c). `_opBufSize` + `opBufSize()` +
-  `pss.opBufSize` sysprop + Clojure `:op-buf-size`; no behavior forks ⇒ I0.
+- **M1 — Settings gate. DONE** (commit a745d8c). `_diffBufSize` + `diffBufSize()` +
+  `pss.diffBufSize` sysprop + Clojure `:diff-buf-size`; no behavior forks ⇒ I0.
 - **M2 — data model. DONE.** `Branch._slots` (nullable `Object[]`; a slot is a per-child
   diff: a `PersistentTreeMap<Key, element|ABSENT>` under `_cmp`, plus a cached
   `(count, measure)` snapshot and the buffer `anchor`) + the `_rebalanced` dirty bit
-  used only by store. Null/unset at opBufSize=0. Inert ⇒ suite green.
+  used only by store. Null/unset at diffBufSize=0. Inert ⇒ suite green.
 - **M3 — deposit at leaf-parents. DONE.** In `cons`/`disjoin`/`replace`, when
-  `opBufSize>0` and `_level == 1` (the changed child is a leaf), on the
+  `diffBufSize>0` and `_level == 1` (the changed child is a leaf), on the
   content-only return (`EARLY_EXIT` / single-`{node}` with no rebalance) record the
   leaf-op into the leaf-parent's `_slots[i]` (`{cmp-key → element|ABSENT}`, net
   latest-wins) + refresh its `ĝ`. Higher branches (`_level > 1`) do **not** deposit
@@ -530,8 +530,8 @@ validates the new behavior. All new behavior forks on `_settings.opBufSize() > 0
   (W7). On any structural return set `_rebalanced` (all levels — store needs it).
   Persistent path copies the leaf-parent's slot array forward then deposits;
   transient mutates in place. *No store/restore change yet* — slots accumulate and
-  are ignored; suite green at 0 (I0), and opBufSize>0 stays correct (slots unused).
-  Gate (met): compile + suite green; `dev/op_buf_v5_m3_probe.clj` — content exact,
+  are ignored; suite green at 0 (I0), and diffBufSize>0 stays correct (slots unused).
+  Gate (met): compile + suite green; `dev/diff_buf_v5_m3_probe.clj` — content exact,
   deposit fires at level 1 with exact ĝ, latest-wins, Absent recorded, **and slots
   appear only at level-1 leaf-parents (0 higher-level slots)**.
 - **M4 — store (the write decision).** Sub-stepped:
@@ -548,9 +548,9 @@ validates the new behavior. All new behavior forks on `_settings.opBufSize() > 0
     leaf child has a slot) **and** under budget (`Σ embedded entries ≤ B`); else **written**
     — fall back to the baseline recursive store of the `address==null` children (`markFreed`
     the anchor). `markFreed` is deferred from mutation to store (a buffered child's anchor
-    must survive). Serialize `:slots` **only when present** (opBufSize=0 = old format
+    must survive). Serialize `:slots` **only when present** (diffBufSize=0 = old format
     byte-for-byte). Slot-aware test storage.
-  - Gate: suite green at 0 (I0); opBufSize>0 store→restore (with M5) content/count
+  - Gate: suite green at 0 (I0); diffBufSize>0 store→restore (with M5) content/count
     exact.
   - **Store decision (worked out).** `Branch.store`, per child `i`:
     - `_addresses[i] != null && slot == null` → **clean**, reuse.
@@ -573,7 +573,7 @@ validates the new behavior. All new behavior forks on `_settings.opBufSize() > 0
     `{idx → {:count :measure :diff :max-key}}` (diffs pre-assembled; `:max-key` read
     from the live `_keys[i]`; sparse). `Slot.ABSENT` is a namespaced **keyword** so
     leaf-diffs are edn-serializable directly. Storage emits `:slots` only when non-null
-    (opBufSize=0 ⇒ absent ⇒ old format).
+    (diffBufSize=0 ⇒ absent ⇒ old format).
 - **M5 — restore (projection). DONE.** `Branch.child` projects at the lazy
   materialization boundary: a **leaf** child is rebuilt in one pass from durable keys
   ⊕ leaf-diff (`projectLeaf`, no restructure); a **branch** child has the nested diff
@@ -600,12 +600,12 @@ validates the new behavior. All new behavior forks on `_settings.opBufSize() > 0
     kept the anchor's stale separators, so `Branch.contains`'s `search ≥ 0` short-circuit
     matched a phantom separator (false positive) and routing skipped past a raised max
     (false negative). Fix: carry each modified child's `max-key` in the diff and reinstall
-    it in `projectBranch` (§2). Now green: `dev/op_buf_v5_m3_probe.clj` → `probe-generative`
-    (gated in `run-all`) and `dev/op_buf_v5_flush_debug.clj` `scan` (1400+ seeded runs across
+    it in `projectBranch` (§2). Now green: `dev/diff_buf_v5_m3_probe.clj` → `probe-generative`
+    (gated in `run-all`) and `dev/diff_buf_v5_flush_debug.clj` `scan` (1400+ seeded runs across
     branching factors and down to `B=1`, 0 failures); I0 suite green.
-- **M6 — benchmark + B sweep. DONE (synthetic).** `dev/op_buf_v5_io_bench.clj` measures
+- **M6 — benchmark + B sweep. DONE (synthetic).** `dev/diff_buf_v5_io_bench.clj` measures
   amortized PUTs/commit (with the per-commit content-only vs split-triggered decomposition),
-  durable objects/bytes, and read-amplification (object GETs), baseline vs op-buf across a
+  durable objects/bytes, and read-amplification (object GETs), baseline vs diff-buf across a
   `B`-sweep; each config correctness-checked (fresh-restore == reference). Findings: content-only
   commits = 1 PUT/index; at bf=512 a split fires ~once per `bf/2` inserts, so ~99% of small
   commits are 1 PUT; read-amplification is zero in object-GET terms (diffs apply in-memory).

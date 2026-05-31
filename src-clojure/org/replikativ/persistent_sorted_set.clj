@@ -135,8 +135,10 @@
              nil)
            ^IMeasure (:measure m)
            (:leaf-processor m)
-           (int (or (:op-buf-size m) 0)))]
-    ;; OP_BUF_V5: thread the set's comparator into Settings so buffered leaf-diffs can
+           ;; DIFF_BUF_V5: default ON — fall back to the shared Settings default (256, or the
+           ;; pss.diffBufSize sysprop) when the caller doesn't specify. 0 = baseline (I0).
+           (int (or (:diff-buf-size m) (Settings/defaultDiffBufSize))))]
+    ;; DIFF_BUF_V5: thread the set's comparator into Settings so buffered leaf-diffs can
     ;; be projected onto restored leaves (Branch.child). Defaults to compare.
     (set! (.-_comparator s) ^java.util.Comparator (or (:comparator m) (:cmp m) compare))
     s))
@@ -149,7 +151,7 @@
                        RefType/WEAK   :weak)
    :measure          ^IMeasure (.measure s)
    :leaf-processor   (.leafProcessor s)
-   :op-buf-size      (.opBufSize s)})
+   :diff-buf-size      (.diffBufSize s)})
 
 (defn from-sorted-array
   "Fast path to create a set if you already have a sorted array of elements on your hands."

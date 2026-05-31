@@ -1,5 +1,5 @@
-(ns op-buf-v5-flush-debug
-  "Deterministic (seeded) reproduction of the OP_BUF_V5 flush-path bug, with durable
+(ns diff-buf-v5-flush-debug
+  "Deterministic (seeded) reproduction of the DIFF_BUF_V5 flush-path bug, with durable
    tree dumping to localize where a buffered diff is lost under budget-overflow flushing."
   (:require [org.replikativ.persistent-sorted-set :as ss]
             [org.replikativ.persistent-sorted-set.test.storage :as tstore]
@@ -17,7 +17,7 @@
 (defn fresh-restore [addr disk bf b]
   (ss/restore-by cmp addr
                  (tstore/->Storage (atom {}) disk (opbuf-settings bf b))
-                 {:branching-factor bf :op-buf-size b :comparator cmp}))
+                 {:branching-factor bf :diff-buf-size b :comparator cmp}))
 
 ;; --- durable tree dump (reads disk objects; does NOT project) ------------------
 (defn dump [disk addr indent]
@@ -60,7 +60,7 @@
         mkst #(tstore/->Storage (atom {}) disk (opbuf-settings bf b))
         ref (atom (sorted-set-by cmp))
         s0 (reduce (fn [s i] (swap! ref conj [i 0]) (conj s [i 0]))
-                   (ss/sorted-set* {:comparator cmp :branching-factor bf :op-buf-size b}) (range 0 keyrange 2))
+                   (ss/sorted-set* {:comparator cmp :branching-factor bf :diff-buf-size b}) (range 0 keyrange 2))
         oplog (atom [])]
     (loop [c 0, addr (ss/store s0 (mkst)), prev-addr nil, produced-by s0]
       (if (= c cycles)
@@ -86,7 +86,7 @@
                              loaded (range ops))]
               (recur (inc c) (ss/store s2 (mkst)) addr s2))))))))
 
-;; Replay the SAME rng stream, but after EVERY op compare the live op-buf set to ref.
+;; Replay the SAME rng stream, but after EVERY op compare the live diff-buf set to ref.
 ;; Classifies the first divergence:
 ;;   - at a cycle's restore (loaded != ref before any op) -> STORE/RESTORE bug
 ;;   - mid-cycle after an op (op made live != ref)        -> IN-MEMORY MUTATION bug
@@ -98,7 +98,7 @@
         mkst #(tstore/->Storage (atom {}) disk (opbuf-settings bf b))
         ref (atom (sorted-set-by cmp))
         s0 (reduce (fn [s i] (swap! ref conj [i 0]) (conj s [i 0]))
-                   (ss/sorted-set* {:comparator cmp :branching-factor bf :op-buf-size b}) (range 0 keyrange 2))
+                   (ss/sorted-set* {:comparator cmp :branching-factor bf :diff-buf-size b}) (range 0 keyrange 2))
         window (fn [s k] (vec (map first (subseq s >= [(- k 4) 0] <= [(+ k 4) 0]))))]
     (loop [c 0, addr (ss/store s0 (mkst))]
       (if (= c cycles)
@@ -141,7 +141,7 @@
         mkst #(tstore/->Storage (atom {}) disk (opbuf-settings bf b))
         ref (atom (sorted-set-by cmp))
         s0 (reduce (fn [s i] (swap! ref conj [i 0]) (conj s [i 0]))
-                   (ss/sorted-set* {:comparator cmp :branching-factor bf :op-buf-size b}) (range 0 keyrange 2))]
+                   (ss/sorted-set* {:comparator cmp :branching-factor bf :diff-buf-size b}) (range 0 keyrange 2))]
     (loop [c 0, addr (ss/store s0 (mkst))]
       (if (= c cycles)
         (do (println "read-consistent across all" cycles "cycles") {:ok true})

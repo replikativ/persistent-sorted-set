@@ -23,8 +23,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // For lazy computation when restored from old storage format.
   public long _subtreeCount;
 
-  // OP_BUF_V5 (only used when _settings.opBufSize() > 0; null/false otherwise, so
-  // opBufSize==0 is byte-identical to baseline — invariant I0).
+  // DIFF_BUF_V5 (only used when _settings.diffBufSize() > 0; null/false otherwise, so
+  // diffBufSize==0 is byte-identical to baseline — invariant I0).
   //
   // Per-child diff slot: _slots[i], when non-null, is the buffered logical diff of
   // child i against its durable version (a Slot holding a PersistentTreeMap<Key,Op>
@@ -140,11 +140,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       assert _addresses[idx] != null;
       ANode base = storage.restore(_addresses[idx]);
       Slot sl = (_slots != null) ? (Slot) _slots[idx] : null;
-      // OP_BUF_V5 push-down (M5): project this parent's buffered diff onto the freshly
+      // DIFF_BUF_V5 push-down (M5): project this parent's buffered diff onto the freshly
       // loaded child — leaf: batch-rebuild keys; branch: install the nested diff as the
       // child's own _slots + set its aggregates from ĝ. Runs once, here, at materialization
       // (reads stay baseline). Parent's slot supersedes any diff baked in the child's object.
-      if (_settings.opBufSize() > 0 && sl != null && sl.diff != null) {
+      if (_settings.diffBufSize() > 0 && sl != null && sl.diff != null) {
         // Projection comparator: prefer the traversing storage's (per-set/index) comparator;
         // fall back to Settings (single-comparator embeddings, e.g. the test storage).
         Comparator pcmp = (storage.comparator() != null) ? storage.comparator() : _settings.comparator();
@@ -358,9 +358,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     assert 0 <= ins && ins < _len;
     ANode oldChild = child(storage, ins);
     long oldChildCount = ((ISubtreeCount) oldChild).subtreeCount();
-    // OP_BUF_V5: capture child ins's durable address BEFORE the mutation nulls it,
+    // DIFF_BUF_V5: capture child ins's durable address BEFORE the mutation nulls it,
     // so a deposit at this level can record it as the buffer anchor.
-    Object anchor0 = (_settings.opBufSize() > 0 && _addresses != null) ? _addresses[ins] : null;
+    Object anchor0 = (_settings.diffBufSize() > 0 && _addresses != null) ? _addresses[ins] : null;
     ANode[] nodes = oldChild.add(storage, key, cmp, settings);
 
     if (PersistentSortedSet.UNCHANGED == nodes) { // child signalling already in set
@@ -375,7 +375,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.opBufSize() > 0) depositInto(storage, ins, key, key, cmp, anchor0); // content-only: Present(key) / branch marker
+      if (_settings.diffBufSize() > 0) depositInto(storage, ins, key, key, cmp, anchor0); // content-only: Present(key) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
     }
 
@@ -389,10 +389,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (1 == nodes.length && editable()) {
       ANode<Key, Address> node = nodes[0];
       _keys[ins] = node.maxKey();
-      // Mark old child address as freed before clearing. OP_BUF_V5: under op-buf the old
+      // Mark old child address as freed before clearing. DIFF_BUF_V5: under diff-buf the old
       // address may be re-pointed as a buffered anchor at store, so freeing is DEFERRED to
       // store (which frees the old root + any flushed anchors) — else GC frees a live node.
-      if (_settings.opBufSize() <= 0 && storage != null && _addresses != null && _addresses[ins] != null) {
+      if (_settings.diffBufSize() <= 0 && storage != null && _addresses != null && _addresses[ins] != null) {
         storage.markFreed(_addresses[ins]);
       }
       child(ins, node);
@@ -405,7 +405,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.opBufSize() > 0) depositInto(storage, ins, key, key, cmp, anchor0); // content-only: Present(key) / branch marker
+      if (_settings.diffBufSize() > 0) depositInto(storage, ins, key, key, cmp, anchor0); // content-only: Present(key) / branch marker
       if (ins == _len - 1)
         return new ANode[]{ this }; // last child changed, propagate maxKey update
       else
@@ -434,7 +434,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           ? _subtreeCount - oldChildCount + newChildrenCount : -1;
       Object newMeasure = tryComputeMeasureFromChildren(newChildren, _len, storage, measureOps);
       Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, newCount, newMeasure, settings);
-      if (settings.opBufSize() > 0) { nb._rebalanced = _rebalanced; // a rebalance earlier this txn must persist (structure ≠ anchor)
+      if (settings.diffBufSize() > 0) { nb._rebalanced = _rebalanced; // a rebalance earlier this txn must persist (structure ≠ anchor)
                                       nb.carryAndDeposit(storage, _slots, ins, key, key, cmp, anchor0); } // content-only: Present(key) / branch marker
       return new ANode[]{ nb };
     }
@@ -473,7 +473,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           ? _subtreeCount - oldChildCount + newChildrenCount : -1;
       Object measure = tryComputeMeasureFromChildren(allChildren, newLen, storage, measureOps);
       Branch<Key, Address> nb = new Branch(_level, newLen, allKeys, allAddresses, allChildren, count, measure, settings);
-      if (settings.opBufSize() > 0) {
+      if (settings.diffBufSize() > 0) {
         nb._rebalanced = true; // absorbed a child split: structural → written, but it still buffers surviving siblings
         nb._slots = stitchSlots(ins, nodes.length, newLen); // carry buffered siblings' slots through the rebuild
       }
@@ -501,7 +501,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     Object measure2 = tryComputeMeasureFromChildren(children2, half2, storage, measureOps);
     Branch<Key, Address> sb1 = new Branch(_level, half1, keys1, addresses1, children1, count1, measure1, settings);
     Branch<Key, Address> sb2 = new Branch(_level, half2, keys2, addresses2, children2, count2, measure2, settings);
-    if (settings.opBufSize() > 0) {
+    if (settings.diffBufSize() > 0) {
       sb1._rebalanced = true; sb2._rebalanced = true; // split: structural → written, still buffer surviving siblings
       Object[] all = stitchSlots(ins, nodes.length, newLen); // carry buffered siblings' slots through the split
       if (all != null) {
@@ -525,8 +525,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
     assert 0 <= idx && idx < _len;
     
-    // OP_BUF_V5: capture child idx's durable address before the mutation nulls it (M4a).
-    Object anchor0 = (_settings.opBufSize() > 0 && _addresses != null) ? _addresses[idx] : null;
+    // DIFF_BUF_V5: capture child idx's durable address before the mutation nulls it (M4a).
+    Object anchor0 = (_settings.diffBufSize() > 0 && _addresses != null) ? _addresses[idx] : null;
     ANode leftChild  = idx > 0      ? child(storage, idx - 1) : null,
           rightChild = idx < _len-1 ? child(storage, idx + 1) : null;
     int leftChildLen = safeLen(leftChild);
@@ -544,7 +544,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.opBufSize() > 0) depositInto(storage, idx, key, Slot.ABSENT, cmp, anchor0); // content-only: Absent(key) / branch marker
+      if (_settings.diffBufSize() > 0) depositInto(storage, idx, key, Slot.ABSENT, cmp, anchor0); // content-only: Absent(key) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
     }
 
@@ -569,9 +569,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (newLen >= _settings.minBranchingFactor() || (left == null && right == null)) {
       // can update in place
       if (editable() && idx < _len-2) {
-        // Mark freed addresses before clearing them. OP_BUF_V5: deferred to store under
-        // op-buf (old addresses may be re-pointed as buffered anchors — see add()).
-        if (_settings.opBufSize() <= 0 && storage != null && _addresses != null) {
+        // Mark freed addresses before clearing them. DIFF_BUF_V5: deferred to store under
+        // diff-buf (old addresses may be re-pointed as buffered anchors — see add()).
+        if (_settings.diffBufSize() <= 0 && storage != null && _addresses != null) {
           // The child at idx is always being replaced
           if (_addresses[idx] != null) {
             storage.markFreed(_addresses[idx]);
@@ -610,7 +610,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         if (newLen != _len)
           cs.copyAll(_children, idx+2, _len);
 
-        if (_settings.opBufSize() > 0 && _slots != null
+        if (_settings.diffBufSize() > 0 && _slots != null
             && (leftChanged || rightChanged || newLen != _len)) { // structural only: mirror the address Stitch
           Stitch ss = new Stitch(_slots, Math.max(idx - 1, 0));   // (content-only keeps _slots[idx] so the deposit below accumulates)
           if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(idx - 1));
@@ -627,7 +627,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         if (measureOps != null && _measure != null) {
           _measure = tryComputeMeasure(storage);
         }
-        if (_settings.opBufSize() > 0) {
+        if (_settings.diffBufSize() > 0) {
           if (!leftChanged && !rightChanged && newLen == _len) {
             depositInto(storage, idx, key, Slot.ABSENT, cmp, anchor0); // content-only: Absent(key) / branch marker
           } else {
@@ -666,7 +666,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // Compute exact subtree count from children (accounts for processor changes)
       newCenter._subtreeCount = tryComputeSubtreeCountFromChildren(newCenter._children, newLen, storage);
       newCenter._measure = tryComputeMeasureFromChildren(newCenter._children, newLen, storage, measureOps);
-      if (settings.opBufSize() > 0) {
+      if (settings.diffBufSize() > 0) {
         if (!leftChanged && !rightChanged && newLen == _len) {
           // content-only: carry slots aligned and ACCUMULATE Absent onto the center's
           // existing diff (it may already hold buffered Present/Absent for this leaf).
@@ -721,7 +721,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // Compute exact subtree count from children (accounts for processor changes)
       join._subtreeCount = tryComputeSubtreeCountFromChildren(join._children, left._len + newLen, storage);
       join._measure = tryComputeMeasureFromChildren(join._children, left._len + newLen, storage, measureOps);
-      if (settings.opBufSize() > 0) {
+      if (settings.diffBufSize() > 0) {
         join._rebalanced = true; // merged with left: structural → written, still buffers surviving siblings
         Object[] ns = new Object[join._keys.length];           // mirror the address Stitch above
         Stitch ss = new Stitch(ns, 0);
@@ -770,7 +770,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // Compute exact subtree count from children (accounts for processor changes)
       join._subtreeCount = tryComputeSubtreeCountFromChildren(join._children, newLen + right._len, storage);
       join._measure = tryComputeMeasureFromChildren(join._children, newLen + right._len, storage, measureOps);
-      if (settings.opBufSize() > 0) {
+      if (settings.diffBufSize() > 0) {
         join._rebalanced = true; // merged with right: structural → written, still buffers surviving siblings
         Object[] ns = new Object[join._keys.length];           // mirror the address Stitch above
         Stitch ss = new Stitch(ns, 0);
@@ -836,7 +836,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       }
       newCenter._subtreeCount = tryComputeSubtreeCountFromChildren(newCenter._children, newCenterLen, storage);
       newCenter._measure = tryComputeMeasureFromChildren(newCenter._children, newCenterLen, storage, measureOps);
-      if (settings.opBufSize() > 0) {
+      if (settings.diffBufSize() > 0) {
         newLeft._rebalanced = true; newCenter._rebalanced = true; // borrowed from left: structural
         if (left._slots != null) {                               // newLeft keeps left's first newLeftLen slots
           Object[] nl = new Object[newLeft._keys.length];
@@ -908,7 +908,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         newRight._subtreeCount = tryComputeSubtreeCountFromChildren(newRight._children, newRightLen, storage);
         newRight._measure = tryComputeMeasureFromChildren(newRight._children, newRightLen, storage, measureOps);
       }
-      if (settings.opBufSize() > 0) {
+      if (settings.diffBufSize() > 0) {
         newCenter._rebalanced = true; newRight._rebalanced = true; // borrowed from right: structural
         Object[] nc = new Object[newCenter._keys.length];        // mirror the newCenter address Stitch above
         Stitch ss = new Stitch(nc, 0);
@@ -941,8 +941,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (idx == _len) idx = _len - 1; // key might be in last child
     assert 0 <= idx && idx < _len;
 
-    // OP_BUF_V5: capture child idx's durable address before the mutation nulls it (M4a).
-    Object anchor0 = (_settings.opBufSize() > 0 && _addresses != null) ? _addresses[idx] : null;
+    // DIFF_BUF_V5: capture child idx's durable address before the mutation nulls it (M4a).
+    Object anchor0 = (_settings.diffBufSize() > 0 && _addresses != null) ? _addresses[idx] : null;
     // Recursively replace in child
     ANode[] nodes = child(storage, idx).replace(storage, oldKey, newKey, cmp, settings);
 
@@ -955,7 +955,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.opBufSize() > 0) depositInto(storage, idx, newKey, newKey, cmp, anchor0); // content-only: Present(newKey) / branch marker
+      if (_settings.diffBufSize() > 0) depositInto(storage, idx, newKey, newKey, cmp, anchor0); // content-only: Present(newKey) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
     }
 
@@ -968,9 +968,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // Transient: can modify in place
     if (editable()) {
       _keys[idx] = newMaxKey;
-      // Mark old child address as freed before clearing. OP_BUF_V5: deferred to store
-      // under op-buf (old address may be re-pointed as a buffered anchor — see add()).
-      if (_settings.opBufSize() <= 0 && storage != null && _addresses != null && _addresses[idx] != null) {
+      // Mark old child address as freed before clearing. DIFF_BUF_V5: deferred to store
+      // under diff-buf (old address may be re-pointed as a buffered anchor — see add()).
+      if (_settings.diffBufSize() <= 0 && storage != null && _addresses != null && _addresses[idx] != null) {
         storage.markFreed(_addresses[idx]);
       }
       child(idx, newChild);
@@ -979,7 +979,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.opBufSize() > 0) depositInto(storage, idx, newKey, newKey, cmp, anchor0); // content-only: Present(newKey) / branch marker
+      if (_settings.diffBufSize() > 0) depositInto(storage, idx, newKey, newKey, cmp, anchor0); // content-only: Present(newKey) / branch marker
       if (maxKeyChanged)
         return new ANode[]{this};
       else
@@ -1005,7 +1005,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (measureOps != null && _measure != null) {
       newBranch._measure = newBranch.tryComputeMeasure(storage);
     }
-    if (settings.opBufSize() > 0) { newBranch._rebalanced = _rebalanced; // persist a prior-this-txn rebalance
+    if (settings.diffBufSize() > 0) { newBranch._rebalanced = _rebalanced; // persist a prior-this-txn rebalance
                                     newBranch.carryAndDeposit(storage, _slots, idx, newKey, newKey, cmp, anchor0); } // content-only: Present(newKey)
 
     return new ANode[]{newBranch};
@@ -1026,7 +1026,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     }
   }
 
-  // ---- OP_BUF_V5 deposit (active only when _settings.opBufSize() > 0) ----
+  // ---- DIFF_BUF_V5 deposit (active only when _settings.diffBufSize() > 0) ----
   //
   // On the mutation return path, a content-only change to child i is recorded
   // into _slots[i] as Present(element) | Absent, with ĝ refreshed from the
@@ -1080,7 +1080,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     _slots[i] = new Slot(diff, childCount(storage, i), child.measure(), anchor);
   }
 
-  // OP_BUF_V5: a child's slot travels with its address. These mirror the per-element /
+  // DIFF_BUF_V5: a child's slot travels with its address. These mirror the per-element /
   // bulk copies of the address Stitch so a structural REMOVE rebuild carries surviving
   // siblings' buffered slots (null-source tolerant: a sibling branch may have no _slots).
   private Object slotAt(int i) { return (_slots != null) ? _slots[i] : null; }
@@ -1113,7 +1113,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     depositInto(storage, i, mapKey, val, cmp, anchor0);
   }
 
-  // ---- OP_BUF_V5 store-side helpers (M4b) ----
+  // ---- DIFF_BUF_V5 store-side helpers (M4b) ----
   private static final Keyword KW_COUNT   = Keyword.intern(null, "count");
   private static final Keyword KW_MEASURE = Keyword.intern(null, "measure");
   private static final Keyword KW_DIFF    = Keyword.intern(null, "diff");
@@ -1196,7 +1196,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     return m.count() == 0 ? null : m;
   }
 
-  // ---- OP_BUF_V5 restore-side projection (M5) ----
+  // ---- DIFF_BUF_V5 restore-side projection (M5) ----
 
   // Apply a leaf-diff to a durable leaf in ONE pass (no split/merge): merge the durable
   // keys with the diff (Present upserts the element, Absent removes) under the set's
@@ -1233,7 +1233,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       slots[i] = new Slot(d, cnt, measure, base._addresses[i]);   // anchor = grandchild's durable address
       // Restore the separator: base came from the anchor (old durable object) whose _keys[i] is
       // the PRE-diff max. The diff changed child i's max, so fix the separator here — otherwise
-      // search/contains route against a phantom max-key (the verified op-buf-v5 read bug).
+      // search/contains route against a phantom max-key (the verified diff-buf-v5 read bug).
       if (mk != null) base._keys[i] = (Key) mk;
     }
     base._slots = slots;
@@ -1244,7 +1244,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
   @Override
   public Address store(IStorage<Key, Address> storage) {
-    if (_settings.opBufSize() <= 0) {                           // baseline ⇒ byte-identical (I0)
+    if (_settings.diffBufSize() <= 0) {                           // baseline ⇒ byte-identical (I0)
       ensureAddresses();
       for (int i = 0; i < _len; ++i) {
         if (_addresses[i] == null) {
@@ -1255,10 +1255,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       return storage.store(this);
     }
 
-    // OP_BUF_V5: buffer content-only dirty children (record their diff in THIS object,
+    // DIFF_BUF_V5: buffer content-only dirty children (record their diff in THIS object,
     // re-point the address to the child's durable anchor) up to the budget B; write the rest.
     ensureAddresses();
-    final int budget = _settings.opBufSize();
+    final int budget = _settings.diffBufSize();
     int embedded = 0;
     for (int i = 0; i < _len; ++i) {
       Slot sl = (_slots != null) ? (Slot) _slots[i] : null;

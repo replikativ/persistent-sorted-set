@@ -1,5 +1,5 @@
-(ns op-buf-v5-io-bench
-  "Measure the IO savings of OP_BUF_V5 vs baseline PSS: object PUTs per commit
+(ns diff-buf-v5-io-bench
+  "Measure the IO savings of DIFF_BUF_V5 vs baseline PSS: object PUTs per commit
    (amortized over flushes), total durable objects/bytes, and the read-amplification
    cost of materializing a buffered tree. Each configuration is correctness-checked
    (fresh-restore == reference) so the numbers come from a verified-correct run."
@@ -19,13 +19,13 @@
 (defn fresh-restore [addr disk bf b]
   (ss/restore-by cmp addr
                  (tstore/->Storage (atom {}) disk (opbuf-settings bf b))
-                 {:branching-factor bf :op-buf-size b :comparator cmp}))
+                 {:branching-factor bf :diff-buf-size b :comparator cmp}))
 
 (defn disk-bytes [disk] (reduce + 0 (map (comp count str) (vals @disk))))
 
 ;; A "commit" = apply K random ops (insert-heavy mix: ~70% conj, ~15% replace, ~15% disj)
 ;; to the LIVE in-memory tree (kept across commits, like a datahike connection), then store.
-;; b=0 ⇒ baseline (opBufSize off). Returns per-commit PUTs and end-state IO + a correctness flag.
+;; b=0 ⇒ baseline (diffBufSize off). Returns per-commit PUTs and end-state IO + a correctness flag.
 ;; Pure-replace (update-in-place) workload: every op replaces the value at an EXISTING
 ;; cmp-key, which never changes leaf sizes ⇒ always content-only ⇒ buffers to ~1 PUT/commit
 ;; until the accumulated diff exceeds B. Demonstrates the best-case ceiling.
@@ -35,7 +35,7 @@
         disk (atom {})
         mkst #(tstore/->Storage (atom {}) disk (opbuf-settings bf b))
         s0 (reduce (fn [s i] (conj s [i 0]))
-                   (ss/sorted-set* {:comparator cmp :branching-factor bf :op-buf-size b})
+                   (ss/sorted-set* {:comparator cmp :branching-factor bf :diff-buf-size b})
                    (range M))
         ref (atom (into (sorted-set-by cmp) (map #(vector % 0) (range M))))
         ckpt (ss/store s0 (mkst))]
@@ -62,7 +62,7 @@
         disk (atom {})
         mkst #(tstore/->Storage (atom {}) disk (opbuf-settings bf b))
         s0 (reduce (fn [s i] (conj s [i 0]))
-                   (ss/sorted-set* {:comparator cmp :branching-factor bf :op-buf-size b})
+                   (ss/sorted-set* {:comparator cmp :branching-factor bf :diff-buf-size b})
                    (range M))
         nxt (atom M)                                   ; next sequential key
         ckpt (ss/store s0 (mkst))]
@@ -92,7 +92,7 @@
         mkst #(tstore/->Storage (atom {}) disk (opbuf-settings bf b))
         ref (atom (sorted-set-by cmp))
         s0 (reduce (fn [s i] (swap! ref conj [i 0]) (conj s [i 0]))
-                   (ss/sorted-set* {:comparator cmp :branching-factor bf :op-buf-size b})
+                   (ss/sorted-set* {:comparator cmp :branching-factor bf :diff-buf-size b})
                    (range M))
         ckpt-addr (ss/store s0 (mkst))]            ; initial checkpoint (full write, not counted)
     (loop [c 0, s s0, addr ckpt-addr, writes-per (transient [])]
