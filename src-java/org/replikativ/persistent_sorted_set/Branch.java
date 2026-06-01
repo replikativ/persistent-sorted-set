@@ -1257,39 +1257,72 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
     // diff-buf: buffer content-only dirty children (record their diff in THIS object,
     // re-point the address to the child's durable anchor) up to the budget B; write the rest.
+    //
+    // Eviction is BIGGEST-FIRST: when the dirty children don't all fit, we flush the ones
+    // with the LARGEST diffs and keep the small ones buffered. This makes a slot that
+    // regularly consumes a big share of the budget get written proportionally often (rather
+    // than jamming the buffer while small diffs are flushed under a naive index-order fill),
+    // and reclaims the most budget per PUT. Only dirty (resident) children are ever flushed,
+    // so a flush never triggers a read; clean buffered-passthrough children consume budget
+    // but are left untouched (flushing them would require loading their anchor). The running
+    // total stays <= B strictly. See doc/diff-buffering.md (Store / eviction policy).
     ensureAddresses();
     final int budget = _settings.diffBufSize();
-    int embedded = 0;
+
+    // Pass 1: account clean passthrough diffs, and classify each dirty child as bufferable
+    // (content-only, has an anchor) or must-write (rebalanced subtree, or no anchor).
+    int passthrough = 0;
+    int[] csz = new int[_len];                                  // dirty child's diff size
+    Object[] cnested = new Object[_len];                        // its assembled nested diff
+    java.util.ArrayList<Integer> bufferable = new java.util.ArrayList<>();
+    java.util.ArrayList<Integer> writeList = new java.util.ArrayList<>();
     for (int i = 0; i < _len; ++i) {
       Slot sl = (_slots != null) ? (Slot) _slots[i] : null;
       if (_addresses[i] != null) {
-        if (sl != null) embedded += diffSize(sl.diff, _level - 1); // passthrough (do NOT touch child)
-        continue;                                                // clean or buffered-passthrough
+        if (sl != null) passthrough += diffSize(sl.diff, _level - 1); // clean buffered-passthrough
+        continue;
       }
       // _addresses[i] == null: dirty this commit ⇒ child is resident
       ANode child = (ANode) _settings.readReference(_children[i]);
-      boolean canBuffer;
-      int sz;
-      Object nested;
       if (sl == null || sl.anchor == null) {                    // no durable anchor ⇒ must write
-        canBuffer = false; sz = 0; nested = null;
+        writeList.add(i);
       } else if (child instanceof Leaf) {
-        canBuffer = true; sz = diffSize(sl.diff, 0); nested = sl.diff;   // leaf child ⇒ leaf-diff
+        csz[i] = diffSize(sl.diff, 0); cnested[i] = sl.diff;    // leaf child ⇒ leaf-diff
+        bufferable.add(i);
       } else {
         int s = contentOnlyDiffSize(storage, (Branch) child);   // -1 if subtree rebalanced
-        canBuffer = (s >= 0);
-        sz = (s >= 0) ? s : 0;
-        nested = (s >= 0) ? ((sl.diff != null) ? sl.diff : assembleNested(storage, (Branch) child)) : null;
+        if (s >= 0) {
+          csz[i] = s;
+          cnested[i] = (sl.diff != null) ? sl.diff : assembleNested(storage, (Branch) child);
+          bufferable.add(i);
+        } else {
+          writeList.add(i);                                     // rebalanced ⇒ written in full
+        }
       }
-      if (canBuffer && embedded + sz <= budget) {
+    }
+
+    // Pass 2: buffer the SMALLEST bufferable children while the running total (passthrough +
+    // buffered) stays within budget; the rest — the largest — are flushed (biggest-first).
+    bufferable.sort((x, y) -> Integer.compare(csz[x], csz[y]));
+    int embedded = passthrough;
+    for (int i : bufferable) {
+      Slot sl = (Slot) _slots[i];
+      if (embedded + csz[i] <= budget) {
         _addresses[i] = (Address) sl.anchor;                    // re-point to durable anchor (no write)
-        _slots[i] = new Slot(nested, sl.count, sl.measure, sl.anchor); // write back assembled diff
-        embedded += sz;
+        _slots[i] = new Slot(cnested[i], sl.count, sl.measure, sl.anchor); // write back assembled diff
+        embedded += csz[i];
       } else {
-        if (sl != null && sl.anchor != null) storage.markFreed((Address) sl.anchor);
-        _addresses[i] = ((ANode<Key, Address>) child).store(storage);
-        if (_slots != null) _slots[i] = null;
+        writeList.add(i);                                       // doesn't fit ⇒ flush
       }
+    }
+
+    // Pass 3: write the flushed/structural children (all resident ⇒ no read).
+    for (int i : writeList) {
+      ANode child = (ANode) _settings.readReference(_children[i]);
+      Slot sl = (_slots != null) ? (Slot) _slots[i] : null;
+      if (sl != null && sl.anchor != null) storage.markFreed((Address) sl.anchor);
+      _addresses[i] = ((ANode<Key, Address>) child).store(storage);
+      if (_slots != null) _slots[i] = null;
     }
     Address a = storage.store(this);
     // Written ⇒ this node now matches its durable object. Clear the per-txn rebalance mark

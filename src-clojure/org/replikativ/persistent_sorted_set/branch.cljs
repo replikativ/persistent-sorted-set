@@ -737,59 +737,60 @@
                            (address this i child-address)))
                        (recur (inc i))))
                    (await (storage/store storage this opts)))
-                 ;; diff-buf: buffer content-only dirty children (record their diff in THIS object,
-                 ;; re-point the address to the child's durable anchor) up to the budget B; write the rest.
+                 ;; diff-buf: buffer content-only dirty children (re-point to the child's durable
+                 ;; anchor) up to budget B; flush the rest BIGGEST-FIRST — the largest diffs are
+                 ;; written and the small ones kept buffered, so a slot that regularly fills a big
+                 ;; share of the budget is written proportionally often and can't jam the buffer.
+                 ;; Only dirty (resident) children are flushed (no read); clean passthrough consumes
+                 ;; budget but is left untouched. Mirrors JVM Branch.store (see doc/diff-buffering.md).
                  (let [addrs  (.-addresses this)
+                       slots  (.-_slots this)
                        budget (or (:diff-buf-size (.-settings this)) 0)
                        len    (arrays/alength (.-keys this))
-                       level  (.-level this)]
-                   (loop [i 0, embedded 0]
-                     (if-not (< i len)
-                       (let [a (await (storage/store storage this opts))]
-                         ;; Written ⇒ this node now matches its durable object; clear the per-txn mark.
-                         (set! (.-_rebalanced this) false)
-                         a)
-                       (let [slots (.-_slots this)
+                       level  (.-level this)
+                       ;; Pass 1: account clean passthrough; classify dirty children.
+                       classified
+                       (loop [i 0, pass 0, buf [], wl []]
+                         (if-not (< i len)
+                           {:pass pass :buf buf :wl wl}
+                           (let [sl (when slots (aget slots i))]
+                             (if (some? (aget addrs i))
+                               (recur (inc i) (if sl (+ pass (diff-size (:diff sl) (dec level))) pass) buf wl)
+                               (let [child (aget (.-children this) i)]
+                                 (if (or (nil? sl) (nil? (:anchor sl)))
+                                   (recur (inc i) pass buf (conj wl i))   ; no anchor ⇒ must write
+                                   (if (instance? Leaf child)
+                                     (recur (inc i) pass (conj buf {:i i :sz (diff-size (:diff sl) 0) :nested (:diff sl)}) wl)
+                                     (let [s (await (content-only-diff-size storage child opts))]
+                                       (if (neg? s)
+                                         (recur (inc i) pass buf (conj wl i))   ; rebalanced ⇒ must write
+                                         (let [nested (if (some? (:diff sl)) (:diff sl) (await (assemble-nested storage child opts)))]
+                                           (recur (inc i) pass (conj buf {:i i :sz s :nested nested}) wl)))))))))))
+                       ;; Pass 2: buffer SMALLEST-first while running total ≤ budget; flush the rest.
+                       flushed (->> (sort-by :sz (:buf classified))
+                                    (reduce (fn [[emb wl] {:keys [i sz nested]}]
+                                              (if (<= (+ emb sz) budget)
+                                                (let [sl (aget slots i)]
+                                                  (aset addrs i (:anchor sl))
+                                                  (aset slots i {:diff nested :count (:count sl) :measure (:measure sl) :anchor (:anchor sl)})
+                                                  [(+ emb sz) wl])
+                                                [emb (conj wl i)]))
+                                            [(:pass classified) (:wl classified)])
+                                    second)]
+                   ;; Pass 3: write flushed/structural children (all resident ⇒ no read).
+                   (loop [ws (seq flushed)]
+                     (when ws
+                       (let [i     (first ws)
+                             child (aget (.-children this) i)
                              sl    (when slots (aget slots i))]
-                         (if (some? (aget addrs i))
-                           ;; clean or buffered-passthrough — do NOT touch child
-                           (recur (inc i) (if sl (+ embedded (diff-size (:diff sl) (dec level))) embedded))
-                           ;; _addresses[i] == nil ⇒ dirty this commit ⇒ child resident
-                           (let [child (aget (.-children this) i)]
-                             (if (or (nil? sl) (nil? (:anchor sl)))
-                               ;; no durable anchor ⇒ must write
-                               (let [a (await (node/store child storage opts))]
-                                 (aset addrs i a)
-                                 (when slots (aset slots i nil))
-                                 (recur (inc i) embedded))
-                               (if (instance? Leaf child)
-                                 ;; leaf child ⇒ leaf-diff
-                                 (let [sz (diff-size (:diff sl) 0)]
-                                   (if (<= (+ embedded sz) budget)
-                                     (do (aset addrs i (:anchor sl))
-                                         (aset slots i {:diff (:diff sl) :count (:count sl) :measure (:measure sl) :anchor (:anchor sl)})
-                                         (recur (inc i) (+ embedded sz)))
-                                     (do (storage/markFreed storage (:anchor sl))
-                                         (aset addrs i (await (node/store child storage opts)))
-                                         (aset slots i nil)
-                                         (recur (inc i) embedded))))
-                                 ;; branch child ⇒ -1 if subtree rebalanced, else nested diff
-                                 (let [s (await (content-only-diff-size storage child opts))]
-                                   (if (neg? s)
-                                     (do (storage/markFreed storage (:anchor sl))
-                                         (aset addrs i (await (node/store child storage opts)))
-                                         (when slots (aset slots i nil))
-                                         (recur (inc i) embedded))
-                                     (let [assembled (when (nil? (:diff sl)) (await (assemble-nested storage child opts)))
-                                           nested    (if (some? (:diff sl)) (:diff sl) assembled)]
-                                       (if (<= (+ embedded s) budget)
-                                         (do (aset addrs i (:anchor sl))
-                                             (aset slots i {:diff nested :count (:count sl) :measure (:measure sl) :anchor (:anchor sl)})
-                                             (recur (inc i) (+ embedded s)))
-                                         (do (storage/markFreed storage (:anchor sl))
-                                             (aset addrs i (await (node/store child storage opts)))
-                                             (when slots (aset slots i nil))
-                                             (recur (inc i) embedded))))))))))))))))))
+                         (when (and sl (:anchor sl)) (storage/markFreed storage (:anchor sl)))
+                         (aset addrs i (await (node/store child storage opts)))
+                         (when slots (aset slots i nil))
+                         (recur (next ws)))))
+                   (let [a (await (storage/store storage this opts))]
+                     ;; Written ⇒ this node now matches its durable object; clear the per-txn mark.
+                     (set! (.-_rebalanced this) false)
+                     a))))))
 
 (defn walk-addresses
   [^Branch this storage on-address {:keys [sync?] :or {sync? true} :as opts}]

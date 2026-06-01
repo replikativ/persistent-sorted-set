@@ -157,12 +157,17 @@ Within one slot a later op on the same `cmp`-key overwrites (net latest-wins). N
 ```
 store(node):
   if clean (has _address): return _address          # unchanged → reuse durable object
+  pass := Σ diffSize(slotⱼ) over CLEAN children j    # buffered-passthrough diffs (kept as-is)
+  cand := []                                         # dirty, content-only children (bufferable)
   for each dirty child cᵢ:
-     if cᵢ's whole dirty subtree is content-only (no rebalance anywhere) and under budget B:
-        child_addrᵢ := cᵢ.anchor                     # BUFFER: do not write cᵢ, do not markFreed
-        slotᵢ       := (assembled nested diff, ĝᵢ, maxKeyᵢ)
-     else:
-        child_addrᵢ := store(cᵢ); markFreed(old anchor); slotᵢ := ∅
+     if cᵢ rebalanced (structure ≠ anchor) or has no anchor:
+        store(cᵢ); markFreed(old anchor); slotᵢ := ∅  # must write
+     else: cand += (i, szᵢ := diffSize of cᵢ's subtree diff, assembled nested diff)
+  embedded := pass                                   # BIGGEST-FIRST: buffer small, flush large
+  for (i, szᵢ, diffᵢ) in cand sorted by szᵢ ASCENDING:
+     if embedded + szᵢ ≤ B:
+        child_addrᵢ := cᵢ.anchor; slotᵢ := (diffᵢ, ĝᵢ, maxKeyᵢ); embedded += szᵢ   # BUFFER
+     else: store(cᵢ); markFreed(old anchor); slotᵢ := ∅                            # FLUSH
   write node (base + slots); return new _address     # written because rebalanced / child-written / root
 ```
 
@@ -170,10 +175,17 @@ store(node):
 - **Structural changes are written**, so the durable structure always matches in-memory —
   no divergence, no re-derive, no sibling load on read. A rebalancing commit writes the
   affected path (~depth PUTs); rebalances are ~1/BF of ops, so amortized ≈ `1 + depth/BF`.
-- **Budget `B`** is enforced here: if buffering a child would push this node's embedded diff
-  over `B`, that child is written (materializing its diff) instead, keeping every stored
-  object's `Σ embedded diff ≤ B`.
-- All written nodes are resident (the dirty in-memory nodes), so writing never reads.
+- **Budget `B`** caps the buffered diff of one written object, measured in *entries* (number
+  of buffered element-changes, summed over the node's slots — not bytes). It is enforced
+  strictly: a child is buffered only if it keeps the running total `≤ B`, so every stored
+  object satisfies `Σ embedded diff ≤ B`.
+- **Eviction is biggest-first.** When the bufferable children don't all fit, the ones with
+  the *largest* diffs are flushed (written) and the small ones kept buffered. A slot that
+  regularly consumes a big share of the budget is thus written proportionally often (it can't
+  jam the buffer), and flushing the largest reclaims the most budget per PUT. Clean
+  *passthrough* children (buffered in a prior commit, untouched now) consume budget but are
+  never flushed here — flushing them would require loading their anchor.
+- All flushed/written children are **dirty this commit ⇒ resident**, so a flush never reads.
 
 ### Restore (project the diff down, lazily, one level per deserialization)
 
@@ -317,22 +329,24 @@ durable object). B1/B2 keep buffering. Rebalances are ~1/BF of ops, so amortized
 
 ### Stage 3 — budget overflow (flush an over-budget child)
 
-Suppose B2 has accumulated, over several content-only commits, a buffered diff whose size
-would exceed the per-node budget `B` if folded into R again. `store(R)` detects
-`embedded + size(slot[2]) > B` and **flushes** that child instead of buffering it:
+Suppose this commit dirties B1 and B2, and folding both diffs into R would exceed the per-node
+budget `B`. `store(R)` sorts the bufferable dirty children by diff size and keeps the small
+ones while the running total fits, **flushing the largest** (biggest-first):
 
 ```
-store(R):
-  ...
-  B2: embedded + size(nested(B2)) > B            → WRITE B2 in full ⇒ @B2'  (its diff is
-                                                     MATERIALIZED into the rewritten subtree);
-                                                     markFreed(@B2); slot[2] := ∅
-  R                                              → WRITE ⇒ @R'''
+store(R):  B = 6, passthrough = 0
+  bufferable dirty: B1 (size 2), B2 (size 5)        → sort ascending: [B1(2), B2(5)]
+  B1: embedded 0+2 ≤ 6                              → BUFFER (addr[1]:=@B1, slot[1] kept); embedded=2
+  B2: embedded 2+5 = 7 > 6                          → FLUSH ⇒ @B2'  (its diff MATERIALIZED into
+                                                       the rewritten subtree); markFreed(@B2); slot[2]:=∅
+  R                                                → WRITE ⇒ @R'''
 ```
 
-The flush turns accumulated buffered diffs back into a compact written subtree, bounding every
-stored object to `Σ embedded diff ≤ B`. Cost is the flushed child's path (here `@B2'`,`@R'''`);
-the budget chooses how many cheap content-only commits ride between such flushes.
+The large diff (B2) is the one written, so a slot that regularly fills a big share of the
+budget is flushed proportionally often and can't jam the buffer; the small diff (B1) keeps
+riding. Every stored object stays within `Σ embedded diff ≤ B`, and only resident (dirty)
+children are flushed, so the flush reads nothing. The budget chooses how many cheap
+content-only commits ride between flushes.
 
 ## Serialized format and the storage contract
 
@@ -360,15 +374,17 @@ and the library cannot detect that capability through the `IStorage` protocol.
 - Readers without diff-buf support cannot read slot-bearing objects, so a consumer should
   bump its store/version guard when it starts writing them.
 
-`B` (the per-node budget) trades buffering depth against object size and cold-reconstruction
-cost: larger `B` buffers more commits before a flush but bloats every object and slows cold
-reads; smaller `B` does the reverse.
+`B` (the per-node budget, in diff *entries*) trades buffering depth against object size and
+cold-reconstruction cost: larger `B` buffers more commits before a flush but bloats every
+object and slows cold reads; smaller `B` does the reverse. When a node overflows, eviction is
+**biggest-first** (flush the largest dirty diffs, keep the small ones) — see *Store*.
 
 ## Cost and trade-offs
 
 - **Writes.** Content-only commit: ~1 PUT (the root). Rebalancing commit: writes the affected
   path (~depth PUTs); amortized ≈ `1 + depth/BF`. A budget-overflow commit writes the
-  over-budget buffered children. Bulk-then-store writes the tree once, like baseline. Composes
+  largest over-budget dirty children (biggest-first eviction). Bulk-then-store writes the tree
+  once, like baseline. Composes
   with datahike index-root fusion (the index roots' slots ride inside the fused db-record), so
   a small commit can approach ~1 PUT *total* across indexes.
 - **Reads.** Warm = normal materialized B-tree, `O(log_B N)`, full fanout, no read penalty
