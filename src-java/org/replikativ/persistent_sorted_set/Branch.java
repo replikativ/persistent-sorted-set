@@ -476,6 +476,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (settings.diffBufSize() > 0) {
         nb._rebalanced = true; // absorbed a child split: structural → written, but it still buffers surviving siblings
         nb._slots = stitchSlots(ins, nodes.length, newLen); // carry buffered siblings' slots through the rebuild
+        freeDroppedChild(storage, ins); // diff-buf: free the split child's old blob (replaced by N new nodes)
       }
       return new ANode[]{ nb };
     }
@@ -503,6 +504,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     Branch<Key, Address> sb2 = new Branch(_level, half2, keys2, addresses2, children2, count2, measure2, settings);
     if (settings.diffBufSize() > 0) {
       sb1._rebalanced = true; sb2._rebalanced = true; // split: structural → written, still buffer surviving siblings
+      freeDroppedChild(storage, ins); // diff-buf: free the split child's old blob (replaced by N new nodes)
       Object[] all = stitchSlots(ins, nodes.length, newLen); // carry buffered siblings' slots through the split
       if (all != null) {
         sb1._slots = Arrays.copyOfRange(all, 0, half1);
@@ -569,20 +571,21 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (newLen >= _settings.minBranchingFactor() || (left == null && right == null)) {
       // can update in place
       if (editable() && idx < _len-2) {
-        // Mark freed addresses before clearing them. diff-buf: deferred to store under
-        // diff-buf (old addresses may be re-pointed as buffered anchors — see add()).
-        if (_settings.diffBufSize() <= 0 && storage != null && _addresses != null) {
-          // The child at idx is always being replaced
-          if (_addresses[idx] != null) {
-            storage.markFreed(_addresses[idx]);
-          }
-          // Left child if changed
-          if (leftChanged && idx > 0 && _addresses[idx - 1] != null) {
-            storage.markFreed(_addresses[idx - 1]);
-          }
-          // Right child if changed
-          if (rightChanged && _addresses[idx + 1] != null) {
-            storage.markFreed(_addresses[idx + 1]);
+        // Mark freed addresses before clearing them.
+        //  - baseline (diffBufSize<=0): free the replaced child + changed siblings immediately.
+        //  - diff-buf: the CONTENT-ONLY sub-case re-points _addresses[idx] to the child's anchor
+        //    (deferred to store); a STRUCTURAL sub-case (merge/borrow) consumes idx / changed
+        //    siblings — never re-pointed — so free them now (store has no slot/anchor for the
+        //    materialized structural child, so it can't free them later → they would leak).
+        if (storage != null && _addresses != null) {
+          if (_settings.diffBufSize() <= 0) {
+            if (_addresses[idx] != null) storage.markFreed(_addresses[idx]);
+            if (leftChanged && idx > 0 && _addresses[idx - 1] != null) storage.markFreed(_addresses[idx - 1]);
+            if (rightChanged && _addresses[idx + 1] != null) storage.markFreed(_addresses[idx + 1]);
+          } else if (leftChanged || rightChanged || newLen != _len) { // diff-buf, structural
+            freeDroppedChild(storage, idx);
+            if (leftChanged && idx > 0) freeDroppedChild(storage, idx - 1);
+            if (rightChanged) freeDroppedChild(storage, idx + 1);
           }
         }
 
@@ -674,6 +677,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           newCenter.carryAndDeposit(storage, _slots, idx, key, Slot.ABSENT, cmp, anchor0);
         } else {
           newCenter._rebalanced = true;                        // structural: mirror the address Stitch
+          // diff-buf: free this node's dropped children (consumed into the new structure,
+          // never re-pointed) so they don't leak — store has no slot/anchor for them.
+          freeDroppedChild(storage, idx);
+          if (leftChanged && idx > 0) freeDroppedChild(storage, idx - 1);
+          if (rightChanged) freeDroppedChild(storage, idx + 1);
           Object[] ns = new Object[newCenter._keys.length];    // (center/changed siblings materialized → null slot)
           Stitch ss = new Stitch(ns, 0);
           slotCopyAll(ss, _slots, 0, idx - 1);
@@ -723,6 +731,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       join._measure = tryComputeMeasureFromChildren(join._children, left._len + newLen, storage, measureOps);
       if (settings.diffBufSize() > 0) {
         join._rebalanced = true; // merged with left: structural → written, still buffers surviving siblings
+        freeDroppedChild(storage, idx);                        // diff-buf: free dropped (merged) children
+        if (leftChanged && idx > 0) freeDroppedChild(storage, idx - 1);
+        if (rightChanged) freeDroppedChild(storage, idx + 1);
         Object[] ns = new Object[join._keys.length];           // mirror the address Stitch above
         Stitch ss = new Stitch(ns, 0);
         slotCopyAll(ss, left._slots, 0, left._len);
@@ -772,6 +783,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       join._measure = tryComputeMeasureFromChildren(join._children, newLen + right._len, storage, measureOps);
       if (settings.diffBufSize() > 0) {
         join._rebalanced = true; // merged with right: structural → written, still buffers surviving siblings
+        freeDroppedChild(storage, idx);                        // diff-buf: free dropped (merged) children
+        if (leftChanged && idx > 0) freeDroppedChild(storage, idx - 1);
+        if (rightChanged) freeDroppedChild(storage, idx + 1);
         Object[] ns = new Object[join._keys.length];           // mirror the address Stitch above
         Stitch ss = new Stitch(ns, 0);
         slotCopyAll(ss, _slots, 0, idx - 1);
@@ -838,6 +852,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       newCenter._measure = tryComputeMeasureFromChildren(newCenter._children, newCenterLen, storage, measureOps);
       if (settings.diffBufSize() > 0) {
         newLeft._rebalanced = true; newCenter._rebalanced = true; // borrowed from left: structural
+        freeDroppedChild(storage, idx);                          // diff-buf: free dropped (rebalanced) children
+        if (leftChanged && idx > 0) freeDroppedChild(storage, idx - 1);
+        if (rightChanged) freeDroppedChild(storage, idx + 1);
         if (left._slots != null) {                               // newLeft keeps left's first newLeftLen slots
           Object[] nl = new Object[newLeft._keys.length];
           ArrayUtil.copy(left._slots, 0, newLeftLen, nl, 0);
@@ -910,6 +927,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       }
       if (settings.diffBufSize() > 0) {
         newCenter._rebalanced = true; newRight._rebalanced = true; // borrowed from right: structural
+        freeDroppedChild(storage, idx);                          // diff-buf: free dropped (rebalanced) children
+        if (leftChanged && idx > 0) freeDroppedChild(storage, idx - 1);
+        if (rightChanged) freeDroppedChild(storage, idx + 1);
         Object[] nc = new Object[newCenter._keys.length];        // mirror the newCenter address Stitch above
         Stitch ss = new Stitch(nc, 0);
         slotCopyAll(ss, _slots, 0, idx - 1);
@@ -1087,6 +1107,22 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   private static void slotCopyAll(Stitch ss, Object[] src, int from, int to) {
     if (src == null) { for (int i = from; i < to; ++i) ss.copyOne(null); }
     else ss.copyAll(src, from, to);
+  }
+
+  // diff-buf: free child i's durable blob when a STRUCTURAL rebuild (merge/borrow/split)
+  // drops it. Such a child is materialized into a new node and its old blob is never
+  // re-pointed as a buffered anchor (unlike the content-only case, which IS deferred to
+  // store), so it is dead now. The live durable address is _addresses[i] if set, else the
+  // anchor parked in slot i (the child was content-buffered earlier this txn, so its address
+  // was nulled but its anchor lives in the slot). Read i from THIS node before the rebuild
+  // overwrites it. No-op when diff-buf is off (callers gate on diffBufSize() > 0).
+  private void freeDroppedChild(IStorage storage, int i) {
+    if (storage == null) return;
+    if (_addresses != null && _addresses[i] != null) { storage.markFreed(_addresses[i]); return; }
+    if (_slots != null && _slots[i] instanceof Slot) {
+      Object a = ((Slot) _slots[i]).anchor;
+      if (a != null) storage.markFreed((Address) a);
+    }
   }
 
   // Carry _slots through a structural rebuild where child `ins` was replaced by `nNodes`
