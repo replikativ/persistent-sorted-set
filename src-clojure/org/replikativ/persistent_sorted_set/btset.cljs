@@ -24,6 +24,11 @@
                  (when (and (nil? (.-root set)) (some? (.-address set)))
                    (assert (implements? storage/IStorage (.-storage set)))
                    (set! (.-root set) (await (storage/restore (.-storage set) (.-address set) opts)))))
+               ;; diff-buf: seed the projection comparator at the root; branch/child propagates it
+               ;; down as nodes materialize, so a leaf-parent can project buffered leaves with the
+               ;; set's stable comparator. Idempotent; a Leaf root has no buffered children.
+               (when (instance? Branch (.-root set))
+                 (set! (.-_projCmp ^Branch (.-root set)) (.-comparator set)))
                (.-root set))))
 
 (defn $count
@@ -90,7 +95,7 @@
                                                          (measure/merge-measure measure-ops acc cs))
                                                        (measure/identity-measure measure-ops)
                                                        child-measure))]
-                            (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count root-measure (.-settings set) nil false)
+                            (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count root-measure (.-settings set) nil false (.-comparator set))
                                     new-cnt
                                     (.-comparator set)
                                     (.-meta set)
@@ -1614,7 +1619,7 @@
                                            nil
                                            subtree-count
                                            child-measure
-                                           settings nil false))))
+                                           settings nil false cmp))))
          (inc shift))))))
 
 (defn ^BTSet from-sequential [cmp seq opts]

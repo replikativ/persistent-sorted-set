@@ -21,9 +21,8 @@
 (def cmp (fn [a b] (compare (first a) (first b))))
 
 (defn- opbuf-settings ^Settings [bf b]
-  (let [s (Settings. (int bf) nil nil nil (int b))]
-    (set! (.-_comparator s) ^java.util.Comparator cmp)
-    s))
+  ;; diff-buf: comparator lives on the PSS (propagated to Branch._projCmp), not on Settings.
+  (Settings. (int bf) nil nil nil (int b)))
 
 (defn- deref-child [c]
   (cond (instance? ANode c) c
@@ -270,7 +269,6 @@
 (defn- recording-storage [disk bf b freed]
   (let [inner (tstore/->Storage (atom {}) disk (opbuf-settings bf b))]
     (reify IStorage
-      (comparator [_] cmp)
       (restore [_ a] (.restore inner a))
       (store   [_ n] (.store inner n))
       (accessed [_ a] (.accessed inner a))
@@ -306,3 +304,42 @@
           ;; structural changes (relies on offline reachability GC), so it leaks here.
           (when (pos? b)
             (is (empty? leaked) (str "diffBufSize=" b ": " (count leaked) " superseded blob(s) never markFreed (leak)"))))))))
+
+;; --- Regression: a replace whose OP comparator is coarser than the SET comparator (e.g. datahike's
+;; cmp-replace ignores tx while the index order includes it) buffers Absent(old)+Present(new). The
+;; serialized leaf-diff MUST be the comparator-agnostic {:absent :present} form — NOT a map keyed by
+;; the element, which would collapse old/new under coarse element equality and drop the removal,
+;; leaving a stale durable element after restore (the datahike upsert+reopen duplicate-datom bug).
+
+(deftest replace-coarse-cmp-storage-format
+  (testing "coarse-comparator replace records Absent(old)+Present(new); leaf-diff serializes to {:absent :present}; store→restore exact"
+    (let [bf 16, b 256, n 40, disk (atom {})
+          fc      (fn [a c] (compare a c))                   ; SET order: full [k v]
+          pc      (fn [a c] (compare (first a) (first c)))   ; replace key: first element only
+          mkst    #(tstore/->Storage (atom {}) disk (opbuf-settings bf b))
+          restore #(ss/restore-by fc % (mkst) {:branching-factor bf :diff-buf-size b :comparator fc})
+          s0      (reduce (fn [s i] (ss/conj s [i 0] fc))
+                          (ss/sorted-set* {:comparator fc :branching-factor bf :diff-buf-size b}) (range n))
+          l1      (restore (ss/store s0 (mkst)))             ; [i 0] now DURABLE in leaves
+          ;; replace [i 0]->[i 1] via the COARSE pc (old==new under pc, but old!=new under fc)
+          s1      (reduce (fn [s i] (ss/replace s [i 0] [i 1] pc)) l1 (range 0 n 2))
+          ;; format lock: every leaf-parent's serialized leaf-diff is {:absent :present}, and the
+          ;; replace recorded BOTH the removal of old and the insertion of new.
+          diffs   (for [^Branch br (walk-branches (root-of s1))
+                        :when (== 1 (.-_level br))
+                        :let  [sfs (.slotsForStorage br)]
+                        :when sfs
+                        [_ entry] sfs
+                        :let  [d (:diff entry)]
+                        :when (some? d)]
+                    d)
+          present (set (mapcat :present diffs))
+          absent  (set (mapcat :absent diffs))
+          l2      (restore (ss/store s1 (mkst)))
+          exp     (vec (sort fc (map (fn [i] [i (if (even? i) 1 0)]) (range n))))]
+      (is (seq diffs) "expected buffered leaf-diffs after the replaces")
+      (is (every? #(and (map? %) (contains? % :present) (contains? % :absent)) diffs)
+          "leaf-diff serialized as the comparator-agnostic {:absent :present} form")
+      (is (contains? present [0 1]) "Present(new) recorded")
+      (is (contains? absent  [0 0]) "Absent(old) recorded")
+      (is (= exp (vec (seq l2))) "store->restore exact after coarse-comparator replaces (no stale old survives)"))))

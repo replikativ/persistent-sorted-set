@@ -58,6 +58,10 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       root = _storage.restore(_address);
       _root = _settings.makeReference(root);
     }
+    // diff-buf: seed the projection comparator at the root; Branch.child propagates it down
+    // as nodes materialize, so a leaf-parent can project buffered leaves with the set's
+    // comparator. (Idempotent; no-op for a Leaf root, which has no buffered children.)
+    if (root instanceof Branch) ((Branch) root)._projCmp = _cmp;
     return root;
   }
 
@@ -97,7 +101,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     }
     Object measure = computeMeasureFromChildren(nodes);
     return new Branch(nodes[0].level() + 1, n, keys, null, children,
-                      countKnown ? subtreeCount : -1, measure, _settings);
+                      countKnown ? subtreeCount : -1, measure, _cmp, _settings);
   }
 
   /**

@@ -15,11 +15,6 @@ public class Settings {
   // entirely, so every code path is byte-identical to baseline PSS (invariant I0).
   // Design + the IStorage slots contract: doc/diff-buffering.md.
   public final int _diffBufSize;
-  // diff-buf: the set's comparator, needed to PROJECT buffered leaf-diffs onto a
-  // restored leaf at the lazy-load boundary (Branch.child). Set by the Clojure API;
-  // null when diffBufSize==0 (projection never runs). Not final so the various ctors
-  // need not all thread it; editable() preserves it.
-  public Comparator _comparator;
 
   // Canonical constructor (does not normalize; callers pass already-normalized values).
   public Settings(int branchingFactor, RefType refType, AtomicBoolean edit, IMeasure measure, ILeafProcessor leafProcessor, int diffBufSize) {
@@ -115,13 +110,7 @@ public class Settings {
     assert !editable();
     assert value == true;
     Settings s = new Settings(_branchingFactor, _refType, new AtomicBoolean(value), _measure, _leafProcessor, _diffBufSize);
-    s._comparator = _comparator;  // preserve for diff projection during transient mutation
     return s;
-  }
-
-  // diff-buf: the set's comparator (for projecting buffered leaf-diffs on restore).
-  public Comparator comparator() {
-    return _comparator;
   }
 
   public IMeasure measure() {

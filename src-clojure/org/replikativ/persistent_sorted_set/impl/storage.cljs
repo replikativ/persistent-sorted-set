@@ -1,5 +1,4 @@
-(ns org.replikativ.persistent-sorted-set.impl.storage
-  (:refer-clojure :exclude [comparator]))
+(ns org.replikativ.persistent-sorted-set.impl.storage)
 
 (defprotocol IStorage
   (store [this node opts])
@@ -8,7 +7,4 @@
   (delete [this addresses])
   (markFreed [this address])
   (isFreed [this address])
-  (freedInfo [this address])
-  ;; diff-buf: per-set/index comparator used to project buffered leaf-diffs on
-  ;; restore (mirrors JVM IStorage.comparator()). nil ⇒ no per-index comparator.
-  (comparator [this]))
+  (freedInfo [this address]))

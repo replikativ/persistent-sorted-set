@@ -36,6 +36,14 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // differs from its anchor, so it (and its dirty spine) must be written, not buffered.
   public boolean _rebalanced;
 
+  // diff-buf: the SET's stable comparator, used to PROJECT a buffered leaf (projectLeaf rebuilds
+  // it in stored order). It is the set's comparator — NOT any per-operation/navigation comparator
+  // — propagated lazily from the root down to each branch as it is materialized (see child() and
+  // PersistentSortedSet.root()). A leaf-parent projects its buffered leaves with its own _projCmp,
+  // so projection never depends on the comparator of whatever operation drove the descent. null
+  // when diffBufSize==0 / projection never runs.
+  public Comparator _projCmp;
+
   // For i in [0.._len):
   // 
   // 1. Not stored:       (_addresses == null || _addresses[i] == null) && _children[i] == ANode
@@ -58,7 +66,14 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     _subtreeCount = subtreeCount;
   }
 
-  public Branch(int level, int len, Key[] keys, Address[] addresses, Object[] children, long subtreeCount, Object measure, Settings settings) {
+  // diff-buf: this ctor and the (level, len, settings) one below take the set's projection
+  // comparator (projCmp) because they are only ever called by Branch's own structural ops
+  // (add/remove/replace split/merge/borrow), where the new node inherits the creating node's
+  // _projCmp. Passing it here — rather than stamping the field after construction — makes it
+  // impossible to forge an internal branch without a comparator (the projectLeaf assert would
+  // otherwise only catch it at runtime). Restored branches (no comparator at the storage layer)
+  // and the root are stamped on descent instead — see child()/PersistentSortedSet.root().
+  public Branch(int level, int len, Key[] keys, Address[] addresses, Object[] children, long subtreeCount, Object measure, Comparator projCmp, Settings settings) {
     super(len, keys, measure, settings);
     assert level >= 1;
     assert addresses == null || addresses.length >= len : ("addresses = " + Arrays.toString(addresses) + ", len = " + len);
@@ -68,9 +83,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     _addresses    = addresses;
     _children     = children;
     _subtreeCount = subtreeCount;
+    _projCmp      = projCmp;
   }
 
-  public Branch(int level, int len, Settings settings) {
+  public Branch(int level, int len, Comparator projCmp, Settings settings) {
     super(len, (Key[]) new Object[ANode.newLen(len, settings)], settings);
     assert level >= 1;
 
@@ -78,6 +94,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     _addresses    = null;
     _children     = null;
     _subtreeCount = -1;
+    _projCmp      = projCmp;
   }
 
   public Branch(int level, List<Key> keys, List<Address> addresses, Settings settings) {
@@ -139,16 +156,17 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (child == null) {
       assert _addresses[idx] != null;
       ANode base = storage.restore(_addresses[idx]);
+      // diff-buf: propagate the set's projection comparator down to each restored branch, so a
+      // leaf-parent projects its buffered leaves with its own _projCmp — independent of whatever
+      // operation (lookup with a prefix cmp, slice, count, …) drove this descent.
+      if (base instanceof Branch) ((Branch) base)._projCmp = _projCmp;
       Slot sl = (_slots != null) ? (Slot) _slots[idx] : null;
-      // diff-buf push-down: project this parent's buffered diff onto the freshly
-      // loaded child — leaf: batch-rebuild keys; branch: install the nested diff as the
-      // child's own _slots + set its aggregates from ĝ. Runs once, here, at materialization
-      // (reads stay baseline). Parent's slot supersedes any diff baked in the child's object.
+      // diff-buf push-down: project this parent's buffered diff onto the freshly loaded child —
+      // leaf: batch-rebuild keys (with this leaf-parent's _projCmp); branch: install the nested
+      // diff as the child's own _slots + set its aggregates from ĝ. Runs once, here, at
+      // materialization (reads stay baseline). Parent's slot supersedes any diff in the child.
       if (_settings.diffBufSize() > 0 && sl != null && sl.diff != null) {
-        // Projection comparator: prefer the traversing storage's (per-set/index) comparator;
-        // fall back to Settings (single-comparator embeddings, e.g. the test storage).
-        Comparator pcmp = (storage.comparator() != null) ? storage.comparator() : _settings.comparator();
-        child = (base instanceof Leaf) ? (ANode) projectLeaf((Leaf) base, sl.diff, pcmp)
+        child = (base instanceof Leaf) ? (ANode) projectLeaf((Leaf) base, sl.diff, _projCmp)
                                        : (ANode) projectBranch((Branch) base, sl);
       } else {
         child = base;
@@ -375,7 +393,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.diffBufSize() > 0) depositInto(storage, ins, key, key, cmp, anchor0); // content-only: Present(key) / branch marker
+      if (_settings.diffBufSize() > 0) depositInto(storage, ins, key, key, anchor0); // content-only: Present(key) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
     }
 
@@ -405,7 +423,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.diffBufSize() > 0) depositInto(storage, ins, key, key, cmp, anchor0); // content-only: Present(key) / branch marker
+      if (_settings.diffBufSize() > 0) depositInto(storage, ins, key, key, anchor0); // content-only: Present(key) / branch marker
       if (ins == _len - 1)
         return new ANode[]{ this }; // last child changed, propagate maxKey update
       else
@@ -433,9 +451,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       long newCount = (_subtreeCount >= 0 && oldChildCount >= 0)
           ? _subtreeCount - oldChildCount + newChildrenCount : -1;
       Object newMeasure = tryComputeMeasureFromChildren(newChildren, _len, storage, measureOps);
-      Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, newCount, newMeasure, settings);
+      Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, newCount, newMeasure, _projCmp, settings);
       if (settings.diffBufSize() > 0) { nb._rebalanced = _rebalanced; // a rebalance earlier this txn must persist (structure ≠ anchor)
-                                      nb.carryAndDeposit(storage, _slots, ins, key, key, cmp, anchor0); } // content-only: Present(key) / branch marker
+                                      nb.carryAndDeposit(storage, _slots, ins, key, key, anchor0); } // content-only: Present(key) / branch marker
       return new ANode[]{ nb };
     }
 
@@ -472,7 +490,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       long count = (_subtreeCount >= 0 && oldChildCount >= 0)
           ? _subtreeCount - oldChildCount + newChildrenCount : -1;
       Object measure = tryComputeMeasureFromChildren(allChildren, newLen, storage, measureOps);
-      Branch<Key, Address> nb = new Branch(_level, newLen, allKeys, allAddresses, allChildren, count, measure, settings);
+      Branch<Key, Address> nb = new Branch(_level, newLen, allKeys, allAddresses, allChildren, count, measure, _projCmp, settings);
       if (settings.diffBufSize() > 0) {
         nb._rebalanced = true; // absorbed a child split: structural → written, but it still buffers surviving siblings
         nb._slots = stitchSlots(ins, nodes.length, newLen); // carry buffered siblings' slots through the rebuild
@@ -500,8 +518,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     long count2 = tryComputeSubtreeCountFromChildren(children2, half2, storage);
     Object measure1 = tryComputeMeasureFromChildren(children1, half1, storage, measureOps);
     Object measure2 = tryComputeMeasureFromChildren(children2, half2, storage, measureOps);
-    Branch<Key, Address> sb1 = new Branch(_level, half1, keys1, addresses1, children1, count1, measure1, settings);
-    Branch<Key, Address> sb2 = new Branch(_level, half2, keys2, addresses2, children2, count2, measure2, settings);
+    Branch<Key, Address> sb1 = new Branch(_level, half1, keys1, addresses1, children1, count1, measure1, _projCmp, settings);
+    Branch<Key, Address> sb2 = new Branch(_level, half2, keys2, addresses2, children2, count2, measure2, _projCmp, settings);
     if (settings.diffBufSize() > 0) {
       sb1._rebalanced = true; sb2._rebalanced = true; // split: structural → written, still buffer surviving siblings
       freeDroppedChild(storage, ins); // diff-buf: free the split child's old blob (replaced by N new nodes)
@@ -546,7 +564,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.diffBufSize() > 0) depositInto(storage, idx, key, Slot.ABSENT, cmp, anchor0); // content-only: Absent(key) / branch marker
+      if (_settings.diffBufSize() > 0) depositInto(storage, idx, key, Slot.ABSENT, anchor0); // content-only: Absent(key) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
     }
 
@@ -632,7 +650,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         }
         if (_settings.diffBufSize() > 0) {
           if (!leftChanged && !rightChanged && newLen == _len) {
-            depositInto(storage, idx, key, Slot.ABSENT, cmp, anchor0); // content-only: Absent(key) / branch marker
+            depositInto(storage, idx, key, Slot.ABSENT, anchor0); // content-only: Absent(key) / branch marker
           } else {
             _rebalanced = true; // a child merged/borrowed with a sibling: structural → write in full
           }
@@ -640,7 +658,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         return PersistentSortedSet.EARLY_EXIT;
       }
 
-      Branch newCenter = new Branch(_level, newLen, settings);
+      Branch newCenter = new Branch(_level, newLen, _projCmp, settings);
 
       Stitch ks = new Stitch(newCenter._keys, 0);
       ks.copyAll(_keys, 0, idx - 1);
@@ -674,7 +692,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           // content-only: carry slots aligned and ACCUMULATE Absent onto the center's
           // existing diff (it may already hold buffered Present/Absent for this leaf).
           newCenter._rebalanced = _rebalanced; // persist a prior-this-txn rebalance
-          newCenter.carryAndDeposit(storage, _slots, idx, key, Slot.ABSENT, cmp, anchor0);
+          newCenter.carryAndDeposit(storage, _slots, idx, key, Slot.ABSENT, anchor0);
         } else {
           newCenter._rebalanced = true;                        // structural: mirror the address Stitch
           // diff-buf: free this node's dropped children (consumed into the new structure,
@@ -697,7 +715,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
     // can join with left
     if (left != null && left._len + newLen <= _settings.branchingFactor()) {
-      Branch join = new Branch(_level, left._len + newLen, settings);
+      Branch join = new Branch(_level, left._len + newLen, _projCmp, settings);
 
       Stitch ks = new Stitch(join._keys, 0);
       ks.copyAll(left._keys, 0, left._len);
@@ -749,7 +767,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
     // can join with right
     if (right != null && newLen + right._len <= _settings.branchingFactor()) {
-      Branch join = new Branch(_level, newLen + right._len, settings);
+      Branch join = new Branch(_level, newLen + right._len, _projCmp, settings);
 
       Stitch ks = new Stitch(join._keys, 0);
       ks.copyAll(_keys, 0, idx - 1);
@@ -805,8 +823,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       int newLeftLen   = totalLen >>> 1;
       int newCenterLen = totalLen - newLeftLen;
 
-      Branch newLeft   = new Branch(_level, newLeftLen, settings);
-      Branch newCenter = new Branch(_level, newCenterLen, settings);
+      Branch newLeft   = new Branch(_level, newLeftLen, _projCmp, settings);
+      Branch newCenter = new Branch(_level, newCenterLen, _projCmp, settings);
 
       ArrayUtil.copy(left._keys, 0, newLeftLen, newLeft._keys, 0);
 
@@ -880,8 +898,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           newRightLen  = totalLen - newCenterLen,
           rightHead    = right._len - newRightLen;
 
-      Branch newCenter = new Branch(_level, newCenterLen, settings),
-             newRight  = new Branch(_level, newRightLen, settings);
+      Branch newCenter = new Branch(_level, newCenterLen, _projCmp, settings),
+             newRight  = new Branch(_level, newRightLen, _projCmp, settings);
 
       Stitch ks = new Stitch(newCenter._keys, 0);
       ks.copyAll(_keys, 0, idx - 1);
@@ -975,7 +993,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.diffBufSize() > 0) depositInto(storage, idx, newKey, newKey, cmp, anchor0); // content-only: Present(newKey) / branch marker
+      if (_settings.diffBufSize() > 0) depositReplace(storage, idx, oldKey, newKey, anchor0); // content-only: Absent(oldKey)+Present(newKey) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
     }
 
@@ -999,7 +1017,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.diffBufSize() > 0) depositInto(storage, idx, newKey, newKey, cmp, anchor0); // content-only: Present(newKey) / branch marker
+      if (_settings.diffBufSize() > 0) depositReplace(storage, idx, oldKey, newKey, anchor0); // content-only: Absent(oldKey)+Present(newKey) / branch marker
       if (maxKeyChanged)
         return new ANode[]{this};
       else
@@ -1021,12 +1039,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     newChildren[idx] = newChild;
 
     // Try to recompute measure from final state (after child replacement) for new branch
-    Branch<Key, Address> newBranch = new Branch(_level, _len, newKeys, newAddresses, newChildren, _subtreeCount, null, settings);
+    Branch<Key, Address> newBranch = new Branch(_level, _len, newKeys, newAddresses, newChildren, _subtreeCount, null, _projCmp, settings);
     if (measureOps != null && _measure != null) {
       newBranch._measure = newBranch.tryComputeMeasure(storage);
     }
     if (settings.diffBufSize() > 0) { newBranch._rebalanced = _rebalanced; // persist a prior-this-txn rebalance
-                                    newBranch.carryAndDeposit(storage, _slots, idx, newKey, newKey, cmp, anchor0); } // content-only: Present(newKey)
+                                    newBranch.carryAndDepositReplace(storage, _slots, idx, oldKey, newKey, anchor0); } // content-only: Present(newKey)
 
     return new ANode[]{newBranch};
   }
@@ -1068,7 +1086,27 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // pre-mutation durable address (captured before the mutation nulled it); the
   // slot keeps a previously-captured anchor if it already has one (first capture
   // of the txn wins; subsequent ops accumulate against the same anchor).
-  private void depositInto(IStorage storage, int i, Object mapKey, Object val, Comparator cmp, Object anchor0) {
+  private void depositInto(IStorage storage, int i, Object mapKey, Object val, Object anchor0) {
+    depositKV(storage, i, new Object[]{ mapKey, val }, anchor0);
+  }
+
+  // diff-buf: a replace removes the element matching oldKey and inserts newKey. The leaf-diff
+  // is replayed later under the SET's comparator (_projCmp), NOT the operation comparator that
+  // located the element — so when oldKey and newKey differ under _projCmp (a replace with a
+  // COARSER op comparator, e.g. datahike's value-changing upsert), Present(newKey) alone would
+  // add newKey without removing oldKey on projection. Record both Absent(oldKey) + Present(newKey)
+  // so projectLeaf reproduces the net effect with no comparator logic. When oldKey == newKey under
+  // _projCmp (an in-place replace), the Present(newKey) assoc overwrites the Absent(oldKey) at the
+  // same key ⇒ net Present(newKey), identical to a plain deposit. See doc/diff-buffering.md.
+  private void depositReplace(IStorage storage, int i, Object oldKey, Object newKey, Object anchor0) {
+    depositKV(storage, i, new Object[]{ oldKey, Slot.ABSENT, newKey, newKey }, anchor0);
+  }
+
+  // Core leaf-diff deposit: accumulate the given (key,val) pairs onto this branch's slot i,
+  // keyed by the SET's comparator (_projCmp) — the comparator the durable leaf is sorted by and
+  // the only one projectLeaf uses. Keying by _projCmp (not the operation comparator) is what makes
+  // the diff a self-contained "remove/upsert these elements" language that replays without logic.
+  private void depositKV(IStorage storage, int i, Object[] kv, Object anchor0) {
     if (_slots == null) {
       _slots = new Object[_keys.length];
     }
@@ -1077,22 +1115,23 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     ANode child = child(storage, i);
     Object diff;
     if (_level == 1) {
-      // leaf child: accumulate the leaf-op (net latest-wins) onto the existing diff.
+      assert _projCmp != null : "diff-buf: leaf-parent has no _projCmp at deposit (see Branch.child / root)";
+      // leaf child: accumulate the leaf-op(s) (net latest-wins) onto the existing diff.
       PersistentTreeMap d;
       if (prev != null && prev.diff instanceof PersistentTreeMap) {
-        d = (PersistentTreeMap) prev.diff;                         // already sorted under cmp
+        d = (PersistentTreeMap) prev.diff;                         // already sorted under _projCmp
       } else if (prev != null && prev.diff instanceof java.util.Map) {
-        // restored leaf-diff (plain edn map): rebuild a cmp-sorted map so accumulation
-        // (net latest-wins on cmp-equal keys) and projection stay correct vs the anchor.
-        d = Slot.emptyDiff(cmp);
-        for (ISeq s = RT.seq(prev.diff); s != null; s = s.next()) {
-          IMapEntry e = (IMapEntry) s.first();
-          d = (PersistentTreeMap) d.assoc(e.key(), e.val());
-        }
+        // restored leaf-diff in storage form {:absent [el…] :present [el…]}: rebuild a _projCmp-sorted
+        // map so accumulation (net latest-wins) and projection stay correct vs the anchor.
+        d = Slot.emptyDiff(_projCmp);
+        IPersistentMap dm = (IPersistentMap) prev.diff;
+        for (ISeq s = RT.seq(dm.valAt(KW_ABSENT));  s != null; s = s.next()) d = (PersistentTreeMap) d.assoc(s.first(), Slot.ABSENT);
+        for (ISeq s = RT.seq(dm.valAt(KW_PRESENT)); s != null; s = s.next()) d = (PersistentTreeMap) d.assoc(s.first(), s.first());
       } else {
-        d = Slot.emptyDiff(cmp);
+        d = Slot.emptyDiff(_projCmp);
       }
-      diff = d.assoc(mapKey, val);
+      for (int k = 0; k < kv.length; k += 2) d = (PersistentTreeMap) d.assoc(kv[k], kv[k + 1]);
+      diff = d;
     } else {
       // branch child: anchor marker; its nested diff is derived from the live subtree at store
       diff = null;
@@ -1142,11 +1181,20 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // For persistent (non-editable) returns: carry the source branch's slots into
   // this freshly-built branch, then deposit at i. (1-for-1 child replacement, so
   // indices are aligned with the source.)
-  private void carryAndDeposit(IStorage storage, Object[] srcSlots, int i, Object mapKey, Object val, Comparator cmp, Object anchor0) {
+  private void carrySlots(Object[] srcSlots) {
     if (srcSlots != null) {
       _slots = Arrays.copyOf(srcSlots, _keys.length);
     }
-    depositInto(storage, i, mapKey, val, cmp, anchor0);
+  }
+
+  private void carryAndDeposit(IStorage storage, Object[] srcSlots, int i, Object mapKey, Object val, Object anchor0) {
+    carrySlots(srcSlots);
+    depositInto(storage, i, mapKey, val, anchor0);
+  }
+
+  private void carryAndDepositReplace(IStorage storage, Object[] srcSlots, int i, Object oldKey, Object newKey, Object anchor0) {
+    carrySlots(srcSlots);
+    depositReplace(storage, i, oldKey, newKey, anchor0);
   }
 
   // ---- diff-buf store-side helpers ----
@@ -1154,6 +1202,27 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   private static final Keyword KW_MEASURE = Keyword.intern(null, "measure");
   private static final Keyword KW_DIFF    = Keyword.intern(null, "diff");
   private static final Keyword KW_MAXKEY  = Keyword.intern(null, "max-key");
+  private static final Keyword KW_ABSENT  = Keyword.intern(null, "absent");
+  private static final Keyword KW_PRESENT = Keyword.intern(null, "present");
+
+  // diff-buf: convert a live leaf-diff (PersistentTreeMap {element -> element|ABSENT}, keyed by the
+  // set's comparator _projCmp) into the COMPARATOR-AGNOSTIC storage form {:absent [el…] :present [el…]}.
+  // Storage carries no comparator, so the wire form must not be a map keyed by the element: the
+  // element's own .equals/.hashCode (e.g. datahike Datom = e,a,v) can be COARSER than _projCmp
+  // (e,a,v,tx), which would collapse two entries the diff legitimately distinguishes (a tx-only
+  // replace's Absent(old)+Present(new) → one entry, losing the removal). Two element vectors are
+  // lossless. Pass-through if `diff` is already in storage form (a restored leaf-diff re-emitted on
+  // a later store) or null. See doc/diff-buffering.md.
+  static Object leafDiffForStorage(Object diff) {
+    if (!(diff instanceof PersistentTreeMap)) return diff;   // already storage form (restored) or null
+    Object absent = PersistentVector.EMPTY, present = PersistentVector.EMPTY;
+    for (ISeq s = RT.seq(diff); s != null; s = s.next()) {
+      IMapEntry e = (IMapEntry) s.first();
+      if (Slot.ABSENT.equals(e.val())) absent  = ((IPersistentVector) absent).cons(e.key());
+      else                             present = ((IPersistentVector) present).cons(e.val());
+    }
+    return PersistentHashMap.EMPTY.assoc(KW_ABSENT, absent).assoc(KW_PRESENT, present);
+  }
 
   // Entry count of an already-assembled slot diff describing a child at `childLevel`:
   // a leaf-diff (childLevel == 0) returns its element count; a nested branch-diff
@@ -1165,8 +1234,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (!(diff instanceof java.util.Map)) return 0;
     java.util.Map m = (java.util.Map) diff;
     if (m.isEmpty()) return 0;
-    if (childLevel == 0) return m.size();                       // leaf-diff entry count
-    int t = 0;                                                  // nested branch-diff
+    if (childLevel == 0) {                                       // leaf-diff entry count
+      if (diff instanceof PersistentTreeMap) return m.size();    // live form: one entry per element
+      IPersistentMap sm = (IPersistentMap) diff;                 // storage form {:absent :present}
+      return RT.count(sm.valAt(KW_ABSENT)) + RT.count(sm.valAt(KW_PRESENT));
+    }
+    int t = 0;                                                  // nested branch-diff (Long-keyed)
     for (Object v : m.values()) t += diffSize(((IPersistentMap) v).valAt(KW_DIFF), childLevel - 1);
     return t;
   }
@@ -1204,7 +1277,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       for (int j = 0; j < c._len; j++) {
         Slot sl = (Slot) c._slots[j];
         if (sl == null) continue;
-        Object d = (sl.diff != null) ? sl.diff : assembleNested(storage, (Branch) c.child(storage, j));
+        Object d = (sl.diff != null)
+            ? (c._level == 1 ? leafDiffForStorage(sl.diff) : sl.diff)   // leaf child ⇒ comparator-agnostic storage form
+            : assembleNested(storage, (Branch) c.child(storage, j));
         // c._keys[j] = grandchild j's CURRENT (post-diff) separator; carry it so a reconstructed
         // (buffered) c restores its separators instead of keeping the anchor's stale ones.
         IPersistentMap entry = (IPersistentMap) PersistentHashMap.EMPTY
@@ -1224,8 +1299,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     for (int i = 0; i < _len; ++i) {
       Slot sl = (Slot) _slots[i];
       if (sl == null) continue;
+      // _level==1 ⇒ this slot's child is a leaf ⇒ sl.diff is a leaf-diff: emit the comparator-agnostic
+      // storage form {:absent :present}. _level>1 ⇒ sl.diff is null or a (restored) nested map ⇒ as-is.
+      Object diffOut = (_level == 1) ? leafDiffForStorage(sl.diff) : sl.diff;
       IPersistentMap entry = (IPersistentMap) PersistentHashMap.EMPTY
-          .assoc(KW_COUNT, sl.count).assoc(KW_MEASURE, sl.measure).assoc(KW_DIFF, sl.diff)
+          .assoc(KW_COUNT, sl.count).assoc(KW_MEASURE, sl.measure).assoc(KW_DIFF, diffOut)
           .assoc(KW_MAXKEY, _keys[i]);   // child i's current (post-diff) separator
       m = (IPersistentMap) m.assoc((long) i, entry);
     }
@@ -1239,12 +1317,19 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // comparator, emitting the result elements in key order. The net diff keeps the leaf
   // within [min, BF] (else the writer would have rebalanced and written it), so this is IO-free.
   private Leaf<Key, Address> projectLeaf(Leaf<Key, Address> base, Object diff, Comparator cmp) {
+    assert cmp != null : "diff-buf: leaf-parent has no _projCmp — the set's comparator wasn't propagated to this branch (see PersistentSortedSet.root / Branch.child)";
     PersistentTreeMap m = (PersistentTreeMap) PersistentTreeMap.create(cmp, (ISeq) null);
     for (int i = 0; i < base._len; ++i) m = (PersistentTreeMap) m.assoc(base._keys[i], base._keys[i]);
-    for (ISeq s = RT.seq(diff); s != null; s = s.next()) {
-      IMapEntry e = (IMapEntry) s.first();
-      if (Slot.ABSENT.equals(e.val())) m = (PersistentTreeMap) m.without(e.key());
-      else                             m = (PersistentTreeMap) m.assoc(e.val(), e.val()); // upsert: value carries current element
+    if (diff instanceof PersistentTreeMap) {                     // live form {element -> element|ABSENT}
+      for (ISeq s = RT.seq(diff); s != null; s = s.next()) {
+        IMapEntry e = (IMapEntry) s.first();
+        if (Slot.ABSENT.equals(e.val())) m = (PersistentTreeMap) m.without(e.key());
+        else                             m = (PersistentTreeMap) m.assoc(e.val(), e.val()); // upsert: value carries current element
+      }
+    } else {                                                     // storage form {:absent [el…] :present [el…]}
+      IPersistentMap dm = (IPersistentMap) diff;
+      for (ISeq s = RT.seq(dm.valAt(KW_ABSENT));  s != null; s = s.next()) m = (PersistentTreeMap) m.without(s.first());
+      for (ISeq s = RT.seq(dm.valAt(KW_PRESENT)); s != null; s = s.next()) m = (PersistentTreeMap) m.assoc(s.first(), s.first());
     }
     int n = m.count();
     Object[] keys = new Object[n];

@@ -26,10 +26,28 @@
 ;; Slot.ABSENT keyword exactly so JVM-written diffs project identically on cljs frontends.
 (def ^:const ABSENT :org.replikativ.persistent-sorted-set/absent)
 
+(defn- leaf-diff->storage
+  "Convert a live leaf-diff (sorted-map {element -> element|ABSENT}, keyed by the set comparator)
+  into the COMPARATOR-AGNOSTIC storage form {:absent [el…] :present [el…]} (mirrors JVM
+  leafDiffForStorage). Storage carries no comparator, so the wire form must not be a map keyed by
+  the element: the element's own equality can be coarser than the set comparator (e.g. datahike
+  Datom = e,a,v vs e,a,v,tx), which would collapse two entries the diff distinguishes (a tx-only
+  replace's Absent+Present → one, losing the removal). Two vectors are lossless. Pass-through if
+  already storage form (restored, re-emitted) or nil."
+  [diff]
+  (if-not (sorted? diff)
+    diff
+    (reduce (fn [acc [k v]]
+              (if (= v ABSENT) (update acc :absent conj k) (update acc :present conj v)))
+            {:absent [] :present []}
+            diff)))
+
 (defn- project-leaf
   "Apply a leaf-diff to a durable leaf in one pass: merge the durable keys with the diff
-  (Present upserts the element, ABSENT removes) under the set's comparator, emitting the
-  result elements in key order. Mirrors JVM Branch.projectLeaf. IO-free (no split/merge)."
+  (Present upserts the element, Absent removes) under the set's comparator, emitting the
+  result elements in key order. Mirrors JVM Branch.projectLeaf. IO-free (no split/merge).
+  Handles both the live form (sorted-map {element -> element|ABSENT}) and the restored storage
+  form {:absent [el…] :present [el…]}."
   [base diff cmp]
   (let [bkeys (.-keys base)
         n     (arrays/alength bkeys)
@@ -37,12 +55,14 @@
                 (if (< i n)
                   (recur (inc i) (assoc acc (arrays/aget bkeys i) (arrays/aget bkeys i)))
                   acc))
-        m1    (reduce (fn [acc e]
-                        (let [k (key e), v (val e)]
-                          (if (= v ABSENT)
-                            (dissoc acc k)
-                            (assoc acc v v))))   ; upsert: value carries the current element
-                      m0 (seq diff))]
+        m1    (if (sorted? diff)
+                (reduce (fn [acc e]
+                          (let [k (key e), v (val e)]
+                            (if (= v ABSENT) (dissoc acc k) (assoc acc v v))))
+                        m0 (seq diff))
+                (as-> m0 acc
+                  (reduce (fn [a el] (dissoc a el)) acc (:absent diff))
+                  (reduce (fn [a el] (assoc a el el)) acc (:present diff))))]
     (Leaf. (into-array (vals m1)) (.-settings base) nil)))
 
 (defn- project-branch
@@ -76,10 +96,11 @@
   [^Branch node storage idx base]
   (let [sl (when (some? (.-_slots node)) (aget (.-_slots node) idx))]
     (if (and sl (some? (:diff sl)))
-      (let [pcmp (storage/comparator storage)]
-        (if (instance? Leaf base)
-          (project-leaf base (:diff sl) pcmp)
-          (project-branch base sl)))
+      ;; project with THIS leaf-parent's _projCmp (the set's stable comparator), never the
+      ;; operation/navigation comparator that drove the descent. Mirrors JVM Branch.child.
+      (if (instance? Leaf base)
+        (project-leaf base (:diff sl) (.-_projCmp node))
+        (project-branch base sl))
       base)))
 
 (defn ensure-children
@@ -111,6 +132,12 @@
                          _    (assert (some? addr) "expected address to restore child")
                          _    (assert (some? storage) "expected storage")
                          base (await (storage/restore storage addr opts))
+                         ;; diff-buf: propagate the set's projection comparator down to the
+                         ;; restored branch (the storage layer has no comparator), so a
+                         ;; leaf-parent projects its buffered leaves with the set's own
+                         ;; comparator — independent of the op that drove this descent.
+                         _    (when (instance? Branch base)
+                                (set! (.-_projCmp base) (.-_projCmp node)))
                          ;; diff-buf: project this parent's buffered diff onto the freshly
                          ;; loaded child (leaf: rebuild keys; branch: install nested _slots).
                          c    (project-child node storage idx base)]
@@ -206,13 +233,14 @@
                      sc (node/subtree-count c)]
                  (if (>= sc 0) sc (await (node/$count c storage opts)))))))
 
-(defn- deposit-into
-  "In-place deposit into this branch's slot for child i (mirrors JVM depositInto). anchor0 is
-  child i's pre-mutation durable address; the slot keeps a previously-captured anchor if it
-  already has one (first capture of the txn wins). Leaf child ⇒ accumulate the leaf-op (net
-  latest-wins) onto the existing diff; branch child ⇒ nil marker. ĝ refreshed from the
-  (already-mutated, in-memory) child's count/measure."
-  [^Branch node storage i map-key val cmp anchor0 {:keys [sync?] :or {sync? true} :as opts}]
+(defn- deposit-kv
+  "Core leaf-diff deposit (mirrors JVM depositKV): accumulate the given [k v] pairs onto this
+  branch's slot i, keyed by the SET's comparator (.-_projCmp) — the comparator the durable leaf is
+  sorted by and the only one project-leaf uses. Keying by _projCmp (not the operation comparator)
+  is what makes the diff a self-contained remove/upsert language. anchor0 is child i's pre-mutation
+  durable address; the slot keeps a previously-captured anchor (first capture of the txn wins).
+  Leaf child ⇒ accumulate net-latest-wins; branch child ⇒ nil marker."
+  [^Branch node storage i kvs anchor0 {:keys [sync?] :or {sync? true} :as opts}]
   (async+sync sync?
               (async
                (when (nil? (.-_slots node))
@@ -221,21 +249,37 @@
                      prev   (aget slots i)
                      anchor (if (and prev (some? (:anchor prev))) (:anchor prev) anchor0)
                      c      (await (child node storage i opts))
+                     pcmp   (.-_projCmp node)
                      diff   (if (== (.-level node) 1)
-                              ;; leaf child: accumulate net-latest-wins onto the existing diff,
-                              ;; rebuilding a cmp-sorted map from a restored (unsorted) diff.
+                              ;; leaf child: accumulate net-latest-wins, rebuilding a _projCmp-sorted
+                              ;; map from a restored storage-form diff {:absent [..] :present [..]}.
                               (let [pd (when prev (:diff prev))
                                     d  (cond
                                          (sorted? pd) pd
-                                         (map? pd)    (into (sorted-map-by cmp) pd)
-                                         :else        (sorted-map-by cmp))]
-                                (assoc d map-key val))
+                                         (map? pd)    (as-> (sorted-map-by pcmp) d
+                                                        (reduce (fn [d el] (assoc d el ABSENT)) d (:absent pd))
+                                                        (reduce (fn [d el] (assoc d el el)) d (:present pd)))
+                                         :else        (sorted-map-by pcmp))]
+                                (reduce (fn [d [k v]] (assoc d k v)) d kvs))
                               ;; branch child: anchor marker (nested diff derived at store)
                               nil)
                      cnt     (await (child-count node storage i opts))
                      measure (node/measure c)]
                  (aset slots i {:diff diff :count cnt :measure measure :anchor anchor})
                  nil))))
+
+(defn- deposit-into
+  "Deposit a single leaf-op (Present(map-key=val) or Absent(map-key→ABSENT)). Mirrors JVM depositInto."
+  [^Branch node storage i map-key val anchor0 opts]
+  (deposit-kv node storage i [[map-key val]] anchor0 opts))
+
+(defn- deposit-replace
+  "Deposit a replace as Absent(old-key)+Present(new-key) (mirrors JVM depositReplace). When old-key
+  and new-key are equal under _projCmp (in-place replace) the Present overwrites the Absent at the
+  same key ⇒ net Present; when they differ (a coarser-comparator replace, e.g. a tx-only value
+  change), both survive so project-leaf removes old and adds new with no comparator logic."
+  [^Branch node storage i old-key new-key anchor0 opts]
+  (deposit-kv node storage i [[old-key ABSENT] [new-key new-key]] anchor0 opts))
 
 (defn- stitch-slots
   "Carry _slots through a structural rebuild where child `ins` was replaced by `n-nodes` new
@@ -254,20 +298,33 @@
           (recur (inc src) (inc dst))))
       out)))
 
+(defn- carry-slots
+  "Carry the source branch's slots into this freshly-built branch (1-for-1 child replacement, so
+  indices align). Mirrors the slot-copy half of JVM carryAndDeposit."
+  [^Branch node src-slots]
+  (when (some? src-slots)
+    (let [n   (arrays/alength (.-keys node))
+          arr (make-array n)
+          m   (min n (alength src-slots))]
+      (dotimes [k m] (aset arr k (aget src-slots k)))
+      (set! (.-_slots node) arr))))
+
 (defn- carry-and-deposit
-  "For persistent (non-editable) returns: carry the source branch's slots into this freshly-built
-  branch, then deposit at i (1-for-1 child replacement, so indices align). Mirrors JVM
-  carryAndDeposit."
-  [^Branch node storage src-slots i map-key val cmp anchor0 {:keys [sync?] :or {sync? true} :as opts}]
-  (async+sync sync?
+  "Carry source slots then deposit a single leaf-op at i. Mirrors JVM carryAndDeposit."
+  [^Branch node storage src-slots i map-key val anchor0 opts]
+  (async+sync (:sync? opts true)
               (async
-               (when (some? src-slots)
-                 (let [n   (arrays/alength (.-keys node))
-                       arr (make-array n)
-                       m   (min n (alength src-slots))]
-                   (dotimes [k m] (aset arr k (aget src-slots k)))
-                   (set! (.-_slots node) arr)))
-               (await (deposit-into node storage i map-key val cmp anchor0 opts)))))
+               (carry-slots node src-slots)
+               (await (deposit-into node storage i map-key val anchor0 opts)))))
+
+(defn- carry-and-deposit-replace
+  "Carry source slots then deposit a replace (Absent(old)+Present(new)) at i. Mirrors JVM
+  carryAndDepositReplace."
+  [^Branch node storage src-slots i old-key new-key anchor0 opts]
+  (async+sync (:sync? opts true)
+              (async
+               (carry-slots node src-slots)
+               (await (deposit-replace node storage i old-key new-key anchor0 opts)))))
 
 (defn- concat-slots
   "Concatenate two branches' _slots (this ++ next), 1-per-child, padding nils for a slot-less
@@ -366,14 +423,14 @@
                                measure-ops (:measure (.-settings this))
                                new-measure (when (and measure-ops (.-_measure this))
                                              (measure/merge-measure measure-ops (.-_measure this) (measure/extract measure-ops key)))
-                               nb (Branch. (.-level this) new-keys new-children new-addrs new-sc new-measure (.-settings this) nil false)]
+                               nb (Branch. (.-level this) new-keys new-children new-addrs new-sc new-measure (.-settings this) nil false (.-_projCmp this))]
                            ;; diff-buf: nodes-len==1 ⇒ content-only ⇒ carry the source slots and
                            ;; deposit Present(key) (matches JVM persistent path). nodes-len>=2 ⇒ a child
                            ;; split was absorbed ⇒ structural: mark rebalanced + stitch surviving siblings.
                            (when diff-buf?
                              (if (= nodes-len 1)
                                (do (set! (.-_rebalanced nb) (.-_rebalanced this))
-                                   (await (carry-and-deposit nb storage (.-_slots this) idx key key cmp anchor0 opts)))
+                                   (await (carry-and-deposit nb storage (.-_slots this) idx key key anchor0 opts)))
                                (do (set! (.-_rebalanced nb) true)
                                    (free-dropped-child this storage idx) ; diff-buf: free the split child's old blob
                                    (set! (.-_slots nb) (stitch-slots this idx nodes-len (arrays/alength new-children))))))
@@ -419,14 +476,14 @@
                                                 left-addrs
                                                 (try-compute-subtree-count-from-children left-children (arrays/alength left-children))
                                                 left-measure
-                                                (.-settings this) nil false)
+                                                (.-settings this) nil false (.-_projCmp this))
                                right-b (Branch. (.-level this)
                                                 (.slice new-keys middle)
                                                 right-children
                                                 right-addrs
                                                 (try-compute-subtree-count-from-children right-children (arrays/alength right-children))
                                                 right-measure
-                                                (.-settings this) nil false)]
+                                                (.-settings this) nil false (.-_projCmp this))]
                            ;; diff-buf: a child split overflowed this branch → split: structural on both
                            ;; halves → written, but each still buffers its surviving siblings' slots.
                            (when diff-buf?
@@ -504,9 +561,9 @@
                              new-measure (when (and measure-ops (.-_measure this))
                                            (measure/remove-measure measure-ops (.-_measure this) key
                                                                    #(node/try-compute-measure
-                                                                     (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this) nil false)
+                                                                     (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this) nil false (.-_projCmp this))
                                                                      storage measure-ops {:sync? true})))
-                             center (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-measure (.-settings this) nil false)]
+                             center (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-measure (.-settings this) nil false (.-_projCmp this))]
                          ;; diff-buf: install the center's slots BEFORE rotate (so a subsequent
                          ;; rotate merge/merge-split with this node's siblings carries them).
                          ;; content-only ⇒ carry source slots + deposit Absent(key) at idx (1-for-1).
@@ -514,7 +571,7 @@
                          (when diff-buf?
                            (if content-only?
                              (do (set! (.-_rebalanced center) (.-_rebalanced this))
-                                 (await (carry-and-deposit center storage (.-_slots this) idx key ABSENT cmp anchor0 opts)))
+                                 (await (carry-and-deposit center storage (.-_slots this) idx key ABSENT anchor0 opts)))
                              (do (set! (.-_rebalanced center) true)
                                  ;; diff-buf: free this node's dropped (merged/borrowed) children — the
                                  ;; range [left-idx, right-idx) minus unchanged surviving siblings (the
@@ -568,7 +625,7 @@
                        ;; deposit Present(new-key) at this level (mirrors JVM EARLY_EXIT path).
                        (= nodes :early-exit)
                        (do
-                         (when diff-buf? (await (deposit-into this storage idx new-key new-key cmp anchor0 opts)))
+                         (when diff-buf? (await (deposit-replace this storage idx old-key new-key anchor0 opts)))
                          :early-exit)
 
                        ;; Child returned updated node
@@ -594,7 +651,7 @@
                                (when (and measure-ops (.-_measure this))
                                  (set! (.-_measure this)
                                        (replace-measure this storage measure-ops)))
-                               (when diff-buf? (await (deposit-into this storage idx new-key new-key cmp anchor0 opts)))
+                               (when diff-buf? (await (deposit-replace this storage idx old-key new-key anchor0 opts)))
                                (arrays/array this))
                              ;; Persistent: clone arrays
                              (let [new-keys     (arrays/aclone keys)
@@ -608,14 +665,14 @@
                                                     na))
                                    _            (aset new-keys idx new-max-key)
                                    _            (aset new-children idx new-node)
-                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil false)
+                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil false (.-_projCmp this))
                                    new-measure    (when (and measure-ops (.-_measure this))
                                                     (replace-measure new-branch storage measure-ops))]
                                (set! (.-_measure new-branch) new-measure)
                                ;; diff-buf: content-only replace ⇒ carry source slots + deposit Present(new-key).
                                (when diff-buf?
                                  (set! (.-_rebalanced new-branch) (.-_rebalanced this))
-                                 (await (carry-and-deposit new-branch storage (.-_slots this) idx new-key new-key cmp anchor0 opts)))
+                                 (await (carry-and-deposit-replace new-branch storage (.-_slots this) idx old-key new-key anchor0 opts)))
                                (arrays/array new-branch)))
                            ;; maxKey unchanged - reuse keys array
                            (if editable?
@@ -630,7 +687,7 @@
                                (when (and measure-ops (.-_measure this))
                                  (set! (.-_measure this)
                                        (replace-measure this storage measure-ops)))
-                               (when diff-buf? (await (deposit-into this storage idx new-key new-key cmp anchor0 opts)))
+                               (when diff-buf? (await (deposit-replace this storage idx old-key new-key anchor0 opts)))
                                (if last-child?
                                  (arrays/array this)  ; Last child, need to propagate
                                  :early-exit))        ; Not last child, early exit
@@ -646,14 +703,14 @@
                                                     (aset na idx nil)
                                                     na))
                                    _            (aset new-children idx new-node)
-                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil false)
+                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil false (.-_projCmp this))
                                    new-measure    (when (and measure-ops (.-_measure this))
                                                     (replace-measure new-branch storage measure-ops))]
                                (set! (.-_measure new-branch) new-measure)
                                ;; diff-buf: content-only replace ⇒ carry source slots + deposit Present(new-key).
                                (when diff-buf?
                                  (set! (.-_rebalanced new-branch) (.-_rebalanced this))
-                                 (await (carry-and-deposit new-branch storage (.-_slots this) idx new-key new-key cmp anchor0 opts)))
+                                 (await (carry-and-deposit-replace new-branch storage (.-_slots this) idx old-key new-key anchor0 opts)))
                                (arrays/array new-branch))))))))))))
 
 ;; ---- diff-buf store-side helpers (mirror JVM Branch) ----
@@ -667,11 +724,13 @@
   [diff child-level]
   (if-not (map? diff)
     0
-    (let [n (count diff)]
-      (if (zero? n)
-        0
-        (if (== child-level 0)
-          n
+    (if (== child-level 0)
+      (if (sorted? diff)                                         ; live form: one entry per element
+        (count diff)
+        (+ (count (:absent diff)) (count (:present diff))))      ; storage form {:absent :present}
+      (let [n (count diff)]
+        (if (zero? n)
+          0
           (reduce (fn [t v] (+ t (diff-size (:diff v) (dec child-level)))) 0 (vals diff)))))))
 
 (defn- content-only-diff-size
@@ -723,7 +782,7 @@
                              (recur (inc j) m)
                              (let [gc     (when (nil? (:diff sl)) (await (child c storage j opts)))
                                    d      (if (some? (:diff sl))
-                                            (:diff sl)
+                                            (if (== (.-level c) 1) (leaf-diff->storage (:diff sl)) (:diff sl)) ; leaf child ⇒ storage form
                                             (await (assemble-nested storage gc opts)))
                                    entry  {:count   (:count sl)
                                            :measure (:measure sl)
@@ -737,7 +796,8 @@
   Mirrors JVM slotsForStorage."
   [^Branch node]
   (when-some [slots (.-_slots node)]
-    (let [len (arrays/alength (.-keys node))]
+    (let [len   (arrays/alength (.-keys node))
+          leaf? (== (.-level node) 1)]   ; this node's children are leaves ⇒ leaf-diffs
       (loop [i 0, m {}]
         (if (>= i len)
           (when (pos? (count m)) m)
@@ -746,7 +806,8 @@
               (recur (inc i) m)
               (recur (inc i) (assoc m i {:count   (:count sl)
                                          :measure (:measure sl)
-                                         :diff    (:diff sl)
+                                         ;; leaf child ⇒ comparator-agnostic storage form; branch child ⇒ nested map as-is
+                                         :diff    (if leaf? (leaf-diff->storage (:diff sl)) (:diff sl))
                                          :max-key (arrays/aget (.-keys node) i)})))))))))
 
 (defn store
@@ -839,7 +900,8 @@
 
 (defn ^Branch from-map
   [{:keys [level keys addresses subtree-count measure settings]}]
-  (Branch. level keys nil addresses (or subtree-count -1) measure settings nil false))
+  ;; cold restore (storage deserializer): no comparator here — stamped on descent by -root/child.
+  (Branch. level keys nil addresses (or subtree-count -1) measure settings nil false nil))
 
 ;; diff-buf (mirrors JVM Branch):
 ;;   `_slots`      — per-child buffered diff (nil unless diff-buf-size > 0). Read/projection
@@ -848,7 +910,12 @@
 ;;                   (a split/merge/borrow happened on it this txn) ⇒ it must be WRITTEN,
 ;;                   not buffered. Default false; set on structural rebuilds; propagated to
 ;;                   persistent successors; cleared after store(). Matches JVM Branch._rebalanced.
-(deftype Branch [^number level keys ^:mutable children ^:mutable addresses ^:mutable ^number subtree-count ^:mutable _measure settings ^:mutable _slots ^:mutable _rebalanced]
+;;   `_projCmp`    — the SET's stable comparator, used to PROJECT a buffered leaf (project-leaf
+;;                   rebuilds it in stored order) — NOT any per-operation/navigation comparator.
+;;                   Internally-created branches inherit it from the creating node via the ctor;
+;;                   the root (-root) and freshly-restored branches (child) are stamped on
+;;                   descent — the storage layer has no comparator. Matches JVM Branch._projCmp.
+(deftype Branch [^number level keys ^:mutable children ^:mutable addresses ^:mutable ^number subtree-count ^:mutable _measure settings ^:mutable _slots ^:mutable _rebalanced ^:mutable _projCmp]
   Object
   (toString [_] (pr-str* {:level level :keys (vec keys)}))
   INode
@@ -934,7 +1001,7 @@
                       new-addrs
                       new-sc
                       new-measure
-                      settings nil false)]
+                      settings nil false _projCmp)]
       ;; diff-buf: a merged node's structure differs from any anchor ⇒ it must be WRITTEN
       ;; (_rebalanced), but it still buffers the surviving children's slots (concatenated).
       (when (pos? (or (:diff-buf-size settings) 0))
@@ -976,8 +1043,8 @@
                                  (reduced nil)))))
                          (measure/identity-measure measure-ops)
                          p1))
-            b0 (Branch. level (arrays/aget ks 0) p0 (when as (arrays/aget as 0)) sc0 m0 settings nil false)
-            b1 (Branch. level (arrays/aget ks 1) p1 (when as (arrays/aget as 1)) sc1 m1 settings nil false)]
+            b0 (Branch. level (arrays/aget ks 0) p0 (when as (arrays/aget as 0)) sc0 m0 settings nil false _projCmp)
+            b1 (Branch. level (arrays/aget ks 1) p1 (when as (arrays/aget as 1)) sc1 m1 settings nil false _projCmp)]
         ;; diff-buf: redistribution is structural on both halves (_rebalanced); split the
         ;; concatenated slots at the same child boundary so each half buffers its own children.
         (when (pos? (or (:diff-buf-size settings) 0))

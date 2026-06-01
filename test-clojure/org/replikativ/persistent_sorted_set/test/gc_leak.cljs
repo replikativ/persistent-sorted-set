@@ -20,8 +20,7 @@
       (accessed [_ a] (storage/accessed inner a))
       (markFreed [_ a] (swap! freed conj a) nil)
       (isFreed  [_ a] (contains? @freed a))
-      (freedInfo [_ a] nil)
-      (comparator [_] cmp))))
+      (freedInfo [_ a] nil))))
 
 (defn disk-reach [disk root]
   (let [seen (atom #{})]

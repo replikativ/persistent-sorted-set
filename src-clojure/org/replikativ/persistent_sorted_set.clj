@@ -139,9 +139,8 @@
            ;; 0/off unless the pss.diffBufSize sysprop is set) when the caller doesn't specify.
            ;; 0 = baseline (I0). See doc/diff-buffering.md.
            (int (or (:diff-buf-size m) (Settings/defaultDiffBufSize))))]
-    ;; diff-buf: thread the set's comparator into Settings so buffered leaf-diffs can
-    ;; be projected onto restored leaves (Branch.child). Defaults to compare.
-    (set! (.-_comparator s) ^java.util.Comparator (or (:comparator m) (:cmp m) compare))
+    ;; diff-buf: the comparator is NOT stored on Settings — it lives on the PersistentSortedSet
+    ;; (_cmp) and is propagated to Branch nodes (Branch._projCmp) for leaf projection.
     s))
 
 (defn- settings->map [^Settings s]
@@ -192,6 +191,7 @@
                                    children
                                    (long subtree-count)
                                    measure
+                                   cmp
                                    settings)))]
      (loop [level 1
             nodes (mapv ->Leaf (split keys len Object avg-branching-factor max-branching-factor))]

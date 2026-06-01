@@ -148,9 +148,10 @@ and `contains`/routing break.
 
 `apply(batch, M)` runs the normal B-tree mutation. As each op returns up the path it records
 its logical effect into the parent's slot for the child it descended into and refreshes that
-slot's `ĝ` from `M`: `insert k → Present(k)`, `remove k → Absent(k)`, `replace → Present(k')`.
-Within one slot a later op on the same `cmp`-key overwrites (net latest-wins). No tree-diffing
-— the op states its own effect.
+slot's `ĝ` from `M`: `insert k → Present(k)`, `remove k → Absent(k)`,
+`replace(old → new) → Absent(old) + Present(new)` (collapses to just `Present(new)` when `old`
+and `new` are equal under the set comparator). Within one slot a later op on the same key (under
+the set comparator) overwrites (net latest-wins). No tree-diffing — the op states its own effect.
 
 ### Store (write the touched nodes, buffer the rest)
 
@@ -220,17 +221,58 @@ materialize(node, i):                       # when child i is first descended in
 
 ```
 node-diff   ::= leaf-diff | branch-diff
-leaf-diff   ::= { cmp-key → Absent | Present(element) }      # net latest-wins per key
+leaf-diff   ::= Absent(element)* + Present(element)*          # net latest-wins per element
 branch-diff ::= { child-index → (node-diff, ĝ, max-key) }    # nested, per child
 ĝ           ::= (count, measure)                             # absolute snapshot
 ```
 
 One recursive form, exactly **two** ops. `Present(element)` carries the stored element and
-expresses both **add** (key absent ⇒ insert) and **replace** (a `cmp`-equal but different
-element present ⇒ overwrite) — it is an upsert applied during the leaf rebuild, never a
-delete-then-add (which could transiently restructure). `Absent` expresses **remove**. The
-aggregate is *absolute state*, not a delta, so non-invertible measures (min/max) are fine and
-it is free to collect (the in-memory node already maintains `count`/`measure`).
+expresses both **add** (element absent ⇒ insert) and the value side of a **replace** — it is an
+upsert applied during the leaf rebuild, never a delete-then-add (which could transiently
+restructure). `Absent(element)` expresses **remove**. The aggregate is *absolute state*, not a
+delta, so non-invertible measures (min/max) are fine and it is free to collect (the in-memory
+node already maintains `count`/`measure`).
+
+**A `replace(old → new)` records `Absent(old) + Present(new)`.** When `old` and `new` are equal
+under the set's comparator (the common in-place edit — only a non-key field changed) the
+`Present` upsert overwrites at the same key, so this collapses to a plain `Present(new)`. When
+they *differ* under the set's comparator — a replace driven by a **coarser** operation comparator
+(e.g. datahike's upsert locates the datom by `(e,a)` while the index orders by `(e,a,v,tx)`) —
+both entries survive, so projection removes `old` and inserts `new` with no comparator logic.
+Recording the concrete `Absent`/`Present` elements (not "the op the comparator implied") is what
+lets projection replay the diff later under one fixed comparator. See *Two representations* below.
+
+### Two representations: in-memory vs serialized
+
+The leaf-diff has **two forms**, and the distinction is load-bearing:
+
+- **In memory** it is a `PersistentTreeMap` keyed by the **set's comparator** (`Branch._projCmp`)
+  with values `element | Absent`. Keying by the set comparator gives O(log n) net-latest-wins
+  accumulation and is what keeps two elements the order distinguishes (e.g. two datoms differing
+  only in `tx`) as *separate* entries.
+
+- **On the wire** it is the **comparator-agnostic** form `{:absent [element…] :present [element…]}`
+  — two vectors. Storage carries no comparator (the projection comparator lives on the tree, not
+  on `IStorage` — see *Projection comparator* below), so the serialized diff must not be a map
+  keyed by the element: an element's own `.equals`/`.hashCode` can be **coarser** than the set
+  comparator (datahike `Datom` equality is `(e,a,v)`; the index order is `(e,a,v,tx)`). A map
+  round-tripped through that coarser equality would **collapse** two order-distinct entries — a
+  tx-only replace's `Absent(old)+Present(new)` would merge into one and lose the removal, leaving
+  a stale element after restore. Two vectors round-trip losslessly regardless of element equality.
+
+`Branch.slotsForStorage`/`assembleNested` convert leaf-diffs to the wire form on store
+(`leafDiffForStorage`); `projectLeaf`/`depositKV`/`diffSize` accept both. Branch-diffs are keyed
+by integer child-index, never by an element, so they have no such hazard.
+
+### Projection comparator
+
+Projecting a buffered leaf rebuilds it in **stored order**, which requires the **set's** stable
+comparator — never the per-operation/navigation comparator that drove a given descent (datahike
+slices and upserts with *partial* `(e,a,v)`/`(e,a)` comparators). The set's comparator therefore
+lives **on the tree** as `Branch._projCmp`, propagated from the root: `PersistentSortedSet.root()`
+stamps the root; `Branch.child()` stamps each branch restored from storage (storage has no
+comparator); and internally-created branches (split/merge/rebuild) inherit it through the
+constructor. There is no comparator on `IStorage` and none threaded through node operations.
 
 ## Worked lifecycle (BF 4, depth 3)
 
@@ -272,17 +314,18 @@ anchors. No `markFreed` (no anchor was superseded). **1 PUT.** `@R'`'s stored ob
 {:level 2 :keys [6 16 31]
  :addresses [@B0 @B1 @B2]                  ; all three = children's UNCHANGED Stage-0 anchors
  :slots {0 {:count 5 :measure mB0 :max-key 6
-            :diff {1 {:count 3 :measure mL1 :max-key 6  :diff {3 3}}}}      ; Present(3)
+            :diff {1 {:count 3 :measure mL1 :max-key 6  :diff {:present [3]}}}}        ; Present(3)
          1 {:count 5 :measure mB1 :max-key 16
-            :diff {1 {:count 3 :measure mL3 :max-key 16 :diff {12 12}}}}    ; Present(12)
+            :diff {1 {:count 3 :measure mL3 :max-key 16 :diff {:present [12]}}}}       ; Present(12)
          2 {:count 4 :measure mB2 :max-key 31
-            :diff {0 {:count 2 :measure mL4 :max-key 22 :diff {20 :ABSENT}} ; Absent(20)
-                   1 {:count 2 :measure mL5 :max-key 30* :diff {30 30*}}}}}}; replace
+            :diff {0 {:count 2 :measure mL4 :max-key 22 :diff {:absent [20]}}          ; Absent(20)
+                   1 {:count 2 :measure mL5 :max-key 30* :diff {:present [30*]}}}}}}   ; replace ⇒ Present(new)
 ```
 
-`:diff` is keyed by **child-index** at a branch level and by **cmp-key** at a leaf level
-(known from the child's level). The whole nested structure lives only in the topmost written
-object (`@R'`); unchanged children (L0, L2) have **no entry** — their objects and `ĝ` stand.
+A **branch**-level `:diff` is a map keyed by **child-index**; a **leaf**-level `:diff` is the
+comparator-agnostic `{:absent […] :present […]}` form (known from the child's level — see
+*The diff language → Two representations*). The whole nested structure lives only in the topmost
+written object (`@R'`); unchanged children (L0, L2) have **no entry** — their objects and `ĝ` stand.
 
 ### Reading Stage 1 back — project down (lazy, one level per load)
 
@@ -353,8 +396,16 @@ content-only commits ride between flushes.
 A buffered branch serializes one extra field, `:slots` — a sparse map
 `{child-index → {:count :measure :diff :max-key}}` (`Branch.slotsForStorage` produces it,
 restore reconstructs it). `:slots` is **emitted only when present**, so a baseline node (or
-any node at `diffBufSize = 0`) is byte-for-byte the pre-diff-buf format. `Absent` is a
-namespaced keyword so leaf-diffs are directly edn/fressian-serializable.
+any node at `diffBufSize = 0`) is byte-for-byte the pre-diff-buf format.
+
+A **leaf**-level `:diff` is serialized in the comparator-agnostic form
+`{:absent [element…] :present [element…]}` — two vectors, never a map keyed by the element.
+This is mandatory, not stylistic: the deserializer has no comparator and would re-key an
+element-keyed map by the element's own `.equals`/`.hashCode`, which can be coarser than the
+set's order and silently collapse order-distinct entries (a tx-only `Absent`+`Present` → one,
+dropping the removal). A **branch**-level `:diff` stays a `{child-index → …}` map (integer keys
+never collapse). See *The diff language → Two representations*. The elements and the `:absent`/
+`:present` vectors are directly edn/fressian-serializable.
 
 **Storage contract.** `store` re-points a buffered child's address to its anchor and parks
 the child's change in the parent's `_slots`. Therefore an `IStorage` implementation **must
