@@ -298,5 +298,11 @@
               loaded    (ss/restore-by cmp final-addr (mkst) {:branching-factor bf :diff-buf-size b :comparator cmp})
               reachable (atom #{})
               _         (ss/walk-addresses loaded (fn [a] (swap! reachable conj a)))
-              live-freed (clojure.set/intersection @reachable @freed)]
-          (is (empty? live-freed) (str "diffBufSize=" b ": " (count live-freed) " reachable node(s) were markFreed (over-free)")))))))
+              live-freed (clojure.set/intersection @reachable @freed)
+              ;; markFreed completeness: every superseded blob (written, now unreachable) is freed.
+              leaked     (clojure.set/difference (set (keys @disk)) @reachable @freed)]
+          (is (empty? live-freed) (str "diffBufSize=" b ": " (count live-freed) " reachable node(s) were markFreed (over-free)"))
+          ;; Only under diff-buf (b>0): baseline PSS markFreed is intentionally incomplete for
+          ;; structural changes (relies on offline reachability GC), so it leaks here.
+          (when (pos? b)
+            (is (empty? leaked) (str "diffBufSize=" b ": " (count leaked) " superseded blob(s) never markFreed (leak)"))))))))
