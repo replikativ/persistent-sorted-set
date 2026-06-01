@@ -170,9 +170,12 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     IMeasure measureOps = _settings.measure();
     final Leaf thisLeaf = this;
 
-    // Skip transient shortcut when processor would fire
+    // Skip transient shortcut when processor would fire. Never fire on a leaf that just
+    // became empty (newLen == 0): there is nothing to compact/split and the processor
+    // contract (must return >= 1 entry) cannot be honored for an empty leaf — the empty
+    // leaf is handled by the normal underflow/merge path below.
     ILeafProcessor processor = settings.leafProcessor();
-    boolean processorWillFire = processor != null && processor.shouldProcess(newLen, settings);
+    boolean processorWillFire = processor != null && newLen > 0 && processor.shouldProcess(newLen, settings);
 
     // nothing to merge — transient, can edit in place (only if processor won't fire)
     if (editable() && !processorWillFire && (newLen >= _settings.minBranchingFactor() || (left == null && right == null))) {
