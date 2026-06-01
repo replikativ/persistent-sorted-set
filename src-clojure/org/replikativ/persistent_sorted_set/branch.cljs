@@ -304,6 +304,24 @@
           (recur (inc i) (inc dst)))))
     out))
 
+(defn- free-dropped-child
+  "diff-buf: free child i's durable blob when a STRUCTURAL rebuild (merge/borrow/split) drops
+  it. Such a child is materialized into a new node and its old blob is never re-pointed as a
+  buffered anchor (unlike the content-only case, which IS deferred to store), so it is dead
+  now. The live durable address is addresses[i] if set, else the anchor parked in slot i
+  (content-buffered earlier this txn). Read i from THIS node before the rebuild overwrites it.
+  Mirrors JVM Branch.freeDroppedChild. No-op when storage is nil / diff-buf is off (callers gate)."
+  [^Branch this storage i]
+  (when storage
+    (let [addrs (.-addresses this)
+          a     (when addrs (aget addrs i))]
+      (if (some? a)
+        (storage/markFreed storage a)
+        (let [slots (.-_slots this)
+              sl    (when slots (aget slots i))]
+          (when (and sl (some? (:anchor sl)))
+            (storage/markFreed storage (:anchor sl))))))))
+
 (defn add
   [^Branch this storage key cmp opts]
   (let [{:keys [sync?] :or {sync? true}} opts
@@ -357,6 +375,7 @@
                                (do (set! (.-_rebalanced nb) (.-_rebalanced this))
                                    (await (carry-and-deposit nb storage (.-_slots this) idx key key cmp anchor0 opts)))
                                (do (set! (.-_rebalanced nb) true)
+                                   (free-dropped-child this storage idx) ; diff-buf: free the split child's old blob
                                    (set! (.-_slots nb) (stitch-slots this idx nodes-len (arrays/alength new-children))))))
                            (arrays/array nb))
                          (let [middle      (arrays/half (arrays/alength new-children))
@@ -413,6 +432,7 @@
                            (when diff-buf?
                              (set! (.-_rebalanced left-b) true)
                              (set! (.-_rebalanced right-b) true)
+                             (free-dropped-child this storage idx) ; diff-buf: free the split child's old blob
                              (when-let [all (stitch-slots this idx nodes-len new-len)]
                                (set! (.-_slots left-b)  (.slice all 0 middle))
                                (set! (.-_slots right-b) (.slice all middle))))
@@ -496,6 +516,16 @@
                              (do (set! (.-_rebalanced center) (.-_rebalanced this))
                                  (await (carry-and-deposit center storage (.-_slots this) idx key ABSENT cmp anchor0 opts)))
                              (do (set! (.-_rebalanced center) true)
+                                 ;; diff-buf: free this node's dropped (merged/borrowed) children — the
+                                 ;; range [left-idx, right-idx) minus unchanged surviving siblings (the
+                                 ;; diff-buf twin of the baseline markFreed loop above). Never re-pointed
+                                 ;; as anchors ⇒ free now (store has no slot/anchor for the structural child).
+                                 (when storage
+                                   (dotimes [i (- right-idx left-idx)]
+                                     (let [ci (+ left-idx i)]
+                                       (when-not (or (and (= ci left-idx) left-unchanged)
+                                                     (and (= ci (dec right-idx)) right-unchanged))
+                                         (free-dropped-child this storage ci)))))
                                  (set! (.-_slots center)
                                        (remove-stitch-slots this left-idx right-idx alen left-child right-child
                                                             left-unchanged right-unchanged (arrays/alength new-kids))))))
