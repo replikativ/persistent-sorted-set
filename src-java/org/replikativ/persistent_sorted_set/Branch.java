@@ -397,9 +397,19 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       return PersistentSortedSet.EARLY_EXIT;
     }
 
-    // Compute new children's total count (accounts for processor expanding/compacting)
+    // Compute new children's total count (accounts for processor expanding/compacting).
+    // A child with UNKNOWN count (-1, e.g. a lazily-restored subtree under diff-buf whose count
+    // hasn't been materialized) makes the total unknown: blindly summing -1 silently corrupts
+    // the parent's cached _subtreeCount (count-drift after restore+mutate). Signal unknown as -1
+    // so the delta updates below fall back to lazy recompute. (Baseline dodges this because its
+    // unprojected oldChild has count -1, tripping the oldChildCount guard; diff-buf projection
+    // can populate oldChildCount, so the newChildrenCount guard is the one that must hold.)
     long newChildrenCount = 0;
-    for (ANode n : nodes) newChildrenCount += ((ISubtreeCount) n).subtreeCount();
+    for (ANode n : nodes) {
+      long c = ((ISubtreeCount) n).subtreeCount();
+      if (c < 0) { newChildrenCount = -1; break; }
+      newChildrenCount += c;
+    }
 
     IMeasure measureOps = _settings.measure();
 
@@ -415,7 +425,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       }
       child(ins, node);
       // Update subtree count using exact delta from old vs new child
-      if (_subtreeCount >= 0 && oldChildCount >= 0)
+      if (_subtreeCount >= 0 && oldChildCount >= 0 && newChildrenCount >= 0)
         _subtreeCount = _subtreeCount - oldChildCount + newChildrenCount;
       else
         _subtreeCount = -1;
@@ -448,7 +458,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       newChildren[ins] = node;
 
       // Exact subtree count using delta from old vs new child
-      long newCount = (_subtreeCount >= 0 && oldChildCount >= 0)
+      long newCount = (_subtreeCount >= 0 && oldChildCount >= 0 && newChildrenCount >= 0)
           ? _subtreeCount - oldChildCount + newChildrenCount : -1;
       Object newMeasure = tryComputeMeasureFromChildren(newChildren, _len, storage, measureOps);
       Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, newCount, newMeasure, _projCmp, settings);
@@ -487,7 +497,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // Absorb: fits in single branch
     if (newLen <= settings.branchingFactor()) {
       // Use delta formula: exact and O(1), avoids scanning all children
-      long count = (_subtreeCount >= 0 && oldChildCount >= 0)
+      long count = (_subtreeCount >= 0 && oldChildCount >= 0 && newChildrenCount >= 0)
           ? _subtreeCount - oldChildCount + newChildrenCount : -1;
       Object measure = tryComputeMeasureFromChildren(allChildren, newLen, storage, measureOps);
       Branch<Key, Address> nb = new Branch(_level, newLen, allKeys, allAddresses, allChildren, count, measure, _projCmp, settings);
