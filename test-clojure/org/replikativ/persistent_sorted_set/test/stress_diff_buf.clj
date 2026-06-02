@@ -15,9 +15,10 @@
    slice is wired as a deftest for the regular suite."
   (:require [clojure.test :as t :refer [deftest is]]
             [clojure.set]
+            [clojure.edn :as edn]
             [org.replikativ.persistent-sorted-set :as ss]
             [org.replikativ.persistent-sorted-set.test.storage :as tstore])
-  (:import [org.replikativ.persistent_sorted_set Branch ANode PersistentSortedSet IStorage IMeasure Settings]
+  (:import [org.replikativ.persistent_sorted_set Branch ANode Leaf Slot PersistentSortedSet IStorage IMeasure Settings]
            [java.util Random]))
 
 (def cmp (fn [a b] (compare (first a) (first b))))
@@ -242,3 +243,75 @@
     (is (pos? (:replaces cov)) "bounded grid exercised replaces")
     (is (pos? (:restores cov)) "bounded grid exercised cold restores")
     (is (pos? (:measure-checks cov)) "bounded grid exercised the measure oracle")))
+
+;; ---- #4: content-address determinism / dedup under diff-buf -----------------
+;; A content-addressed storage: a node's address is the SHA-256 of its serialized form
+;; (incl. diff-buf :slots). If that serialization is deterministic, the same logical
+;; tree (built+mutated+stored identically) yields IDENTICAL addresses — i.e. dedup works
+;; and merkle hashes are stable. Mirrors the test storage's serialization exactly, but
+;; with a content hash instead of a random UUID.
+
+(defn- sha256 ^String [^String s]
+  (let [d (java.security.MessageDigest/getInstance "SHA-256")]
+    (apply str (map #(format "%02x" %) (.digest d (.getBytes s "UTF-8"))))))
+
+(deftype CHStorage [*disk ^Settings settings]
+  IStorage
+  (store [_ node]
+    (let [slots (when (instance? Branch node) (.slotsForStorage ^Branch node))
+          m {:level     (.level ^ANode node)
+             :keys      (.keys ^ANode node)
+             :addresses (when (instance? Branch node) (.addresses ^Branch node))}
+          s (pr-str (if slots (assoc m :slots slots) m))
+          a (sha256 s)]
+      (swap! *disk assoc a s)
+      a))
+  (accessed [_ _addr] nil)
+  (restore [_ address]
+    (let [{:keys [level ^java.util.List keys ^java.util.List addresses slots]} (edn/read-string (@*disk address))
+          node (if addresses (Branch. (int level) keys addresses settings) (Leaf. keys settings))]
+      (when (and slots (instance? Branch node))
+        (let [^Branch b node arr (object-array (alength (.-_keys b)))]
+          (doseq [[idx entry] slots]
+            (aset arr (int idx) (Slot. (:diff entry) (long (:count entry)) (:measure entry) (nth addresses (int idx)))))
+          (set! (.-_slots b) arr)))
+      node))
+  (markFreed [_ _a] nil)
+  (isFreed [_ _a] false)
+  (freedInfo [_ _a] nil))
+
+(defn- ch-final-addr
+  "Run a deterministic build+mutate+store sequence under content-addressed storage;
+   return [root-address, #{all node addresses}]. Same (seed,params) ⇒ identical result iff
+   the serialized form (incl. slots) is deterministic."
+  [seed {:keys [bf b keyrange init cycles ops]}]
+  (let [rng  (Random. seed)
+        rint (fn [n] (.nextInt rng (int n)))
+        disk (atom {})
+        st   (fn [] (->CHStorage disk (opbuf-settings bf b nil)))
+        s0   (reduce (fn [s _] (conj s [(rint keyrange) 0]))
+                     (ss/sorted-set* {:comparator cmp :branching-factor bf :diff-buf-size b})
+                     (range init))]
+    (loop [c 0, addr (ss/store s0 (st))]
+      (if (= c cycles)
+        [addr (set (keys @disk))]
+        (let [s (ss/restore-by cmp addr (st) {:branching-factor bf :diff-buf-size b :comparator cmp})
+              s (reduce (fn [s _] (let [k (rint keyrange) r (rint 3)]
+                                    (cond (= r 0) (conj s [k 0])
+                                          (= r 1) (disj s [k 0])
+                                          (contains? s [k 0]) (ss/replace s [k 0] [k (inc (rint 9))])
+                                          :else (conj s [k 0]))))
+                        s (range ops))]
+          (recur (inc c) (ss/store s (st))))))))
+
+(deftest address-determinism
+  ;; same seed+params, two independent content-addressed runs ⇒ identical root address AND
+  ;; identical full address set (every node hashes identically) ⇒ deterministic serialization
+  ;; / content-addressing / dedup, with diff-buf slots in the hash.
+  (doseq [params (for [bf [4 16] b [0 64 256] kr [80 1500]]
+                   {:bf bf :b b :keyrange kr :init (min kr 300) :cycles 6 :ops 25})
+          seed (range 3)]
+    (let [[r1 ks1] (ch-final-addr seed params)
+          [r2 ks2] (ch-final-addr seed params)]
+      (is (= r1 r2) (str "non-deterministic root address for " params " seed " seed))
+      (is (= ks1 ks2) (str "non-deterministic node address set for " params " seed " seed)))))
