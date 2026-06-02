@@ -16,7 +16,11 @@ public class Settings {
   // Design + the IStorage slots contract: doc/diff-buffering.md.
   public final int _diffBufSize;
 
-  // Canonical constructor (does not normalize; callers pass already-normalized values).
+  // Canonical edit-carrying constructor (does not normalize; callers pass already-normalized
+  // values). Used by editable() — which threads BOTH the set's branchingFactor and diffBufSize
+  // through unchanged, so a transient preserves them. (The pre-diff-buf 5-arg edit ctor was
+  // removed: it was unused and, lacking a diffBufSize arg, would have silently reset it to the
+  // sysprop default.)
   public Settings(int branchingFactor, RefType refType, AtomicBoolean edit, IMeasure measure, ILeafProcessor leafProcessor, int diffBufSize) {
     _branchingFactor = branchingFactor;
     _refType = refType;
@@ -24,11 +28,6 @@ public class Settings {
     _measure = measure;
     _leafProcessor = leafProcessor;
     _diffBufSize = diffBufSize;
-  }
-
-  // Back-compat: previous 5-arg canonical ctor (used by editable()).
-  public Settings(int branchingFactor, RefType refType, AtomicBoolean edit, IMeasure measure, ILeafProcessor leafProcessor) {
-    this(branchingFactor, refType, edit, measure, leafProcessor, defaultDiffBufSize());
   }
 
   public Settings() {
