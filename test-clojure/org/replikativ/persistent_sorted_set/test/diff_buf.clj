@@ -82,9 +82,14 @@
 
 (deftest leaf-deposit
   (testing "a content-only replace deposits Present at a leaf-parent (level 1) with exact ĝ; latest-wins"
-    (let [s0  (reduce (fn [s i] (conj s [i 0]))
+    ;; store s0 first so leaves have a durable anchor: a deposit only buffers a diff against a
+    ;; durable base. A never-stored leaf is written wholesale at store (its diff would be
+    ;; discarded), so the deposit gate skips building one — see depositKV / store() Pass 1.
+    (let [st  (tstore/storage-with-settings (opbuf-settings 4 100))
+          s0  (reduce (fn [s i] (conj s [i 0]))
                       (ss/sorted-set* {:comparator cmp :branching-factor 4 :diff-buf-size 100})
                       (range 64))
+          _   (ss/store s0 st)
           k   17
           s1  (ss/replace s0 [k 0] [k 111])
           hit (find-leaf-slot (walk-branches (root-of s1)) k)]
@@ -104,6 +109,20 @@
                                  (keep #(aget ^objects sl %) (range (.-_len bb)))))
                              (walk-branches (root-of s2))))]
         (is (= [k 222] v2) "later op on the same key overwrites (net latest-wins)")))))
+
+(deftest anchorless-deposit-skips-diff
+  (testing "a never-stored leaf has no durable base ⇒ a content-only op deposits NO leaf-diff
+            (it would be discarded at store, where an anchorless child is written wholesale —
+            store() Pass 1: sl.anchor == null ⇒ writeList); content stays exact regardless"
+    (let [s0 (reduce (fn [s i] (conj s [i 0]))
+                     (ss/sorted-set* {:comparator cmp :branching-factor 4 :diff-buf-size 100})
+                     (range 64))
+          k  17
+          s1 (ss/replace s0 [k 0] [k 111])]
+      (is (nil? (find-leaf-slot (walk-branches (root-of s1)) k))
+          "no anchor ⇒ no buffered leaf-diff built for the replaced key (the optimization)")
+      (is (= [k 111] (some #(when (= k (first %)) %) (seq s1)))
+          "content reflects the replace exactly (the live in-memory leaf carries it)"))))
 
 (deftest anchor-capture
   (testing "a buffered leaf slot's anchor restores to the pre-mutation durable leaf"

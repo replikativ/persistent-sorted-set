@@ -1114,7 +1114,16 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     Object anchor = (prev != null && prev.anchor != null) ? prev.anchor : anchor0;
     ANode child = child(storage, i);
     Object diff;
-    if (_level == 1) {
+    if (anchor == null) {
+      // diff-buf: this child has NO durable base to diff against (a never-stored tree, or a
+      // child created/split this txn). At store() such a slot takes the write-wholesale branch
+      // (Pass 1: sl.anchor == null ⇒ writeList) and its diff is NEVER projected — so building a
+      // leaf-diff here is pure waste (the dominant per-op cost: a PersistentTreeMap.assoc per
+      // insert on a bulk load / fresh split). Skip it. The slot still carries count/measure
+      // (unchanged) for op-buf-aware aggregation; diff=null + anchor=null is store-identical to
+      // today's wasted-diff slot — the child is written in full either way. See store() Pass 1.
+      diff = null;
+    } else if (_level == 1) {
       assert _projCmp != null : "diff-buf: leaf-parent has no _projCmp at deposit (see Branch.child / root)";
       // leaf child: accumulate the leaf-op(s) (net latest-wins) onto the existing diff.
       PersistentTreeMap d;

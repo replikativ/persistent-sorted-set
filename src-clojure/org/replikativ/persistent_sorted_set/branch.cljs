@@ -250,7 +250,13 @@
                      anchor (if (and prev (some? (:anchor prev))) (:anchor prev) anchor0)
                      c      (await (child node storage i opts))
                      pcmp   (.-_projCmp node)
-                     diff   (if (== (.-level node) 1)
+                     diff   (cond
+                              ;; no durable base to diff against (never-stored tree / child split
+                              ;; this txn): at store such a child is written wholesale and its diff
+                              ;; is discarded, so building one is pure waste. Skip it (mirrors JVM
+                              ;; depositKV); count/measure stay for op-buf-aware aggregation.
+                              (nil? anchor) nil
+                              (== (.-level node) 1)
                               ;; leaf child: accumulate net-latest-wins, rebuilding a _projCmp-sorted
                               ;; map from a restored storage-form diff {:absent [..] :present [..]}.
                               (let [pd (when prev (:diff prev))
@@ -262,7 +268,7 @@
                                          :else        (sorted-map-by pcmp))]
                                 (reduce (fn [d [k v]] (assoc d k v)) d kvs))
                               ;; branch child: anchor marker (nested diff derived at store)
-                              nil)
+                              :else nil)
                      cnt     (await (child-count node storage i opts))
                      measure (node/measure c)]
                  (aset slots i {:diff diff :count cnt :measure measure :anchor anchor})

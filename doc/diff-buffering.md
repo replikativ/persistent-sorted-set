@@ -153,6 +153,16 @@ slot's `ĝ` from `M`: `insert k → Present(k)`, `remove k → Absent(k)`,
 and `new` are equal under the set comparator). Within one slot a later op on the same key (under
 the set comparator) overwrites (net latest-wins). No tree-diffing — the op states its own effect.
 
+**Anchorless children skip the deposit.** A diff is only meaningful *against a durable base*
+(the child's anchor). A child with **no anchor** — a never-stored tree (bulk load before the
+first `store`) or a child created/split this txn — is written *wholesale* at store (see the
+`has no anchor ⇒ must write` arm below), so any diff buffered for it is discarded. `depositKV`
+therefore skips building the leaf-diff when the effective anchor is `null`, leaving the slot's
+`ĝ` (count/measure) intact. This is store-identical to building-then-discarding, but avoids the
+dominant per-op cost (a `PersistentTreeMap.assoc` per insert) — so a bulk load runs at baseline
+throughput even with diff-buf on. Children that *do* have an anchor (the common modify-an-
+existing-leaf case, the source of the PUT win) deposit as normal.
+
 ### Store (write the touched nodes, buffer the rest)
 
 ```
