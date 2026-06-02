@@ -17,13 +17,34 @@
             [clojure.set]
             [org.replikativ.persistent-sorted-set :as ss]
             [org.replikativ.persistent-sorted-set.test.storage :as tstore])
-  (:import [org.replikativ.persistent_sorted_set Branch ANode PersistentSortedSet IStorage Settings]
+  (:import [org.replikativ.persistent_sorted_set Branch ANode PersistentSortedSet IStorage IMeasure Settings]
            [java.util Random]))
 
 (def cmp (fn [a b] (compare (first a) (first b))))
 
-(defn- opbuf-settings ^Settings [bf b] (Settings. (int bf) nil nil nil (int b)))
-(defn- mkst [disk bf b] (tstore/->Storage (atom {}) disk (opbuf-settings bf b)))
+;; A simple monoid measure for the stress oracle: SUM of element keys (first of each [k v]).
+;; extract keys on (first), so a content-only replace [k 0]->[k v] leaves the measure
+;; unchanged (k constant) — exercising that projection/maintenance preserves measure across
+;; a buffered replace, while add/remove move it. This is the ĝ.measure sibling of ĝ.count.
+(def ^IMeasure sum-measure
+  (reify IMeasure
+    (identity [_] (long 0))
+    (extract  [_ k] (long (first k)))
+    (merge    [_ a b] (+ (long a) (long b)))
+    (remove   [_ cur k _recompute] (- (long cur) (long (first k))))))
+
+(defn- opbuf-settings ^Settings [bf b measure] (Settings. (int bf) nil ^IMeasure measure nil (int b)))
+(defn- mkst [disk bf b measure] (tstore/->Storage (atom {}) disk (opbuf-settings bf b measure)))
+
+;; Wrap a storage to record every markFreed into `freed` (for the GC over-free/leak checks).
+(defn- recording ^IStorage [^IStorage inner freed]
+  (reify IStorage
+    (restore   [_ a] (.restore inner a))
+    (store     [_ n] (.store inner n))
+    (accessed  [_ a] (.accessed inner a))
+    (markFreed [_ a] (swap! freed conj a))
+    (isFreed   [_ a] (contains? @freed a))
+    (freedInfo [_ a] nil)))
 
 ;; depth via public Branch.child (restores+projects lazily on descent).
 (defn- tree-depth [^PersistentSortedSet s storage]
@@ -39,21 +60,27 @@
 (defn run-trial
   "Run one deterministic trial. Returns {:ok? bool :seed :params :cov {...} (:detail on failure)}.
    Never throws — wraps failures so the sweep collects every failing seed."
-  [seed {:keys [bf b keyrange init cycles ops restore-prob transient-prob] :as params}]
+  [seed {:keys [bf b keyrange init cycles ops restore-prob transient-prob measure? gc?] :as params}]
   (try
     (let [rng   (Random. seed)
           rint  (fn [n] (.nextInt rng (int n)))
           rd    (fn [] (.nextDouble rng))
           disk  (atom {})
+          meas  (when measure? sum-measure)
+          freed (when gc? (atom #{}))
+          mk    (fn [] (let [s (mkst disk bf b meas)] (if freed (recording s freed) s)))
+          ropts (cond-> {:branching-factor bf :diff-buf-size b :comparator cmp}
+                  meas (assoc :measure meas))
           cov   (atom {:stores 0 :buffered 0 :flushed 0 :max-depth 0 :restores 0
-                       :adds 0 :removes 0 :replaces 0 :ops 0})
+                       :adds 0 :removes 0 :replaces 0 :ops 0 :measure-checks 0})
           ref   (atom (sorted-set-by cmp))
           ;; initial bulk load
           s0    (reduce (fn [s _]
                           (let [k (rint keyrange)] (swap! ref conj [k 0]) (conj s [k 0])))
-                        (ss/sorted-set* {:comparator cmp :branching-factor bf :diff-buf-size b})
+                        (ss/sorted-set* (cond-> {:comparator cmp :branching-factor bf :diff-buf-size b}
+                                          meas (assoc :measure meas)))
                         (range init))
-          store! (fn [s] (tstore/with-stats (let [a (ss/store s (mkst disk bf b))]
+          store! (fn [s] (tstore/with-stats (let [a (ss/store s (mk))]
                                               (swap! cov update :stores inc)
                                               (if (> (writes) 1)
                                                 (swap! cov update :flushed inc)
@@ -75,7 +102,23 @@
                    (dotimes [_ 12]
                      (let [k (rint keyrange) want (contains? @ref [k 0]) got (contains? s [k 0])]
                        (when (not= want got)
-                         (throw (ex-info (str "lookup mismatch @ " tag) {:tag tag :k k :want want :got got}))))))
+                         (throw (ex-info (str "lookup mismatch @ " tag) {:tag tag :k k :want want :got got})))))
+                   ;; measure oracle (ĝ.measure sibling of the count check): the set's aggregate
+                   ;; measure (sum of keys) must equal the model's — both the cached/incremental
+                   ;; value (the count-bug analogue: present-but-wrong) and a forced recompute
+                   ;; from PROJECTED children (catches projection/ĝ.measure bugs).
+                   (when meas
+                     (swap! cov update :measure-checks inc)
+                     (let [true-m (reduce + 0 (map (comp long first) @ref))
+                           ^ANode root (.root ^PersistentSortedSet s)
+                           cached (.-_measure root)]
+                       (when (and (some? cached) (not= true-m (long cached)))
+                         (throw (ex-info (str "cached measure mismatch @ " tag)
+                                         {:tag tag :true true-m :cached cached})))
+                       (let [forced (.forceComputeMeasure root (mk))]
+                         (when (and (some? forced) (not= true-m (long forced)))
+                           (throw (ex-info (str "forced measure mismatch @ " tag)
+                                           {:tag tag :true true-m :forced forced})))))))
           ;; persistent branch uses ss/replace (exercises the buffered Absent+Present deposit);
           ;; transient branch models replace as disj!+conj! (ss/replace is persistent-only).
           do-ops (fn [s]
@@ -116,15 +159,29 @@
       (check s0 :initial)
       (loop [c 0, s s0, addr (store! s0)]
         (if (= c cycles)
-          (let [st (mkst disk bf b)
-                loaded (ss/restore-by cmp addr st {:branching-factor bf :diff-buf-size b :comparator cmp})]
+          (let [st (mk)
+                loaded (ss/restore-by cmp addr st ropts)]
             (check loaded :final-restore)
             (swap! cov update :max-depth max (tree-depth loaded st))
+            ;; GC checks (when gc?): no reachable node was ever markFreed (over-free), and
+            ;; under diff-buf (b>0) every superseded blob WAS freed (no leak). Mirrors the
+            ;; markfreed-never-frees-live unit test, but over the full sweep.
+            (when freed
+              (let [reachable (atom #{})]
+                (ss/walk-addresses loaded (fn [a] (swap! reachable conj a)))
+                (let [over   (clojure.set/intersection @reachable @freed)
+                      leaked (clojure.set/difference (set (keys @disk)) @reachable @freed)]
+                  (when (seq over)
+                    (throw (ex-info (str "GC over-free: " (count over) " reachable node(s) markFreed")
+                                    {:over (count over)})))
+                  (when (and (pos? b) (seq leaked))
+                    (throw (ex-info (str "GC leak: " (count leaked) " superseded blob(s) never freed")
+                                    {:leaked (count leaked)}))))))
             {:ok? true :seed seed :params params :cov @cov})
           (let [;; cold restore with prob, else keep live set
                 s (if (< (rd) (double (or restore-prob 0.5)))
-                    (let [st (mkst disk bf b)
-                          loaded (ss/restore-by cmp addr st {:branching-factor bf :diff-buf-size b :comparator cmp})]
+                    (let [st (mk)
+                          loaded (ss/restore-by cmp addr st ropts)]
                       (swap! cov update :restores inc)
                       (check loaded (str "restore-cycle-" c))
                       (swap! cov update :max-depth max (tree-depth loaded st))
@@ -138,7 +195,7 @@
        :detail (str (.getMessage e) " " (ex-data e))})))
 
 (defn- merge-cov [cs]
-  (reduce (fn [m c] (merge-with + m (select-keys c [:stores :buffered :flushed :restores :adds :removes :replaces :ops])))
+  (reduce (fn [m c] (merge-with + m (select-keys c [:stores :buffered :flushed :restores :adds :removes :replaces :ops :measure-checks])))
           {} cs))
 
 (defn sweep
@@ -159,10 +216,11 @@
       (doseq [f (take 20 fails)] (println "  " (:seed f) (:params f) "->" (:detail f))))
     {:trials (count results) :failures (vec fails) :cov (assoc cov :max-depth max-d)}))
 
+;; broad-grid exercises ALL oracles per trial (content/count/lookup + measure + GC over-free/leak).
 (def broad-grid
   (for [bf [4 16 64 512] b [0 4 32 256 4096] keyrange [50 500 5000]]
     {:bf bf :b b :keyrange keyrange :init (min keyrange 2000)
-     :cycles 20 :ops 40 :restore-prob 0.5 :transient-prob 0.3}))
+     :cycles 20 :ops 40 :restore-prob 0.5 :transient-prob 0.3 :measure? true :gc? true}))
 
 (def large-grid
   (for [bf [64 512] b [0 256] keyrange [100000]]
@@ -176,10 +234,11 @@
 (deftest stress-bounded
   (let [grid (for [bf [4 32] b [0 64] kr [80 2000]]
                {:bf bf :b b :keyrange kr :init (min kr 1000)
-                :cycles 8 :ops 30 :restore-prob 0.5 :transient-prob 0.3})
+                :cycles 8 :ops 30 :restore-prob 0.5 :transient-prob 0.3 :measure? true :gc? true})
         {:keys [failures cov]} (sweep {:grid grid :seeds 5 :label "stress-bounded(suite)"})]
     (is (empty? failures) (str (count failures) " stress trial(s) failed"))
-    ;; sanity: the bounded grid must actually exercise flushes + replaces + restores
+    ;; sanity: the bounded grid must actually exercise each path it claims to test
     (is (pos? (:flushed cov)) "bounded grid exercised at least one flush")
     (is (pos? (:replaces cov)) "bounded grid exercised replaces")
-    (is (pos? (:restores cov)) "bounded grid exercised cold restores")))
+    (is (pos? (:restores cov)) "bounded grid exercised cold restores")
+    (is (pos? (:measure-checks cov)) "bounded grid exercised the measure oracle")))
