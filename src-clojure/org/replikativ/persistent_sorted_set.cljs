@@ -189,11 +189,11 @@
    `(seek (seq set) to)` returns iterator for all Xs where to <= X.
    Optionally pass in comparator that will override the one that set uses."
   ([seq to]
-   (btset/seek seq to))
+   (when seq (btset/seek seq to)))                 ; seq is nil for an empty set ⇒ nothing to seek
   ([seq to arg]
-   (btset/seek seq to arg))
+   (when seq (btset/seek seq to arg)))
   ([seq to cmp opts]
-   (btset/seek seq to cmp opts)))
+   (when seq (btset/seek seq to cmp opts))))
 
 (defn walk-addresses
   "Visit each address used by this set. Usable for cleaning up

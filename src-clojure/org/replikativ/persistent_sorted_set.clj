@@ -66,9 +66,9 @@
   `(seek (seq set) to)` returns iterator for all Xs where to <= X.
   Optionally pass in comparator that will override the one that set uses."
   ([seq to]
-   (.seek ^Seq seq to))
+   (when seq (.seek ^Seq seq to)))                 ; seq is nil for an empty set ⇒ nothing to seek
   ([seq to cmp]
-   (.seek ^Seq seq to ^Comparator cmp)))
+   (when seq (.seek ^Seq seq to ^Comparator cmp))))
 
 (defn lookup
   "Look up a key and return the actual stored element.
@@ -205,6 +205,7 @@
   ([^Comparator cmp keys]
    (from-sequential cmp keys (Settings.)))
   ([^Comparator cmp keys opts]
+   (when (some nil? keys) (throw (IllegalArgumentException. "PersistentSortedSet cannot store nil")))
    (let [arr (to-array keys)
          _   (arrays/asort arr cmp)
          len (ArrayUtil/distinct cmp arr)]

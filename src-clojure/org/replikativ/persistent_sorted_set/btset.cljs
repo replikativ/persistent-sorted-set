@@ -56,6 +56,8 @@
      (conjoin set key arg {:sync? true})
      (conjoin set key (.-comparator set) arg)))
   ([^BTSet set key cmp {:keys [sync?] :or {sync? true} :as opts}]
+   ;; nil is not a storable value (matches upstream / the JVM PersistentSortedSet.cons check).
+   (when (nil? key) (throw (ex-info "PersistentSortedSet cannot store nil" {:key key})))
    (async+sync sync?
                (async
                 (let [root  (await (-root set opts))
@@ -1487,7 +1489,7 @@
   (-reduce [this f start] (if-let [i (-iter this {:sync? true})] (-reduce i f start) start))
 
   IReversible
-  (-rseq [this] (rseq (-iter this {:sync? true})))
+  (-rseq [this] (when-some [i (-iter this {:sync? true})] (rseq i)))   ; empty set ⇒ nil (not a nil-iter error)
 
   ; ISorted
   ; (-sorted-seq [this ascending?])
@@ -1628,6 +1630,7 @@
          (inc shift))))))
 
 (defn ^BTSet from-sequential [cmp seq opts]
+  (when (some nil? seq) (throw (ex-info "PersistentSortedSet cannot store nil" {})))
   (let [arr (-> (into-array seq) (arrays/asort cmp) (sorted-arr-distinct cmp))]
     (from-sorted-array cmp arr (alength arr) opts)))
 

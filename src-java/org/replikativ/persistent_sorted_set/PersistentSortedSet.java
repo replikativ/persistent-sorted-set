@@ -475,6 +475,9 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   }
 
   public PersistentSortedSet cons(Object key, Comparator cmp) {
+    // nil is not a storable value (matches upstream persistent-sorted-set; nil would also be
+    // ambiguous against the null "not found"/sentinel returns and comparator-dependent ordering).
+    if (key == null) throw new IllegalArgumentException("PersistentSortedSet cannot store nil");
     ANode[] nodes = root().add(_storage, (Key) key, cmp, _settings);
 
     if (UNCHANGED == nodes) return this;
