@@ -4,7 +4,10 @@
  {:node-tests
   {:target    :node-test  ;shadow-cljs release node-tests && node target/pss/tests.min.js
    :output-to "target/pss/tests.min.js"
-   :ns-regexp "^(?!org.replikativ.persistent-sorted-set.test.stress|org.replikativ.persistent-sorted-set.test.structural-invariants|org.replikativ.persistent-sorted-set.test.generative)"
+   ;; Excludes only `stress` (runs in :node-stress). generative.cljc is cross-platform
+   ;; (#?(:cljs …) storage branches) so it runs here too. (The old `structural-invariants`
+   ;; exclusion was dead — no such namespace.)
+   :ns-regexp "^(?!org.replikativ.persistent-sorted-set.test.stress)"
    ;; diff-buf: library default is 0 (baseline); run the test suite with diff-buf ON so
    ;; it gates the buffering path (the cljs analogue of -Dpss.diffBufSize=256 on the JVM).
    :closure-defines {org.replikativ.persistent-sorted-set/default-diff-buf-size 256}
@@ -12,7 +15,8 @@
                       :parallel-build true
                       :static-fns true
                       :fn-invoke-direct true
-                      :elide-asserts true
+                      ;; keep in-tree assertions live in the test build (cljs analogue of -ea)
+                      :elide-asserts false
                       :optimizations :advanced}}
   :node-stress ;shadow-cljs release node-stress && node target/pss/stress.min.js
   {:target    :node-test
@@ -22,7 +26,8 @@
                       :parallel-build true
                       :static-fns true
                       :fn-invoke-direct true
-                      :elide-asserts true
+                      ;; keep in-tree assertions live in the stress build too
+                      :elide-asserts false
                       :optimizations :advanced}}
   :ci ;shadow-cljs compile ci && node target/pss/ci-tests.js
   {:target    :node-test

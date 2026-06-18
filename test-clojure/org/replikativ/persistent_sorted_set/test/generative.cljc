@@ -588,6 +588,45 @@
                   (= actual expected))))
 
 ;; =============================================================================
+;; diff-buf: coarse-comparator replace round-trip (datahike upsert bug), cross-platform
+;; =============================================================================
+
+;; A replace whose OPERATION comparator is coarser than the set's order: old == new under the
+;; op-comparator (so replace finds the element), but old != new under the set order. Under diff
+;; buffering the leaf-diff must record BOTH the removal of old and the insertion of new — if the
+;; serialized diff were keyed by the element's own (coarse) equality the two would collapse and a
+;; stale old element would survive next to new after store→restore. This is exactly the datahike
+;; upsert-then-reopen duplicate-datom bug; we exercise the behavioral outcome on BOTH platforms.
+;; (diff_buf.clj additionally locks the {:absent :present} serialized form, JVM-only / white-box.)
+;; A diff-buf-aware storage SHARED across store/restore cycles. (The single-shot `roundtrip`
+;; helper above makes a fresh storage each call, which is wrong for a MULTI-cycle diff-buf test:
+;; the second store re-points buffered children to their anchors in the FIRST disk, so a fresh
+;; second disk would be missing them. Share one disk across cycles.)
+#?(:clj
+   (defn diffbuf-storage [bf b]
+     (storage/storage-with-settings (Settings. (int bf) nil nil nil (int b)))))
+#?(:cljs
+   (defn diffbuf-storage [bf b]
+     (storage-util/storage (atom {}) (atom {}) {:branching-factor bf :diff-buf-size b})))
+
+(deftest replace-coarse-comparator-roundtrip
+  (testing "coarse-comparator replace keeps no stale old element after store→restore"
+    (let [n  40, bf 16, b 256
+          ;; elements are [k v]; set order is the default (compares both k and v),
+          ;; the op-comparator pc keys on k only ⇒ [i 0] and [i 1] are pc-equal but order-distinct.
+          pc      (fn [a c] (compare (first a) (first c)))
+          opts    {:diff-buf-size b :branching-factor bf}
+          storage (diffbuf-storage bf b)                          ; one disk shared across both cycles
+          s0  (reduce (fn [s i] (conj s [i 0])) (set/sorted-set* opts) (range n))
+          l1  (set/restore (set/store s0 storage) storage opts)   ; [i 0] now durable in leaves
+          s1  (reduce (fn [s i] (set/replace s [i 0] [i 1] pc))   ; replace even i: [i 0] -> [i 1]
+                      l1 (range 0 n 2))
+          l2  (set/restore (set/store s1 storage) storage opts)
+          exp (vec (sort (map (fn [i] [i (if (even? i) 1 0)]) (range n))))]
+      (is (= exp (vec (seq s1))) "in-memory exact after coarse-comparator replaces")
+      (is (= exp (vec (seq l2))) "store→restore exact: stale old element did not survive next to new"))))
+
+;; =============================================================================
 ;; Run all specs (for manual testing)
 ;; =============================================================================
 

@@ -438,6 +438,12 @@ re-pointed (stale) anchor address while dropping the diff — **silently losing 
 mutation**. This is why the default is off: pre-diff-buf storages do not serialize `_slots`,
 and the library cannot detect that capability through the `IStorage` protocol.
 
+**Content-addressing.** The serialized form — `:slots` included — is deterministic, so a
+content-addressed backend (e.g. konserve, which hashes values with hasch) gives the same
+logical tree the same node addresses on both JVM and ClojureScript: dedup works and the
+per-node hashes are stable merkle pointers. The stress suite exercises this on both platforms
+(build + mutate + store twice under a hasch-addressed storage ⇒ identical address sets).
+
 ## Configuration
 
 - **Default: off** (`diffBufSize = 0` ⇒ baseline, invariant I0).

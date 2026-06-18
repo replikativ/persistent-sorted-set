@@ -17,7 +17,8 @@
             [clojure.set]
             [clojure.edn :as edn]
             [org.replikativ.persistent-sorted-set :as ss]
-            [org.replikativ.persistent-sorted-set.test.storage :as tstore])
+            [org.replikativ.persistent-sorted-set.test.storage :as tstore]
+            [hasch.core :as hasch])
   (:import [org.replikativ.persistent_sorted_set Branch ANode Leaf Slot PersistentSortedSet IStorage IMeasure Settings]
            [java.util Random]))
 
@@ -251,20 +252,16 @@
 ;; and merkle hashes are stable. Mirrors the test storage's serialization exactly, but
 ;; with a content hash instead of a random UUID.
 
-(defn- sha256 ^String [^String s]
-  (let [d (java.security.MessageDigest/getInstance "SHA-256")]
-    (apply str (map #(format "%02x" %) (.digest d (.getBytes s "UTF-8"))))))
-
 (deftype CHStorage [*disk ^Settings settings]
   IStorage
   (store [_ node]
     (let [slots (when (instance? Branch node) (.slotsForStorage ^Branch node))
           m {:level     (.level ^ANode node)
-             :keys      (.keys ^ANode node)
-             :addresses (when (instance? Branch node) (.addresses ^Branch node))}
-          s (pr-str (if slots (assoc m :slots slots) m))
-          a (sha256 s)]
-      (swap! *disk assoc a s)
+             :keys      (vec (.keys ^ANode node))
+             :addresses (when (instance? Branch node) (vec (.addresses ^Branch node)))}
+          m (if slots (assoc m :slots slots) m)
+          a (str (hasch/uuid m))]    ; content address = hasch hash (SHA-512, konserve's hashing)
+      (swap! *disk assoc a (pr-str m))
       a))
   (accessed [_ _addr] nil)
   (restore [_ address]
