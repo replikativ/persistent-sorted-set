@@ -9,7 +9,7 @@
             [org.replikativ.persistent-sorted-set.leaf :refer [Leaf]]
             [org.replikativ.persistent-sorted-set.util :as util]))
 
-(declare Branch)
+(declare Branch diff-size)
 
 ;; diff-buf read/projection parity with the JVM Branch.java.
 ;;
@@ -223,6 +223,32 @@
   [^Branch node i]
   (when-some [slots (.-_slots node)] (aget slots i)))
 
+(defn- slot-be
+  "Buffered-entry count this slot contributes: its cached :buf-entries, or — for a slot
+  reconstructed from storage (no :buf-entries) — derived from the diff blob (IO-free). A restored
+  slot simply lacks :buf-entries (nil ⇒ derive), the cljs analogue of JVM Slot.LAZY (-2). The
+  slot's child is at child-level. Mirrors JVM Branch.slotBE."
+  [sl child-level]
+  (let [be (:buf-entries sl)]
+    (if (nil? be) (diff-size (:diff sl) child-level) be)))
+
+(defn- buf-entries
+  "This branch's subtree buffered-diff size in entries (mirrors JVM bufEntries()). Resolves a
+  restored node's LAZY (-2) value from its slots once (IO-free — the diffs are already in
+  memory), caches it, then returns; -1 (must-write) passes through. O(1) once resolved."
+  [^Branch node]
+  (let [be (.-_bufEntries node)]
+    (if (== be -2)
+      (let [slots (.-_slots node)
+            clvl  (dec (.-level node))
+            s     (if (nil? slots)
+                    0
+                    (areduce slots j acc 0
+                             (+ acc (if-some [sl (aget slots j)] (slot-be sl clvl) 0))))]
+        (set! (.-_bufEntries node) s)
+        s)
+      be)))
+
 (defn- child-count
   "Exact subtree count of in-memory child i (cheap; maintained by add/remove). Mirrors
   JVM childCount. Async because cljs `child` is async."
@@ -270,8 +296,22 @@
                               ;; branch child: anchor marker (nested diff derived at store)
                               :else nil)
                      cnt     (await (child-count node storage i opts))
-                     measure (node/measure c)]
-                 (aset slots i {:diff diff :count cnt :measure measure :anchor anchor})
+                     measure (node/measure c)
+                     ;; this slot's new buffered-entry count (subtree total for a branch child)
+                     new-be  (cond
+                               (nil? anchor)        0                 ; written wholesale ⇒ no budget
+                               (== (.-level node) 1) (count diff)      ; leaf-diff entry count
+                               :else                (buf-entries c))   ; child subtree total (-1 if it rebalanced)
+                     ;; resolve our running total and the old slot's contribution BEFORE overwriting
+                     ;; slot i (buf-entries may sum over the slots, which still hold prev here).
+                     cur     (buf-entries node)
+                     old-be  (if prev (slot-be prev (dec (.-level node))) 0)]
+                 (aset slots i {:diff diff :count cnt :measure measure :anchor anchor :buf-entries new-be})
+                 ;; maintain this node's running total by delta (mirrors JVM depositKV / subtree-count).
+                 ;; A -1 (must-write) child poisons us → the must-write signal climbs the deposit sum
+                 ;; with no extra propagation code (this is what replaced the store-time subtree walk).
+                 (when-not (== cur -1)
+                   (set! (.-_bufEntries node) (if (== new-be -1) -1 (+ (- cur old-be) new-be))))
                  nil))))
 
 (defn- deposit-into
@@ -429,15 +469,15 @@
                                measure-ops (:measure (.-settings this))
                                new-measure (when (and measure-ops (.-_measure this))
                                              (measure/merge-measure measure-ops (.-_measure this) (measure/extract measure-ops key)))
-                               nb (Branch. (.-level this) new-keys new-children new-addrs new-sc new-measure (.-settings this) nil false (.-_projCmp this))]
+                               nb (Branch. (.-level this) new-keys new-children new-addrs new-sc new-measure (.-settings this) nil 0 (.-_projCmp this))]
                            ;; diff-buf: nodes-len==1 ⇒ content-only ⇒ carry the source slots and
                            ;; deposit Present(key) (matches JVM persistent path). nodes-len>=2 ⇒ a child
                            ;; split was absorbed ⇒ structural: mark rebalanced + stitch surviving siblings.
                            (when diff-buf?
                              (if (= nodes-len 1)
-                               (do (set! (.-_rebalanced nb) (.-_rebalanced this))
+                               (do (set! (.-_bufEntries nb) (buf-entries this)) ; carry running total (or -1) onto successor
                                    (await (carry-and-deposit nb storage (.-_slots this) idx key key anchor0 opts)))
-                               (do (set! (.-_rebalanced nb) true)
+                               (do (set! (.-_bufEntries nb) -1) ; absorbed a child split: structural → must write
                                    (free-dropped-child this storage idx) ; diff-buf: free the split child's old blob
                                    (set! (.-_slots nb) (stitch-slots this idx nodes-len (arrays/alength new-children))))))
                            (arrays/array nb))
@@ -482,19 +522,19 @@
                                                 left-addrs
                                                 (try-compute-subtree-count-from-children left-children (arrays/alength left-children))
                                                 left-measure
-                                                (.-settings this) nil false (.-_projCmp this))
+                                                (.-settings this) nil 0 (.-_projCmp this))
                                right-b (Branch. (.-level this)
                                                 (.slice new-keys middle)
                                                 right-children
                                                 right-addrs
                                                 (try-compute-subtree-count-from-children right-children (arrays/alength right-children))
                                                 right-measure
-                                                (.-settings this) nil false (.-_projCmp this))]
+                                                (.-settings this) nil 0 (.-_projCmp this))]
                            ;; diff-buf: a child split overflowed this branch → split: structural on both
                            ;; halves → written, but each still buffers its surviving siblings' slots.
                            (when diff-buf?
-                             (set! (.-_rebalanced left-b) true)
-                             (set! (.-_rebalanced right-b) true)
+                             (set! (.-_bufEntries left-b) -1) ; split: structural on both halves → must write
+                             (set! (.-_bufEntries right-b) -1)
                              (free-dropped-child this storage idx) ; diff-buf: free the split child's old blob
                              (when-let [all (stitch-slots this idx nodes-len new-len)]
                                (set! (.-_slots left-b)  (.slice all 0 middle))
@@ -567,18 +607,18 @@
                              new-measure (when (and measure-ops (.-_measure this))
                                            (measure/remove-measure measure-ops (.-_measure this) key
                                                                    #(node/try-compute-measure
-                                                                     (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this) nil false (.-_projCmp this))
+                                                                     (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this) nil 0 (.-_projCmp this))
                                                                      storage measure-ops {:sync? true})))
-                             center (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-measure (.-settings this) nil false (.-_projCmp this))]
+                             center (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-measure (.-settings this) nil 0 (.-_projCmp this))]
                          ;; diff-buf: install the center's slots BEFORE rotate (so a subsequent
                          ;; rotate merge/merge-split with this node's siblings carries them).
                          ;; content-only ⇒ carry source slots + deposit Absent(key) at idx (1-for-1).
-                         ;; structural ⇒ _rebalanced + stitch surviving siblings (the rebuilt range is nulled).
+                         ;; structural ⇒ _bufEntries=-1 (must write) + stitch surviving siblings (rebuilt range nulled).
                          (when diff-buf?
                            (if content-only?
-                             (do (set! (.-_rebalanced center) (.-_rebalanced this))
+                             (do (set! (.-_bufEntries center) (buf-entries this)) ; carry running total (or -1) onto successor
                                  (await (carry-and-deposit center storage (.-_slots this) idx key ABSENT anchor0 opts)))
-                             (do (set! (.-_rebalanced center) true)
+                             (do (set! (.-_bufEntries center) -1) ; child merged/borrowed: structural → must write
                                  ;; diff-buf: free this node's dropped (merged/borrowed) children — the
                                  ;; range [left-idx, right-idx) minus unchanged surviving siblings (the
                                  ;; diff-buf twin of the baseline markFreed loop above). Never re-pointed
@@ -671,13 +711,13 @@
                                                     na))
                                    _            (aset new-keys idx new-max-key)
                                    _            (aset new-children idx new-node)
-                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil false (.-_projCmp this))
+                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil 0 (.-_projCmp this))
                                    new-measure    (when (and measure-ops (.-_measure this))
                                                     (replace-measure new-branch storage measure-ops))]
                                (set! (.-_measure new-branch) new-measure)
                                ;; diff-buf: content-only replace ⇒ carry source slots + deposit Present(new-key).
                                (when diff-buf?
-                                 (set! (.-_rebalanced new-branch) (.-_rebalanced this))
+                                 (set! (.-_bufEntries new-branch) (buf-entries this)) ; carry running total (or -1) onto successor
                                  (await (carry-and-deposit-replace new-branch storage (.-_slots this) idx old-key new-key anchor0 opts)))
                                (arrays/array new-branch)))
                            ;; maxKey unchanged - reuse keys array
@@ -709,24 +749,27 @@
                                                     (aset na idx nil)
                                                     na))
                                    _            (aset new-children idx new-node)
-                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil false (.-_projCmp this))
+                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil 0 (.-_projCmp this))
                                    new-measure    (when (and measure-ops (.-_measure this))
                                                     (replace-measure new-branch storage measure-ops))]
                                (set! (.-_measure new-branch) new-measure)
                                ;; diff-buf: content-only replace ⇒ carry source slots + deposit Present(new-key).
                                (when diff-buf?
-                                 (set! (.-_rebalanced new-branch) (.-_rebalanced this))
+                                 (set! (.-_bufEntries new-branch) (buf-entries this)) ; carry running total (or -1) onto successor
                                  (await (carry-and-deposit-replace new-branch storage (.-_slots this) idx old-key new-key anchor0 opts)))
                                (arrays/array new-branch))))))))))))
 
 ;; ---- diff-buf store-side helpers (mirror JVM Branch) ----
 
 (defn- diff-size
-  "Entry count of an already-assembled slot diff describing a child at `child-level`: a leaf-diff
-  (child-level == 0) returns its element count; a nested branch-diff sums diff-size over each
-  entry's child (at child-level-1). Discriminated by structural level, not by probing values
-  (a leaf-diff's values are the set's ELEMENTS, which may themselves be maps — e.g. Datoms).
-  Mirrors JVM diffSize."
+  "Entry count (buffered element-changes) in a slot's diff blob. CONTRACT: `child-level` is the
+  level of the NODE whose diff this is — for a slot in a node at level L describing its child
+  (level L-1), call (diff-size slot-diff (dec L)). child-level 0 ⇒ a leaf-diff (live sorted-map or
+  storage form {:absent :present}) ⇒ element count; child-level >= 1 ⇒ a branch-diff {idx ->
+  {:diff …}} ⇒ sum over children at child-level-1, recursing to the leaf-diffs. Counts only leaf
+  entries (interior levels add nothing ⇒ linear in buffered ops, not exponential in depth).
+  Discriminated by child-level, not by probing values (a leaf-diff's values are the set's
+  ELEMENTS, which may themselves be maps — e.g. Datoms). Mirrors JVM diffSize."
   [diff child-level]
   (if-not (map? diff)
     0
@@ -739,36 +782,9 @@
           0
           (reduce (fn [t v] (+ t (diff-size (:diff v) (dec child-level)))) 0 (vals diff)))))))
 
-(defn- content-only-diff-size
-  "Total content-only diff size of c's dirty subtree, or -1 if any dirty descendant REBALANCED
-  (⇒ c is not bufferable — the affected path must be written). Mirrors JVM contentOnlyDiffSize."
-  [storage ^Branch c {:keys [sync?] :or {sync? true} :as opts}]
-  (async+sync sync?
-              (async
-               (cond
-                 (.-_rebalanced c)   -1
-                 (nil? (.-_slots c)) 0
-                 :else
-                 (let [slots (.-_slots c)
-                       len   (arrays/alength (.-keys c))
-                       clvl  (.-level c)]
-                   (loop [j 0, total 0]
-                     (if (>= j len)
-                       total
-                       (let [sl (aget slots j)]
-                         (cond
-                           (nil? sl)
-                           (recur (inc j) total)
-
-                           (nil? (:diff sl))           ;; branch marker → recurse live child
-                           (let [gc (await (child c storage j opts))]
-                             (if-not (instance? Branch gc)
-                               -1
-                               (let [s (await (content-only-diff-size storage gc opts))]
-                                 (if (neg? s) -1 (recur (inc j) (+ total s))))))
-
-                           :else
-                           (recur (inc j) (+ total (diff-size (:diff sl) (dec clvl)))))))))))))
+;; (The recursive content-only-diff-size walk that classified a dirty branch child was replaced
+;; by the O(1) _bufEntries aggregate: a child's subtree size is (buf-entries child) and its
+;; must-write status is the -1 poison that already climbed the deposit sum — see store/deposit-kv.)
 
 (defn- assemble-nested
   "Assemble c's serializable nested diff {idx -> {:count :measure :diff :max-key}}, recursing
@@ -845,35 +861,37 @@
                        budget (or (:diff-buf-size (.-settings this)) 0)
                        len    (arrays/alength (.-keys this))
                        level  (.-level this)
-                       ;; Pass 1: account clean passthrough; classify dirty children.
+                       ;; Pass 1: account clean passthrough; classify dirty children. Both are O(1)
+                       ;; per child now: size = the slot's cached :buf-entries (slot-be resolves a
+                       ;; restored slot from its diff), must-write = the -1 poison the deposit sum
+                       ;; already lifted from the rebalance point (no subtree walk).
                        classified
                        (loop [i 0, pass 0, buf [], wl []]
                          (if-not (< i len)
                            {:pass pass :buf buf :wl wl}
                            (let [sl (when slots (aget slots i))]
                              (if (some? (aget addrs i))
-                               (recur (inc i) (if sl (+ pass (diff-size (:diff sl) (dec level))) pass) buf wl)
+                               (recur (inc i) (if sl (+ pass (slot-be sl (dec level))) pass) buf wl)  ; clean passthrough subtree total
                                (let [child (aget (.-children this) i)]
-                                 (if (or (nil? sl) (nil? (:anchor sl)))
-                                   (recur (inc i) pass buf (conj wl i))   ; no anchor ⇒ must write
-                                   (if (instance? Leaf child)
-                                     (recur (inc i) pass (conj buf {:i i :sz (diff-size (:diff sl) 0) :nested (:diff sl)}) wl)
-                                     (let [s (await (content-only-diff-size storage child opts))]
-                                       (if (neg? s)
-                                         (recur (inc i) pass buf (conj wl i))   ; rebalanced ⇒ must write
-                                         (let [nested (if (some? (:diff sl)) (:diff sl) (await (assemble-nested storage child opts)))]
-                                           (recur (inc i) pass (conj buf {:i i :sz s :nested nested}) wl)))))))))))
+                                 (cond
+                                   (or (nil? sl) (nil? (:anchor sl)))         ; no anchor ⇒ must write
+                                   (recur (inc i) pass buf (conj wl i))
+                                   (== (:buf-entries sl) -1)                   ; subtree rebalanced (poison) ⇒ must write
+                                   (recur (inc i) pass buf (conj wl i))
+                                   :else                                       ; content-only ⇒ bufferable, size O(1)
+                                   (let [nested (if (some? (:diff sl)) (:diff sl) (await (assemble-nested storage child opts)))]
+                                     (recur (inc i) pass (conj buf {:i i :sz (:buf-entries sl) :nested nested}) wl))))))))
                        ;; Pass 2: buffer SMALLEST-first while running total ≤ budget; flush the rest.
-                       flushed (->> (sort-by :sz (:buf classified))
-                                    (reduce (fn [[emb wl] {:keys [i sz nested]}]
-                                              (if (<= (+ emb sz) budget)
-                                                (let [sl (aget slots i)]
-                                                  (aset addrs i (:anchor sl))
-                                                  (aset slots i {:diff nested :count (:count sl) :measure (:measure sl) :anchor (:anchor sl)})
-                                                  [(+ emb sz) wl])
-                                                [emb (conj wl i)]))
-                                            [(:pass classified) (:wl classified)])
-                                    second)]
+                       [embedded flushed]
+                       (reduce (fn [[emb wl] {:keys [i sz nested]}]
+                                 (if (<= (+ emb sz) budget)
+                                   (let [sl (aget slots i)]
+                                     (aset addrs i (:anchor sl))
+                                     (aset slots i {:diff nested :count (:count sl) :measure (:measure sl) :anchor (:anchor sl) :buf-entries sz})
+                                     [(+ emb sz) wl])
+                                   [emb (conj wl i)]))
+                               [(:pass classified) (:wl classified)]
+                               (sort-by :sz (:buf classified)))]
                    ;; Pass 3: write flushed/structural children (all resident ⇒ no read).
                    (loop [ws (seq flushed)]
                      (when ws
@@ -885,8 +903,11 @@
                          (when slots (aset slots i nil))
                          (recur (next ws)))))
                    (let [a (await (storage/store storage this opts))]
-                     ;; Written ⇒ this node now matches its durable object; clear the per-txn mark.
-                     (set! (.-_rebalanced this) false)
+                     ;; Written ⇒ this node equals its durable object, whose remaining slots are the
+                     ;; children we BUFFERED (passthrough + newly buffered); flushed ones were nulled.
+                     ;; So the settled total is `embedded`, not 0 (also clears any -1 poison — the new
+                     ;; structure is now materialized on disk). A later commit deltas from here.
+                     (set! (.-_bufEntries this) embedded)
                      a))))))
 
 (defn walk-addresses
@@ -907,21 +928,24 @@
 (defn ^Branch from-map
   [{:keys [level keys addresses subtree-count measure settings]}]
   ;; cold restore (storage deserializer): no comparator here — stamped on descent by -root/child.
-  (Branch. level keys nil addresses (or subtree-count -1) measure settings nil false nil))
+  ;; _bufEntries = -2 (LAZY): derived from _slots on first read (the storage layer attaches them
+  ;; after construction), mirroring subtree-count = -1. See buf-entries.
+  (Branch. level keys nil addresses (or subtree-count -1) measure settings nil -2 nil))
 
 ;; diff-buf (mirrors JVM Branch):
 ;;   `_slots`      — per-child buffered diff (nil unless diff-buf-size > 0). Read/projection
 ;;                   parity with clj; written-back on restore by the storage layer.
-;;   `_rebalanced` — per-txn flag: this node's structure differs from its durable anchor
-;;                   (a split/merge/borrow happened on it this txn) ⇒ it must be WRITTEN,
-;;                   not buffered. Default false; set on structural rebuilds; propagated to
-;;                   persistent successors; cleared after store(). Matches JVM Branch._rebalanced.
+;;   `_bufEntries` — this node's subtree buffered-diff size in *entries* (the budget-B unit),
+;;                   maintained by delta on the deposit return path (mirrors JVM Branch._bufEntries
+;;                   and subtree-count). >= 0 content-only size; -1 must-WRITE (a split/merge/borrow
+;;                   in this subtree — propagates up the deposit sum, so the store gate is O(1));
+;;                   -2 LAZY (restored, derived from _slots on first read). Cleared to 0 at store().
 ;;   `_projCmp`    — the SET's stable comparator, used to PROJECT a buffered leaf (project-leaf
 ;;                   rebuilds it in stored order) — NOT any per-operation/navigation comparator.
 ;;                   Internally-created branches inherit it from the creating node via the ctor;
 ;;                   the root (-root) and freshly-restored branches (child) are stamped on
 ;;                   descent — the storage layer has no comparator. Matches JVM Branch._projCmp.
-(deftype Branch [^number level keys ^:mutable children ^:mutable addresses ^:mutable ^number subtree-count ^:mutable _measure settings ^:mutable _slots ^:mutable _rebalanced ^:mutable _projCmp]
+(deftype Branch [^number level keys ^:mutable children ^:mutable addresses ^:mutable ^number subtree-count ^:mutable _measure settings ^:mutable _slots ^:mutable _bufEntries ^:mutable _projCmp]
   Object
   (toString [_] (pr-str* {:level level :keys (vec keys)}))
   INode
@@ -1007,11 +1031,11 @@
                       new-addrs
                       new-sc
                       new-measure
-                      settings nil false _projCmp)]
+                      settings nil 0 _projCmp)]
       ;; diff-buf: a merged node's structure differs from any anchor ⇒ it must be WRITTEN
-      ;; (_rebalanced), but it still buffers the surviving children's slots (concatenated).
+      ;; (-1), but it still buffers the surviving children's slots (concatenated).
       (when (pos? (or (:diff-buf-size settings) 0))
-        (set! (.-_rebalanced nb) true)
+        (set! (.-_bufEntries nb) -1)
         (set! (.-_slots nb) (concat-slots this next)))
       nb))
   (merge-split [this ^Branch next]
@@ -1049,13 +1073,13 @@
                                  (reduced nil)))))
                          (measure/identity-measure measure-ops)
                          p1))
-            b0 (Branch. level (arrays/aget ks 0) p0 (when as (arrays/aget as 0)) sc0 m0 settings nil false _projCmp)
-            b1 (Branch. level (arrays/aget ks 1) p1 (when as (arrays/aget as 1)) sc1 m1 settings nil false _projCmp)]
-        ;; diff-buf: redistribution is structural on both halves (_rebalanced); split the
+            b0 (Branch. level (arrays/aget ks 0) p0 (when as (arrays/aget as 0)) sc0 m0 settings nil 0 _projCmp)
+            b1 (Branch. level (arrays/aget ks 1) p1 (when as (arrays/aget as 1)) sc1 m1 settings nil 0 _projCmp)]
+        ;; diff-buf: redistribution is structural on both halves (-1); split the
         ;; concatenated slots at the same child boundary so each half buffers its own children.
         (when (pos? (or (:diff-buf-size settings) 0))
-          (set! (.-_rebalanced b0) true)
-          (set! (.-_rebalanced b1) true)
+          (set! (.-_bufEntries b0) -1)
+          (set! (.-_bufEntries b1) -1)
           (when-let [all (concat-slots this next)]
             (let [n0 (arrays/alength p0)]
               (set! (.-_slots b0) (.slice all 0 n0))

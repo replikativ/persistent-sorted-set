@@ -51,11 +51,32 @@ public class Slot {
    *  At store, a buffered child's parent re-points addresses[i] := anchor. */
   public final Object anchor;
 
+  /** diff-buf budget accounting (in-memory only — never serialized). The number of buffered
+   *  element-changes in this child's WHOLE subtree (= {@code diffSize(diff, childLevel)}), used to
+   *  enforce the per-node budget B at store and to delta-maintain {@link Branch#_bufEntries}.
+   *  {@link #LAZY} (-2) marks a slot reconstructed from storage whose count hasn't been derived
+   *  yet — {@code Branch.slotBE} resolves it from {@code diff} on demand (IO-free, the blob is
+   *  already in memory), so the durable format carries no redundant count. Live slots (built by
+   *  deposit/store) carry the exact value. */
+  public final long bufEntries;
+
+  /** Sentinel: this slot was reconstructed from storage and its {@link #bufEntries} hasn't been
+   *  derived from {@link #diff} yet. The 4-arg ctor (used by every IStorage on restore) defaults
+   *  to it, so storage impls need no change and the on-disk format is unchanged. */
+  public static final long LAZY = -2;
+
+  /** Restore/IStorage ctor: {@code bufEntries} is derived lazily from {@code diff} (see
+   *  {@link #LAZY}). Keeps the storage contract — and the serialized format — unchanged. */
   public Slot(Object diff, long count, Object measure, Object anchor) {
+    this(diff, count, measure, anchor, LAZY);
+  }
+
+  public Slot(Object diff, long count, Object measure, Object anchor, long bufEntries) {
     this.diff = diff;
     this.count = count;
     this.measure = measure;
     this.anchor = anchor;
+    this.bufEntries = bufEntries;
   }
 
   static PersistentTreeMap emptyDiff(Comparator cmp) {

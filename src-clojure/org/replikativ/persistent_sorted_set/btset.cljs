@@ -95,7 +95,10 @@
                                                          (measure/merge-measure measure-ops acc cs))
                                                        (measure/identity-measure measure-ops)
                                                        child-measure))]
-                            (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count root-measure (.-settings set) nil false (.-comparator set))
+                            ;; diff-buf: new root on growth — _bufEntries = 0 (no buffered diff; this
+                            ;; node is always the root ⇒ always written; if later mutated in a transient
+                            ;; batch the first deposit poisons it correctly). Mirrors JVM makeBranchFromChildren.
+                            (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count root-measure (.-settings set) nil 0 (.-comparator set))
                                     new-cnt
                                     (.-comparator set)
                                     (.-meta set)
@@ -1619,7 +1622,9 @@
                                            nil
                                            subtree-count
                                            child-measure
-                                           settings nil false cmp))))
+                                           ;; diff-buf: bulk-built branch — _bufEntries = 0 (no slots,
+                                           ;; anchorless ⇒ written wholesale at store). See branch.cljs.
+                                           settings nil 0 cmp))))
          (inc shift))))))
 
 (defn ^BTSet from-sequential [cmp seq opts]

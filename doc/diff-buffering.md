@@ -197,6 +197,18 @@ store(node):
   *passthrough* children (buffered in a prior commit, untouched now) consume budget but are
   never flushed here — flushing them would require loading their anchor.
 - All flushed/written children are **dirty this commit ⇒ resident**, so a flush never reads.
+- **The two classifications above are O(1), not a subtree walk.** Both "did `cᵢ` rebalance?" and
+  "`szᵢ` = diffSize of `cᵢ`'s subtree" are read from a single per-node aggregate, `_bufEntries` —
+  the buffered-entry count of a node's subtree, maintained by delta on the deposit return path
+  exactly like the `count` in `ĝ` (a `−1` *must-write* sentinel for a rebalanced subtree, a `−2`
+  *lazy* sentinel resolved from a restored node's slots on first read, IO-free). A deposit folds
+  its child's value into the parent's running total, so a rebalance's `−1` **poisons upward**
+  automatically and reaches the nearest written ancestor with no propagation code — this is what
+  replaces the recursive content-only-diff-size walk that a deep rebalance (hidden under content-
+  only intermediate nodes) would otherwise force. `_bufEntries` is in-memory only; the on-disk
+  format is unchanged (it is cheaply re-derived from a slot's diff, unlike `count`, which is
+  stored because deriving it needs IO). An `-ea` oracle re-walks the subtree at each store to
+  cross-check the maintained value.
 
 ### Restore (project the diff down, lazily, one level per deserialization)
 
@@ -362,11 +374,12 @@ cached as an ordinary materialized node — later `lookup`s on this path see no 
 Starting from the Stage-1 in-memory tree, batch `add 7, add 8, add 9` (all →L1). `L1[5,6]`
 grows to `[5,6,7,8]` (full at BF 4), then `add 9` **overflows → splits** into `[5,6]` and
 `[7,8,9]`. B0 absorbs the split child: `keys[2,6] → keys[2,6,9]`, now 3 children. That is a
-**structural** return — B0's `_rebalanced` is set:
+**structural** return — B0's `_bufEntries` is set to the must-write sentinel (`−1`), which the
+deposit on R's return path folds into R's total (poisoning it must-write too):
 
 ```
 store(R):
-  B0._rebalanced = true                          → WRITE B0 in full ⇒ @B0'  (new structure,
+  B0._bufEntries = −1 (must write)               → WRITE B0 in full ⇒ @B0'  (new structure,
                                                      keys[2,6,9] → L0,[5,6],[7,8,9]);
                                                      markFreed(@B0)     ← Stage-1 anchor
   B1 still content-only-dirty / clean            → BUFFER (addr[1]:=@B1, slot re-emitted)

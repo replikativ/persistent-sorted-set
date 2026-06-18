@@ -31,10 +31,20 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // + a cached (count, measure) snapshot ĝ). null == child i has no buffered diff.
   public Object[] _slots;
 
-  // Store-time bookkeeping: a split/merge/borrow happened AT this node this txn. Carried
-  // forward through content-only ops and cleared at store. A rebalanced node's structure
-  // differs from its anchor, so it (and its dirty spine) must be written, not buffered.
-  public boolean _rebalanced;
+  // diff-buf store-time bookkeeping: this node's subtree buffered-diff size, in *entries*
+  // (number of buffered element-changes summed over the whole subtree — the budget-B unit).
+  // Maintained by delta on the deposit return path, mirroring _subtreeCount. Three states:
+  //   >= 0   : content-only — the exact buffered-entry count (what the old deep walk returned);
+  //   WRITE  : must be WRITTEN, not buffered — a split/merge/borrow happened in this subtree.
+  //            Set at the rebuild site; PROPAGATES UP automatically because a parent's deposit
+  //            folds the child's value into this sum (a WRITE child poisons the parent), so the
+  //            store-time gate is an O(1) field read instead of a recursive subtree walk.
+  //   LAZY   : restored from storage, not yet derived — bufEntries() resolves it from _slots
+  //            (IO-free, the diffs are already in memory). Mirrors _subtreeCount's -1/lazy.
+  // Cleared to 0 at store (the node then equals its durable object). Untouched at diffBufSize==0.
+  public long _bufEntries;
+  public static final long BUF_WRITE = -1;   // must write (rebalanced subtree)
+  public static final long BUF_LAZY  = Slot.LAZY;  // restored, derive from _slots on first read
 
   // diff-buf: the SET's stable comparator, used to PROJECT a buffered leaf (projectLeaf rebuilds
   // it in stored order). It is the set's comparator — NOT any per-operation/navigation comparator
@@ -64,6 +74,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     _addresses    = addresses;
     _children     = children;
     _subtreeCount = subtreeCount;
+    // diff-buf: this ctor backs restore (the List ctor) and bulk build — slots, if any, are
+    // attached afterwards by the storage layer, so the buffered-entry count is derived lazily
+    // from _slots on first read (mirrors _subtreeCount = -1). Mutation ctors set it explicitly.
+    _bufEntries   = BUF_LAZY;
   }
 
   // diff-buf: this ctor and the (level, len, settings) one below take the set's projection
@@ -209,6 +223,69 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   @Override
   public long subtreeCount() {
     return _subtreeCount;
+  }
+
+  // diff-buf: this node's buffered-diff size in entries (see _bufEntries). Resolves a restored
+  // node's LAZY value from its slots once (IO-free — the slot diffs are already in memory),
+  // then caches; passes BUF_WRITE (must-write) through. O(1) once resolved. Mirrors count().
+  public long bufEntries() {
+    if (_bufEntries == BUF_LAZY) {
+      long s = 0;
+      if (_slots != null)
+        for (int j = 0; j < _len; j++) {
+          Slot sl = (Slot) _slots[j];
+          if (sl != null) s += slotBE(sl);
+        }
+      _bufEntries = s;
+    }
+    return _bufEntries;
+  }
+
+  // Entry count contributed by one slot of THIS node: its cached value, or — for a slot
+  // reconstructed from storage (LAZY) — derived from the diff blob (IO-free). A slot's child
+  // is at _level-1, so its diff is summed with that childLevel.
+  private int slotBE(Slot sl) {
+    return (sl.bufEntries == Slot.LAZY) ? diffSize(sl.diff, _level - 1) : (int) sl.bufEntries;
+  }
+
+  // diff-buf oracle (assert-only, -ea): recompute a content-only node's buffered-entry total by
+  // walking the live subtree (the work the old store-time deep walk did), to cross-check the
+  // delta-maintained _bufEntries. Skipped for BUF_WRITE/BUF_LAZY (negative ⇒ not a settled size).
+  // A >=0 node can't have a rebalanced descendant (the poison would have made it negative), so the
+  // walk never hits a must-write child. Runs only under -ea (e.g. the :dev alias), never in :test.
+  private boolean assertBufEntries(IStorage storage) {
+    if (_bufEntries < 0) return true;
+    // Post-order: check dirty (resident, marker) children first so the DEEPEST mismatch throws.
+    if (_slots != null)
+      for (int j = 0; j < _len; j++) {
+        Slot s = (Slot) _slots[j];
+        if (s != null && s.diff == null) {
+          ANode gc = child(storage, j);
+          if (gc instanceof Branch) ((Branch) gc).assertBufEntries(storage);
+        }
+      }
+    long slow = bufEntriesSlow(storage);
+    if (_bufEntries != slow)
+      throw new AssertionError("diff-buf: _bufEntries " + _bufEntries + " != recomputed " + slow + " (level " + _level + ")");
+    return true;
+  }
+
+  private long bufEntriesSlow(IStorage storage) {
+    if (_slots == null) return 0;
+    long total = 0;
+    for (int j = 0; j < _len; j++) {
+      Slot sl = (Slot) _slots[j];
+      if (sl == null) continue;
+      if (sl.anchor == null) continue;                        // anchorless child ⇒ written wholesale at
+                                                              // store ⇒ embeds nothing here (deposit set newBE=0)
+      if (sl.diff == null) {                                   // live branch marker → recurse resident child
+        ANode gc = child(storage, j);
+        total += (gc instanceof Branch) ? ((Branch) gc).bufEntriesSlow(storage) : 0;
+      } else {
+        total += diffSize(sl.diff, _level - 1);                // leaf-diff or restored-nested
+      }
+    }
+    return total;
   }
 
   /**
@@ -462,7 +539,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           ? _subtreeCount - oldChildCount + newChildrenCount : -1;
       Object newMeasure = tryComputeMeasureFromChildren(newChildren, _len, storage, measureOps);
       Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, newCount, newMeasure, _projCmp, settings);
-      if (settings.diffBufSize() > 0) { nb._rebalanced = _rebalanced; // a rebalance earlier this txn must persist (structure ≠ anchor)
+      if (settings.diffBufSize() > 0) { nb._bufEntries = bufEntries(); // carry this node's running total (or BUF_WRITE) onto the successor
                                       nb.carryAndDeposit(storage, _slots, ins, key, key, anchor0); } // content-only: Present(key) / branch marker
       return new ANode[]{ nb };
     }
@@ -502,7 +579,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       Object measure = tryComputeMeasureFromChildren(allChildren, newLen, storage, measureOps);
       Branch<Key, Address> nb = new Branch(_level, newLen, allKeys, allAddresses, allChildren, count, measure, _projCmp, settings);
       if (settings.diffBufSize() > 0) {
-        nb._rebalanced = true; // absorbed a child split: structural → written, but it still buffers surviving siblings
+        nb._bufEntries = BUF_WRITE; // absorbed a child split: structural → written, but it still buffers surviving siblings
         nb._slots = stitchSlots(ins, nodes.length, newLen); // carry buffered siblings' slots through the rebuild
         freeDroppedChild(storage, ins); // diff-buf: free the split child's old blob (replaced by N new nodes)
       }
@@ -531,7 +608,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     Branch<Key, Address> sb1 = new Branch(_level, half1, keys1, addresses1, children1, count1, measure1, _projCmp, settings);
     Branch<Key, Address> sb2 = new Branch(_level, half2, keys2, addresses2, children2, count2, measure2, _projCmp, settings);
     if (settings.diffBufSize() > 0) {
-      sb1._rebalanced = true; sb2._rebalanced = true; // split: structural → written, still buffer surviving siblings
+      sb1._bufEntries = BUF_WRITE; sb2._bufEntries = BUF_WRITE; // split: structural → written, still buffer surviving siblings
       freeDroppedChild(storage, ins); // diff-buf: free the split child's old blob (replaced by N new nodes)
       Object[] all = stitchSlots(ins, nodes.length, newLen); // carry buffered siblings' slots through the split
       if (all != null) {
@@ -662,7 +739,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           if (!leftChanged && !rightChanged && newLen == _len) {
             depositInto(storage, idx, key, Slot.ABSENT, anchor0); // content-only: Absent(key) / branch marker
           } else {
-            _rebalanced = true; // a child merged/borrowed with a sibling: structural → write in full
+            _bufEntries = BUF_WRITE; // a child merged/borrowed with a sibling: structural → write in full
           }
         }
         return PersistentSortedSet.EARLY_EXIT;
@@ -701,10 +778,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         if (!leftChanged && !rightChanged && newLen == _len) {
           // content-only: carry slots aligned and ACCUMULATE Absent onto the center's
           // existing diff (it may already hold buffered Present/Absent for this leaf).
-          newCenter._rebalanced = _rebalanced; // persist a prior-this-txn rebalance
+          newCenter._bufEntries = bufEntries(); // carry this node's running total (or BUF_WRITE) onto the successor
           newCenter.carryAndDeposit(storage, _slots, idx, key, Slot.ABSENT, anchor0);
         } else {
-          newCenter._rebalanced = true;                        // structural: mirror the address Stitch
+          newCenter._bufEntries = BUF_WRITE;                   // structural: mirror the address Stitch
           // diff-buf: free this node's dropped children (consumed into the new structure,
           // never re-pointed) so they don't leak — store has no slot/anchor for them.
           freeDroppedChild(storage, idx);
@@ -758,7 +835,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       join._subtreeCount = tryComputeSubtreeCountFromChildren(join._children, left._len + newLen, storage);
       join._measure = tryComputeMeasureFromChildren(join._children, left._len + newLen, storage, measureOps);
       if (settings.diffBufSize() > 0) {
-        join._rebalanced = true; // merged with left: structural → written, still buffers surviving siblings
+        join._bufEntries = BUF_WRITE; // merged with left: structural → written, still buffers surviving siblings
         freeDroppedChild(storage, idx);                        // diff-buf: free dropped (merged) children
         if (leftChanged && idx > 0) freeDroppedChild(storage, idx - 1);
         if (rightChanged) freeDroppedChild(storage, idx + 1);
@@ -810,7 +887,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       join._subtreeCount = tryComputeSubtreeCountFromChildren(join._children, newLen + right._len, storage);
       join._measure = tryComputeMeasureFromChildren(join._children, newLen + right._len, storage, measureOps);
       if (settings.diffBufSize() > 0) {
-        join._rebalanced = true; // merged with right: structural → written, still buffers surviving siblings
+        join._bufEntries = BUF_WRITE; // merged with right: structural → written, still buffers surviving siblings
         freeDroppedChild(storage, idx);                        // diff-buf: free dropped (merged) children
         if (leftChanged && idx > 0) freeDroppedChild(storage, idx - 1);
         if (rightChanged) freeDroppedChild(storage, idx + 1);
@@ -879,7 +956,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       newCenter._subtreeCount = tryComputeSubtreeCountFromChildren(newCenter._children, newCenterLen, storage);
       newCenter._measure = tryComputeMeasureFromChildren(newCenter._children, newCenterLen, storage, measureOps);
       if (settings.diffBufSize() > 0) {
-        newLeft._rebalanced = true; newCenter._rebalanced = true; // borrowed from left: structural
+        newLeft._bufEntries = BUF_WRITE; newCenter._bufEntries = BUF_WRITE; // borrowed from left: structural
         freeDroppedChild(storage, idx);                          // diff-buf: free dropped (rebalanced) children
         if (leftChanged && idx > 0) freeDroppedChild(storage, idx - 1);
         if (rightChanged) freeDroppedChild(storage, idx + 1);
@@ -954,7 +1031,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         newRight._measure = tryComputeMeasureFromChildren(newRight._children, newRightLen, storage, measureOps);
       }
       if (settings.diffBufSize() > 0) {
-        newCenter._rebalanced = true; newRight._rebalanced = true; // borrowed from right: structural
+        newCenter._bufEntries = BUF_WRITE; newRight._bufEntries = BUF_WRITE; // borrowed from right: structural
         freeDroppedChild(storage, idx);                          // diff-buf: free dropped (rebalanced) children
         if (leftChanged && idx > 0) freeDroppedChild(storage, idx - 1);
         if (rightChanged) freeDroppedChild(storage, idx + 1);
@@ -1053,7 +1130,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (measureOps != null && _measure != null) {
       newBranch._measure = newBranch.tryComputeMeasure(storage);
     }
-    if (settings.diffBufSize() > 0) { newBranch._rebalanced = _rebalanced; // persist a prior-this-txn rebalance
+    if (settings.diffBufSize() > 0) { newBranch._bufEntries = bufEntries(); // carry this node's running total (or BUF_WRITE) onto the successor
                                     newBranch.carryAndDepositReplace(storage, _slots, idx, oldKey, newKey, anchor0); } // content-only: Present(newKey)
 
     return new ANode[]{newBranch};
@@ -1079,8 +1156,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // On the mutation return path, a content-only change to child i is recorded
   // into _slots[i] as Present(element) | Absent, with ĝ refreshed from the
   // (already-mutated, in-memory) child's count/measure. Structural returns
-  // (split/merge/borrow) instead set _rebalanced and never deposit — that node
-  // will be written in full, materializing the new structure (see store(), M4).
+  // (split/merge/borrow) instead set _bufEntries = BUF_WRITE and never deposit —
+  // that node will be written in full, materializing the new structure (see store()).
 
   // Exact subtree count of the in-memory child i (cheap: maintained by add/remove).
   private long childCount(IStorage storage, int i) {
@@ -1124,6 +1201,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     Object anchor = (prev != null && prev.anchor != null) ? prev.anchor : anchor0;
     ANode child = child(storage, i);
     Object diff;
+    long newBE;          // this slot's new buffered-entry count (subtree total for a branch child)
     if (anchor == null) {
       // diff-buf: this child has NO durable base to diff against (a never-stored tree, or a
       // child created/split this txn). At store() such a slot takes the write-wholesale branch
@@ -1133,6 +1211,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // (unchanged) for op-buf-aware aggregation; diff=null + anchor=null is store-identical to
       // today's wasted-diff slot — the child is written in full either way. See store() Pass 1.
       diff = null;
+      newBE = 0;                  // written wholesale ⇒ consumes none of the parent's buffer budget
     } else if (_level == 1) {
       assert _projCmp != null : "diff-buf: leaf-parent has no _projCmp at deposit (see Branch.child / root)";
       // leaf child: accumulate the leaf-op(s) (net latest-wins) onto the existing diff.
@@ -1151,11 +1230,21 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       }
       for (int k = 0; k < kv.length; k += 2) d = (PersistentTreeMap) d.assoc(kv[k], kv[k + 1]);
       diff = d;
+      newBE = d.count();          // leaf-diff entry count (net latest-wins ⇒ one entry per cmp-key)
     } else {
       // branch child: anchor marker; its nested diff is derived from the live subtree at store
       diff = null;
+      newBE = ((Branch) child).bufEntries();   // child's whole-subtree total (BUF_WRITE if it rebalanced)
     }
-    _slots[i] = new Slot(diff, childCount(storage, i), child.measure(), anchor);
+    // diff-buf: maintain this node's running buffered-entry total by delta (mirrors _subtreeCount).
+    // A BUF_WRITE child poisons us → the must-write signal climbs to the nearest written ancestor
+    // with no extra propagation code (this is the deposit sum doing the work the old deep walk did).
+    long cur = bufEntries();                    // resolve our own LAZY (restored) value first
+    if (cur != BUF_WRITE) {
+      if (newBE == BUF_WRITE) _bufEntries = BUF_WRITE;
+      else                    _bufEntries = cur - (prev != null ? slotBE(prev) : 0) + newBE;
+    }
+    _slots[i] = new Slot(diff, childCount(storage, i), child.measure(), anchor, newBE);
   }
 
   // diff-buf: a child's slot travels with its address. These mirror the per-element /
@@ -1243,12 +1332,19 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     return PersistentHashMap.EMPTY.assoc(KW_ABSENT, absent).assoc(KW_PRESENT, present);
   }
 
-  // Entry count of an already-assembled slot diff describing a child at `childLevel`:
-  // a leaf-diff (childLevel == 0) returns its element count; a nested branch-diff
-  // {idx -> {:count :measure :diff :max-key}} sums diffSize over each entry's child
-  // (at childLevel-1). We discriminate by the structural level rather than by probing
-  // values, because a leaf-diff's values are the set's ELEMENTS — which may themselves
-  // be Associative (e.g. datahike Datoms), so a value.containsKey(:diff) probe is unsafe.
+  // Entry count (number of buffered element-changes) in a slot's diff blob.
+  //
+  // CONTRACT: `childLevel` is the level of the NODE whose diff this is — i.e. for a slot in a node
+  // at level L describing its child (level L-1), call diffSize(slot.diff, L-1). At childLevel 0 the
+  // diff is a LEAF-diff (live PersistentTreeMap or storage form {:absent :present}) ⇒ element count;
+  // at childLevel >= 1 it is a BRANCH-diff {idx -> {:diff <child-diff>}} ⇒ sum of diffSize over each
+  // entry's child diff at childLevel-1, recursing down to the leaf-diffs. So the result counts only
+  // leaf entries; interior branch-diff levels contribute nothing (the size is linear in buffered ops,
+  // not exponential in depth). callers: slotBE (resolving a restored LAZY slot) and bufEntriesSlow.
+  //
+  // We discriminate by `childLevel` rather than by probing values, because a leaf-diff's values are
+  // the set's ELEMENTS — which may themselves be Associative (e.g. datahike Datoms), so a
+  // value.containsKey(:diff) probe is unsafe.
   private static int diffSize(Object diff, int childLevel) {
     if (!(diff instanceof java.util.Map)) return 0;
     java.util.Map m = (java.util.Map) diff;
@@ -1263,29 +1359,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     return t;
   }
 
-  // Total content-only diff size of c's dirty subtree, or -1 if any dirty descendant
-  // REBALANCED (⇒ c is not bufferable — the affected path must be written). The
-  // recursive check is needed because a deep rebalance leaves intermediate nodes
-  // content-only (a single-{node} return up), so _rebalanced alone at c is insufficient.
-  private int contentOnlyDiffSize(IStorage storage, Branch c) {
-    if (c._rebalanced) return -1;
-    if (c._slots == null) return 0;
-    int total = 0;
-    for (int j = 0; j < c._len; j++) {
-      Slot sl = (Slot) c._slots[j];
-      if (sl == null) continue;
-      if (sl.diff == null) {                                    // branch marker -> recurse live child
-        ANode gc = c.child(storage, j);
-        if (!(gc instanceof Branch)) return -1;
-        int s = contentOnlyDiffSize(storage, (Branch) gc);
-        if (s < 0) return -1;
-        total += s;
-      } else {
-        total += diffSize(sl.diff, c._level - 1);               // leaf-diff or restored-nested (child at c._level-1)
-      }
-    }
-    return total;
-  }
+  // (The recursive content-only-diff-size walk that classified a dirty branch child here was
+  // replaced by the O(1) _bufEntries aggregate: a child's subtree size is read from its slot
+  // (slotBE) and its must-write status is the BUF_WRITE poison that already climbed the deposit
+  // sum — see store() Pass 1 and depositKV. No store-time subtree walk.)
 
   // Assemble c's serializable nested diff {Long idx -> {:count :measure :diff}}, recursing
   // markers into the (resident) live subtree. Called once when c is first buffered, so the
@@ -1408,9 +1485,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // total stays <= B strictly. See doc/diff-buffering.md (Store / eviction policy).
     ensureAddresses();
     final int budget = _settings.diffBufSize();
+    assert assertBufEntries(storage);  // -ea oracle: delta-maintained total == fresh subtree walk
 
     // Pass 1: account clean passthrough diffs, and classify each dirty child as bufferable
-    // (content-only, has an anchor) or must-write (rebalanced subtree, or no anchor).
+    // (content-only) or must-write — both now O(1) per child: the size is the slot's cached
+    // bufEntries (resolved from the diff for a restored slot), and the must-write gate is the
+    // BUF_WRITE poison the deposit sum already lifted from the rebalance point (no subtree walk).
     int passthrough = 0;
     int[] csz = new int[_len];                                  // dirty child's diff size
     Object[] cnested = new Object[_len];                        // its assembled nested diff
@@ -1419,25 +1499,19 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     for (int i = 0; i < _len; ++i) {
       Slot sl = (_slots != null) ? (Slot) _slots[i] : null;
       if (_addresses[i] != null) {
-        if (sl != null) passthrough += diffSize(sl.diff, _level - 1); // clean buffered-passthrough
+        if (sl != null) passthrough += slotBE(sl);             // clean buffered-passthrough subtree total
         continue;
       }
-      // _addresses[i] == null: dirty this commit ⇒ child is resident
-      ANode child = (ANode) _settings.readReference(_children[i]);
+      // _addresses[i] == null: dirty this commit ⇒ child is resident; its slot is live (deposited).
       if (sl == null || sl.anchor == null) {                    // no durable anchor ⇒ must write
         writeList.add(i);
-      } else if (child instanceof Leaf) {
-        csz[i] = diffSize(sl.diff, 0); cnested[i] = sl.diff;    // leaf child ⇒ leaf-diff
+      } else if (sl.bufEntries == BUF_WRITE) {                  // subtree rebalanced (poison) ⇒ must write
+        writeList.add(i);
+      } else {                                                  // content-only ⇒ bufferable
+        csz[i] = (int) sl.bufEntries;
+        cnested[i] = (sl.diff != null) ? sl.diff                // leaf-diff, or restored-nested branch-diff
+                   : assembleNested(storage, (Branch)(ANode) _settings.readReference(_children[i])); // live branch marker
         bufferable.add(i);
-      } else {
-        int s = contentOnlyDiffSize(storage, (Branch) child);   // -1 if subtree rebalanced
-        if (s >= 0) {
-          csz[i] = s;
-          cnested[i] = (sl.diff != null) ? sl.diff : assembleNested(storage, (Branch) child);
-          bufferable.add(i);
-        } else {
-          writeList.add(i);                                     // rebalanced ⇒ written in full
-        }
       }
     }
 
@@ -1449,7 +1523,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       Slot sl = (Slot) _slots[i];
       if (embedded + csz[i] <= budget) {
         _addresses[i] = (Address) sl.anchor;                    // re-point to durable anchor (no write)
-        _slots[i] = new Slot(cnested[i], sl.count, sl.measure, sl.anchor); // write back assembled diff
+        _slots[i] = new Slot(cnested[i], sl.count, sl.measure, sl.anchor, csz[i]); // write back assembled diff + its size
         embedded += csz[i];
       } else {
         writeList.add(i);                                       // doesn't fit ⇒ flush
@@ -1465,9 +1539,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (_slots != null) _slots[i] = null;
     }
     Address a = storage.store(this);
-    // Written ⇒ this node now matches its durable object. Clear the per-txn rebalance mark
-    // so a later content-only op (which carries it forward) doesn't treat it as rebalanced.
-    _rebalanced = false;
+    // Written ⇒ this node now equals its durable object, whose remaining slots are exactly the
+    // children we BUFFERED (passthrough + newly buffered) — the flushed ones were nulled. So the
+    // settled buffered-entry total is `embedded`, not 0 (a later commit deltas from here). This
+    // also clears any BUF_WRITE poison: the new structure is now materialized on disk.
+    _bufEntries = embedded;
     return a;
   }
 
