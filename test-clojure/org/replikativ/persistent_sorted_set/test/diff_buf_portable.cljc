@@ -54,9 +54,9 @@
 ;; 0 ⇒ leaf-diff {:absent :present}; >=1 ⇒ branch-diff {idx -> {:diff …}} summed at childLevel-1.
 (defn- nentries [diff child-level]
   (if-not (map? diff) 0
-    (if (zero? child-level)
-      (+ (count (:absent diff)) (count (:present diff)))
-      (reduce + 0 (map (fn [e] (nentries (:diff (val e)) (dec child-level))) diff)))))
+          (if (zero? child-level)
+            (+ (count (:absent diff)) (count (:present diff)))
+            (reduce + 0 (map (fn [e] (nentries (:diff (val e)) (dec child-level))) diff)))))
 
 (defn- blob-embedded [blob-str]                            ; buffered entries embedded in a written branch blob
   (let [{:keys [level slots]} (edn/read-string blob-str)]
@@ -92,7 +92,7 @@
           _  (dorun (seq l1))
           ;; content-only replaces (cmp-equal ⇒ buffered Present): 20 in a low subtree, 3 in a mid one
           s1 (as-> l1 s (reduce (fn [s i] (set/replace s [i 0] [i 1])) s (range 0 20))
-                        (reduce (fn [s i] (set/replace s [i 0] [i 1])) s (range 100 103)))
+                   (reduce (fn [s i] (set/replace s [i 0] [i 1])) s (range 100 103)))
           addr (set/store s1 (make-storage disk bf b))]
       ;; budget bound on EVERY written branch blob
       (is (every? #(<= (blob-embedded %) b) (filter #(re-find #":slots" %) (vals @disk)))
@@ -122,7 +122,7 @@
           o {:branching-factor bf :diff-buf-size b :comparator cmp}
           l1 (restore* (set/store (build 60 o) (make-storage disk bf b)) (make-storage disk bf b) o)
           s1 (as-> l1 s (reduce (fn [s i] (conj s [i 0])) s (range 60 90))   ; splits
-                        (reduce (fn [s i] (disj s [i 0])) s (range 10 30)))      ; merges
+                   (reduce (fn [s i] (disj s [i 0])) s (range 10 30)))      ; merges
           l2 (restore* (set/store s1 (make-storage disk bf b)) (make-storage disk bf b) o)]
       (is (= (vec (seq s1)) (vec (seq l2))) "content exact")
       (is (= (tree-shape s1) (tree-shape l2)) "writer and reconstructed trees are structurally identical"))))

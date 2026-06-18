@@ -73,8 +73,8 @@
   #?(:clj (NumericStatsOps/instance) :cljs numeric-stats/numeric-stats-ops))
 (defn- stats->map [s]
   (if (nil? s) {:cnt 0 :min-val nil :max-val nil}
-    #?(:clj  {:cnt (.-count ^NumericStats s) :min-val (.-min ^NumericStats s) :max-val (.-max ^NumericStats s)}
-       :cljs {:cnt (:cnt s) :min-val (:min-val s) :max-val (:max-val s)})))
+      #?(:clj  {:cnt (.-count ^NumericStats s) :min-val (.-min ^NumericStats s) :max-val (.-max ^NumericStats s)}
+         :cljs {:cnt (:cnt s) :min-val (:min-val s) :max-val (:max-val s)})))
 (defn- expected [coll]
   {:cnt (count coll) :min-val (apply min coll) :max-val (apply max coll)})
 
