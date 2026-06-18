@@ -4,7 +4,6 @@
    leaked = (blobs ever written) - (reachable from final root) - (markFreed). With the
    structural-free fix, leaked == 0; without it, leaked is large. LIVE-FREED must be 0."
   (:require [cljs.test :refer-macros [deftest is]]
-            [clojure.edn :as edn]
             [clojure.set]
             [org.replikativ.persistent-sorted-set :as set]
             [org.replikativ.persistent-sorted-set.impl.storage :as storage :refer [IStorage]]
@@ -22,13 +21,14 @@
       (isFreed  [_ a] (contains? @freed a))
       (freedInfo [_ a] nil))))
 
-(defn disk-reach [disk root]
-  (let [seen (atom #{})]
-    ((fn w [a] (when (and a (not (contains? @seen a)))
-                 (swap! seen conj a)
-                 (let [m (edn/read-string (get @disk a))]
-                   (when (:addresses m) (doseq [c (:addresses m)] (w c))))))
-     root)
+;; Reachable durable blobs = the addresses of the LIVE projected tree (matches the JVM GC oracle
+;; and the corrected stress harness). An off-disk :addresses walk can diverge from the projected
+;; structure under buffering — under-counting reachable, which both spuriously flags leaks AND can
+;; SILENTLY miss a real over-free (freeing a still-reachable node). Walking the live tree avoids both.
+(defn- reachable [disk root opts]
+  (let [loaded (set/restore root (util/storage (atom {}) disk opts) opts)
+        seen   (atom #{root})]                         ; the root address itself isn't a child of anything
+    (set/walk-addresses loaded (fn [a] (swap! seen conj a) true))
     @seen))
 
 (deftest gc-leak-structural
@@ -42,7 +42,7 @@
                           s2 (reduce (fn [s k] (set/disj s [k 0])) loaded
                                      (range (* c 40) (+ (* c 40) 40)))]   ; contiguous chunk ⇒ forces merges
                       (recur (inc c) (set/store s2 (rec-storage disk freed) {:sync? true})))))
-        r       (disk-reach disk final)
+        r       (reachable disk final opts)
         written (set (keys @disk))
         leaked  (clojure.set/difference written r @freed)
         live    (clojure.set/intersection r @freed)]

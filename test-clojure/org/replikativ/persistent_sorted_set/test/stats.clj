@@ -13,6 +13,19 @@
   (when-let [root (.root s)]
     (.-_measure ^ANode root)))
 
+(defn expected-sum-sq
+  "Sum of squares for a collection of numbers (as the NumericStats sumSq would hold it)."
+  [coll]
+  (double (reduce + 0.0 (map #(* (double %) (double %)) coll))))
+
+(defn expected-variance
+  "Population variance: sumSq/n - mean^2 (matches NumericStats.variance())."
+  [coll]
+  (let [n    (count coll)
+        sum  (double (reduce + 0.0 coll))
+        mean (/ sum n)]
+    (- (/ (expected-sum-sq coll) n) (* mean mean))))
+
 (deftest test-from-sorted-array-stats
   (testing "stats computed for small set"
     (let [arr (object-array [1 2 3 4 5])
@@ -52,16 +65,22 @@
       (is (= 3 (.count stats1)))
       (is (= 6.0 (.sum stats1)))
       (is (= 3 (.max stats1)))
+      (is (= (expected-sum-sq [1 2 3]) (.sumSq stats1)))
+      (is (= (expected-variance [1 2 3]) (.variance stats1)))
 
       ;; s2 has [1 2 3 4]
       (is (= 4 (.count stats2)))
       (is (= 10.0 (.sum stats2)))
       (is (= 4 (.max stats2)))
+      (is (= (expected-sum-sq [1 2 3 4]) (.sumSq stats2)))
+      (is (= (expected-variance [1 2 3 4]) (.variance stats2)))
 
       ;; s3 has [1 2 3 4 5]
       (is (= 5 (.count stats3)))
       (is (= 15.0 (.sum stats3)))
-      (is (= 5 (.max stats3))))))
+      (is (= 5 (.max stats3)))
+      (is (= (expected-sum-sq [1 2 3 4 5]) (.sumSq stats3)))
+      (is (= (expected-variance [1 2 3 4 5]) (.variance stats3))))))
 
 (deftest test-disj-maintains-stats
   (testing "stats updated after disj"
@@ -77,18 +96,24 @@
       (is (= 15.0 (.sum stats1)))
       (is (= 1 (.min stats1)))
       (is (= 5 (.max stats1)))
+      (is (= (expected-sum-sq [1 2 3 4 5]) (.sumSq stats1)))
+      (is (= (expected-variance [1 2 3 4 5]) (.variance stats1)))
 
       ;; s2 has [1 2 3 4]
       (is (= 4 (.count stats2)))
       (is (= 10.0 (.sum stats2)))
       (is (= 1 (.min stats2)))
       (is (= 4 (.max stats2)))
+      (is (= (expected-sum-sq [1 2 3 4]) (.sumSq stats2)))
+      (is (= (expected-variance [1 2 3 4]) (.variance stats2)))
 
       ;; s3 has [2 3 4]
       (is (= 3 (.count stats3)))
       (is (= 9.0 (.sum stats3)))
       (is (= 2 (.min stats3)))
-      (is (= 4 (.max stats3))))))
+      (is (= 4 (.max stats3)))
+      (is (= (expected-sum-sq [2 3 4]) (.sumSq stats3)))
+      (is (= (expected-variance [2 3 4]) (.variance stats3))))))
 
 (deftest test-transient-maintains-stats
   (testing "stats updated for transient operations"
@@ -102,7 +127,9 @@
       (is (= 5 (.count stats)))
       (is (= 15.0 (.sum stats)))
       (is (= 1 (.min stats)))
-      (is (= 5 (.max stats))))))
+      (is (= 5 (.max stats)))
+      (is (= (expected-sum-sq [1 2 3 4 5]) (.sumSq stats)))
+      (is (= (expected-variance [1 2 3 4 5]) (.variance stats))))))
 
 (deftest test-no-stats-when-not-configured
   (testing "no stats computed when stats not configured"

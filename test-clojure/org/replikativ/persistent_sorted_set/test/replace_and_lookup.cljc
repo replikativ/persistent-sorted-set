@@ -276,43 +276,24 @@
       (is (identical? s (set/replace s 11 21 cmp-mod)))
       (is (= 5 (count s)))))
 
-  (testing "Replace preserves set properties"
-    (testing "Count unchanged - with custom comparator"
-      ;; Use mod-100 comparator so 50 and 150 compare equal
-      (let [cmp-mod (fn [a b] (compare (mod a 100) (mod b 100)))
-            s (into (set/sorted-set-by cmp-mod) (range 100))
-            s2 (set/replace s 50 150)]
-        (is (= (count s) (count s2)))))
-
-    (testing "Ordering maintained - with custom comparator"
-      ;; Use mod-100 comparator so 50 and 150 compare equal
-      (let [cmp-mod (fn [a b] (compare (mod a 100) (mod b 100)))
-            s (into (set/sorted-set-by cmp-mod) (range 100))
-            s2 (set/replace s 50 150)]
-        (is (= 100 (count s2)))
-        (is (= 150 (set/lookup s2 50)))   ; lookup with 50 finds 150
-        (is (= 150 (set/lookup s2 150))))))
-
-  (testing "Contains works correctly - with custom comparator"
-    ;; Use mod-100 comparator so 50 and 150 compare equal
+  (testing "Replace preserves set properties (count, lookup, ordering, contains?)"
+    ;; Use mod-100 comparator so 50 and 150 compare equal.
+    ;; Consolidated from the former separate "Count unchanged", "Ordering
+    ;; maintained", "Contains works correctly" and "Slice works after replace"
+    ;; cases, which were all the same mod-100 (replace s 50 150) re-asserting the
+    ;; same count/lookup facts. contains? is the only genuinely distinct check.
     (let [cmp-mod (fn [a b] (compare (mod a 100) (mod b 100)))
           s (into (set/sorted-set-by cmp-mod) (range 100))
           s2 (set/replace s 50 150)]
-      ;; contains? uses comparator, so both 50 and 150 return true (they compare equal)
-      (is (contains? s2 150))
-      (is (contains? s2 50))  ; true because 50 and 150 compare equal
-      ;; Use lookup to verify actual stored value is 150, not 50
-      (is (= 150 (set/lookup s2 50)))
-      (is (= 150 (set/lookup s2 150)))))
-
-  (testing "Slice works after replace - with custom comparator"
-    ;; Use mod-100 comparator so 50 and 150 compare equal
-    (let [cmp-mod (fn [a b] (compare (mod a 100) (mod b 100)))
-          s (into (set/sorted-set-by cmp-mod) (range 100))
-          s2 (set/replace s 50 150)]
+      ;; count unchanged
+      (is (= (count s) (count s2)))
       (is (= 100 (count s2)))
-      (is (= 150 (set/lookup s2 50)))   ; lookup with 50 finds 150
-      (is (= 150 (set/lookup s2 150))))))
+      ;; lookup finds the replacement (50 and 150 compare equal under mod 100)
+      (is (= 150 (set/lookup s2 50)))
+      (is (= 150 (set/lookup s2 150)))
+      ;; contains? uses the comparator, so both 50 and 150 return true
+      (is (contains? s2 150))
+      (is (contains? s2 50)))))
 
 (deftest test-replace-and-lookup-integration
   (testing "Replace and lookup work together"

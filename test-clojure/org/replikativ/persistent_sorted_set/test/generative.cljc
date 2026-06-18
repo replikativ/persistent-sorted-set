@@ -108,7 +108,8 @@
           ;; Apply operations
                       clj-set (into (sorted-set) initial-elements)
                       [pss-final clj-final] (apply-ops lazy-set clj-set ops)]
-                  (= (count pss-final) (count clj-final)))))
+                  (and (= (count pss-final) (count clj-final))
+                       (= (vec pss-final) (vec clj-final))))))
 
 (defspec lazy-set-count-with-interleaved-count-calls 100
   (prop/for-all [initial-elements gen-elements
@@ -126,7 +127,8 @@
                                     :remove [(disj pss val) (disj clj val)])))
                               [lazy-set clj-set]
                               ops)]
-                  (= (count pss-final) (count clj-final)))))
+                  (and (= (count pss-final) (count clj-final))
+                       (= (vec pss-final) (vec clj-final))))))
 
 (defspec lazy-set-vec-matches-count 100
   (prop/for-all [initial-elements gen-elements
@@ -183,7 +185,8 @@
                       expected (-> (into (sorted-set) initial-elements)
                                    (into adds)
                                    (#(reduce disj % removes)))]
-                  (= (count result) (count expected)))))
+                  (and (= (count result) (count expected))
+                       (= (vec result) (vec expected))))))
 
 ;; =============================================================================
 ;; Tree rebalancing (operations that cause splits/merges)
@@ -200,7 +203,8 @@
                       to-remove (take (quot (count elements) 2) (shuffle elements))
                       result (reduce disj lazy-pss to-remove)
                       expected (reduce disj (into (sorted-set) elements) to-remove)]
-                  (= (count result) (count expected)))))
+                  (and (= (count result) (count expected))
+                       (= (vec result) (vec expected))))))
 
 (defspec split-heavy-operations 100
   (prop/for-all [elements (gen/vector gen-int 100 500)]
@@ -498,11 +502,18 @@
                       n (count final-vec)]
                   (if (zero? n)
                     true
-                    ;; Check a sample of indices
-                    (every? (fn [i]
-                              (let [[entry _] (set/get-nth final-pss i)]
-                                (= entry (nth final-vec i))))
-                            (take 10 (range n)))))))
+                    ;; Sample across the WHOLE range: first, last, middle and an
+                    ;; even spread (or every index when n is small) so the tail and
+                    ;; interior of large trees are exercised, not just the head.
+                    (let [indices (if (<= n 32)
+                                    (range n)
+                                    (distinct
+                                     (concat [0 (quot n 2) (dec n)]
+                                             (map #(quot (* % (dec n)) 31) (range 32)))))]
+                      (every? (fn [i]
+                                (let [[entry _] (set/get-nth final-pss i)]
+                                  (= entry (nth final-vec i))))
+                              indices))))))
 
 ;; =============================================================================
 ;; Rebalancing preserves measure (small branching factor)
