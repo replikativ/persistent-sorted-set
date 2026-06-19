@@ -70,7 +70,11 @@
        (reify WriteHandler
          (write [_ w leaf]
            (.writeTag w leaf-tag 1)
-           (.writeObject w {:keys (.keys ^ANode leaf)})))}
+           (.writeObject w (cond-> {:keys (.keys ^ANode leaf)}
+                             ;; :measure = the cached aggregate (nil for measure-less
+                             ;; consumers); when present it recurses through the consumer's
+                             ;; measure handler, so a restored node keeps it without recompute.
+                             (some? (.-_measure ^ANode leaf)) (assoc :measure (.-_measure ^ANode leaf))))))}
       Branch
       {branch-tag
        (reify WriteHandler
@@ -78,23 +82,30 @@
            (.writeTag w branch-tag 1)
            (let [^Branch b node
                  slots (.slotsForStorage b)]
-             (.writeObject w (cond-> {:level     (.level b)
-                                      :keys      (.keys b)
-                                      :addresses (.addresses b)}
-                               slots (assoc :slots slots))))))}}
+             ;; :subtree-count = the cached element count (−1 when not yet computed);
+             ;; carried so a restored Branch keeps an accurate (count set) without a walk.
+             (.writeObject w (cond-> {:level         (.level b)
+                                      :keys          (.keys b)
+                                      :addresses     (.addresses b)
+                                      :subtree-count (.subtreeCount b)}
+                               (some? (.-_measure b)) (assoc :measure (.-_measure b))
+                               slots                  (assoc :slots slots))))))}}
      :cljs
      {Leaf
       (fn [w leaf]
         (fress/write-tag w leaf-tag 1)
-        (fress/write-object w {:keys (vec (.-keys leaf))}))
+        (fress/write-object w (cond-> {:keys (vec (.-keys leaf))}
+                                (some? (.-_measure leaf)) (assoc :measure (.-_measure leaf)))))
       Branch
       (fn [w node]
         (fress/write-tag w branch-tag 1)
         (let [slots (branch/slots-for-storage node)]
-          (fress/write-object w (cond-> {:level     (node/level node)
-                                         :keys      (vec (.-keys node))
-                                         :addresses (vec (.-addresses node))}
-                                  slots (assoc :slots slots)))))}))
+          (fress/write-object w (cond-> {:level         (node/level node)
+                                         :keys          (vec (.-keys node))
+                                         :addresses     (vec (.-addresses node))
+                                         :subtree-count (.-subtree-count node)}
+                                  (some? (.-_measure node)) (assoc :measure (.-_measure node))
+                                  slots                     (assoc :slots slots)))))}))
 
 ;; ---------------------------------------------------------------------------
 ;; Read handlers — canonical store-map → Leaf/Branch, with `settings` injected
@@ -135,26 +146,33 @@
        {leaf-tag
         (reify ReadHandler
           (read [_ rdr _tag _n]
-            (let [{:keys [keys]} (.readObject rdr)]
-              (Leaf. ^List keys settings))))
+            (let [{:keys [keys measure]} (.readObject rdr)
+                  l (Leaf. ^List keys settings)]
+              (when (some? measure) (set! (.-_measure ^ANode l) measure))
+              l)))
         branch-tag
         (reify ReadHandler
           (read [_ rdr _tag _n]
-            (let [{:keys [level keys addresses slots]} (.readObject rdr)
+            (let [{:keys [level keys addresses subtree-count measure slots]} (.readObject rdr)
                   b (Branch. (int level) ^List keys ^List addresses settings)]
+              ;; restore the cached count (−1 ⇒ recompute lazily); _subtreeCount is public.
+              (set! (.-_subtreeCount b) (long (or subtree-count -1)))
+              (when (some? measure) (set! (.-_measure ^ANode b) measure))
               (when slots (attach-slots! b addresses slots))
               b)))})
      :cljs
      {leaf-tag
       (fn [rdr _tag _n]
-        (let [{:keys [keys]} (fress/read-object rdr)]
-          (Leaf. (to-array keys) settings nil)))
+        (let [{:keys [keys measure]} (fress/read-object rdr)]
+          (Leaf. (to-array keys) settings measure)))
       branch-tag
       (fn [rdr _tag _n]
-        (let [{:keys [level keys addresses slots]} (fress/read-object rdr)
-              node (branch/from-map {:level     level
-                                     :keys      (to-array keys)
-                                     :addresses (to-array addresses)
-                                     :settings  settings})]
+        (let [{:keys [level keys addresses subtree-count measure slots]} (fress/read-object rdr)
+              node (branch/from-map {:level         level
+                                     :keys          (to-array keys)
+                                     :addresses     (to-array addresses)
+                                     :subtree-count subtree-count   ; from-map: (or subtree-count -1)
+                                     :measure       measure
+                                     :settings      settings})]
           (when slots (attach-slots! node addresses slots))
           node))}))

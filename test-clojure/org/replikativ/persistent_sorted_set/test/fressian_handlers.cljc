@@ -12,7 +12,9 @@
             #?(:clj  [clojure.data.fressian :as fress]
                :cljs [fress.api :as fress])
             #?(:cljs [org.replikativ.persistent-sorted-set.impl.storage :refer [IStorage]]))
-  #?(:clj (:import [org.replikativ.persistent_sorted_set IStorage Settings]
+  #?(:clj (:import [org.replikativ.persistent_sorted_set IStorage ANode Branch Settings
+                    NumericStats NumericStatsOps]
+                   [org.fressian.handlers WriteHandler ReadHandler]
                    [java.io ByteArrayOutputStream ByteArrayInputStream])))
 
 ;; ---- per-platform fressian storage shim (the only platform-specific code) -----------------
@@ -89,3 +91,51 @@
           back     (vec (set/restore a2 storage))
           expected (vec (remove #(zero? (mod % 7)) elems))]
       (is (= expected back)))))
+
+;; JVM-only: prove a non-nil node measure is CARRIED + restored (not silently
+;; recomputed) by round-tripping a single measured Branch with the consumer's OWN
+;; measure-value handler — the element-agnostic recursion that keeps the codec generic.
+#?(:clj
+   (deftest measure-roundtrip
+     (testing "a Branch's _measure survives via a consumer measure handler"
+       (let [ops      (NumericStatsOps/instance)
+             settings (Settings. (int 8) nil ops)
+             nstats-w {NumericStats
+                       {"test/numeric-stats"
+                        (reify WriteHandler
+                          (write [_ w s]
+                            (.writeTag w "test/numeric-stats" 1)
+                            (let [^NumericStats s s]
+                              (.writeObject w [(.-count s) (.-sum s) (.-sumSq s) (.-min s) (.-max s)]))))}}
+             nstats-r {"test/numeric-stats"
+                       (reify ReadHandler
+                         (read [_ rdr _ _]
+                           (let [[c s sq mn mx] (.readObject rdr)]
+                             (NumericStats. (long c) (double s) (double sq) mn mx))))}
+             wl (-> (merge fress/clojure-write-handlers pss-fress/write-handlers nstats-w)
+                    fress/associative-lookup fress/inheritance-lookup)
+             rl (-> (merge fress/clojure-read-handlers (pss-fress/read-handlers settings) nstats-r)
+                    fress/associative-lookup)
+             ser2   (fn [node] (let [o (ByteArrayOutputStream.)]
+                                 (.writeObject (fress/create-writer o :handlers wl) node) (.toByteArray o)))
+             deser2 (fn [bs] (.readObject (fress/create-reader (ByteArrayInputStream. bs) :handlers rl)))
+             ;; a storage that flushes children, so the root is a Branch we can inspect
+             *disk   (atom {})
+             storage (reify IStorage
+                       (store [_ node] (let [a (random-uuid)] (swap! *disk assoc a (ser2 node)) a))
+                       (accessed [_ _] nil)
+                       (restore [_ a] (deser2 (@*disk a)))
+                       (markFreed [_ _] nil) (isFreed [_ _] false) (freedInfo [_ _] nil))
+             s    (reduce (fn [s e] (set/conj s e compare))
+                          (set/sorted-set* {:storage storage :measure ops :branching-factor 8})
+                          (range 500))
+             _    (set/measure s)                         ; force the aggregates to compute
+             root (.root s)
+             m0   ^NumericStats (.-_measure ^ANode root)
+             root2 (deser2 (ser2 root))                   ; round-trip the root node alone
+             m1   ^NumericStats (.-_measure ^ANode root2)]
+         (is (instance? Branch root) "multi-level tree ⇒ a Branch root")
+         (is (some? m0) "the live root carries a computed measure")
+         (is (some? m1) "the restored root carries the measure (not nil ⇒ it was serialized, not recomputed)")
+         (is (= [(.-count m0) (.-sum m0)] [(.-count m1) (.-sum m1)])
+             "the restored Branch measure equals the original")))))
