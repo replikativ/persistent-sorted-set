@@ -226,6 +226,13 @@
                               :address (.-address pset)
                               :count   (count pset)}))))
 
+(def root-write-handlers
+  "Pre-keyed root write handler, shaped like `write-handlers` so a cljc consumer can
+   `(merge write-handlers root-write-handlers …)` WITHOUT importing the root type itself.
+   JVM: {PersistentSortedSet {tag WriteHandler}}; cljs: {BTSet fn}."
+  #?(:clj  {PersistentSortedSet {set-tag (root-write-handler)}}
+     :cljs {BTSet (root-write-handler)}))
+
 (defn root-read-handler
   "Canonical read handler for a PSS root. Reconstructs a lazy root from
    `{:meta :address :count}`, resolving the two CONSUMER-specific parts from the wire
