@@ -7,8 +7,16 @@
   (:require [org.replikativ.persistent-sorted-set.arrays :as arrays]
             [org.replikativ.persistent-sorted-set.btset :as btset :refer [BTSet]]))
 
+;; diff-buf: diff-buffering is OFF by default (0 ⇒ byte-identical baseline) so existing
+;; storages (which don't serialize Branch._slots) are unaffected — enabling it without a
+;; slots-aware storage would silently drop buffered diffs on write. Mirrors the JVM default
+;; (Settings.defaultDiffBufSize). Consumers serializing :slots (e.g. datahike) pass an
+;; explicit :diff-buf-size; the cljs test build overrides this define to 256 to gate the path.
+(goog-define default-diff-buf-size 0)
+
 (def ^:private default-opts
-  {:branching-factor 512})
+  {:branching-factor 512
+   :diff-buf-size default-diff-buf-size})
 
 (defn- with-defaults [opts]
   (merge default-opts opts))
@@ -181,11 +189,11 @@
    `(seek (seq set) to)` returns iterator for all Xs where to <= X.
    Optionally pass in comparator that will override the one that set uses."
   ([seq to]
-   (btset/seek seq to))
+   (when seq (btset/seek seq to)))                 ; seq is nil for an empty set ⇒ nothing to seek
   ([seq to arg]
-   (btset/seek seq to arg))
+   (when seq (btset/seek seq to arg)))
   ([seq to cmp opts]
-   (btset/seek seq to cmp opts)))
+   (when seq (btset/seek seq to cmp opts))))
 
 (defn walk-addresses
   "Visit each address used by this set. Usable for cleaning up

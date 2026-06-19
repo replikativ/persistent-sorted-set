@@ -24,6 +24,11 @@
                  (when (and (nil? (.-root set)) (some? (.-address set)))
                    (assert (implements? storage/IStorage (.-storage set)))
                    (set! (.-root set) (await (storage/restore (.-storage set) (.-address set) opts)))))
+               ;; diff-buf: seed the projection comparator at the root; branch/child propagates it
+               ;; down as nodes materialize, so a leaf-parent can project buffered leaves with the
+               ;; set's stable comparator. Idempotent; a Leaf root has no buffered children.
+               (when (instance? Branch (.-root set))
+                 (set! (.-_projCmp ^Branch (.-root set)) (.-comparator set)))
                (.-root set))))
 
 (defn $count
@@ -51,6 +56,8 @@
      (conjoin set key arg {:sync? true})
      (conjoin set key (.-comparator set) arg)))
   ([^BTSet set key cmp {:keys [sync?] :or {sync? true} :as opts}]
+   ;; nil is not a storable value (matches upstream / the JVM PersistentSortedSet.cons check).
+   (when (nil? key) (throw (ex-info "PersistentSortedSet cannot store nil" {:key key})))
    (async+sync sync?
                (async
                 (let [root  (await (-root set opts))
@@ -90,7 +97,10 @@
                                                          (measure/merge-measure measure-ops acc cs))
                                                        (measure/identity-measure measure-ops)
                                                        child-measure))]
-                            (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count root-measure (.-settings set))
+                            ;; diff-buf: new root on growth — _bufEntries = 0 (no buffered diff; this
+                            ;; node is always the root ⇒ always written; if later mutated in a transient
+                            ;; batch the first deposit poisons it correctly). Mirrors JVM makeBranchFromChildren.
+                            (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count root-measure (.-settings set) nil 0 (.-comparator set))
                                     new-cnt
                                     (.-comparator set)
                                     (.-meta set)
@@ -1479,7 +1489,7 @@
   (-reduce [this f start] (if-let [i (-iter this {:sync? true})] (-reduce i f start) start))
 
   IReversible
-  (-rseq [this] (rseq (-iter this {:sync? true})))
+  (-rseq [this] (when-some [i (-iter this {:sync? true})] (rseq i)))   ; empty set ⇒ nil (not a nil-iter error)
 
   ; ISorted
   ; (-sorted-seq [this ascending?])
@@ -1614,10 +1624,13 @@
                                            nil
                                            subtree-count
                                            child-measure
-                                           settings))))
+                                           ;; diff-buf: bulk-built branch — _bufEntries = 0 (no slots,
+                                           ;; anchorless ⇒ written wholesale at store). See branch.cljs.
+                                           settings nil 0 cmp))))
          (inc shift))))))
 
 (defn ^BTSet from-sequential [cmp seq opts]
+  (when (some nil? seq) (throw (ex-info "PersistentSortedSet cannot store nil" {})))
   (let [arr (-> (into-array seq) (arrays/asort cmp) (sorted-arr-distinct cmp))]
     (from-sorted-array cmp arr (alength arr) opts)))
 

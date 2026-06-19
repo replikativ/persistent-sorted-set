@@ -58,6 +58,10 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       root = _storage.restore(_address);
       _root = _settings.makeReference(root);
     }
+    // diff-buf: seed the projection comparator at the root; Branch.child propagates it down
+    // as nodes materialize, so a leaf-parent can project buffered leaves with the set's
+    // comparator. (Idempotent; no-op for a Leaf root, which has no buffered children.)
+    if (root instanceof Branch) ((Branch) root)._projCmp = _cmp;
     return root;
   }
 
@@ -96,8 +100,14 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       }
     }
     Object measure = computeMeasureFromChildren(nodes);
+    // diff-buf: this ctor leaves _bufEntries at its default 0 (no diff-buf block). That is correct
+    // here precisely because the result is ALWAYS the root (both callers assign it to _root): the
+    // root is always written, so its _bufEntries is never read by a parent to decide buffering, and
+    // it has no slots (nothing buffered). If it is mutated further this txn the first deposit folds
+    // its children's values in (poisoning it to BUF_WRITE if a child rebalanced). Do not reuse this
+    // for a non-root branch without setting _bufEntries.
     return new Branch(nodes[0].level() + 1, n, keys, null, children,
-                      countKnown ? subtreeCount : -1, measure, _settings);
+                      countKnown ? subtreeCount : -1, measure, _cmp, _settings);
   }
 
   /**
@@ -465,6 +475,9 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   }
 
   public PersistentSortedSet cons(Object key, Comparator cmp) {
+    // nil is not a storable value (matches upstream persistent-sorted-set; nil would also be
+    // ambiguous against the null "not found"/sentinel returns and comparator-dependent ordering).
+    if (key == null) throw new IllegalArgumentException("PersistentSortedSet cannot store nil");
     ANode[] nodes = root().add(_storage, (Key) key, cmp, _settings);
 
     if (UNCHANGED == nodes) return this;

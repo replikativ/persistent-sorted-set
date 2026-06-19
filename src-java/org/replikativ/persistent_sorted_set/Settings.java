@@ -1,6 +1,7 @@
 package org.replikativ.persistent_sorted_set;
 
 import java.lang.ref.*;
+import java.util.*;
 import java.util.concurrent.atomic.*;
 
 @SuppressWarnings("rawtypes")
@@ -10,13 +11,23 @@ public class Settings {
   public final AtomicBoolean _edit;
   public final IMeasure _measure;
   public final ILeafProcessor _leafProcessor;
+  // diff-buf: per-node diff budget B. 0 (default) disables the write-opt path
+  // entirely, so every code path is byte-identical to baseline PSS (invariant I0).
+  // Design + the IStorage slots contract: doc/diff-buffering.md.
+  public final int _diffBufSize;
 
-  public Settings(int branchingFactor, RefType refType, AtomicBoolean edit, IMeasure measure, ILeafProcessor leafProcessor) {
+  // Canonical edit-carrying constructor (does not normalize; callers pass already-normalized
+  // values). Used by editable() — which threads BOTH the set's branchingFactor and diffBufSize
+  // through unchanged, so a transient preserves them. (The pre-diff-buf 5-arg edit ctor was
+  // removed: it was unused and, lacking a diffBufSize arg, would have silently reset it to the
+  // sysprop default.)
+  public Settings(int branchingFactor, RefType refType, AtomicBoolean edit, IMeasure measure, ILeafProcessor leafProcessor, int diffBufSize) {
     _branchingFactor = branchingFactor;
     _refType = refType;
     _edit = edit;
     _measure = measure;
     _leafProcessor = leafProcessor;
+    _diffBufSize = diffBufSize;
   }
 
   public Settings() {
@@ -36,6 +47,11 @@ public class Settings {
   }
 
   public Settings(int branchingFactor, RefType refType, IMeasure measure, ILeafProcessor leafProcessor) {
+    this(branchingFactor, refType, measure, leafProcessor, defaultDiffBufSize());
+  }
+
+  // Normalizing constructor with explicit diffBufSize (used by the Clojure API).
+  public Settings(int branchingFactor, RefType refType, IMeasure measure, ILeafProcessor leafProcessor, int diffBufSize) {
     if (branchingFactor <= 0) {
       branchingFactor = 512;
     }
@@ -47,6 +63,21 @@ public class Settings {
     _edit = null;
     _measure = measure;
     _leafProcessor = leafProcessor;
+    _diffBufSize = diffBufSize < 0 ? 0 : diffBufSize;
+  }
+
+  // diff-buf: diff-buffering is OFF by default (0 ⇒ byte-identical baseline, invariant
+  // I0) so existing IStorage impls — which don't serialize Branch._slots — are unaffected;
+  // enabling it without a slots-aware storage would silently drop buffered diffs on write.
+  // Consumers that serialize :slots (e.g. datahike) opt in via Settings/the config, or set
+  // the pss.diffBufSize system property (the test suite uses -Dpss.diffBufSize=256).
+  // Public so the Clojure API (map->settings) shares this single default source.
+  public static int defaultDiffBufSize() {
+    try {
+      return Integer.parseInt(System.getProperty("pss.diffBufSize", "0"));
+    } catch (Exception e) {
+      return 0;
+    }
   }
 
   public int minBranchingFactor() {
@@ -61,6 +92,11 @@ public class Settings {
     return 8;
   }
 
+  // diff-buf per-node diff budget; 0 disables the write-opt path (I0: baseline-identical).
+  public int diffBufSize() {
+    return _diffBufSize;
+  }
+
   public RefType refType() {
     return _refType;
   }
@@ -72,7 +108,8 @@ public class Settings {
   public Settings editable(boolean value) {
     assert !editable();
     assert value == true;
-    return new Settings(_branchingFactor, _refType, new AtomicBoolean(value), _measure, _leafProcessor);
+    Settings s = new Settings(_branchingFactor, _refType, new AtomicBoolean(value), _measure, _leafProcessor, _diffBufSize);
+    return s;
   }
 
   public IMeasure measure() {

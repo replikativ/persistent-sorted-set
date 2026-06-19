@@ -66,9 +66,9 @@
   `(seek (seq set) to)` returns iterator for all Xs where to <= X.
   Optionally pass in comparator that will override the one that set uses."
   ([seq to]
-   (.seek ^Seq seq to))
+   (when seq (.seek ^Seq seq to)))                 ; seq is nil for an empty set ⇒ nothing to seek
   ([seq to cmp]
-   (.seek ^Seq seq to ^Comparator cmp)))
+   (when seq (.seek ^Seq seq to ^Comparator cmp))))
 
 (defn lookup
   "Look up a key and return the actual stored element.
@@ -126,15 +126,22 @@
            (conj! (array-from-indexed coll type (+ from (quot len 2)) to)))))))
 
 (defn- map->settings ^Settings [m]
-  (Settings.
-   (int (or (:branching-factor m) 0))
-   (case (:ref-type m)
-     :strong RefType/STRONG
-     :soft   RefType/SOFT
-     :weak   RefType/WEAK
-     nil)
-   (:measure m)
-   (:leaf-processor m)))
+  (let [s (Settings.
+           (int (or (:branching-factor m) 0))
+           (case (:ref-type m)
+             :strong RefType/STRONG
+             :soft   RefType/SOFT
+             :weak   RefType/WEAK
+             nil)
+           ^IMeasure (:measure m)
+           (:leaf-processor m)
+           ;; diff-buf: fall back to the shared Settings default (Settings/defaultDiffBufSize,
+           ;; 0/off unless the pss.diffBufSize sysprop is set) when the caller doesn't specify.
+           ;; 0 = baseline (I0). See doc/diff-buffering.md.
+           (int (or (:diff-buf-size m) (Settings/defaultDiffBufSize))))]
+    ;; diff-buf: the comparator is NOT stored on Settings — it lives on the PersistentSortedSet
+    ;; (_cmp) and is propagated to Branch nodes (Branch._projCmp) for leaf projection.
+    s))
 
 (defn- settings->map [^Settings s]
   {:branching-factor (.branchingFactor s)
@@ -143,7 +150,8 @@
                        RefType/SOFT   :soft
                        RefType/WEAK   :weak)
    :measure          ^IMeasure (.measure s)
-   :leaf-processor   (.leafProcessor s)})
+   :leaf-processor   (.leafProcessor s)
+   :diff-buf-size      (.diffBufSize s)})
 
 (defn from-sorted-array
   "Fast path to create a set if you already have a sorted array of elements on your hands."
@@ -183,6 +191,7 @@
                                    children
                                    (long subtree-count)
                                    measure
+                                   cmp
                                    settings)))]
      (loop [level 1
             nodes (mapv ->Leaf (split keys len Object avg-branching-factor max-branching-factor))]
@@ -196,6 +205,7 @@
   ([^Comparator cmp keys]
    (from-sequential cmp keys (Settings.)))
   ([^Comparator cmp keys opts]
+   (when (some nil? keys) (throw (IllegalArgumentException. "PersistentSortedSet cannot store nil")))
    (let [arr (to-array keys)
          _   (arrays/asort arr cmp)
          len (ArrayUtil/distinct cmp arr)]

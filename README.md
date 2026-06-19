@@ -246,6 +246,32 @@ See [test_storage.clj](test-clojure/org/replikativ/persistent_sorted_set/test_st
 
 ClojureScript also supports durable storage with async operations. The `IStorage` interface works the same way, but `store` and `restore` methods return promises/async values instead of direct values. This allows integration with IndexedDB, remote storage APIs, and other async storage backends.
 
+## Write amplification (diff buffering)
+
+On immutable, content-addressed storage (e.g. konserve on S3/GCS), each `store` of a node is a
+new object, and a commit normally rewrites the whole root→leaf path it touched (`≈ depth+1`
+objects). Where each `PUT` dominates cost/latency, **diff buffering** brings a content-only
+commit down to **~1 object per commit**: the in-memory tree stays an ordinary B-tree, and at
+the serialization boundary a rewritten branch buffers each unchanged-structure child's *diff*
+(plus an aggregate snapshot) into its own object, re-pointing to the child's existing durable
+address instead of rewriting it. Reads are unaffected (the diff is projected back lazily on
+descent, once per node). Queries, counts, ranks, and measures all work unchanged.
+
+It is **off by default** and gated by a per-node budget; `0` is byte-identical to baseline.
+
+```clojure
+;; opt in per set:
+(set/sorted-set* {:diff-buf-size 256 :storage my-storage ...})
+;; or globally via the JVM system property -Dpss.diffBufSize=256
+```
+
+**Important:** enabling it requires an `IStorage` implementation that serializes and restores
+the per-child slots (`Branch.slotsForStorage` / reconstructing `_slots`). A storage that
+ignores them will silently drop buffered changes on write — which is why the default is off.
+
+See [doc/diff-buffering.md](doc/diff-buffering.md) for the model, invariants, on-disk format,
+and the storage contract.
+
 ## Efficient Range Counting
 
 Count elements in a range without iterating through them:

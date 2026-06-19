@@ -8,7 +8,7 @@
    [clojure.lang RT]
    [java.lang.ref Reference]
    [java.util Comparator Arrays]
-   [org.replikativ.persistent_sorted_set ANode ArrayUtil Branch IStorage Leaf PersistentSortedSet Settings]))
+   [org.replikativ.persistent_sorted_set ANode ArrayUtil Branch IStorage Leaf PersistentSortedSet Settings Slot]))
 
 (set! *warn-on-reflection* true)
 
@@ -32,13 +32,15 @@
   (store [_ node]
     (swap! *stats update :writes inc)
     (let [node    ^ANode node
-          address (gen-addr)]
-      (swap! *disk assoc address
-             (pr-str
-              {:level     (.level node)
-               :keys      (.keys node)
-               :addresses (when (instance? Branch node)
-                            (.addresses ^Branch node))}))
+          address (gen-addr)
+          ;; diff-buf: per-child buffered diffs, only present when diffBufSize>0 (else nil ⇒
+          ;; the map is byte-identical to baseline, so diffBufSize=0 is unaffected — I0).
+          slots   (when (instance? Branch node) (.slotsForStorage ^Branch node))
+          m       {:level     (.level node)
+                   :keys      (.keys node)
+                   :addresses (when (instance? Branch node)
+                                (.addresses ^Branch node))}]
+      (swap! *disk assoc address (pr-str (if slots (assoc m :slots slots) m)))
       address))
   (accessed [_ address]
     (swap! *stats update :accessed inc)
@@ -48,10 +50,20 @@
      (@*memory address)
      (let [{:keys [level
                    ^java.util.List keys
-                   ^java.util.List addresses]} (edn/read-string (@*disk address))
+                   ^java.util.List addresses
+                   slots]} (edn/read-string (@*disk address))
            node (if addresses
                   (Branch. (int level) ^java.util.List keys ^java.util.List addresses settings)
                   (Leaf. keys settings))]
+       ;; diff-buf: reconstruct per-child buffered diffs into _slots (anchor = the child's
+       ;; durable address). Branch.child projects them on descent (M5). Absent when diffBufSize=0.
+       (when (and slots (instance? Branch node))
+         (let [^Branch b node
+               arr (object-array (alength (.-_keys b)))]
+           (doseq [[idx entry] slots]
+             (aset arr (int idx)
+                   (Slot. (:diff entry) (long (:count entry)) (:measure entry) (nth addresses (int idx)))))
+           (set! (.-_slots b) arr)))
        (swap! *stats update :reads inc)
        (swap! *memory assoc address node)
        node)))
@@ -144,10 +156,16 @@
          (recur tail#)))))
 
 (deftest stresstest-stable-addresses
+  ;; diff-buf: this asserts a BASELINE structural-sharing invariant — that the durable
+  ;; node at each address byte-matches the in-memory child. Under diff-buffering a buffered
+  ;; child's address re-points to its (pre-diff) ANCHOR while the diff lives in the parent's
+  ;; slot, so the on-disk node intentionally differs from the post-diff child. Pin diff-buf
+  ;; OFF here; the address/anchor semantics under buffering are covered by the round-trip
+  ;; and generative content tests.
   (let [size      10000
         adds      (shuffle (range size))
         removes   (shuffle adds)
-        *set      (atom (set/sorted-set))
+        *set      (atom (set/sorted-set* {:diff-buf-size 0}))
         *disk     (atom {})
         storage   (storage *disk)
         invariant (fn invariant
@@ -188,7 +206,7 @@
                    (set/store set' storage))))
 
     (testing "Persist once"
-      (reset! *set (into (set/sorted-set) adds))
+      (reset! *set (into (set/sorted-set* {:diff-buf-size 0}) adds))
       (set/store @*set storage)
       (dobatches [xs removes]
                  (let [set' (swap! *set #(reduce disj % xs))]
@@ -216,17 +234,23 @@
       (is (= (- @*stored 4) @*stored')))))
 
 (deftest test-lazyness
+  ;; diff-buf: asserts BASELINE lazy-loading invariants (loaded-ratio after partial
+  ;; traversal; conj into an already-loaded area loads no extra nodes). Diff-buffering
+  ;; changes which nodes are touched/written on conj (buffering + projection), so these
+  ;; exact loaded-ratio equalities are a baseline property — pin diff-buf OFF here.
   (let [size       1000000
         xs         (shuffle (range size))
         rm         (vec (repeatedly (quot size 5) #(rand-nth xs)))
-        original   (-> (reduce disj (into (set/sorted-set* {:branching-factor 64}) xs) rm)
+        original   (-> (reduce disj (into (set/sorted-set* {:branching-factor 64 :diff-buf-size 0}) xs) rm)
                        (disj (quot size 4) (quot size 2)))
-        storage    (storage)
+        ;; storage reconstructs restored nodes with ITS settings — pin diff-buf 0 too so a
+        ;; later conj on the restored set stays baseline (no ĝ child-load) for loaded-ratio.
+        storage    (storage-with-settings (Settings. (int 64) nil nil nil (int 0)))
         address    (with-stats
                      (set/store original storage))
         _          (is (= 0 (:reads @*stats)))
         ; _          (is (> (:writes @*stats) (/ size PersistentSortedSet/MAX_LEN)))
-        loaded     (set/restore address storage {:branching-factor 64})
+        loaded     (set/restore address storage {:branching-factor 64 :diff-buf-size 0})
         _          (is (= 0 (:reads @*stats)))
         _          (is (= 0.0 (loaded-ratio loaded)))
         _          (is (= 1.0 (durable-ratio loaded)))
