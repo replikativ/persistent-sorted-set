@@ -60,52 +60,50 @@
 ;; :keys / :slots recurse through the consumer's own handlers.
 ;; ---------------------------------------------------------------------------
 
+(defn node->map
+  "Project a PSS node to its canonical, serializable store-map — exactly the value the
+   write handler emits. PUBLIC so a consumer can CONTENT-ADDRESS a node (hash this map)
+   without serializing it, or store the map directly. Leaf → {:keys …}; Branch →
+   {:level :keys :addresses :subtree-count (:measure) (:slots)}. `:measure` /
+   `:subtree-count` carried when present so a restored node needs no recompute.
+   Comparator/storage-free; element values stay raw (they recurse / hash through the
+   consumer's own handlers)."
+  [node]
+  #?(:clj
+     (if (instance? Branch node)
+       (let [^Branch b node
+             slots (.slotsForStorage b)]
+         (cond-> {:level         (.level b)
+                  :keys          (.keys b)
+                  :addresses     (.addresses b)
+                  :subtree-count (.subtreeCount b)}
+           (some? (.-_measure b)) (assoc :measure (.-_measure b))
+           slots                  (assoc :slots slots)))
+       (cond-> {:keys (.keys ^ANode node)}
+         (some? (.-_measure ^ANode node)) (assoc :measure (.-_measure ^ANode node))))
+     :cljs
+     (if (instance? Branch node)
+       (let [slots (branch/slots-for-storage node)]
+         (cond-> {:level         (node/level node)
+                  :keys          (vec (.-keys node))
+                  :addresses     (vec (.-addresses node))
+                  :subtree-count (.-subtree-count node)}
+           (some? (.-_measure node)) (assoc :measure (.-_measure node))
+           slots                     (assoc :slots slots)))
+       (cond-> {:keys (vec (.-keys node))}
+         (some? (.-_measure node)) (assoc :measure (.-_measure node))))))
+
 (def write-handlers
   "Fressian write handlers for PSS nodes. JVM: {Class {tag WriteHandler}} (for
    clojure.data.fressian's associative+inheritance lookup). cljs: {Type fn} (for fress).
-   Merge into the consumer's write-handler map next to its element handlers."
+   Merge into the consumer's write-handler map next to its element handlers. Both
+   leaf+branch emit `node->map` under their canonical tag."
   #?(:clj
-     {Leaf
-      {leaf-tag
-       (reify WriteHandler
-         (write [_ w leaf]
-           (.writeTag w leaf-tag 1)
-           (.writeObject w (cond-> {:keys (.keys ^ANode leaf)}
-                             ;; :measure = the cached aggregate (nil for measure-less
-                             ;; consumers); when present it recurses through the consumer's
-                             ;; measure handler, so a restored node keeps it without recompute.
-                             (some? (.-_measure ^ANode leaf)) (assoc :measure (.-_measure ^ANode leaf))))))}
-      Branch
-      {branch-tag
-       (reify WriteHandler
-         (write [_ w node]
-           (.writeTag w branch-tag 1)
-           (let [^Branch b node
-                 slots (.slotsForStorage b)]
-             ;; :subtree-count = the cached element count (−1 when not yet computed);
-             ;; carried so a restored Branch keeps an accurate (count set) without a walk.
-             (.writeObject w (cond-> {:level         (.level b)
-                                      :keys          (.keys b)
-                                      :addresses     (.addresses b)
-                                      :subtree-count (.subtreeCount b)}
-                               (some? (.-_measure b)) (assoc :measure (.-_measure b))
-                               slots                  (assoc :slots slots))))))}}
+     {Leaf   {leaf-tag   (reify WriteHandler (write [_ w leaf] (.writeTag w leaf-tag 1)   (.writeObject w (node->map leaf))))}
+      Branch {branch-tag (reify WriteHandler (write [_ w node] (.writeTag w branch-tag 1) (.writeObject w (node->map node))))}}
      :cljs
-     {Leaf
-      (fn [w leaf]
-        (fress/write-tag w leaf-tag 1)
-        (fress/write-object w (cond-> {:keys (vec (.-keys leaf))}
-                                (some? (.-_measure leaf)) (assoc :measure (.-_measure leaf)))))
-      Branch
-      (fn [w node]
-        (fress/write-tag w branch-tag 1)
-        (let [slots (branch/slots-for-storage node)]
-          (fress/write-object w (cond-> {:level         (node/level node)
-                                         :keys          (vec (.-keys node))
-                                         :addresses     (vec (.-addresses node))
-                                         :subtree-count (.-subtree-count node)}
-                                  (some? (.-_measure node)) (assoc :measure (.-_measure node))
-                                  slots                     (assoc :slots slots)))))}))
+     {Leaf   (fn [w leaf] (fress/write-tag w leaf-tag 1)   (fress/write-object w (node->map leaf)))
+      Branch (fn [w node] (fress/write-tag w branch-tag 1) (fress/write-object w (node->map node)))}))
 
 ;; ---------------------------------------------------------------------------
 ;; Read handlers — canonical store-map → Leaf/Branch, with `settings` injected
