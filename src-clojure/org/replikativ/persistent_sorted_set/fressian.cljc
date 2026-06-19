@@ -47,13 +47,16 @@
   #?(:cljs (:require [fress.api :as fress]
                      [org.replikativ.persistent-sorted-set.impl.node :as node]
                      [org.replikativ.persistent-sorted-set.leaf :refer [Leaf]]
-                     [org.replikativ.persistent-sorted-set.branch :refer [Branch] :as branch]))
-  #?(:clj (:import [org.replikativ.persistent_sorted_set ANode Leaf Branch Settings Slot]
+                     [org.replikativ.persistent-sorted-set.branch :refer [Branch] :as branch]
+                     [org.replikativ.persistent-sorted-set.btset :refer [BTSet]]))
+  #?(:clj (:import [org.replikativ.persistent_sorted_set ANode Leaf Branch Settings Slot
+                    PersistentSortedSet]
                    [org.fressian.handlers WriteHandler ReadHandler]
                    [java.util List])))
 
 (def ^:const leaf-tag "pss/leaf")
 (def ^:const branch-tag "pss/branch")
+(def ^:const set-tag "pss/set")
 
 ;; ---------------------------------------------------------------------------
 ;; Write handlers — Leaf/Branch → canonical store-map. Element values inside
@@ -177,3 +180,70 @@
                                      :settings      settings})]
           (when slots (attach-slots! node addresses slots))
           node))}))
+
+;; ---------------------------------------------------------------------------
+;; ROOT (PersistentSortedSet / BTSet) handlers.
+;;
+;; Like the nodes, the ROOT write handler keys on ONE type — so on a shared
+;; serializer there can be exactly one. Hence it too is canonical: `root-write-handler`
+;; emits `{:meta :address :count}` under `pss/set` for everyone. Unlike a node, a root
+;; reconstruction needs a comparator + storage — both CONSUMER concerns — so
+;; `root-read-handler` resolves them per-call from the wire `meta` via caller-supplied
+;; `resolve-storage` / `resolve-cmp`. (A consumer with one local store passes a constant
+;; storage; a multi-store/wire consumer resolves it by an id in `meta`, e.g. via the
+;; store-registry below.) Tag dispatch + the parameterized read are what let datahike's
+;; in-store and kabel root handlers fuse into one.
+;; ---------------------------------------------------------------------------
+
+(defonce ^{:doc "id → IStorage, for root readers that resolve storage by an id carried
+   in the set's meta (a shared/wire consumer). `register-store!` before reading roots."}
+  store-registry (atom {}))
+
+(defn register-store!   [id storage] (swap! store-registry assoc id storage) storage)
+(defn unregister-store! [id] (swap! store-registry dissoc id) nil)
+(defn registered-store  [id] (get @store-registry id))
+
+(defn root-write-handler
+  "Canonical write handler for a PSS root. One per the root type, so consumers on a
+   shared serializer don't conflict. Emits `{:meta :address :count}` under `pss/set`;
+   the set MUST be flushed (root address realized) first."
+  []
+  #?(:clj
+     (reify WriteHandler
+       (write [_ w pset]
+         (when (nil? (.-_address ^PersistentSortedSet pset))
+           (throw (ex-info "PSS root must be flushed before serialization" {:type :must-be-flushed})))
+         (.writeTag w set-tag 1)
+         (.writeObject w {:meta    (meta pset)
+                          :address (.-_address ^PersistentSortedSet pset)
+                          :count   (count pset)})))
+     :cljs
+     (fn [w pset]
+       (when (nil? (.-address pset))
+         (throw (ex-info "PSS root must be flushed before serialization" {:type :must-be-flushed})))
+       (fress/write-tag w set-tag 1)
+       (fress/write-object w {:meta    (meta pset)
+                              :address (.-address pset)
+                              :count   (count pset)}))))
+
+(defn root-read-handler
+  "Canonical read handler for a PSS root. Reconstructs a lazy root from
+   `{:meta :address :count}`, resolving the two CONSUMER-specific parts from the wire
+   `meta`:
+     :settings        the PSS Settings.
+     :resolve-storage (fn [meta] -> IStorage) — REQUIRED. e.g. `(constantly my-storage)`
+                      for one local store, or `(comp registered-store :store-id)` for a
+                      registry lookup.
+     :resolve-cmp     (fn [meta] -> Comparator) — default `(constantly nil)`."
+  [{:keys [settings resolve-storage resolve-cmp] :or {resolve-cmp (constantly nil)}}]
+  #?(:clj
+     (reify ReadHandler
+       (read [_ rdr _tag _n]
+         (let [{:keys [meta address count]} (.readObject rdr)]
+           (PersistentSortedSet. meta (resolve-cmp meta) address (resolve-storage meta)
+                                 nil (int count) settings 0))))
+     :cljs
+     (fn [rdr _tag _n]
+       (let [{:keys [meta address count]} (fress/read-object rdr)]
+         ;; BTSet deftype: [root cnt comparator meta _hash storage address settings]
+         (BTSet. nil count (resolve-cmp meta) meta nil (resolve-storage meta) address settings)))))

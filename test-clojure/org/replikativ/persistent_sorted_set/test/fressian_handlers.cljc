@@ -13,7 +13,7 @@
                :cljs [fress.api :as fress])
             #?(:cljs [org.replikativ.persistent-sorted-set.impl.storage :refer [IStorage]]))
   #?(:clj (:import [org.replikativ.persistent_sorted_set IStorage ANode Branch Settings
-                    NumericStats NumericStatsOps]
+                    PersistentSortedSet NumericStats NumericStatsOps]
                    [org.fressian.handlers WriteHandler ReadHandler]
                    [java.io ByteArrayOutputStream ByteArrayInputStream])))
 
@@ -139,3 +139,27 @@
          (is (some? m1) "the restored root carries the measure (not nil ⇒ it was serialized, not recomputed)")
          (is (= [(.-count m0) (.-sum m0)] [(.-count m1) (.-sum m1)])
              "the restored Branch measure equals the original")))))
+
+#?(:clj
+   (deftest root-roundtrip
+     (testing "a flushed PSS root serializes as a pointer (pss/set) and restores lazily,
+               with storage + comparator resolved per-call from the wire meta"
+       (let [settings (Settings. (int 8) nil)
+             storage  (->FressStorage (atom {}) settings)
+             elems    (vec (range 500))
+             s        (reduce (fn [s e] (set/conj s e compare))
+                              (set/sorted-set* {:storage storage :branching-factor 8}) elems)
+             _        (set/store s storage)            ; flush ⇒ root address realized
+             root-wl  (-> (merge fress/clojure-write-handlers
+                                 {PersistentSortedSet {pss-fress/set-tag (pss-fress/root-write-handler)}})
+                          fress/associative-lookup fress/inheritance-lookup)
+             out      (ByteArrayOutputStream.)
+             _        (.writeObject (fress/create-writer out :handlers root-wl) s)
+             root-rl  (-> (merge fress/clojure-read-handlers
+                                 {pss-fress/set-tag
+                                  (pss-fress/root-read-handler {:settings settings
+                                                                :resolve-storage (constantly storage)})})
+                          fress/associative-lookup)
+             s2       (.readObject (fress/create-reader (ByteArrayInputStream. (.toByteArray out)) :handlers root-rl))]
+         (is (instance? PersistentSortedSet s2) "the pss/set pointer restores a PersistentSortedSet")
+         (is (= elems (vec s2)) "elements load lazily from the resolved storage")))))
