@@ -33,10 +33,16 @@
                 io.github.borkdude/gh-release-artifact {:git/tag "v0.2.1" :git/sha "4a9a74f"}}
    :ns-default build}
 
+  ;; The optional Fressian node-handler ns (org.replikativ.persistent-sorted-set.fressian)
+  ;; treats data.fressian as `provided` for consumers; here it's a plain dev/test dep.
+  :fressian
+  {:extra-deps {org.clojure/data.fressian {:mvn/version "1.1.0"}}}
+
   :test
   {:extra-paths ["test-clojure"]
    :extra-deps  {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}
                  org.clojure/test.check {:mvn/version "1.1.1"}
+                 org.clojure/data.fressian {:mvn/version "1.1.0"}
                  org.replikativ/hasch {:mvn/version "0.4.98"}}
    ;; diff-buf: library default is 0 (baseline). Run the suite with diff-buf ON so it
    ;; gates the buffering path; baseline-only invariant tests pin {:diff-buf-size 0} to override.
