@@ -163,3 +163,78 @@
              s2       (.readObject (fress/create-reader (ByteArrayInputStream. (.toByteArray out)) :handlers root-rl))]
          (is (instance? PersistentSortedSet s2) "the pss/set pointer restores a PersistentSortedSet")
          (is (= elems (vec s2)) "elements load lazily from the resolved storage")))))
+
+;; ---- Scope registry: many stores / one serializer (the shared-wire model) -----------------
+
+(defn- rooted
+  "Build a storage-backed set, stamp its store-id into meta, flush it (realize the root
+   address), and return the flushed set — ready to serialize as a `pss/set` pointer."
+  [storage bf store-id elems]
+  (let [s (-> (reduce (fn [s e] (set/conj s e compare))
+                      (set/sorted-set* {:storage storage :branching-factor bf}) elems)
+              (vary-meta assoc pss-fress/store-id-key store-id))]
+    (set/store s storage)
+    s))
+
+#?(:clj
+   (deftest two-scope-registry-roundtrip
+     (testing "two stores with DIFFERENT settings, registered under distinct store-ids; ONE
+               composite value carrying a root from EACH round-trips through ONE serializer — each
+               root resolves its own storage+settings+cmp from scope-registry by (:store-id meta)
+               and lazy-loads its tree from the RIGHT store (the serializer carries no node handlers;
+               child loads go through each resolved storage's own deser)."
+       (let [stA    (make-fress-storage 8 0)
+             stB    (make-fress-storage 16 0)
+             elemsA (vec (range 300))
+             elemsB (vec (range 1000 1500))
+             sA     (rooted stA 8  :store/a elemsA)
+             sB     (rooted stB 16 :store/b elemsB)
+             _      (pss-fress/register-scope! :store/a {:storage stA :settings (:settings stA) :resolve-cmp (constantly compare)})
+             _      (pss-fress/register-scope! :store/b {:storage stB :settings (:settings stB) :resolve-cmp (constantly compare)})
+             wl     (-> (merge fress/clojure-write-handlers pss-fress/root-write-handlers)
+                        fress/associative-lookup fress/inheritance-lookup)
+             ;; root reader uses the DEFAULT (registry by :store-id) — no closed-over storage/settings
+             rl     (-> (merge fress/clojure-read-handlers {pss-fress/set-tag (pss-fress/root-read-handler)})
+                        fress/associative-lookup)
+             out    (ByteArrayOutputStream.)
+             _      (.writeObject (fress/create-writer out :handlers wl) {:a sA :b sB})
+             back   (.readObject (fress/create-reader (ByteArrayInputStream. (.toByteArray out)) :handlers rl))]
+         (try
+           (is (instance? PersistentSortedSet (:a back)))
+           (is (= elemsA (vec (:a back))) "root :a lazy-loads its tree from store A")
+           (is (= elemsB (vec (:b back))) "root :b lazy-loads its tree from store B")
+           (is (identical? stA (.-_storage ^PersistentSortedSet (:a back))) "root :a resolved store A's storage")
+           (is (identical? stB (.-_storage ^PersistentSortedSet (:b back))) "root :b resolved store B's storage")
+           (finally (pss-fress/unregister-scope! :store/a)
+                    (pss-fress/unregister-scope! :store/b)))))))
+
+;; A custom consumer record + its element handlers — models a CRDT/record (e.g. a yggdrasil
+;; CRDT, or a datahike Datom) that must coexist with the canonical PSS handlers on ONE serializer.
+#?(:clj (defrecord Tag [v]))
+#?(:clj
+   (def ^:private tag-wh
+     {Tag {"test/tag" (reify WriteHandler (write [_ w t] (.writeTag w "test/tag" 1) (.writeObject w (:v ^Tag t))))}}))
+#?(:clj
+   (def ^:private tag-rh
+     {"test/tag" (reify ReadHandler (read [_ rdr _ _] (->Tag (.readObject rdr))))}))
+
+#?(:clj
+   (deftest cross-system-shape-roundtrip
+     (testing "a custom record handler (Tag) composes on the SAME serializer as the canonical root
+               handler — one handler per type, no collision — modeling a CRDT/record sibling of a PSS
+               root from another store (the yggdrasil-CRDT-carrying-a-datahike-ref shape)."
+       (let [st   (make-fress-storage 8 0)
+             s    (rooted st 8 :store/x (vec (range 200)))
+             _    (pss-fress/register-scope! :store/x {:storage st :settings (:settings st) :resolve-cmp (constantly compare)})
+             wl   (-> (merge fress/clojure-write-handlers pss-fress/root-write-handlers tag-wh)
+                      fress/associative-lookup fress/inheritance-lookup)
+             rl   (-> (merge fress/clojure-read-handlers {pss-fress/set-tag (pss-fress/root-read-handler)} tag-rh)
+                      fress/associative-lookup)
+             out  (ByteArrayOutputStream.)
+             _    (.writeObject (fress/create-writer out :handlers wl) {:root s :tag (->Tag 42)})
+             back (.readObject (fress/create-reader (ByteArrayInputStream. (.toByteArray out)) :handlers rl))]
+         (try
+           (is (= (->Tag 42) (:tag back)) "the custom record round-trips alongside the PSS root")
+           (is (instance? PersistentSortedSet (:root back)))
+           (is (= (vec (range 200)) (vec (:root back))) "the PSS root resolves its scope + lazy-loads")
+           (finally (pss-fress/unregister-scope! :store/x)))))))

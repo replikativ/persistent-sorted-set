@@ -182,26 +182,46 @@
           node))}))
 
 ;; ---------------------------------------------------------------------------
-;; ROOT (PersistentSortedSet / BTSet) handlers.
+;; ROOT (PersistentSortedSet / BTSet) handlers + the reconstruction SCOPE.
 ;;
-;; Like the nodes, the ROOT write handler keys on ONE type — so on a shared
-;; serializer there can be exactly one. Hence it too is canonical: `root-write-handler`
-;; emits `{:meta :address :count}` under `pss/set` for everyone. Unlike a node, a root
-;; reconstruction needs a comparator + storage — both CONSUMER concerns — so
-;; `root-read-handler` resolves them per-call from the wire `meta` via caller-supplied
-;; `resolve-storage` / `resolve-cmp`. (A consumer with one local store passes a constant
-;; storage; a multi-store/wire consumer resolves it by an id in `meta`, e.g. via the
-;; store-registry below.) Tag dispatch + the parameterized read are what let datahike's
-;; in-store and kabel root handlers fuse into one.
+;; Like the nodes, the ROOT write handler keys on ONE type — so on a shared serializer
+;; there can be exactly one. Hence it too is canonical: `root-write-handler` emits
+;; `{:meta :address :count}` under `pss/set` for everyone.
+;;
+;; Unlike a node, reconstructing a root needs three things its bytes can't carry — a live
+;; `IStorage` (for lazy child loads), a `Settings` (branching-factor / diff-buf / measure-ops),
+;; and a comparator. These form the per-store SCOPE = `{:storage :settings :resolve-cmp}`.
+;; Storage is a LIVE object, so a deserialized root can only find it by an id at runtime; that
+;; same id resolves the WHOLE scope. So a root carries `:store-id` in its meta, and
+;; `root-read-handler` resolves the scope from `scope-registry` by that id. (Settings is NOT
+;; serialized into the root — that would let the root's settings diverge from its nodes'; one
+;; id → one scope keeps them identical. The settings DATA lives in the consumer's config; the
+;; FUNCTION parts — comparator via the meta, measure-ops in settings — are resolved by id, never
+;; serialized.)
+;;
+;; A single LOCAL store can instead pass a fixed scope (and skip `:store-id`); a shared/wire peer
+;; uses the registry. Roots resolve by id; nodes carry no id and never travel inside a value (they
+;; lazy-load store-locally from the storage the root resolves to). On raw konserve-sync replication
+;; a node DOES cross, but only transiently — re-stored settings-independently, re-read with the
+;; destination store's real settings — so its wire settings never matters.
 ;; ---------------------------------------------------------------------------
 
-(defonce ^{:doc "id → IStorage, for root readers that resolve storage by an id carried
-   in the set's meta (a shared/wire consumer). `register-store!` before reading roots."}
-  store-registry (atom {}))
+(def ^:const store-id-key
+  "Canonical key, in a root's meta, carrying the id of the store/scope it belongs to. A shared/wire
+   serializer resolves a root's reconstruction scope by this id. Consumers stamp it at root creation."
+  :store-id)
 
-(defn register-store!   [id storage] (swap! store-registry assoc id storage) storage)
-(defn unregister-store! [id] (swap! store-registry dissoc id) nil)
-(defn registered-store  [id] (get @store-registry id))
+(defonce ^{:doc "store-id → scope `{:storage :settings :resolve-cmp}`. A root reader on a shared/wire
+   serializer resolves a root's reconstruction context by `(:store-id meta)`. `register-scope!` each
+   participating store before reading its roots; `unregister-scope!` on release."}
+  scope-registry (atom {}))
+
+(defn register-scope!
+  "Register a store's reconstruction scope under `id`. scope = `{:storage :settings :resolve-cmp}`;
+   `:resolve-cmp` is `(fn [meta] -> Comparator)` (defaults to `(constantly nil)` when absent)."
+  [id scope] (swap! scope-registry assoc id scope) scope)
+(defn unregister-scope! [id] (swap! scope-registry dissoc id) nil)
+(defn registered-scope  [id] (get @scope-registry id))
 
 (defn root-write-handler
   "Canonical write handler for a PSS root. One per the root type, so consumers on a
@@ -234,23 +254,58 @@
      :cljs {BTSet (root-write-handler)}))
 
 (defn root-read-handler
-  "Canonical read handler for a PSS root. Reconstructs a lazy root from
-   `{:meta :address :count}`, resolving the two CONSUMER-specific parts from the wire
-   `meta`:
-     :settings        the PSS Settings.
-     :resolve-storage (fn [meta] -> IStorage) — REQUIRED. e.g. `(constantly my-storage)`
-                      for one local store, or `(comp registered-store :store-id)` for a
-                      registry lookup.
-     :resolve-cmp     (fn [meta] -> Comparator) — default `(constantly nil)`."
-  [{:keys [settings resolve-storage resolve-cmp] :or {resolve-cmp (constantly nil)}}]
-  #?(:clj
-     (reify ReadHandler
-       (read [_ rdr _tag _n]
-         (let [{:keys [meta address count]} (.readObject rdr)]
-           (PersistentSortedSet. meta (resolve-cmp meta) address (resolve-storage meta)
-                                 nil (int count) settings 0))))
-     :cljs
-     (fn [rdr _tag _n]
-       (let [{:keys [meta address count]} (fress/read-object rdr)]
-         ;; BTSet deftype: [root cnt comparator meta _hash storage address settings]
-         (BTSet. nil count (resolve-cmp meta) meta nil (resolve-storage meta) address settings)))))
+  "Canonical read handler for a PSS root. Reconstructs a lazy root from `{:meta :address :count}`,
+   resolving its SCOPE — `{:storage :settings :resolve-cmp}` — per read.
+
+   Opts:
+     :resolve-scope (fn [meta] -> scope). DEFAULT: `(registered-scope (get meta store-id-key))`
+                    — a shared/wire serializer. A single local store may pass
+                    `(constantly its-own-scope)`.
+   Back-compat single-store form (builds a fixed scope from these keys instead of :resolve-scope):
+     :settings  :resolve-storage  [:resolve-cmp]."
+  ([] (root-read-handler {}))
+  ([{:keys [resolve-scope settings resolve-storage resolve-cmp]
+     :or {resolve-cmp (constantly nil)}}]
+   (let [resolve-scope (cond
+                         resolve-scope    resolve-scope
+                         resolve-storage  (fn [_meta] {:storage     (resolve-storage _meta)
+                                                       :settings    settings
+                                                       :resolve-cmp resolve-cmp})
+                         :else            (fn [meta] (registered-scope (get meta store-id-key))))]
+     #?(:clj
+        (reify ReadHandler
+          (read [_ rdr _tag _n]
+            (let [{:keys [meta address count]} (.readObject rdr)
+                  {scope-storage :storage scope-settings :settings
+                   scope-cmp :resolve-cmp :or {scope-cmp (constantly nil)}} (resolve-scope meta)]
+              (PersistentSortedSet. meta (scope-cmp meta) address scope-storage
+                                    nil (int count) scope-settings 0))))
+        :cljs
+        (fn [rdr _tag _n]
+          (let [{:keys [meta address count]} (fress/read-object rdr)
+                {scope-storage :storage scope-settings :settings
+                 scope-cmp :resolve-cmp :or {scope-cmp (constantly nil)}} (resolve-scope meta)]
+            ;; BTSet deftype: [root cnt comparator meta _hash storage address settings]
+            (BTSet. nil count (scope-cmp meta) meta nil scope-storage address scope-settings)))))))
+
+;; ---------------------------------------------------------------------------
+;; Bundle builders — assemble a consumer's full canonical handler maps in one call.
+;; A local STORE passes its real `settings` + a fixed `resolve-scope`; a shared kabel PEER
+;; passes a default `settings` (node settings is transient on the wire) + omits `resolve-scope`
+;; (⇒ registry by store-id) + the UNION of participants' element handlers (one per type).
+;; ---------------------------------------------------------------------------
+
+(defn canonical-read-handlers
+  "Full canonical READ handler map: node handlers (pss/leaf + pss/branch, from `settings`) +
+   the root handler (pss/set, via `resolve-scope`) + the consumer's `element-read-handlers`.
+   Omit `:resolve-scope` to resolve roots from `scope-registry` by `(:store-id meta)`."
+  [{:keys [settings resolve-scope element-read-handlers]}]
+  (merge (read-handlers settings)
+         {set-tag (root-read-handler (cond-> {} resolve-scope (assoc :resolve-scope resolve-scope)))}
+         element-read-handlers))
+
+(defn canonical-write-handlers
+  "Full canonical WRITE handler map: node + root writes (settings-independent) + the consumer's
+   `element-write-handlers`. JVM shape `{Class {tag WH}}`; cljs `{Type fn}`."
+  [{:keys [element-write-handlers]}]
+  (merge write-handlers root-write-handlers element-write-handlers))
