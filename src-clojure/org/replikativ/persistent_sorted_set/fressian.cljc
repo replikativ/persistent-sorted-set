@@ -70,16 +70,19 @@
    consumer's own handlers)."
   [node]
   #?(:clj
+     ;; `vec` the keys/addresses: the raw trimmed Java List (Arrays$ArrayList) isn't
+     ;; hash-coercible (hasch) and differs from the cljs vector form — a Clojure vector
+     ;; is both, and fressian reads either back as a vector, so round-trip is identical.
      (if (instance? Branch node)
        (let [^Branch b node
              slots (.slotsForStorage b)]
          (cond-> {:level         (.level b)
-                  :keys          (.keys b)
-                  :addresses     (.addresses b)
+                  :keys          (vec (.keys b))
+                  :addresses     (vec (.addresses b))
                   :subtree-count (.subtreeCount b)}
            (some? (.-_measure b)) (assoc :measure (.-_measure b))
            slots                  (assoc :slots slots)))
-       (cond-> {:keys (.keys ^ANode node)}
+       (cond-> {:keys (vec (.keys ^ANode node))}
          (some? (.-_measure ^ANode node)) (assoc :measure (.-_measure ^ANode node))))
      :cljs
      (if (instance? Branch node)
