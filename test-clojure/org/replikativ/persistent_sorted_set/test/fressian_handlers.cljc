@@ -24,8 +24,12 @@
      (def ^:private write-lookup
        (-> (merge fress/clojure-write-handlers pss-fress/write-handlers)
            fress/associative-lookup fress/inheritance-lookup))
-     (defn- read-lookup [settings]
-       (-> (merge fress/clojure-read-handlers (pss-fress/read-handlers settings))
+     (defn- read-lookup [^Settings settings]
+       ;; bf now self-describes per node from the blob; the storage's settings only supplies the
+       ;; consumer's measure-ops + a default-bf fallback for pre-bf blobs.
+       (-> (merge fress/clojure-read-handlers
+                  (pss-fress/read-handlers {:measure-ops (.-_measure settings)
+                                            :default-bf   (.branchingFactor settings)}))
            fress/associative-lookup))
      (defn- ser ^bytes [node]
        (let [out (ByteArrayOutputStream.)]
@@ -45,7 +49,9 @@
    :cljs
    (do
      (defn- ser [node] (fress/write node :handlers pss-fress/write-handlers))
-     (defn- deser [settings bs] (fress/read bs :handlers (pss-fress/read-handlers settings)))
+     (defn- deser [settings bs]
+       (fress/read bs :handlers (pss-fress/read-handlers {:measure-ops (:measure settings)
+                                                          :default-bf  (:branching-factor settings)})))
      (defrecord FressStorage [*disk settings]
        IStorage
        (store    [_ node _opts] (let [a (random-uuid)] (swap! *disk assoc a (ser node)) a))
@@ -114,7 +120,8 @@
                              (NumericStats. (long c) (double s) (double sq) mn mx))))}
              wl (-> (merge fress/clojure-write-handlers pss-fress/write-handlers nstats-w)
                     fress/associative-lookup fress/inheritance-lookup)
-             rl (-> (merge fress/clojure-read-handlers (pss-fress/read-handlers settings) nstats-r)
+             rl (-> (merge fress/clojure-read-handlers
+                           (pss-fress/read-handlers {:measure-ops ops :default-bf 8}) nstats-r)
                     fress/associative-lookup)
              ser2   (fn [node] (let [o (ByteArrayOutputStream.)]
                                  (.writeObject (fress/create-writer o :handlers wl) node) (.toByteArray o)))
@@ -142,8 +149,8 @@
 
 #?(:clj
    (deftest root-roundtrip
-     (testing "a flushed PSS root serializes as a pointer (pss/set) and restores lazily,
-               with storage + comparator resolved per-call from the wire meta"
+     (testing "a flushed PSS root serializes as a pointer (pss/set) and restores lazily, with storage
+               resolved per-call (lexical here) and bf self-describing from the blob"
        (let [settings (Settings. (int 8) nil)
              storage  (->FressStorage (atom {}) settings)
              elems    (vec (range 500))
@@ -157,44 +164,79 @@
              _        (.writeObject (fress/create-writer out :handlers root-wl) s)
              root-rl  (-> (merge fress/clojure-read-handlers
                                  {pss-fress/set-tag
-                                  (pss-fress/root-read-handler {:settings settings
-                                                                :resolve-storage (constantly storage)})})
+                                  (pss-fress/root-read-handler {:resolve-storage (constantly storage)
+                                                                :default-bf 8})})
                           fress/associative-lookup)
              s2       (.readObject (fress/create-reader (ByteArrayInputStream. (.toByteArray out)) :handlers root-rl))]
          (is (instance? PersistentSortedSet s2) "the pss/set pointer restores a PersistentSortedSet")
          (is (= elems (vec s2)) "elements load lazily from the resolved storage")))))
 
-;; ---- Scope registry: many stores / one serializer (the shared-wire model) -----------------
+;; ---- bf self-describes per node ⇒ many branching-factors in ONE store/serializer --------------
+
+#?(:clj
+   (deftest multi-bf-one-store-roundtrip
+     (testing "two trees with DIFFERENT branching factors stored through ONE store + ONE serializer:
+               each node self-describes its bf in the blob, so reconstruction honors the per-node bf
+               (the serializer's default-bf 999 is never used) — the one-Settings-per-store constraint
+               is lifted."
+       (let [*disk   (atom {})
+             wl      (-> (merge fress/clojure-write-handlers pss-fress/write-handlers)
+                         fress/associative-lookup fress/inheritance-lookup)
+             rl      (-> (merge fress/clojure-read-handlers (pss-fress/read-handlers {:default-bf 999}))
+                         fress/associative-lookup)
+             ser1    (fn [node] (let [o (ByteArrayOutputStream.)]
+                                  (.writeObject (fress/create-writer o :handlers wl) node) (.toByteArray o)))
+             storage (reify IStorage
+                       (store [_ node] (let [a (random-uuid)] (swap! *disk assoc a (ser1 node)) a))
+                       (accessed [_ _] nil)
+                       (restore [_ a] (.readObject (fress/create-reader (ByteArrayInputStream. (@*disk a)) :handlers rl)))
+                       (markFreed [_ _] nil) (isFreed [_ _] false) (freedInfo [_ _] nil))
+             store-tree (fn [bf elems]
+                          (set/store (reduce (fn [s e] (set/conj s e compare))
+                                             (set/sorted-set* {:storage storage :branching-factor bf}) elems)
+                                     storage))
+             a4     (store-tree 4  (vec (range 400)))
+             a32    (store-tree 32 (vec (range 400)))
+             root4  (.restore storage a4)
+             root32 (.restore storage a32)]
+         (is (= 4  (.branchingFactor (.-_settings ^ANode root4)))  "bf-4 root node reconstructs at bf 4")
+         (is (= 32 (.branchingFactor (.-_settings ^ANode root32))) "bf-32 root node reconstructs at bf 32 — same serializer")
+         (is (= (vec (range 400)) (vec (set/restore a4 storage))))
+         (is (= (vec (range 400)) (vec (set/restore a32 storage))))))))
+
+;; ---- many stores / one wire serializer — resolve each root's storage by :storage-id ------------
 
 (defn- rooted
-  "Build a storage-backed set, stamp its store-id into meta, flush it (realize the root
-   address), and return the flushed set — ready to serialize as a `pss/set` pointer."
-  [storage bf store-id elems]
+  "Build a storage-backed set, stamp its :storage-id into meta, flush it (realize the root address),
+   and return the flushed set — ready to serialize as a `pss/set` pointer."
+  [storage bf storage-id elems]
   (let [s (-> (reduce (fn [s e] (set/conj s e compare))
                       (set/sorted-set* {:storage storage :branching-factor bf}) elems)
-              (vary-meta assoc pss-fress/store-id-key store-id))]
+              (vary-meta assoc pss-fress/storage-id-key storage-id))]
     (set/store s storage)
     s))
 
 #?(:clj
-   (deftest two-scope-registry-roundtrip
-     (testing "two stores with DIFFERENT settings, registered under distinct store-ids; ONE
-               composite value carrying a root from EACH round-trips through ONE serializer — each
-               root resolves its own storage+settings+cmp from scope-registry by (:store-id meta)
-               and lazy-loads its tree from the RIGHT store (the serializer carries no node handlers;
-               child loads go through each resolved storage's own deser)."
+   (deftest two-store-wire-roundtrip
+     (testing "two stores with DIFFERENT branching factors registered under distinct :storage-ids; ONE
+               composite value carrying a root from EACH round-trips through ONE wire serializer — each
+               root resolves its OWN storage from storage-registry by (:storage-id meta), bf
+               self-describes from the blob, and lazy child loads go through each resolved storage."
        (let [stA    (make-fress-storage 8 0)
              stB    (make-fress-storage 16 0)
              elemsA (vec (range 300))
              elemsB (vec (range 1000 1500))
              sA     (rooted stA 8  :store/a elemsA)
              sB     (rooted stB 16 :store/b elemsB)
-             _      (pss-fress/register-scope! :store/a {:storage stA :settings (:settings stA) :resolve-cmp (constantly compare)})
-             _      (pss-fress/register-scope! :store/b {:storage stB :settings (:settings stB) :resolve-cmp (constantly compare)})
+             _      (pss-fress/register-storage! :store/a stA)
+             _      (pss-fress/register-storage! :store/b stB)
              wl     (-> (merge fress/clojure-write-handlers pss-fress/root-write-handlers)
                         fress/associative-lookup fress/inheritance-lookup)
-             ;; root reader uses the DEFAULT (registry by :store-id) — no closed-over storage/settings
-             rl     (-> (merge fress/clojure-read-handlers {pss-fress/set-tag (pss-fress/root-read-handler)})
+             ;; wire reader: storage by :storage-id from the registry; comparator constant here.
+             rl     (-> (merge fress/clojure-read-handlers
+                               {pss-fress/set-tag (pss-fress/root-read-handler
+                                                   {:resolve-storage (pss-fress/registry-storage-resolver)
+                                                    :resolve-cmp     (constantly compare)})})
                         fress/associative-lookup)
              out    (ByteArrayOutputStream.)
              _      (.writeObject (fress/create-writer out :handlers wl) {:a sA :b sB})
@@ -205,11 +247,11 @@
            (is (= elemsB (vec (:b back))) "root :b lazy-loads its tree from store B")
            (is (identical? stA (.-_storage ^PersistentSortedSet (:a back))) "root :a resolved store A's storage")
            (is (identical? stB (.-_storage ^PersistentSortedSet (:b back))) "root :b resolved store B's storage")
-           (finally (pss-fress/unregister-scope! :store/a)
-                    (pss-fress/unregister-scope! :store/b)))))))
+           (finally (pss-fress/unregister-storage! :store/a)
+                    (pss-fress/unregister-storage! :store/b)))))))
 
-;; A custom consumer record + its element handlers — models a CRDT/record (e.g. a yggdrasil
-;; CRDT, or a datahike Datom) that must coexist with the canonical PSS handlers on ONE serializer.
+;; A custom consumer record + its element handlers — models a CRDT/record (e.g. a yggdrasil CRDT, or
+;; a datahike Datom) that must coexist with the canonical PSS handlers on ONE serializer.
 #?(:clj (defrecord Tag [v]))
 #?(:clj
    (def ^:private tag-wh
@@ -225,10 +267,14 @@
                root from another store (the yggdrasil-CRDT-carrying-a-datahike-ref shape)."
        (let [st   (make-fress-storage 8 0)
              s    (rooted st 8 :store/x (vec (range 200)))
-             _    (pss-fress/register-scope! :store/x {:storage st :settings (:settings st) :resolve-cmp (constantly compare)})
+             _    (pss-fress/register-storage! :store/x st)
              wl   (-> (merge fress/clojure-write-handlers pss-fress/root-write-handlers tag-wh)
                       fress/associative-lookup fress/inheritance-lookup)
-             rl   (-> (merge fress/clojure-read-handlers {pss-fress/set-tag (pss-fress/root-read-handler)} tag-rh)
+             rl   (-> (merge fress/clojure-read-handlers
+                             {pss-fress/set-tag (pss-fress/root-read-handler
+                                                 {:resolve-storage (pss-fress/registry-storage-resolver)
+                                                  :resolve-cmp     (constantly compare)})}
+                             tag-rh)
                       fress/associative-lookup)
              out  (ByteArrayOutputStream.)
              _    (.writeObject (fress/create-writer out :handlers wl) {:root s :tag (->Tag 42)})
@@ -236,5 +282,5 @@
          (try
            (is (= (->Tag 42) (:tag back)) "the custom record round-trips alongside the PSS root")
            (is (instance? PersistentSortedSet (:root back)))
-           (is (= (vec (range 200)) (vec (:root back))) "the PSS root resolves its scope + lazy-loads")
-           (finally (pss-fress/unregister-scope! :store/x)))))))
+           (is (= (vec (range 200)) (vec (:root back))) "the PSS root resolves storage + lazy-loads")
+           (finally (pss-fress/unregister-storage! :store/x)))))))
