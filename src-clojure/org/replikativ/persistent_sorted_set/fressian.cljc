@@ -214,7 +214,7 @@
 (defn unregister-storage!   [id] (swap! storage-registry dissoc id) nil)
 (defn registered-storage    [id] (get @storage-registry id))
 (defn register-comparator!  [id cmp] (swap! comparator-registry assoc id cmp) cmp)
-(defn unregister-comparator![id] (swap! comparator-registry dissoc id) nil)
+(defn unregister-comparator! [id] (swap! comparator-registry dissoc id) nil)
 (defn registered-comparator [id] (get @comparator-registry id))
 (defn register-measure!     [id m] (swap! measure-registry assoc id m) m)
 (defn unregister-measure!   [id] (swap! measure-registry dissoc id) nil)
