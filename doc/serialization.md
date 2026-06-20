@@ -1,117 +1,122 @@
 # Canonical node serialization (`org.replikativ.persistent-sorted-set.fressian`)
 
-An **optional** namespace providing one canonical Fressian read/write handler set for
-PSS B-tree **nodes** (`Leaf`/`Branch`), so every konserve/kabel-backed consumer shares a
-single node wire form. This is the reference that datahike, yggdrasil, proximum and
-stratum square their storage/wire layers against.
+An **optional** namespace providing one canonical Fressian read/write handler set for PSS
+B-tree **nodes** (`Leaf`/`Branch`) **and roots** (`PersistentSortedSet`/`BTSet`), so every
+konserve/kabel-backed consumer shares a single wire form. It is the reference that
+datahike, yggdrasil, proximum and stratum square their storage and wire layers against.
+
+The namespace is not loaded unless you require it, and it depends on `clojure.data.fressian`
+(JVM) / `fress` (cljs) as a **`provided`** dependency — a consumer that uses it brings its
+own version.
 
 ## Why one shared codec
 
 On a single kabel websocket there is exactly **one** fressian write-handler per type, so
 once two PSS-backed systems put nodes on the same socket the node codec is shared *by
 construction*. A single socket is also what preserves **causal ordering** across systems
-(two sockets = two message orderings = a record can arrive before the nodes it
-references). So: centralize the node codec, get one wire form + one place that fixes the
-JVM/cljs drift, and keep everything else per-project.
+(two sockets = two message orderings = a record can arrive before the nodes it references).
+So: centralize the node codec, get one wire form + one place that fixes JVM/cljs drift, and
+keep everything else per-project.
 
 ## The node ⇄ root seam (the load-bearing distinction)
 
 A **node** carries neither a comparator nor storage nor the set's identity — the
 constructors prove it: `Leaf(keys, settings)`, `Branch(level, keys, addresses, settings)`.
-Both live on the **root** (`_cmp` and `_storage` on the set). Therefore:
+Those live on the **root**. So the split is:
 
 | concern | lives on | who handles it |
 |---|---|---|
-| node structure (`:keys`, `:level`, `:addresses`, diff-buf `:slots`) | the node | **this ns (canonical, shared)** |
-| comparator (re-stamped lazily on descent) | the root | the consumer's root/record handler |
-| storage (lazy child loading) | the root (`IStorage`) | the consumer |
-| element types (Datom, ChunkEntry, RegistryEntry, maps, …) | inside `:keys`/`:slots` | the consumer's **element** handlers (recursion) |
-| set identity / re-attach by store-config `:id` | the root | the consumer's root/record handler |
+| node structure (`:keys`, `:level`, `:addresses`, `:subtree-count`, `:measure`, diff-buf `:slots`) | the node | **this ns (canonical, shared)** |
+| comparator (re-stamped lazily on descent) | the root | a resolver you pass |
+| storage (lazy child loading, live `IStorage`) | the root | a resolver you pass |
+| element types (Datom, ChunkEntry, RegistryEntry, maps, …) | inside `:keys`/`:slots` | the consumer's **element** handlers (by recursion) |
 
-So this ns is parameterized only by `settings` (branching-factor + measure-ops), supplied
-at read time: `(read-handlers settings)`. It never inspects an element type.
+The node codec never inspects an element type; element values recurse through the consumer's
+own handlers.
 
-## Canonical store-map (the format `IStorage` already prescribes)
+## What travels vs what is resolved
+
+A blob carries plain data but not live objects or functions:
+
+- **Serialized (in the blob):** `keys` / `addresses` / `level` / `subtree-count` /
+  `measure`-value / `slots`, **and the node's own `:branching-factor` + `:diff-buf-size`**.
+  Because branching/diff-buf ride in the blob, each node is **self-describing** for its
+  structure — its `Settings` are reconstructed per node — so one store may hold nodes of
+  different branching factors. (These two are *not* part of `node->map`, the content-hash
+  projection, so content addresses are unchanged.)
+- **Resolved at read (runtime):** the live `IStorage`, the comparator (fn), and the
+  measure-ops (`IMeasure`) — supplied by the consumer via three resolvers, each
+  `(fn [meta] -> thing)`:
+  - **lexical** — a serializer that owns *one* store closes over its storage/cmp/measure; no
+    ids needed, and old roots (without ids) just read. The convenient default.
+  - **registry** — a shared/wire serializer over *many* stores resolves by an id the root
+    stamps in its `meta` (`:storage-id` / `:comparator-id` / `:measure-id`) via the
+    `registry-*-resolver` helpers + the `register-*!` registries in the ns.
+
+## Blob shapes
 
 ```
-pss/leaf   → {:keys <elements>}
-pss/branch → {:level n :keys <separators> :addresses <child-addrs> :slots? <diff-buf>}
+pss/leaf   → {:keys <elements>                                  :branching-factor n :diff-buf-size d}
+pss/branch → {:level n :keys <separators> :addresses <addrs>
+              :subtree-count c (:measure m) (:slots <diff-buf>)  :branching-factor n :diff-buf-size d}
+pss/set    → {:meta <root-meta> :address <root-addr> :count n   :branching-factor n :diff-buf-size d}
 ```
 
-- `subtree-count` and `measure` are **not** serialized — they recompute lazily on restore
-  (the library's own reference storage relies on the same), which keeps the wire minimal
-  and byte-identical across JVM/cljs.
-- cljs `keys`/`addresses` are JS arrays; normalized to/from vectors here, once.
+`subtree-count`/`measure` are carried for completeness; `:slots` appears only when diff-buf
+is enabled (`Settings.diffBufSize > 0`), where a leaf child's `:diff` is the comparator-agnostic
+`{:absent [..] :present [..]}` form (`Slot/leafDiffForStorage`) and slots reconstruct into
+`_slots` with `anchor = addresses[idx]` (re-derived, not stored). cljs `keys`/`addresses` are
+JS arrays, normalized to/from vectors here, once.
 
-### diff-buf (`Settings.diffBufSize > 0`, opt-in)
+## Usage
 
-A `Branch` additionally carries
-`:slots {idx -> {:count :measure :diff :max-key}}`, where a **leaf** child's `:diff` is the
-comparator-agnostic `{:absent [..] :present [..]}` form (`Slot/leafDiffForStorage`, produced
-by `slotsForStorage`) and a **branch** child's `:diff` is the nested map. All plain data;
-on restore the slots reconstruct into `_slots` with `anchor = addresses[idx]` (re-derived,
-not stored). At `diffBufSize = 0` `_slots` is nil ⇒ `:slots` absent ⇒ baseline-identical.
-The comparator is **not** needed: a restored leaf-diff is projected into a `_projCmp`-sorted
-map lazily on descent.
+Assemble your full handler maps via the bundle builders — node handlers + the root handler +
+your element handlers — in one call.
 
-## Consumer requirements gathered (what made the design general)
+```clojure
+(require '[org.replikativ.persistent-sorted-set.fressian :as pss-fress])
+
+;; A LOCAL store serializer (owns one store): lexical resolvers, no ids needed.
+(pss-fress/canonical-read-handlers
+  {:resolve-storage (fn [_] my-storage)   ; the live IStorage
+   :resolve-cmp     (fn [_] my-comparator)
+   :measure-ops     nil                   ; node-level IMeasure (nil for most)
+   :default-bf      512                   ; fallback bf for any pre-bf legacy blob
+   :element-read-handlers {…}})           ; e.g. a Datom / ChunkEntry handler
+(pss-fress/canonical-write-handlers {:element-write-handlers {…}})
+
+;; A WIRE peer (one serializer over many stores): registry resolvers, by id in root meta.
+(pss-fress/canonical-read-handlers
+  {:resolve-storage (pss-fress/registry-storage-resolver)
+   :resolve-cmp     (pss-fress/registry-cmp-resolver)
+   :resolve-measure (pss-fress/registry-measure-resolver)
+   :default-bf      512
+   :element-read-handlers {…}})
+;; …with the peer registering its store/comparator/measure beforehand:
+;;   (pss-fress/register-storage! store-id my-storage)   ; per-connect (live)
+;;   (pss-fress/register-comparator! cmp-id my-cmp)      ; static, at ns load
+```
+
+The lower-level pieces (`write-handlers`, `(read-handlers {:measure-ops :default-bf})`,
+`root-write-handlers`, `(root-read-handler {…})`, `node->map`) are public too if you need to
+compose them directly. A `.transit` sibling could mirror the same tags/shape for transit
+consumers.
+
+## Consumer characteristics (what made the design general)
 
 | | datahike | yggdrasil | proximum | stratum |
 |---|---|---|---|---|
-| node form today | objects+handlers | plain maps | objects+handlers | objects+handlers |
-| element/key types | Datom | kw/str/vec/tuple/record | maps; Long/Str/UUID | `ChunkEntry` record |
+| element/key types | `Datom` | kw/str/vec/tuple/record | maps; Long/Str/UUID | `ChunkEntry` record |
 | comparator (root) | index-type→cmp | `compare` | 3 custom, dual-mode | lex vector-of-longs |
 | branching | 512 | const | 512 | **64** |
-| Settings extras | — | — | — | **IMeasure** + RefType/WEAK |
+| Settings extras | — | — | — | **IMeasure** |
 | diff-buf `:slots` | **opt-in** | — | — | — |
 | wire | kabel | konserve-sync | local | local |
 | platform | JVM+cljs | JVM+cljs | JVM | JVM |
 
-All variation is **root/Settings/element-level**, none touches the node codec:
-comparators inject at the root; `ChunkEntry`/Datom/… serialize by recursion through the
-consumer's element handlers; branching/measure-ops inject via `settings` at restore. So
-one node codec serves all four. Stratum (measure-ops + branching 64) is the strictness
-oracle; yggdrasil is the cross-platform + plain-map-migration oracle; datahike is the
-dual-tag-migration + kabel-wire oracle.
-
-## Usage
-
-```clojure
-(require '[org.replikativ.persistent-sorted-set.fressian :as pss-fress]
-         '[clojure.data.fressian :as fress])
-
-;; write: merge the node handlers next to your element handlers
-(fress/create-writer out :handlers
-  (-> (merge fress/clojure-write-handlers
-             pss-fress/write-handlers          ; {Leaf {...} Branch {...}}
-             my-element-write-handlers)        ; e.g. Datom
-      fress/associative-lookup fress/inheritance-lookup))
-
-;; read: settings supplies branching + measure-ops; comparator stays on the root
-(fress/create-reader in :handlers
-  (-> (merge fress/clojure-read-handlers
-             (pss-fress/read-handlers settings)
-             my-element-read-handlers)
-      fress/associative-lookup))
-```
-
-`data.fressian` is a **`provided`** dependency — consumers bring their own version. A
-`.transit` sibling can mirror the same tags/shape for transit-based consumers.
-
-## Squaring the storage layers (follow-up)
-
-Each consumer registers these node handlers **+ its own element + root handlers**, in both
-its store serializer and (datahike/yggdrasil) its kabel peer:
-
-- **datahike** — its two drifted node-handler sets (in-store 7-arg `Branch`+`@storage`;
-  kabel 4-arg `Branch`) collapse into this one codec; domain handlers (Datom/DB/TxReport)
-  stay datahike's. On-disk migration = tag rename with dual-tag read during transition.
-- **yggdrasil** — switch from plain-map nodes to this codec; `storage.cljc`'s store/restore
-  simplify; the cljs to-array fix lives here now. Wire-identical to datahike.
-- **proximum / stratum** — replace their private `"proximum.*"` / `"stratum.*"` node tags
-  with the canonical ones (free drift fixes); local-only, validating the generality.
-
-## Status
-
-JVM handlers + round-trip test (baseline, heterogeneous elements, diff-buf slots): green.
-cljs handlers (`fress`) + a portable test: next. Then the per-consumer adoption above.
+All variation is **root / Settings / element-level**, none touches the node codec:
+comparators and storage inject at the root via resolvers; `ChunkEntry`/`Datom`/… serialize by
+recursion through the consumer's element handlers; branching/measure-ops inject via the
+per-node `Settings` at restore. So one node codec serves all four. Stratum (measure-ops +
+branching 64) is the strictness oracle; yggdrasil is the cross-platform oracle; datahike is
+the kabel-wire oracle.

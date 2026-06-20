@@ -1,3 +1,16 @@
+# 0.4.0
+
+- Added `org.replikativ.persistent-sorted-set.fressian` — an **optional** canonical Fressian
+  read/write handler set for PSS nodes (`pss/leaf`/`pss/branch`) and roots (`pss/set`), so
+  konserve/kabel-backed consumers (datahike, yggdrasil, proximum, stratum) share one wire
+  form. JVM (`clojure.data.fressian`) + cljs (`fress`); `data.fressian` is a `provided` dep.
+- Nodes are self-describing: `:branching-factor`/`:diff-buf-size` ride in the blob (a store
+  may hold mixed branching factors); the content-hash projection (`node->map`) is unchanged.
+- The non-serializable bits (live `IStorage`, comparator, measure-ops) resolve at read via
+  consumer-supplied resolvers — lexical closures for a one-store serializer, or id-keyed
+  registries (`register-storage!`/`registry-storage-resolver`, …) for a shared/wire serializer.
+- See `doc/serialization.md`.
+
 # 0.3.0
 
 - JVM: Per-set branching factor
