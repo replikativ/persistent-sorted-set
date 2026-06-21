@@ -85,9 +85,11 @@
      ;; supplied (never serialized); leaf-processor stays nil — it's the operating root's, threaded.
      (Settings. (int bf) (kw->ref-type ref-type) measure nil (int dbs)))
    :cljs
-   (defn- settings-for [bf dbs measure _ref-type]
-     ;; cljs Settings has no ref-type (JS has no soft/weak refs) — the arg is ignored.
-     {:branching-factor bf :diff-buf-size dbs :measure measure}))
+   (defn- settings-for [bf dbs measure ref-type]
+     ;; cljs has no soft/weak refs, so ref-type is inert here — but CARRY it so it round-trips
+     ;; losslessly through a cljs relay (deserialize → re-serialize) back to a JVM reader.
+     (cond-> {:branching-factor bf :diff-buf-size dbs :measure measure}
+       ref-type (assoc :ref-type ref-type))))
 
 (defn- node-config
   "A node's SERIALIZABLE settings — branching-factor + diff-buf-size + (non-default) ref-type. These
@@ -99,7 +101,8 @@
              (cond-> {:branching-factor (.branchingFactor s) :diff-buf-size (.diffBufSize s)}
                (and rt (not= rt RefType/SOFT)) (assoc :ref-type (ref-type->kw rt))))
      :cljs (let [s (.-settings node)]
-             {:branching-factor (:branching-factor s) :diff-buf-size (:diff-buf-size s)})))
+             (cond-> {:branching-factor (:branching-factor s) :diff-buf-size (:diff-buf-size s)}
+               (:ref-type s) (assoc :ref-type (:ref-type s))))))
 
 ;; ---------------------------------------------------------------------------
 ;; node->map — the CONTENT projection (for content-addressing). Branching-factor/diff-buf are
@@ -279,11 +282,12 @@
          (throw (ex-info "PSS root must be flushed before serialization" {:type :must-be-flushed})))
        (let [s (.-settings pset)]
          (fress/write-tag w set-tag 1)
-         (fress/write-object w {:meta             (meta pset)
-                                :address          (.-address pset)
-                                :count            (count pset)
-                                :branching-factor (:branching-factor s)
-                                :diff-buf-size    (:diff-buf-size s)})))))
+         (fress/write-object w (cond-> {:meta             (meta pset)
+                                        :address          (.-address pset)
+                                        :count            (count pset)
+                                        :branching-factor (:branching-factor s)
+                                        :diff-buf-size    (:diff-buf-size s)}
+                                 (:ref-type s) (assoc :ref-type (:ref-type s))))))))
 
 (def root-write-handlers
   "Pre-keyed root write handler, shaped like `write-handlers` so a cljc consumer merges it WITHOUT
