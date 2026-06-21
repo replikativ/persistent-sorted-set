@@ -36,31 +36,44 @@ own handlers.
 
 ## What travels vs what is resolved
 
-A blob carries plain data but not live objects or functions:
+The rule of thumb: **a node is a self-describing VALUE; all mutation behavior comes from
+the operating root.** A blob carries plain DATA; it never carries a live object or a function.
 
 - **Serialized (in the blob):** `keys` / `addresses` / `level` / `subtree-count` /
-  `measure`-value / `slots`, **and the node's own `:branching-factor` + `:diff-buf-size`**.
-  Because branching/diff-buf ride in the blob, each node is **self-describing** for its
-  structure — its `Settings` are reconstructed per node — so one store may hold nodes of
-  different branching factors. (These two are *not* part of `node->map`, the content-hash
-  projection, so content addresses are unchanged.)
-- **Resolved at read (runtime):** the live `IStorage`, the comparator (fn), and the
-  measure-ops (`IMeasure`) — supplied by the consumer via three resolvers, each
-  `(fn [meta] -> thing)`:
+  `measure`-value / `slots`, the node's own `:branching-factor` + `:diff-buf-size`, and
+  (non-SOFT) `:ref-type` — the soft/weak/strong **caching policy**, which is an enum and
+  therefore data. Because these ride in the blob, each node is **self-describing**: its
+  `Settings` reconstruct per node, one store may hold nodes of different branching factors,
+  and `:ref-type` survives a *rootless* replication (konserve-sync) — a node loaded by a
+  reader that knows nothing about it still caches with the writer's policy. (None of these are
+  part of `node->map`, the content-hash projection, so content addresses are unchanged; SOFT,
+  the default, is omitted so common blobs are byte-unchanged.)
+- **Resolved at read (runtime) — the functions + the live storage:** the live `IStorage`, the
+  comparator, the measure-ops (`IMeasure`), and the leaf-processor. These are **never
+  serialized** (code can't be) and a node never reaches for one:
+  - `storage` / `comparator` / `leaf-processor` are the **operating root's**, threaded down as
+    parameters during `add`/`remove`/`child`;
+  - `measure-ops` is supplied by **each store's own reader** (lexically) — so a node loaded
+    for *its* store always gets *its* ops, and a shared wire (which only transports nodes
+    transiently) needs none.
+  The root's storage/comparator/measure are bound via `(fn [meta] -> thing)` resolvers:
   - **lexical** — a serializer that owns *one* store closes over its storage/cmp/measure; no
     ids needed, and old roots (without ids) just read. The convenient default.
   - **registry** — a shared/wire serializer over *many* stores resolves by an id the root
-    stamps in its `meta` (`:storage-id` / `:comparator-id` / `:measure-id`) via the
+    stamps in its `meta` (`:pss/storage-id` / `:pss/comparator-id` / `:pss/measure-id`) via the
     `registry-*-resolver` helpers + the `register-*!` registries in the ns.
 
 ## Blob shapes
 
 ```
-pss/leaf   → {:keys <elements>                                  :branching-factor n :diff-buf-size d}
+pss/leaf   → {:keys <elements>                                  :branching-factor n :diff-buf-size d (:ref-type)}
 pss/branch → {:level n :keys <separators> :addresses <addrs>
-              :subtree-count c (:measure m) (:slots <diff-buf>)  :branching-factor n :diff-buf-size d}
-pss/set    → {:meta <root-meta> :address <root-addr> :count n   :branching-factor n :diff-buf-size d}
+              :subtree-count c (:measure m) (:slots <diff-buf>)  :branching-factor n :diff-buf-size d (:ref-type)}
+pss/set    → {:meta <root-meta> :address <root-addr> :count n   :branching-factor n :diff-buf-size d (:ref-type)}
 ```
+
+`:ref-type` (`:soft`/`:weak`/`:strong`) is present only when non-default (SOFT omitted). A read-time
+`:ref-type` opt on `read-handlers`/`root-read-handler` overrides the serialized value.
 
 `subtree-count`/`measure` are carried for completeness; `:slots` appears only when diff-buf
 is enabled (`Settings.diffBufSize > 0`), where a leaf child's `:diff` is the comparator-agnostic

@@ -9,6 +9,11 @@
 - The non-serializable bits (live `IStorage`, comparator, measure-ops) resolve at read via
   consumer-supplied resolvers — lexical closures for a one-store serializer, or id-keyed
   registries (`register-storage!`/`registry-storage-resolver`, …) for a shared/wire serializer.
+- A node's `ref-type` (the soft/weak/strong caching policy) now rides in the blob as data, so it
+  survives a round-trip / rootless replication (a node reconstructs with the writer's policy even
+  when the reader knows nothing about it); SOFT (the default) is omitted, and a read-time
+  `:ref-type` overrides what was serialized. JVM-only (cljs has no ref-type). Content addresses
+  are unchanged.
 - See `doc/serialization.md`.
 
 # 0.3.0

@@ -5,18 +5,27 @@
    anyway; centralizing it here gives one wire form (causal ordering on one socket) and one place
    that fixes the JVM/cljs drift.
 
-   WHAT TRAVELS vs WHAT IS RESOLVED. A node/root blob can carry plain data but not live objects or
-   functions, so the split is:
+   WHAT TRAVELS vs WHAT IS RESOLVED. A node is a self-describing VALUE: a blob carries plain DATA but
+   not live objects or FUNCTIONS. So the split is:
 
      SERIALIZED (in the blob):  keys / addresses / level / subtree-count / measure-VALUE / slots,
-                                and the node's own `:branching-factor` + `:diff-buf-size`.
-     RESOLVED AT READ (runtime): the IStorage (live), the comparator (fn), the measure-OPS (fn).
+                                the node's own `:branching-factor` + `:diff-buf-size`, and (non-SOFT)
+                                `:ref-type` — the caching policy, an enum, hence data.
+     RESOLVED AT READ (runtime): the IStorage (live), the comparator (fn), the measure-OPS (fn), and
+                                the leaf-processor (fn). These are bound by the consumer at the
+                                operating root / its per-store reader, never serialized — and a node
+                                never reaches for a function (storage/comparator/leaf-processor are
+                                the operating root's, threaded down; measure-ops comes from each
+                                store's own reader). So one shared wire can carry many stores' nodes
+                                without knowing any store's functions.
 
-   Because `:branching-factor`/`:diff-buf-size` ride in the blob, a node is SELF-DESCRIBING for its
-   structure — its `Settings` are reconstructed per node from the blob (+ a default ref-type + the
-   consumer's measure-ops). This lifts the old one-`Settings`-per-store constraint: a store may hold
-   nodes of different branching factors. (`branching-factor`/`diff-buf-size` are NOT in `node->map`,
-   the content-hash projection, so content addresses are unchanged.)
+   Because `:branching-factor`/`:diff-buf-size`/`:ref-type` ride in the blob, a node is SELF-DESCRIBING:
+   its `Settings` are reconstructed per node from the blob (+ the consumer's measure-ops). This lifts
+   the one-`Settings`-per-store constraint (a store may hold nodes of different branching factors) and
+   means `:ref-type` survives a rootless replication (konserve-sync) — a node loaded by a reader that
+   knows nothing about it still caches with the writer's policy; a read-time `:ref-type` can override.
+   (None of these are in `node->map`, the content-hash projection, so content addresses are unchanged;
+   SOFT — the default — is omitted, so common blobs are byte-unchanged.)
 
    THE THREE NON-SERIALIZABLE BITS are resolved by the consumer via three resolvers passed to the
    handlers, each `(fn [meta] -> thing)`:
@@ -48,7 +57,7 @@
                      [org.replikativ.persistent-sorted-set.leaf :refer [Leaf]]
                      [org.replikativ.persistent-sorted-set.branch :refer [Branch] :as branch]
                      [org.replikativ.persistent-sorted-set.btset :refer [BTSet]]))
-  #?(:clj (:import [org.replikativ.persistent_sorted_set ANode Leaf Branch Settings Slot IMeasure
+  #?(:clj (:import [org.replikativ.persistent_sorted_set ANode Leaf Branch Settings Slot IMeasure RefType
                     PersistentSortedSet]
                    [org.fressian.handlers WriteHandler ReadHandler]
                    [java.util List])))
@@ -58,24 +67,37 @@
 (def ^:const set-tag "pss/set")
 
 ;; ---------------------------------------------------------------------------
-;; Settings (de)construction — the serializable bits (bf, diff-buf) travel; ref-type is a
-;; read-time default; measure-ops is supplied by the consumer (never serialized).
+;; Settings (de)construction. A Settings splits into DATA and FUNCTIONS:
+;;   DATA (serialized, ride in the blob):     branching-factor, diff-buf-size, ref-type (an enum).
+;;   FUNCTIONS (never serialized — code):      measure-ops (IMeasure), leaf-processor, comparator.
+;; The functions + the live storage are bound by the consumer at the operating root / its per-store
+;; reader; a node carries only data. ref-type travels as data (default SOFT omitted to keep common
+;; blobs unchanged); a read-time `:ref-type` may override what was serialized.
 ;; ---------------------------------------------------------------------------
 
+#?(:clj (defn- ref-type->kw [^RefType rt] (when rt (keyword (.toLowerCase (.name rt))))))
+#?(:clj (defn- kw->ref-type ^RefType [kw]
+          (case kw :strong RefType/STRONG :soft RefType/SOFT :weak RefType/WEAK nil)))
+
 #?(:clj
-   (defn- settings-for ^Settings [bf dbs ^IMeasure measure]
-     ;; ref-type left nil ⇒ Settings normalizes to SOFT (a per-process policy, not serialized).
-     (Settings. (int bf) nil measure nil (int dbs)))
+   (defn- settings-for ^Settings [bf dbs ^IMeasure measure ref-type]
+     ;; ref-type nil ⇒ Settings normalizes to SOFT. `measure` is the IMeasure OPS the consumer
+     ;; supplied (never serialized); leaf-processor stays nil — it's the operating root's, threaded.
+     (Settings. (int bf) (kw->ref-type ref-type) measure nil (int dbs)))
    :cljs
-   (defn- settings-for [bf dbs measure]
+   (defn- settings-for [bf dbs measure _ref-type]
+     ;; cljs Settings has no ref-type (JS has no soft/weak refs) — the arg is ignored.
      {:branching-factor bf :diff-buf-size dbs :measure measure}))
 
 (defn- node-config
-  "A node's SERIALIZABLE settings — branching-factor + diff-buf-size. These ride in the blob
-   (self-describing) but NOT in `node->map` (the content hash), so addresses are unchanged."
+  "A node's SERIALIZABLE settings — branching-factor + diff-buf-size + (non-default) ref-type. These
+   ride in the blob (self-describing) but NOT in `node->map` (the content hash), so addresses are
+   unchanged. ref-type is omitted when SOFT (the default), so common-case blobs are byte-unchanged."
   [node]
-  #?(:clj  (let [^Settings s (.-_settings ^ANode node)]
-             {:branching-factor (.branchingFactor s) :diff-buf-size (.diffBufSize s)})
+  #?(:clj  (let [^Settings s (.-_settings ^ANode node)
+                 rt (.refType s)]
+             (cond-> {:branching-factor (.branchingFactor s) :diff-buf-size (.diffBufSize s)}
+               (and rt (not= rt RefType/SOFT)) (assoc :ref-type (ref-type->kw rt))))
      :cljs (let [s (.-settings node)]
              {:branching-factor (:branching-factor s) :diff-buf-size (:diff-buf-size s)})))
 
@@ -158,23 +180,24 @@
 (defn read-handlers
   "Fressian read handlers for PSS nodes. Each node's `Settings` are reconstructed from its blob's
    `:branching-factor`/`:diff-buf-size` (falling back to `:default-bf`/0 for pre-bf blobs) + the
-   consumer's `:measure-ops` (the non-serializable IMeasure, nil for measure-less consumers).
+   consumer's `:measure-ops` (non-serializable IMeasure, nil for most). `:ref-type` overrides the
+   blob's serialized ref-type (default: use the blob, falling back to SOFT).
    Returns {tag handler}. Comparator-free (the comparator lives on the root)."
-  [{:keys [measure-ops default-bf] :or {default-bf 0}}]
-  (let [mk-settings (memoize (fn [bf dbs] (settings-for bf dbs measure-ops)))]
+  [{:keys [measure-ops default-bf ref-type] :or {default-bf 0}}]
+  (let [mk-settings (memoize (fn [bf dbs rt] (settings-for bf dbs measure-ops rt)))]
     #?(:clj
        {leaf-tag
         (reify ReadHandler
           (read [_ rdr _tag _n]
-            (let [{:keys [keys measure branching-factor diff-buf-size]} (.readObject rdr)
-                  l (Leaf. ^List keys (mk-settings (or branching-factor default-bf) (or diff-buf-size 0)))]
+            (let [{:keys [keys measure branching-factor diff-buf-size] blob-rt :ref-type} (.readObject rdr)
+                  l (Leaf. ^List keys (mk-settings (or branching-factor default-bf) (or diff-buf-size 0) (or ref-type blob-rt)))]
               (when (some? measure) (set! (.-_measure ^ANode l) measure))
               l)))
         branch-tag
         (reify ReadHandler
           (read [_ rdr _tag _n]
-            (let [{:keys [level keys addresses subtree-count measure slots branching-factor diff-buf-size]} (.readObject rdr)
-                  b (Branch. (int level) ^List keys ^List addresses (mk-settings (or branching-factor default-bf) (or diff-buf-size 0)))]
+            (let [{:keys [level keys addresses subtree-count measure slots branching-factor diff-buf-size] blob-rt :ref-type} (.readObject rdr)
+                  b (Branch. (int level) ^List keys ^List addresses (mk-settings (or branching-factor default-bf) (or diff-buf-size 0) (or ref-type blob-rt)))]
               (set! (.-_subtreeCount b) (long (or subtree-count -1)))
               (when (some? measure) (set! (.-_measure ^ANode b) measure))
               (when slots (attach-slots! b addresses slots))
@@ -182,17 +205,17 @@
        :cljs
        {leaf-tag
         (fn [rdr _tag _n]
-          (let [{:keys [keys measure branching-factor diff-buf-size]} (fress/read-object rdr)]
-            (Leaf. (to-array keys) (mk-settings (or branching-factor default-bf) (or diff-buf-size 0)) measure)))
+          (let [{:keys [keys measure branching-factor diff-buf-size] blob-rt :ref-type} (fress/read-object rdr)]
+            (Leaf. (to-array keys) (mk-settings (or branching-factor default-bf) (or diff-buf-size 0) (or ref-type blob-rt)) measure)))
         branch-tag
         (fn [rdr _tag _n]
-          (let [{:keys [level keys addresses subtree-count measure slots branching-factor diff-buf-size]} (fress/read-object rdr)
+          (let [{:keys [level keys addresses subtree-count measure slots branching-factor diff-buf-size] blob-rt :ref-type} (fress/read-object rdr)
                 node (branch/from-map {:level         level
                                        :keys          (to-array keys)
                                        :addresses     (to-array addresses)
                                        :subtree-count subtree-count
                                        :measure       measure
-                                       :settings      (mk-settings (or branching-factor default-bf) (or diff-buf-size 0))})]
+                                       :settings      (mk-settings (or branching-factor default-bf) (or diff-buf-size 0) (or ref-type blob-rt))})]
             (when slots (attach-slots! node addresses slots))
             node))})))
 
@@ -241,13 +264,15 @@
        (write [_ w pset]
          (when (nil? (.-_address ^PersistentSortedSet pset))
            (throw (ex-info "PSS root must be flushed before serialization" {:type :must-be-flushed})))
-         (let [^Settings s (.-_settings ^PersistentSortedSet pset)]
+         (let [^Settings s (.-_settings ^PersistentSortedSet pset)
+               rt (.refType s)]
            (.writeTag w set-tag 1)
-           (.writeObject w {:meta             (meta pset)
-                            :address          (.-_address ^PersistentSortedSet pset)
-                            :count            (count pset)
-                            :branching-factor (.branchingFactor s)
-                            :diff-buf-size    (.diffBufSize s)}))))
+           (.writeObject w (cond-> {:meta             (meta pset)
+                                    :address          (.-_address ^PersistentSortedSet pset)
+                                    :count            (count pset)
+                                    :branching-factor (.branchingFactor s)
+                                    :diff-buf-size    (.diffBufSize s)}
+                             (and rt (not= rt RefType/SOFT)) (assoc :ref-type (ref-type->kw rt)))))))
      :cljs
      (fn [w pset]
        (when (nil? (.-address pset))
@@ -276,20 +301,20 @@
    `:default-bf` is the fallback branching-factor for pre-bf root blobs. Pass lexical closures
    (a one-store serializer) or the `registry-*-resolver`s (a shared/wire serializer)."
   ([] (root-read-handler {}))
-  ([{:keys [resolve-storage resolve-cmp resolve-measure default-bf]
+  ([{:keys [resolve-storage resolve-cmp resolve-measure default-bf ref-type]
      :or {resolve-storage (constantly nil) resolve-cmp (constantly nil)
           resolve-measure (constantly nil) default-bf 0}}]
    #?(:clj
       (reify ReadHandler
         (read [_ rdr _tag _n]
-          (let [{:keys [meta address count branching-factor diff-buf-size]} (.readObject rdr)
-                settings (settings-for (or branching-factor default-bf) (or diff-buf-size 0) (resolve-measure meta))]
+          (let [{:keys [meta address count branching-factor diff-buf-size] blob-rt :ref-type} (.readObject rdr)
+                settings (settings-for (or branching-factor default-bf) (or diff-buf-size 0) (resolve-measure meta) (or ref-type blob-rt))]
             (PersistentSortedSet. meta (resolve-cmp meta) address (resolve-storage meta)
                                   nil (int count) settings 0))))
       :cljs
       (fn [rdr _tag _n]
-        (let [{:keys [meta address count branching-factor diff-buf-size]} (fress/read-object rdr)
-              settings (settings-for (or branching-factor default-bf) (or diff-buf-size 0) (resolve-measure meta))]
+        (let [{:keys [meta address count branching-factor diff-buf-size] blob-rt :ref-type} (fress/read-object rdr)
+              settings (settings-for (or branching-factor default-bf) (or diff-buf-size 0) (resolve-measure meta) (or ref-type blob-rt))]
           ;; BTSet deftype: [root cnt comparator meta _hash storage address settings]
           (BTSet. nil count (resolve-cmp meta) meta nil (resolve-storage meta) address settings))))))
 
@@ -303,13 +328,14 @@
    (nil for most); `:resolve-storage`/`:resolve-cmp`/`:resolve-measure` resolve the root's
    non-serializable bits (lexical closures for a one-store serializer, `registry-*-resolver`s for a
    wire peer); `:default-bf` is the pre-bf fallback."
-  [{:keys [resolve-storage resolve-cmp resolve-measure measure-ops default-bf element-read-handlers]
+  [{:keys [resolve-storage resolve-cmp resolve-measure measure-ops default-bf ref-type element-read-handlers]
     :or {default-bf 0}}]
-  (merge (read-handlers {:measure-ops measure-ops :default-bf default-bf})
+  (merge (read-handlers {:measure-ops measure-ops :default-bf default-bf :ref-type ref-type})
          {set-tag (root-read-handler {:resolve-storage resolve-storage
                                       :resolve-cmp     resolve-cmp
                                       :resolve-measure resolve-measure
-                                      :default-bf      default-bf})}
+                                      :default-bf      default-bf
+                                      :ref-type        ref-type})}
          element-read-handlers))
 
 (defn canonical-write-handlers

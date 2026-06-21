@@ -12,7 +12,7 @@
             #?(:clj  [clojure.data.fressian :as fress]
                :cljs [fress.api :as fress])
             #?(:cljs [org.replikativ.persistent-sorted-set.impl.storage :refer [IStorage]]))
-  #?(:clj (:import [org.replikativ.persistent_sorted_set IStorage ANode Branch Settings
+  #?(:clj (:import [org.replikativ.persistent_sorted_set IStorage ANode Leaf Branch Settings RefType
                     PersistentSortedSet NumericStats NumericStatsOps]
                    [org.fressian.handlers WriteHandler ReadHandler]
                    [java.io ByteArrayOutputStream ByteArrayInputStream])))
@@ -97,6 +97,34 @@
           back     (vec (set/restore a2 storage))
           expected (vec (remove #(zero? (mod % 7)) elems))]
       (is (= expected back)))))
+
+;; JVM-only: ref-type is policy DATA (an enum), so it rides in the blob and a node reconstructs with
+;; its own caching policy even when the reader knows nothing about it (the konserve-sync rootless
+;; case). SOFT (the default) is omitted so common blobs are byte-unchanged; a read-time `:ref-type`
+;; overrides what was serialized ("reflects what each context needs").
+#?(:clj
+   (deftest ref-type-roundtrip
+     (testing ":weak rides in the node blob and reconstructs; SOFT omitted; read override wins"
+       (let [keys   (java.util.ArrayList. [1 2 3 4 5])
+             weak   (Leaf. keys (Settings. (int 8) RefType/WEAK nil nil (int 0)))
+             soft   (Leaf. keys (Settings. (int 8) RefType/SOFT nil nil (int 0)))
+             rt-of  (fn [node] (.refType (.-_settings ^ANode node)))
+             ;; serialize `node` via the canonical write handlers, then read it back fresh — exactly
+             ;; the konserve-sync path (a stored node blob deserialized without knowing the root).
+             deser* (fn [node opts]
+                      (let [bs (ser node)]
+                        (-> (fress/create-reader (java.io.ByteArrayInputStream. bs)
+                                                 :handlers (-> (merge fress/clojure-read-handlers
+                                                                      (pss-fress/read-handlers opts))
+                                                               fress/associative-lookup))
+                            .readObject)))]
+         ;; write side — node-config carries :weak; SOFT (the default) is omitted
+         (is (= :weak (:ref-type (#'pss-fress/node-config weak)))           ":weak is serialized")
+         (is (not (contains? (#'pss-fress/node-config soft) :ref-type))     "SOFT default is omitted")
+         ;; read side — the same :weak blob, three ways
+         (is (= RefType/WEAK   (rt-of (deser* weak {})))                    "no reader config ⇒ :weak from the blob")
+         (is (= RefType/STRONG (rt-of (deser* weak {:ref-type :strong})))   "read-time override beats the blob")
+         (is (= RefType/SOFT   (rt-of (deser* weak {:ref-type :soft})))     "override can force SOFT too")))))
 
 ;; JVM-only: prove a non-nil node measure is CARRIED + restored (not silently
 ;; recomputed) by round-tripping a single measured Branch with the consumer's OWN
