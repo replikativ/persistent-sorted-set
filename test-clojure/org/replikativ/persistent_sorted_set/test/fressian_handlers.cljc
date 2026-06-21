@@ -204,10 +204,10 @@
          (is (= (vec (range 400)) (vec (set/restore a4 storage))))
          (is (= (vec (range 400)) (vec (set/restore a32 storage))))))))
 
-;; ---- many stores / one wire serializer — resolve each root's storage by :storage-id ------------
+;; ---- many stores / one wire serializer — resolve each root's storage by :pss/storage-id ------------
 
 (defn- rooted
-  "Build a storage-backed set, stamp its :storage-id into meta, flush it (realize the root address),
+  "Build a storage-backed set, stamp its :pss/storage-id into meta, flush it (realize the root address),
    and return the flushed set — ready to serialize as a `pss/set` pointer."
   [storage bf storage-id elems]
   (let [s (-> (reduce (fn [s e] (set/conj s e compare))
@@ -218,9 +218,9 @@
 
 #?(:clj
    (deftest two-store-wire-roundtrip
-     (testing "two stores with DIFFERENT branching factors registered under distinct :storage-ids; ONE
+     (testing "two stores with DIFFERENT branching factors registered under distinct :pss/storage-ids; ONE
                composite value carrying a root from EACH round-trips through ONE wire serializer — each
-               root resolves its OWN storage from storage-registry by (:storage-id meta), bf
+               root resolves its OWN storage from storage-registry by (:pss/storage-id meta), bf
                self-describes from the blob, and lazy child loads go through each resolved storage."
        (let [stA    (make-fress-storage 8 0)
              stB    (make-fress-storage 16 0)
@@ -232,7 +232,7 @@
              _      (pss-fress/register-storage! :store/b stB)
              wl     (-> (merge fress/clojure-write-handlers pss-fress/root-write-handlers)
                         fress/associative-lookup fress/inheritance-lookup)
-             ;; wire reader: storage by :storage-id from the registry; comparator constant here.
+             ;; wire reader: storage by :pss/storage-id from the registry; comparator constant here.
              rl     (-> (merge fress/clojure-read-handlers
                                {pss-fress/set-tag (pss-fress/root-read-handler
                                                    {:resolve-storage (pss-fress/registry-storage-resolver)

@@ -27,7 +27,7 @@
      LEXICAL (a serializer that owns ONE store): close over that store's storage/cmp/measure — no
        ids needed, old roots (without ids) just read. The convenient default.
      REGISTRY (a shared/wire serializer over MANY stores): `(registry-storage-resolver)` etc. resolve
-       by an id the root stamps in its meta (`:storage-id` / `:comparator-id` / `:measure-id`) from
+       by an id the root stamps in its meta (`:pss/storage-id` / `:pss/comparator-id` / `:pss/measure-id`) from
        the registries below. The consumer `register-*!`s its storage (per-connect) and its
        comparator/measure (static, ns-load).
 
@@ -202,9 +202,11 @@
 ;; shared/WIRE serializer resolves by these via the `registry-*-resolver` helpers.
 ;; ---------------------------------------------------------------------------
 
-(def ^:const storage-id-key    :storage-id)
-(def ^:const comparator-id-key :comparator-id)
-(def ^:const measure-id-key    :measure-id)
+;; Namespaced under `pss/` (matching the `pss/leaf`/`pss/branch`/`pss/set` tags) so the codec never
+;; squats a BARE keyword in the consumer's root-metadata namespace — these keys are library-owned.
+(def ^:const storage-id-key    :pss/storage-id)
+(def ^:const comparator-id-key :pss/comparator-id)
+(def ^:const measure-id-key    :pss/measure-id)
 
 (defonce ^{:doc "storage-id → IStorage (live; per-connect lifecycle)."}    storage-registry    (atom {}))
 (defonce ^{:doc "comparator-id → Comparator (static fn; ns-load)."}        comparator-registry (atom {}))
@@ -220,9 +222,9 @@
 (defn unregister-measure!   [id] (swap! measure-registry dissoc id) nil)
 (defn registered-measure    [id] (get @measure-registry id))
 
-(defn registry-storage-resolver "Wire resolver: storage by (:storage-id meta)."    [] (fn [meta] (registered-storage    (get meta storage-id-key))))
-(defn registry-cmp-resolver     "Wire resolver: comparator by (:comparator-id meta)." [] (fn [meta] (registered-comparator (get meta comparator-id-key))))
-(defn registry-measure-resolver "Wire resolver: measure-ops by (:measure-id meta)."  [] (fn [meta] (registered-measure    (get meta measure-id-key))))
+(defn registry-storage-resolver "Wire resolver: storage by (:pss/storage-id meta)."    [] (fn [meta] (registered-storage    (get meta storage-id-key))))
+(defn registry-cmp-resolver     "Wire resolver: comparator by (:pss/comparator-id meta)." [] (fn [meta] (registered-comparator (get meta comparator-id-key))))
+(defn registry-measure-resolver "Wire resolver: measure-ops by (:pss/measure-id meta)."  [] (fn [meta] (registered-measure    (get meta measure-id-key))))
 
 ;; ---------------------------------------------------------------------------
 ;; ROOT handlers. The root blob = {:meta :address :count :branching-factor :diff-buf-size}; the
@@ -231,7 +233,7 @@
 
 (defn root-write-handler
   "Canonical write handler for a PSS root → `{:meta :address :count :branching-factor :diff-buf-size}`
-   under `pss/set`. `:meta` carries whatever ids the consumer stamped (`:storage-id` etc.). The set
+   under `pss/set`. `:meta` carries whatever ids the consumer stamped (`:pss/storage-id` etc.). The set
    MUST be flushed (root address realized) first."
   []
   #?(:clj
