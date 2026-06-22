@@ -372,61 +372,29 @@ function, the geometric size distribution, canonicality of `conj`/`disj`, and th
 
 ## Performance
 
-To reproduce: install `[com.datomic/datomic-free "0.9.5703"]` locally and run `lein bench`.
+`PersistentSortedSet` vs `clojure.core/sorted-set` (a red-black `PersistentTreeSet`) on the
+same operations. Indicative criterium `quick-bench` means, Clojure 1.12 / JDK 25, Intel Core
+Ultra 7 258V — treat the **speedup ratios** as the robust takeaway (absolute ms vary with
+machine load):
 
-`PersistentTreeSet` is Clojure's red-black-tree sorted-set. `BTSet` is Datomic's B-tree sorted
-set (no transients, no disjoins). `PersistentSortedSet` is this implementation. Numbers on a
-3.2 GHz i7-8700B:
+| operation | `sorted-set` | `PersistentSortedSet` | speedup |
+|---|--:|--:|--:|
+| conj 100k random ints | 54.8 ms | 32.9 ms | ~1.7× |
+| conj 100k (transient) | — | 29.1 ms | ~1.9× |
+| `contains?` 100k on a 100k set | 14.5 ms | 11.4 ms | ~1.3× |
+| iterate (ISeq first/next) 1M | 28.1 ms | 13.0 ms | ~2.2× |
+| iterate sub-range 1..999999 of 1M | 80.1 ms | 8.1 ms | ~9.9× |
+| disj 100k random ints | 60.0 ms | 57.7 ms | ~1.0× |
+| disj 100k (transient) | — | 17.2 ms | ~3.5× |
 
-**Conj 100k randomly sorted Integers**
+The largest wins are in **range iteration** (`slice` descends to the sub-range instead of
+walking from the start) and **transient batch** build/teardown. The sub-range row uses
+`(subseq s >= 1)` + `take-while` for `sorted-set` vs `(set/slice s 1 999999)` for
+PersistentSortedSet.
 
-```
-PersistentTreeSet                 143..165ms
-BTSet                             125..141ms
-PersistentSortedSet               105..121ms
-PersistentSortedSet (transient)   50..54ms
-```
-
-**`contains?` 100k times with random Integer on a 100k set**
-
-```
-PersistentTreeSet     51..54ms
-BTSet                 45..47ms
-PersistentSortedSet   46..47ms
-```
-
-**Iterate with java.util.Iterator over 1M Integers**
-
-```
-PersistentTreeSet     70..77ms
-PersistentSortedSet   10..11ms
-```
-
-**Iterate with ISeq.first/next over 1M Integers**
-
-```
-PersistentTreeSet     116..124ms
-BTSet                 92..105ms
-PersistentSortedSet   56..68ms
-```
-
-**Iterate over a part of a 1M-Integer set (1 .. 999999)**
-
-For `PersistentTreeSet`: `(take-while #(<= % 999999) (.seqFrom set 1 true))`. For
-`PersistentSortedSet`: `(.slice set 1 999999)`.
-
-```
-PersistentTreeSet     238..256ms
-PersistentSortedSet   70..91ms
-```
-
-**Disj 100k elements in randomized order from a 100k set**
-
-```
-PersistentTreeSet                 151..155ms
-PersistentSortedSet               91..98ms
-PersistentSortedSet (transient)   47..50ms
-```
+Earlier published figures additionally compared Datomic's `BTSet` (B-tree, no transients/
+disjoins); install `[com.datomic/datomic-free "0.9.5703"]` to reproduce that three-way
+comparison.
 
 ## Projects using PersistentSortedSet
 

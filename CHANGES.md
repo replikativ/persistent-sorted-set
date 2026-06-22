@@ -1,3 +1,38 @@
+# 0.4.x
+
+- **Content-defined boundary mode (Merkle Search Tree / "prolly" trees)** — opt-in per set via
+  `{:boundary (mst-boundary lzpl)}`. Split points are derived from key hashes (`hasch.fast`,
+  byte-identical JVM↔cljs) instead of node fill, so the tree is a pure function of its element
+  set: the same elements always produce the byte-identical, content-addressed structure
+  regardless of `conj`/`disj` order or which platform built it. Aimed at CRDT state sync and
+  cross-replica dedup. Self-describing (the policy rides in the serialized blob and
+  self-restores with no consumer configuration). Forces diff-buffering off and rejects leaf
+  processors — both would break canonical addressing. Implemented on JVM + cljs, including
+  storage-aware durable removal (address-preserving + `markFreed`). See
+  `doc/merkle-search-tree.md`.
+- Pluggable split-decision seam: the historical count B-tree is now the default `CountBoundary`
+  (`IBoundary`) / `PBoundary` policy, byte-identical to before, with the split point factored
+  out so MST (and future policies) plug in. No measurable performance change to the default
+  path (verified by an interleaved criterium A/B against the pre-seam baseline).
+
+The following also shipped in the 0.4 line but were not previously recorded here:
+
+- **Diff buffering** (opt-in, off by default) — on immutable content-addressed storage, brings a
+  content-only commit down to ~1 written object by buffering each unchanged-structure child's
+  diff at the serialization boundary, re-pointing to the child's existing durable address.
+  Gated by `:diff-buf-size` / `-Dpss.diffBufSize`; `0` is byte-identical to baseline. See
+  `doc/diff-buffering.md`.
+- **Subtree counts** — branch nodes carry subtree element counts; `count-slice` counts a range
+  in O(log n) without iterating, and `hasSubtreeCounts()` is an O(1) check before using it.
+- **Rank-based access** — `get-nth` reaches an element by position in O(log n) for
+  percentile/quantile queries (requires a `:measure` with a `weight`).
+- **Aggregate statistics** — an optional monoidal `:measure` (`IMeasure` interface / protocol),
+  maintained incrementally; `measure` and `measure-slice` answer range aggregates (sum, count,
+  min/max, variance, …) in O(log n). Built-in `NumericStatsOps`. See
+  `doc/statistical-queries.md`.
+- **Faster iteration**, plus `lookup` (retrieve the actually-stored key) and `replace`
+  (single-traversal in-place update at the same logical position).
+
 # 0.4.0
 
 - Added `org.replikativ.persistent-sorted-set.fressian` — an **optional** canonical Fressian
