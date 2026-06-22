@@ -430,34 +430,35 @@
   "split-seam (MST): given the merged separators/children after absorbing a child split,
    cut at boundary keys (≤2-way for one incremental insert). Mirrors the JVM Branch.add seam
    path. MST forces diff-buf off, so no slots/addresses bookkeeping (anchorless re-store)."
-  [^Branch this bd new-keys new-children key]
+  [^Branch this bd new-keys new-children ins key]
   (let [settings    (.-settings this)
         lvl         (.-level this)
         measure-ops (:measure settings)
-        total       (arrays/alength new-children)]
-    (if (b/-overflows? bd new-keys total lvl)
-      (let [lens (b/-split-lengths bd new-keys total lvl)]
-        (loop [out (transient []), pos 0, ls lens]
-          (if (seq ls)
-            (let [l    (first ls)
-                  kseg (.slice new-keys pos (+ pos l))
-                  cseg (.slice new-children pos (+ pos l))
-                  m    (when (and measure-ops (.-_measure this))
-                         (reduce (fn [acc child]
-                                   (if (nil? acc)
-                                     (reduced nil)
-                                     (let [cs (node/measure child)]
-                                       (if cs (measure/merge-measure measure-ops acc cs) (reduced nil)))))
-                                 (measure/identity-measure measure-ops) cseg))
-                  sc   (try-compute-subtree-count-from-children cseg l)]
-              (recur (conj! out (Branch. lvl kseg cseg nil sc m settings nil 0 (.-_projCmp this)))
-                     (+ pos l) (next ls)))
-            (arrays/into-array (persistent! out)))))
+        total       (arrays/alength new-children)
+        ;; O(1): the one promoted separator (the split child's new max) is at `ins`.
+        lens        (b/-split-on-insert bd new-keys total ins lvl)]
+    (if (nil? lens)
       (let [old-sc (.-subtree-count this)
             new-sc (if (>= old-sc 0) (inc old-sc) -1)
             m      (when (and measure-ops (.-_measure this))
                      (measure/merge-measure measure-ops (.-_measure this) (measure/extract measure-ops key)))]
-        (arrays/array (Branch. lvl new-keys new-children nil new-sc m settings nil 0 (.-_projCmp this)))))))
+        (arrays/array (Branch. lvl new-keys new-children nil new-sc m settings nil 0 (.-_projCmp this))))
+      (loop [out (transient []), pos 0, ls lens]
+        (if (seq ls)
+          (let [l    (first ls)
+                kseg (.slice new-keys pos (+ pos l))
+                cseg (.slice new-children pos (+ pos l))
+                m    (when (and measure-ops (.-_measure this))
+                       (reduce (fn [acc child]
+                                 (if (nil? acc)
+                                   (reduced nil)
+                                   (let [cs (node/measure child)]
+                                     (if cs (measure/merge-measure measure-ops acc cs) (reduced nil)))))
+                               (measure/identity-measure measure-ops) cseg))
+                sc   (try-compute-subtree-count-from-children cseg l)]
+            (recur (conj! out (Branch. lvl kseg cseg nil sc m settings nil 0 (.-_projCmp this)))
+                   (+ pos l) (next ls)))
+          (arrays/into-array (persistent! out)))))))
 
 (defn add
   [^Branch this storage key cmp opts]
@@ -481,7 +482,7 @@
                            new-children     (util/splice children idx (inc idx) nodes)
                            nodes-len        (arrays/alength nodes)]
                        (if bd
-                         (mst-branch-add this bd new-keys new-children key)
+                         (mst-branch-add this bd new-keys new-children idx key)
                        (if (<= (arrays/alength new-children) branching-factor)
                          (let [new-addrs
                                (when addrs

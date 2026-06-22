@@ -572,12 +572,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     }
 
     // split-seam: boundary policy decides overflow + cut. Count ⇒ newLen>bf, midpoint
-    // (byte-identical). MST ⇒ a promoted separator rises to level+1 (cut there). An
-    // incremental insert moves one key ⇒ at most one new boundary per level ⇒ ≤2-way.
-    IBoundary boundary = settings.boundary();
+    // (byte-identical). MST ⇒ O(1): the one promoted separator at `ins` (the split child's new
+    // max) is the only possible new boundary; cut there if it rises to level+1. null ⇒ absorb.
+    int[] lengths = settings.boundary().splitOnInsert(allKeys, newLen, ins, _level, settings);
 
     // Absorb: fits in single branch
-    if (!boundary.overflows(allKeys, newLen, _level, settings)) {
+    if (lengths == null) {
       // Use delta formula: exact and O(1), avoids scanning all children
       long count = (_subtreeCount >= 0 && oldChildCount >= 0 && newChildrenCount >= 0)
           ? _subtreeCount - oldChildCount + newChildrenCount : -1;
@@ -592,7 +592,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     }
 
     // Split into two branches (incremental ⇒ ≤2-way; lengths[0] is the first cut)
-    int half1 = boundary.splitLengths(allKeys, newLen, _level, settings)[0], half2 = newLen - half1;
+    int half1 = lengths[0], half2 = newLen - half1;
 
     Key[] keys1 = Arrays.copyOfRange(allKeys, 0, half1);
     Key[] keys2 = Arrays.copyOfRange(allKeys, half1, newLen);

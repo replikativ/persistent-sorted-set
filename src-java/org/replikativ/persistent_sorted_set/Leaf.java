@@ -85,8 +85,10 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     ILeafProcessor processor = settings.leafProcessor();
     boolean processorWillFire = processor != null && processor.shouldProcess(_len + 1, settings);
 
-    // can modify array in place (only if processor won't fire)
-    if (editable() && _len < _keys.length && !processorWillFire) {
+    // can modify array in place (only if processor won't fire). Content (MST) mode opts out:
+    // an in-place insert would skip the boundary split, so a transient batch (e.g. yggdrasil's
+    // into-based set-union) must take the persistent split path that consults the boundary.
+    if (editable() && _len < _keys.length && !processorWillFire && !settings.boundary().contentDefined()) {
       if (ins == _len) {
         _keys[_len] = key;
         _len += 1;
@@ -127,13 +129,13 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       }
     }
 
-    // split-seam: the boundary policy decides whether the run overflows one leaf and,
+    // split-seam: the boundary policy decides whether this single insert overflows the leaf and,
     // if so, how to partition it. Count ⇒ overflows at bf, even ceil(totalLen/bf) split
-    // (byte-identical to the historical arithmetic); MST ⇒ split at boundary keys.
-    IBoundary boundary = settings.boundary();
+    // (byte-identical); MST ⇒ O(1) check of the inserted key. null ⇒ stays one leaf.
+    int[] lengths = settings.boundary().splitOnInsert(allKeys, totalLen, ins, 0, settings);
 
     // Fits in single leaf
-    if (!boundary.overflows(allKeys, totalLen, 0, settings)) {
+    if (lengths == null) {
       Leaf n = new Leaf(totalLen, allKeys, settings);
       if (_measure != null) {
         n._measure = n.tryComputeMeasure(storage);
@@ -142,7 +144,6 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     }
 
     // Split into policy-chosen pieces (lengths sum to totalLen)
-    int[] lengths = boundary.splitLengths(allKeys, totalLen, 0, settings);
     ANode[] result = new ANode[lengths.length];
     int pos = 0;
     for (int i = 0; i < lengths.length; i++) {

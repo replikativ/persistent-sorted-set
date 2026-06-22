@@ -14,12 +14,12 @@ public final class CountBoundary implements IBoundary {
   public static final CountBoundary INSTANCE = new CountBoundary();
 
   @Override
-  public boolean overflows(Object[] run, int len, int level, Settings s) {
-    return len > s.branchingFactor();
+  public int[] splitOnInsert(Object[] run, int len, int ins, int level, Settings s) {
+    if (len <= s.branchingFactor()) return null;   // fits in one node
+    return splitLengths(run, len, level, s);        // count: position-independent, ignores ins
   }
 
-  @Override
-  public int[] splitLengths(Object[] run, int len, int level, Settings s) {
+  private int[] splitLengths(Object[] run, int len, int level, Settings s) {
     if (level == 0) {
       // Leaf rule: ceil(len / bf) pieces, evenly sized, remainder distributed to the
       // later pieces (matches Leaf.add's baseLen + (i >= numLeaves - remainder) layout).

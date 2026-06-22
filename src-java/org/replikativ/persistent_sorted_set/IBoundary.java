@@ -17,19 +17,17 @@ package org.replikativ.persistent_sorted_set;
 public interface IBoundary {
 
   /**
-   * add/bulk: must this run be split into more than one node? Count: {@code len > bf}
-   * (ignores keys). MST: some key at index {@code < len-1} rises to {@code level+1}
-   * (a content boundary falls before the run's end). The run is the merged keys.
+   * The incremental single-insert splitter. {@code run} is the node's keys AFTER a single key
+   * was inserted at index {@code ins} (so {@code run[ins]} is the new key). Returns the
+   * successive node lengths if the node must split, or {@code null} if it stays one node.
+   *
+   * O(1) for MST: a node built by MST has no interior boundaries (only its terminator), so the
+   * only key that can create a new boundary is the inserted one — or, if it was appended past
+   * the old max ({@code ins == len-1}), the now-interior old max at {@code run[len-2]}. Count
+   * ignores {@code ins} and applies its size rule. Used by Leaf.add / Branch.add; bulk load
+   * chunks via {@link #keyLevel} directly.
    */
-  boolean overflows(Object[] run, int len, int level, Settings s);
-
-  /**
-   * add/bulk: partition an overflowing run into successive node lengths (summing to
-   * {@code len}). Count ignores {@code run} and divides evenly toward branchingFactor;
-   * MST cuts after each boundary key. The returned lengths drive the existing copy loop.
-   * Precondition: {@code overflows(len, level, s)} is true (callers handle the fit case).
-   */
-  int[] splitLengths(Object[] run, int len, int level, Settings s);
+  int[] splitOnInsert(Object[] run, int len, int ins, int level, Settings s);
 
   /**
    * The level a key "rises to": 0 ⇒ leaf-only (no promotion), ≥1 ⇒ separator at that

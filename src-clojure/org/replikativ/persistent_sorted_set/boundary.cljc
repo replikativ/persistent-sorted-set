@@ -59,23 +59,15 @@
      (let [lzpl (long (max 1 lzpl))]
        (reify IBoundary
          (keyLevel [_ key _s] (key-level key lzpl))
-         (overflows [_ run len level _s]
-           (let [thresh (inc (long level))
-                 n (dec (long len))]
-             (loop [i 0]
-               (cond
-                 (>= i n) false
-                 (>= (key-level (aget ^objects run i) lzpl) thresh) true
-                 :else (recur (inc i))))))
-         (splitLengths [_ run len level _s]
-           (let [thresh (inc (long level))
-                 n (dec (long len))]
-             (loop [i 0, prev 0, acc (transient [])]
-               (if (>= i n)
-                 (int-array (persistent! (conj! acc (- (long len) (long prev)))))
-                 (if (>= (key-level (aget ^objects run i) lzpl) thresh)
-                   (recur (inc i) (inc i) (conj! acc (- (inc i) (long prev))))
-                   (recur (inc i) prev acc))))))
+         ;; O(1): only the inserted key (or, when appended, the displaced old max) can be a
+         ;; new boundary, since an MST node has no interior boundaries except its terminator.
+         (splitOnInsert [_ run len ins level _s]
+           (let [thresh (inc (long level)) len (long len) ins (long ins)]
+             (if (< ins (dec len))
+               (when (>= (key-level (aget ^objects run ins) lzpl) thresh)
+                 (int-array [(inc ins) (- len (inc ins))]))
+               (when (and (>= len 2) (>= (key-level (aget ^objects run (- len 2)) lzpl) thresh))
+                 (int-array [(dec len) 1])))))
          (contentDefined [_] true)))))
 
 ;; ---- CLJS: implement the PBoundary protocol -------------------------------------------
@@ -84,23 +76,13 @@
    (defrecord MstBoundary [^number lzpl]
      b/PBoundary
      (-key-level [_ key] (key-level key lzpl))
-     (-overflows? [_ run len level]
-       (let [thresh (inc level)
-             n (dec len)]
-         (loop [i 0]
-           (cond
-             (>= i n) false
-             (>= (key-level (aget run i) lzpl) thresh) true
-             :else (recur (inc i))))))
-     (-split-lengths [_ run len level]
-       (let [thresh (inc level)
-             n (dec len)]
-         (loop [i 0, prev 0, acc (transient [])]
-           (if (>= i n)
-             (persistent! (conj! acc (- len prev)))
-             (if (>= (key-level (aget run i) lzpl) thresh)
-               (recur (inc i) (inc i) (conj! acc (- (inc i) prev)))
-               (recur (inc i) prev acc))))))
+     (-split-on-insert [_ run len ins level]
+       (let [thresh (inc level)]
+         (if (< ins (dec len))
+           (when (>= (key-level (aget run ins) lzpl) thresh)
+             [(inc ins) (- len (inc ins))])
+           (when (and (>= len 2) (>= (key-level (aget run (- len 2)) lzpl) thresh))
+             [(dec len) 1]))))
      (-content-defined? [_] true)))
 
 #?(:cljs

@@ -62,21 +62,21 @@
                              ;; Identical to the JVM Leaf.add seam path; key-level is shared cljc.
                              bd
                              (let [all-keys (util/splice keys idx idx (arrays/array key))
-                                   total    (arrays/alength all-keys)]
-                               (if (b/-overflows? bd all-keys total 0)
-                                 (let [lens (b/-split-lengths bd all-keys total 0)]
-                                   (loop [out (transient []), pos 0, ls lens]
-                                     (if (seq ls)
-                                       (let [l  (first ls)
-                                             lf (Leaf. (.slice all-keys pos (+ pos l)) settings nil)]
-                                         (when (and measure-ops _measure)
-                                           (node/try-compute-measure lf nil measure-ops {:sync? true}))
-                                         (recur (conj! out lf) (+ pos l) (next ls)))
-                                       (arrays/into-array (persistent! out)))))
+                                   total    (arrays/alength all-keys)
+                                   lens     (b/-split-on-insert bd all-keys total idx 0)]  ; idx = insert pos
+                               (if (nil? lens)
                                  (let [lf (Leaf. all-keys settings nil)]
                                    (when (and measure-ops _measure)
                                      (node/try-compute-measure lf nil measure-ops {:sync? true}))
-                                   (arrays/array lf))))
+                                   (arrays/array lf))
+                                 (loop [out (transient []), pos 0, ls lens]
+                                   (if (seq ls)
+                                     (let [l  (first ls)
+                                           lf (Leaf. (.slice all-keys pos (+ pos l)) settings nil)]
+                                       (when (and measure-ops _measure)
+                                         (node/try-compute-measure lf nil measure-ops {:sync? true}))
+                                       (recur (conj! out lf) (+ pos l) (next ls)))
+                                     (arrays/into-array (persistent! out))))))
 
                              (== keys-l branching-factor)
                              (let [middle (arrays/half (inc keys-l))

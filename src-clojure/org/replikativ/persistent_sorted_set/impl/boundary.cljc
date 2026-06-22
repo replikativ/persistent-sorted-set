@@ -12,10 +12,10 @@
 #?(:cljs
    (defprotocol PBoundary
      "CLJS parallel of the Java IBoundary seam (MST only — count stays inline)."
-     (-overflows? [_ run len level]
-       "MST: does some key at index <len-1 rise to level+1 (a content boundary before the end)?")
-     (-split-lengths [_ run len level]
-       "MST: vector of successive node lengths (summing to len) — cut after each boundary key.")
+     (-split-on-insert [_ run len ins level]
+       "MST: O(1) split decision after a single key was inserted at `ins` (run[ins] is the new
+        key). Returns [len-a len-b] if it must split, else nil. Only the inserted key — or the
+        displaced old max when appended — can be a new boundary.")
      (-key-level [_ key]
        "The level a key rises to (0 ⇒ leaf-only).")
      (-content-defined? [_] "true for MST.")))

@@ -83,6 +83,18 @@
       (is (= (:shape (first results)) (root-shape fresh))
           "removed tree is byte-identical to a fresh build of the survivors"))))
 
+(deftest transient-add-canonical
+  (testing "transient batch conj (the editable in-place path) still splits at boundaries"
+    ;; yggdrasil's set-union uses (into a b), which conj!'s through a transient. The in-place
+    ;; add shortcut must NOT be taken in MST mode or boundary keys wouldn't split.
+    (let [n 4000
+          ks (vec (range n))
+          via-transient (persistent! (reduce conj! (transient (pss/sorted-set* {:boundary (mkb)})) (shuffle ks)))
+          via-persistent (mst-set (shuffle ks))]
+      (is (= (seq via-transient) (seq ks)) "elements correct")
+      (is (= (root-shape via-transient) (root-shape via-persistent))
+          "transient build is canonical (identical tree to persistent conj)"))))
+
 (deftest remove-stress
   ;; Many random (build-order, remove-order) trials at depth ≥3. The "boundary key alone in
   ;; its leaf, dropped, then the grandparent merges" case is rare (~1 in 15 trials), so a single
