@@ -19,3 +19,12 @@ node_modules
 
 # Internal docs and scratch work
 .internal/
+
+# Claude Code local settings
+.claude/
+# Eclipse project files (in template/)
+.classpath
+.project
+.settings/
+# Stray shadow-cljs/compiled output at repo root (real source is src-clojure/)
+/org/
