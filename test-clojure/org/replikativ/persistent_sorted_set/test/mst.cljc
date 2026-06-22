@@ -4,12 +4,13 @@
    insert / merge / remove order. Runs on BOTH platforms (cljc) — the same battery exercising
    the JVM and the cljs implementations, which must produce identical structures. See
    .internal/SPLIT_SEAM_DESIGN.md."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.test :refer [deftest is testing are]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [clojure.test.check.clojure-test :refer [defspec]]
             [org.replikativ.persistent-sorted-set :as pss]
             [org.replikativ.persistent-sorted-set.boundary :as b]
+            [hasch.core :as hasch]
             #?@(:cljs [[org.replikativ.persistent-sorted-set.leaf :refer [Leaf]]
                        [org.replikativ.persistent-sorted-set.branch :refer [Branch]]
                        [org.replikativ.persistent-sorted-set.arrays :as arrays]]))
@@ -45,6 +46,18 @@
   (if (instance? Leaf node)
     [node]
     (mapcat #(leaves (node-child node %)) (range (node-len node)))))
+
+(defn- merkle
+  "The tree's content address, computed bottom-up exactly like a content-addressed store
+   (hasch/uuid over each node's {:level :keys :addresses}). hasch is deterministic JVM↔cljs."
+  [node]
+  (if (instance? Leaf node)
+    (hasch/uuid {:level 0 :keys (mapv #(key-at node %) (range (node-len node)))})
+    (hasch/uuid {:level     (node-level node)
+                 :keys      (mapv #(key-at node %) (range (node-len node)))
+                 :addresses (mapv #(merkle (node-child node %)) (range (node-len node)))})))
+
+(defn- mst-set-lz [ks lz] (reduce conj (pss/sorted-set* {:boundary (b/mst-boundary lz)}) ks))
 
 ;; ---------------------------------------------------------------------------------------
 
@@ -126,6 +139,19 @@
           interior (butlast ls)]
       (is (every? (fn [lf] (>= (b/key-level (key-at lf (dec (node-len lf))) lzpl) 1)) interior)
           "interior leaf terminators are all boundary keys"))))
+
+(deftest cross-platform-structural-identity
+  ;; The full tree's content address (Merkle hash of the whole structure) must equal the
+  ;; JVM-computed reference on BOTH platforms — the gold-standard proof that JVM and cljs build
+  ;; the byte-identical tree (not just matching key-levels) and hash it identically. A cljs
+  ;; structural OR hashing divergence fails this. Built in shuffled order to also assert
+  ;; order-independence reaches the same address.
+  (testing "root Merkle address matches the JVM reference on this platform"
+    (are [n lz expected]
+        (= expected (str (merkle (root-of (mst-set-lz (shuffle (vec (range n))) lz)))))
+      5000 4 "3763fc7d-cef1-5a60-a65d-46bce9dcb393"
+      5000 6 "2c6ecf6a-0883-5da7-8dab-6309a819cedb"
+      1000 5 "2c95d9db-32db-57a7-8b56-480de2cfd1b8")))
 
 (deftest count-mode-unaffected
   (testing "no :boundary ⇒ default count B-tree, all elements correct"
