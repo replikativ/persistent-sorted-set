@@ -57,6 +57,54 @@
                  :keys      (mapv #(key-at node %) (range (node-len node)))
                  :addresses (mapv #(merkle (node-child node %)) (range (node-len node)))})))
 
+(defn- node-max
+  "A node's maximum key = its last key (leaf) / last separator (branch)."
+  [node] (key-at node (dec (node-len node))))
+
+(defn- leaf-depths [node d]
+  (if (instance? Leaf node)
+    [d]
+    (mapcat #(leaf-depths (node-child node %) (inc d)) (range (node-len node)))))
+
+(defn mst-violation
+  "Structural-invariant validator for canonical MST (test B). Returns nil if the subtree
+   rooted at `node` is a canonical Merkle Search Tree for the given `lz` (leadingZeros-per-
+   level), else a map describing the first violation. Checks the MST-specific properties that
+   element-equality cannot see:
+     1. no MISSING split: every interior leaf key (all but the node's own max) is level-0 —
+        a boundary key inside a leaf would mean the leaf should have been split there;
+     2. no MISSING/EXTRA split at branches: every interior separator (all but the node's own
+        max) is a boundary at the branch's level — i.e. key-level >= branch level, so its
+        child is correctly boundary-terminated and the branch is split at exactly the boundaries;
+     3. B+ shape: each separator equals its child's max key;
+     4. height-balance: all leaves sit at the same depth.
+   The node's own max key (last index) is exempt at every level — it is validated by the
+   parent's separator check, or is the global rightmost spine max (no boundary required)."
+  [node lz]
+  (or
+    ;; (4) height-balance — check once at the top
+   (let [ds (leaf-depths node 0)]
+     (when-not (apply = ds) {:unbalanced-leaf-depths (distinct ds)}))
+   (letfn [(walk [node]
+             (if (instance? Leaf node)
+                ;; (1) interior leaf keys must NOT be boundaries
+               (first (for [i (range (dec (node-len node)))
+                            :when (>= (b/key-level (key-at node i) lz) 1)]
+                        {:leaf-interior-boundary (key-at node i) :index i}))
+               (let [n (node-len node) lvl (node-level node)]
+                 (or
+                    ;; (2) interior separators must be boundaries at this level
+                  (first (for [i (range (dec n))
+                               :when (< (b/key-level (key-at node i) lz) lvl)]
+                           {:separator-not-boundary (key-at node i) :level lvl :index i}))
+                    ;; (3) separator == child max
+                  (first (for [i (range n)
+                               :when (not= (key-at node i) (node-max (node-child node i)))]
+                           {:separator-mismatch i :level lvl}))
+                    ;; recurse
+                  (first (keep #(walk (node-child node %)) (range n)))))))]
+     (walk node))))
+
 (defn- mst-set-lz [ks lz] (reduce conj (pss/sorted-set* {:boundary (b/mst-boundary lz)}) ks))
 
 ;; ---------------------------------------------------------------------------------------
@@ -148,7 +196,7 @@
   ;; order-independence reaches the same address.
   (testing "root Merkle address matches the JVM reference on this platform"
     (are [n lz expected]
-        (= expected (str (merkle (root-of (mst-set-lz (shuffle (vec (range n))) lz)))))
+         (= expected (str (merkle (root-of (mst-set-lz (shuffle (vec (range n))) lz)))))
       5000 4 "3763fc7d-cef1-5a60-a65d-46bce9dcb393"
       5000 6 "2c6ecf6a-0883-5da7-8dab-6309a819cedb"
       1000 5 "2c95d9db-32db-57a7-8b56-480de2cfd1b8")))
@@ -161,18 +209,58 @@
 
 (defspec prop-order-independence 20
   (prop/for-all [ks (gen/such-that seq (gen/set gen/large-integer))]
-    (let [v (vec ks)
-          shapes (map (comp root-shape mst-set) [(sort v) (reverse (sort v)) (shuffle v)])]
-      (and (apply = shapes)
-           (= (seq (mst-set (shuffle v))) (seq (sort v)))))))
+                (let [v (vec ks)
+                      sets (map mst-set [(sort v) (reverse (sort v)) (shuffle v)])]
+                  (and (apply = (map root-shape sets))
+                       (every? #(nil? (mst-violation (root-of %) lzpl)) sets)
+                       (= (seq (mst-set (shuffle v))) (seq (sort v)))))))
 
 (defspec prop-remove-independence 20
   (prop/for-all [ks (gen/such-that #(> (count %) 2) (gen/set gen/large-integer))
                  seed gen/nat]
-    (let [v (vec ks)
-          drop-set (set (take (mod seed (count v)) (shuffle v)))
-          survivors (sort (remove drop-set v))
-          removed (reduce disj (mst-set (shuffle v)) (shuffle (vec drop-set)))
-          fresh (mst-set (shuffle survivors))]
-      (and (= (seq removed) survivors)
-           (= (root-shape removed) (root-shape fresh))))))
+                (let [v (vec ks)
+                      drop-set (set (take (mod seed (count v)) (shuffle v)))
+                      survivors (sort (remove drop-set v))
+                      removed (reduce disj (mst-set (shuffle v)) (shuffle (vec drop-set)))
+                      fresh (mst-set (shuffle survivors))]
+                  (and (= (seq removed) survivors)
+                       (nil? (mst-violation (root-of removed) lzpl))
+                       (= (root-shape removed) (root-shape fresh))))))
+
+;; =============================================================================
+;; Model-based testing under INTERLEAVED operations (test A).
+;;
+;; The analog of generative.cljc's `operations-match-sorted-set`, specialized to MST.
+;; A random INTERLEAVED sequence of conj/disj (not phased build-then-remove) drives the
+;; MST in lock-step with clojure.core/sorted-set, then we assert all three guarantees at
+;; once on the final tree:
+;;   (a) ELEMENTS:      same contents as the sorted-set oracle;
+;;   (b) INVARIANTS:    the tree is a canonical MST (mst-violation = nil);
+;;   (c) CANONICALITY:  identical structure to a FRESH build of the survivors — i.e. full
+;;                      history-independence, now over arbitrary interleaved op orders, the
+;;                      regime the phased order/remove specs above never reach.
+;; Uses a small fanout (lzpl 3 ⇒ B≈8) so even modest N produces multi-level trees that
+;; exercise branch splits, merges, single-child spines and root grow/shrink. Runs on BOTH
+;; platforms; the cljs and JVM trees must be byte-identical for (c) to hold cross-platform.
+;; =============================================================================
+
+(def ^:const ilz 3)
+(defn- iset [ks] (mst-set-lz ks ilz))
+
+(def ^:private gen-op
+  (gen/tuple (gen/elements [:add :remove]) (gen/choose -400 400)))
+
+(defspec prop-interleaved-ops-match-and-canonical 60
+  (prop/for-all [init (gen/vector (gen/choose -400 400) 0 200)
+                 ops  (gen/vector gen-op 0 400)]
+                (let [[pss clj] (reduce (fn [[p c] [op v]]
+                                          (case op
+                                            :add    [(conj p v) (conj c v)]
+                                            :remove [(disj p v) (disj c v)]))
+                                        [(iset init) (into (sorted-set) init)]
+                                        ops)
+                      survivors (vec clj)]
+                  (and (= (vec pss) survivors)                                  ; (a) elements
+                       (nil? (mst-violation (root-of pss) ilz))                 ; (b) invariants
+                       (= (root-shape pss)                                      ; (c) canonical
+                          (root-shape (iset (shuffle survivors))))))))
