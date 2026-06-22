@@ -102,6 +102,25 @@
           expected (vec (remove #(zero? (mod % 7)) elems))]
       (is (= expected back)))))
 
+(deftest mst-durable-remove-roundtrip
+  (testing "MST conj/store/restore/disj/store/restore on a fressian-backed storage (BOTH platforms).
+            Exercises the storage-aware MST remove (children materialized via branch/child, not read
+            directly) and the boundary self-restoring (root adopts the node's strategy)."
+    (let [storage  (make-fress-storage 64 0)
+          elems    (vec (range 3000))
+          s0       (reduce (fn [s e] (set/conj s e compare))
+                           (set/sorted-set* {:storage storage :branching-factor 64
+                                             :boundary (bnd/mst-boundary 5)})
+                           (shuffle elems))
+          a0       (set/store s0 storage)
+          s1       (set/restore a0 storage)                  ; boundary not in opts → self-restores
+          s2       (reduce (fn [s e] (set/disj s e compare)) s1 (range 0 3000 7))  ; storage-aware remove
+          a2       (set/store s2 storage)
+          back     (vec (set/restore a2 storage))
+          expected (vec (remove #(zero? (mod % 7)) elems))]
+      (is (= elems (vec s1)) "restored set correct before removes")
+      (is (= expected back) "durable MST remove (after store/restore) yields the right elements"))))
+
 ;; JVM-only: ref-type is policy DATA (an enum), so it rides in the blob and a node reconstructs with
 ;; its own caching policy even when the reader knows nothing about it (the konserve-sync rootless
 ;; case). SOFT (the default) is omitted so common blobs are byte-unchanged; a read-time `:ref-type`

@@ -24,7 +24,12 @@
                (do
                  (when (and (nil? (.-root set)) (some? (.-address set)))
                    (assert (implements? storage/IStorage (.-storage set)))
-                   (set! (.-root set) (await (storage/restore (.-storage set) (.-address set) opts)))))
+                   (set! (.-root set) (await (storage/restore (.-storage set) (.-address set) opts)))
+                   ;; self-describing boundary: a restored node carries its split strategy; adopt
+                   ;; it so conj/disj use the right splitter even when restore opts omitted it.
+                   (let [nb (b/content-boundary (.-settings (.-root set)))]
+                     (when (and nb (not (b/content-boundary (.-settings set))))
+                       (set! (.-settings set) (assoc (.-settings set) :boundary nb))))))
                ;; diff-buf: seed the projection comparator at the root; branch/child propagates it
                ;; down as nodes materialize, so a leaf-parent can project buffered leaves with the
                ;; set's stable comparator. Idempotent; a Leaf root has no buffered children.
@@ -53,89 +58,121 @@
 ;; Parallel of the JVM PersistentSortedSet.growRoot + ANode.removeContent/mstMergeWith.
 ;; MST forces diff-buf off, so these build anchorless branches (no slots/addresses).
 
+(defn- free-addr [storage addr] (when (and storage addr) (storage/markFreed storage addr)) nil)
+
 (defn- mst-build-branch
-  "Build a level-`lvl` Branch from a seq of child nodes."
-  [lvl children-seq settings projcmp]
-  (let [carr          (arrays/into-array children-seq)
-        child-counts  (map node/subtree-count children-seq)
-        subtree-count (if (every? #(>= % 0) child-counts) (reduce + 0 child-counts) -1)
-        measure-ops   (:measure settings)
-        cmeas         (when measure-ops (map node/measure children-seq))
-        measure       (when (and measure-ops (every? some? cmeas))
-                        (reduce (fn [acc cs] (measure/merge-measure measure-ops acc cs))
-                                (measure/identity-measure measure-ops) cmeas))]
-    (Branch. lvl (arrays/amap node/max-key carr) carr nil subtree-count measure settings nil 0 projcmp)))
+  "Build a level-`lvl` Branch from a seq of child nodes. `addresses-seq` (optional) is the parallel
+   durable addresses to PRESERVE (nil ⇒ anchorless, all children re-stored)."
+  ([lvl children-seq settings projcmp] (mst-build-branch lvl children-seq settings projcmp nil))
+  ([lvl children-seq settings projcmp addresses-seq]
+   (let [carr          (arrays/into-array children-seq)
+         child-counts  (map node/subtree-count children-seq)
+         subtree-count (if (every? #(>= % 0) child-counts) (reduce + 0 child-counts) -1)
+         measure-ops   (:measure settings)
+         cmeas         (when measure-ops (map node/measure children-seq))
+         measure       (when (and measure-ops (every? some? cmeas))
+                         (reduce (fn [acc cs] (measure/merge-measure measure-ops acc cs))
+                                 (measure/identity-measure measure-ops) cmeas))]
+     (Branch. lvl (arrays/amap node/max-key carr) carr
+              (when addresses-seq (arrays/into-array addresses-seq))
+              subtree-count measure settings nil 0 projcmp))))
 
 (defn- mst-children
-  "Vector of a branch's (materialized) children. MST is storage-light: in-memory children are
-   populated directly. (Storage-backed MST remove — needing async restore — is a follow-up.)"
-  [^Branch node]
-  (let [ch (.-children node) n (arrays/alength (.-keys node))]
-    (mapv #(aget ch %) (range n))))
+  "Materialize a branch's children (storage-aware) → (async [children-vec addresses-vec]). Each
+   address is the child's durable address (nil if unstored), preserved on rebuild."
+  [^Branch node storage {:keys [sync?] :or {sync? true} :as opts}]
+  (async+sync sync?
+   (async
+    (let [n (arrays/alength (.-keys node))]
+      (loop [i 0 cs (transient []) as (transient [])]
+        (if (< i n)
+          (recur (inc i)
+                 (conj! cs (await (branch/child node storage i opts)))
+                 (conj! as (branch/address node i)))
+          [(persistent! cs) (persistent! as)]))))))
 
 (declare mst-merge-with mst-remove-content)
 
 (defn- mst-merge-with
   "Combine two same-level nodes whose separating (removed) boundary is gone. The junction —
    a's last child with b's first child — merges recursively ONLY when a's last child ended at
-   that removed boundary (its maxKey is no longer a boundary at its level). If a's last child
-   is still terminated by a LIVE boundary (e.g. a's deepest boundary leaf was dropped, leaving
-   a's tail a properly-terminated leaf), the two must NOT fuse — plain concatenation keeps the
-   live boundary. The inverse of add's promotion (≡ JVM ANode.mstMergeWith)."
-  [a b projcmp bd]
-  (if (instance? Leaf a)
-    ;; reached as a junction ⇒ a ended at the removed boundary (level 0) ⇒ concatenate
-    (let [settings    (.-settings a)
-          measure-ops (:measure settings)
-          lf          (Leaf. (arrays/aconcat (.-keys a) (.-keys b)) settings nil)]
-      (when measure-ops (node/try-compute-measure lf nil measure-ops {:sync? true}))
-      lf)
-    (let [a-ch (mst-children a)
-          b-ch (mst-children b)]
-      (if (>= (b/-key-level bd (node/max-key a)) (.-level a))
-        ;; a's last child is a live boundary ⇒ keep it; just concatenate the child lists.
-        (mst-build-branch (.-level a) (concat a-ch b-ch) (.-settings a) projcmp)
-        ;; a's last child ended at the removed boundary ⇒ merge the junction.
-        (let [junction (mst-merge-with (last a-ch) (first b-ch) projcmp bd)]
-          (mst-build-branch (.-level a) (concat (butlast a-ch) [junction] (rest b-ch))
-                            (.-settings a) projcmp))))))
+   that removed boundary. If a's last child is still terminated by a LIVE boundary, the two must
+   NOT fuse — plain concatenation keeps it. Storage-aware + address-preserving (≡ JVM
+   ANode.mstMergeWith). Returns (async node)."
+  [a b projcmp bd storage {:keys [sync?] :or {sync? true} :as opts}]
+  (async+sync sync?
+   (async
+    (if (instance? Leaf a)
+     ;; reached as a junction ⇒ a ended at the removed boundary (level 0) ⇒ concatenate
+     (let [settings    (.-settings a)
+           measure-ops (:measure settings)
+           lf          (Leaf. (arrays/aconcat (.-keys a) (.-keys b)) settings nil)]
+       (when measure-ops (node/try-compute-measure lf nil measure-ops {:sync? true}))
+       lf)
+     (let [[a-ch a-ad] (await (mst-children a storage opts))
+           [b-ch b-ad] (await (mst-children b storage opts))]
+       (if (>= (b/-key-level bd (node/max-key a)) (.-level a))
+         ;; a's last child is a live boundary ⇒ keep it; concatenate (all addresses preserved).
+         (mst-build-branch (.-level a) (concat a-ch b-ch) (.-settings a) projcmp (concat a-ad b-ad))
+         ;; a's last child ended at the removed boundary ⇒ merge the junction (consumed inputs freed).
+         (let [junction (await (mst-merge-with (last a-ch) (first b-ch) projcmp bd storage opts))]
+           (free-addr storage (last a-ad))
+           (free-addr storage (first b-ad))
+           (mst-build-branch (.-level a)
+                             (concat (butlast a-ch) [junction] (rest b-ch))
+                             (.-settings a) projcmp
+                             (concat (butlast a-ad) [nil] (rest b-ad))))))))))
 
 (defn- mst-remove-content
-  "MST remove without sibling-passing: returns the modified subtree (one node, possibly an
-   empty Leaf), or nil if key absent. A Branch merges two of its own children when the removed
-   key was a boundary at its level; the cross-parent case is handled by the grandparent.
-   Synchronous (≡ JVM ANode.removeContent)."
-  [node key cmp projcmp]
-  (if (instance? Leaf node)
-    (let [keys (.-keys node)
-          idx  (lookup-exact cmp keys key)]
-      (when (>= idx 0)
-        (let [settings    (.-settings node)
-              measure-ops (:measure settings)
-              lf          (Leaf. (splice keys idx (inc idx) (arrays/array)) settings nil)]
-          (when measure-ops (node/try-compute-measure lf nil measure-ops {:sync? true}))
-          lf)))
-    (let [keys (.-keys node)
-          n    (arrays/alength keys)
-          idx  (binary-search-l cmp keys (dec n) key)]
-      (if (== idx n)
-        nil
-        (let [children  (mst-children node)
-              new-child (mst-remove-content (nth children idx) key cmp projcmp)]
-          (if (nil? new-child)
-            nil
-            (let [bd          (b/content-boundary (.-settings node))
-                  lvl         (.-level node)
-                  empty-leaf? (and (instance? Leaf new-child) (== 0 (arrays/alength (.-keys new-child))))
-                  merge-right? (and (< idx (dec n)) (>= (b/-key-level bd key) lvl))
-                  new-children (cond
-                                 empty-leaf?  (concat (take idx children) (drop (inc idx) children))
-                                 merge-right? (let [merged (mst-merge-with new-child (nth children (inc idx)) projcmp bd)]
-                                                (concat (take idx children) [merged] (drop (+ idx 2) children)))
-                                 :else        (concat (take idx children) [new-child] (drop (inc idx) children)))]
-              (if (seq new-children)
-                (mst-build-branch lvl new-children (.-settings node) projcmp)
-                (Leaf. (arrays/array) (.-settings node) nil)))))))))
+  "MST remove without sibling-passing: returns (async <modified subtree, or empty Leaf>) or
+   (async nil) if key absent. Storage-aware + address-preserving (≡ JVM ANode.removeContent)."
+  [node storage key cmp projcmp {:keys [sync?] :or {sync? true} :as opts}]
+  (async+sync sync?
+   (async
+    (if (instance? Leaf node)
+     (let [keys (.-keys node)
+           idx  (lookup-exact cmp keys key)]
+       (when (>= idx 0)
+         (let [settings    (.-settings node)
+               measure-ops (:measure settings)
+               lf          (Leaf. (splice keys idx (inc idx) (arrays/array)) settings nil)]
+           (when measure-ops (node/try-compute-measure lf nil measure-ops {:sync? true}))
+           lf)))
+     (let [keys (.-keys node)
+           n    (arrays/alength keys)
+           idx  (binary-search-l cmp keys (dec n) key)]
+       (if (== idx n)
+         nil
+         (let [[children addrs] (await (mst-children node storage opts))
+               new-child        (await (mst-remove-content (nth children idx) storage key cmp projcmp opts))]
+           (if (nil? new-child)
+             nil
+             (let [bd          (b/content-boundary (.-settings node))
+                   lvl         (.-level node)
+                   settings    (.-settings node)
+                   empty-leaf? (and (instance? Leaf new-child) (== 0 (arrays/alength (.-keys new-child))))
+                   merge-right? (and (< idx (dec n)) (>= (b/-key-level bd key) lvl))]
+               (cond
+                 empty-leaf?
+                 (do (free-addr storage (nth addrs idx))
+                     (let [nc (concat (take idx children) (drop (inc idx) children))
+                           na (concat (take idx addrs) (drop (inc idx) addrs))]
+                       (if (seq nc) (mst-build-branch lvl nc settings projcmp na)
+                           (Leaf. (arrays/array) settings nil))))
+                 merge-right?
+                 (let [merged (await (mst-merge-with new-child (nth children (inc idx)) projcmp bd storage opts))]
+                   (free-addr storage (nth addrs idx))
+                   (free-addr storage (nth addrs (inc idx)))
+                   (mst-build-branch lvl
+                                     (concat (take idx children) [merged] (drop (+ idx 2) children))
+                                     settings projcmp
+                                     (concat (take idx addrs) [nil] (drop (+ idx 2) addrs))))
+                 :else
+                 (do (free-addr storage (nth addrs idx))
+                     (mst-build-branch lvl
+                                       (concat (take idx children) [new-child] (drop (inc idx) children))
+                                       settings projcmp
+                                       (concat (take idx addrs) [nil] (drop (inc idx) addrs))))))))))))))
 
 (defn- mst-grow-root
   "Promote sibling roots by boundary level until one remains (multi-level for high-level keys)."
@@ -283,8 +320,8 @@
                       bd   (b/content-boundary (.-settings set))]
                   (if bd
                     ;; split-seam (MST): sibling-free removeContent + single-child root collapse
-                    ;; (≡ JVM disjoin content branch). Synchronous (in-memory MST).
-                    (let [new-root (mst-remove-content root key cmp (.-comparator set))]
+                    ;; (≡ JVM disjoin content branch). Storage-aware (await child materialization).
+                    (let [new-root (await (mst-remove-content root (.-storage set) key cmp (.-comparator set) opts))]
                       (if (nil? new-root)
                         set
                         (do
@@ -293,7 +330,7 @@
                           (let [new-root (loop [r new-root]
                                            (if (and (instance? Branch r)
                                                     (== 1 (arrays/alength (.-keys r))))
-                                             (recur (aget (.-children r) 0))
+                                             (recur (await (branch/child r (.-storage set) 0 opts)))
                                              r))
                                 current-cnt (.-cnt set)
                                 new-cnt (if (neg? current-cnt) -1 (dec current-cnt))]
@@ -1582,7 +1619,7 @@
 
 #!------------------------------------------------------------------------------
 
-(deftype BTSet [^:mutable root cnt comparator meta ^:mutable _hash storage ^:mutable address settings]
+(deftype BTSet [^:mutable root cnt comparator meta ^:mutable _hash storage ^:mutable address ^:mutable settings]
   Object
   (toString [this] (pr-str* this))
 
