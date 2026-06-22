@@ -483,101 +483,101 @@
                            nodes-len        (arrays/alength nodes)]
                        (if bd
                          (mst-branch-add this bd new-keys new-children idx key)
-                       (if (<= (arrays/alength new-children) branching-factor)
-                         (let [new-addrs
-                               (when addrs
-                                 (if (= nodes-len 1)
-                                   (let [na (arrays/make-array (arrays/alength addrs))]
-                                     (arrays/acopy addrs 0 (arrays/alength addrs) na 0)
+                         (if (<= (arrays/alength new-children) branching-factor)
+                           (let [new-addrs
+                                 (when addrs
+                                   (if (= nodes-len 1)
+                                     (let [na (arrays/make-array (arrays/alength addrs))]
+                                       (arrays/acopy addrs 0 (arrays/alength addrs) na 0)
                                      ;; Mark old child address as freed before clearing. diff-buf:
                                      ;; under diff-buf the old address may be re-pointed as a buffered
                                      ;; anchor at store, so freeing is DEFERRED to store.
-                                     (when (and (not diff-buf?) storage (aget addrs idx))
-                                       (storage/markFreed storage (aget addrs idx)))
-                                     (aset na idx nil)
-                                     na)
-                                   (let [old-addr (aget addrs idx)]
-                                     (when (and (not diff-buf?) storage old-addr)
-                                       (storage/markFreed storage old-addr))
-                                     (util/splice addrs idx (inc idx) (arrays/array nil nil)))))
+                                       (when (and (not diff-buf?) storage (aget addrs idx))
+                                         (storage/markFreed storage (aget addrs idx)))
+                                       (aset na idx nil)
+                                       na)
+                                     (let [old-addr (aget addrs idx)]
+                                       (when (and (not diff-buf?) storage old-addr)
+                                         (storage/markFreed storage old-addr))
+                                       (util/splice addrs idx (inc idx) (arrays/array nil nil)))))
                                ;; After adding one element, increment count if known
-                               old-sc (.-subtree-count this)
-                               new-sc (if (>= old-sc 0) (inc old-sc) -1)
+                                 old-sc (.-subtree-count this)
+                                 new-sc (if (>= old-sc 0) (inc old-sc) -1)
                                ;; Update measure incrementally only if already computed
-                               measure-ops (:measure (.-settings this))
-                               new-measure (when (and measure-ops (.-_measure this))
-                                             (measure/merge-measure measure-ops (.-_measure this) (measure/extract measure-ops key)))
-                               nb (Branch. (.-level this) new-keys new-children new-addrs new-sc new-measure (.-settings this) nil 0 (.-_projCmp this))]
+                                 measure-ops (:measure (.-settings this))
+                                 new-measure (when (and measure-ops (.-_measure this))
+                                               (measure/merge-measure measure-ops (.-_measure this) (measure/extract measure-ops key)))
+                                 nb (Branch. (.-level this) new-keys new-children new-addrs new-sc new-measure (.-settings this) nil 0 (.-_projCmp this))]
                            ;; diff-buf: nodes-len==1 ⇒ content-only ⇒ carry the source slots and
                            ;; deposit Present(key) (matches JVM persistent path). nodes-len>=2 ⇒ a child
                            ;; split was absorbed ⇒ structural: mark rebalanced + stitch surviving siblings.
-                           (when diff-buf?
-                             (if (= nodes-len 1)
-                               (do (set! (.-_bufEntries nb) (buf-entries this)) ; carry running total (or -1) onto successor
-                                   (await (carry-and-deposit nb storage (.-_slots this) idx key key anchor0 opts)))
-                               (do (set! (.-_bufEntries nb) -1) ; absorbed a child split: structural → must write
-                                   (free-dropped-child this storage idx) ; diff-buf: free the split child's old blob
-                                   (set! (.-_slots nb) (stitch-slots this idx nodes-len (arrays/alength new-children))))))
-                           (arrays/array nb))
-                         (let [middle      (arrays/half (arrays/alength new-children))
-                               tmp-addrs   (when addrs
-                                             (let [old-addr (aget addrs idx)]
+                             (when diff-buf?
+                               (if (= nodes-len 1)
+                                 (do (set! (.-_bufEntries nb) (buf-entries this)) ; carry running total (or -1) onto successor
+                                     (await (carry-and-deposit nb storage (.-_slots this) idx key key anchor0 opts)))
+                                 (do (set! (.-_bufEntries nb) -1) ; absorbed a child split: structural → must write
+                                     (free-dropped-child this storage idx) ; diff-buf: free the split child's old blob
+                                     (set! (.-_slots nb) (stitch-slots this idx nodes-len (arrays/alength new-children))))))
+                             (arrays/array nb))
+                           (let [middle      (arrays/half (arrays/alength new-children))
+                                 tmp-addrs   (when addrs
+                                               (let [old-addr (aget addrs idx)]
                                                ;; Mark old child address as freed before clearing (deferred under diff-buf)
-                                               (when (and (not diff-buf?) storage old-addr)
-                                                 (storage/markFreed storage old-addr))
-                                               (util/splice addrs idx (inc idx) (arrays/array nil nil))))
-                               left-addrs  (when tmp-addrs (.slice tmp-addrs 0 middle))
-                               right-addrs (when tmp-addrs (.slice tmp-addrs middle))
-                               left-children (.slice new-children 0 middle)
-                               right-children (.slice new-children middle)
-                               measure-ops (:measure (.-settings this))
+                                                 (when (and (not diff-buf?) storage old-addr)
+                                                   (storage/markFreed storage old-addr))
+                                                 (util/splice addrs idx (inc idx) (arrays/array nil nil))))
+                                 left-addrs  (when tmp-addrs (.slice tmp-addrs 0 middle))
+                                 right-addrs (when tmp-addrs (.slice tmp-addrs middle))
+                                 left-children (.slice new-children 0 middle)
+                                 right-children (.slice new-children middle)
+                                 measure-ops (:measure (.-settings this))
                                ;; Compute measure for split branches from their children only if already computed
                                ;; Return nil if any child measure is nil (don't silently undercount)
-                               left-measure (when (and measure-ops (.-_measure this))
-                                              (reduce (fn [acc child]
-                                                        (if (nil? acc)
-                                                          (reduced nil)
-                                                          (let [cs (node/measure child)]
-                                                            (if cs
-                                                              (measure/merge-measure measure-ops acc cs)
-                                                              (reduced nil)))))
-                                                      (measure/identity-measure measure-ops)
-                                                      left-children))
-                               right-measure (when (and measure-ops (.-_measure this))
-                                               (reduce (fn [acc child]
-                                                         (if (nil? acc)
-                                                           (reduced nil)
-                                                           (let [cs (node/measure child)]
-                                                             (if cs
-                                                               (measure/merge-measure measure-ops acc cs)
-                                                               (reduced nil)))))
-                                                       (measure/identity-measure measure-ops)
-                                                       right-children))
-                               new-len (arrays/alength new-children)
-                               left-b  (Branch. (.-level this)
-                                                (.slice new-keys 0 middle)
-                                                left-children
-                                                left-addrs
-                                                (try-compute-subtree-count-from-children left-children (arrays/alength left-children))
-                                                left-measure
-                                                (.-settings this) nil 0 (.-_projCmp this))
-                               right-b (Branch. (.-level this)
-                                                (.slice new-keys middle)
-                                                right-children
-                                                right-addrs
-                                                (try-compute-subtree-count-from-children right-children (arrays/alength right-children))
-                                                right-measure
-                                                (.-settings this) nil 0 (.-_projCmp this))]
+                                 left-measure (when (and measure-ops (.-_measure this))
+                                                (reduce (fn [acc child]
+                                                          (if (nil? acc)
+                                                            (reduced nil)
+                                                            (let [cs (node/measure child)]
+                                                              (if cs
+                                                                (measure/merge-measure measure-ops acc cs)
+                                                                (reduced nil)))))
+                                                        (measure/identity-measure measure-ops)
+                                                        left-children))
+                                 right-measure (when (and measure-ops (.-_measure this))
+                                                 (reduce (fn [acc child]
+                                                           (if (nil? acc)
+                                                             (reduced nil)
+                                                             (let [cs (node/measure child)]
+                                                               (if cs
+                                                                 (measure/merge-measure measure-ops acc cs)
+                                                                 (reduced nil)))))
+                                                         (measure/identity-measure measure-ops)
+                                                         right-children))
+                                 new-len (arrays/alength new-children)
+                                 left-b  (Branch. (.-level this)
+                                                  (.slice new-keys 0 middle)
+                                                  left-children
+                                                  left-addrs
+                                                  (try-compute-subtree-count-from-children left-children (arrays/alength left-children))
+                                                  left-measure
+                                                  (.-settings this) nil 0 (.-_projCmp this))
+                                 right-b (Branch. (.-level this)
+                                                  (.slice new-keys middle)
+                                                  right-children
+                                                  right-addrs
+                                                  (try-compute-subtree-count-from-children right-children (arrays/alength right-children))
+                                                  right-measure
+                                                  (.-settings this) nil 0 (.-_projCmp this))]
                            ;; diff-buf: a child split overflowed this branch → split: structural on both
                            ;; halves → written, but each still buffers its surviving siblings' slots.
-                           (when diff-buf?
-                             (set! (.-_bufEntries left-b) -1) ; split: structural on both halves → must write
-                             (set! (.-_bufEntries right-b) -1)
-                             (free-dropped-child this storage idx) ; diff-buf: free the split child's old blob
-                             (when-let [all (stitch-slots this idx nodes-len new-len)]
-                               (set! (.-_slots left-b)  (.slice all 0 middle))
-                               (set! (.-_slots right-b) (.slice all middle))))
-                           (arrays/array left-b right-b)))))))))))
+                             (when diff-buf?
+                               (set! (.-_bufEntries left-b) -1) ; split: structural on both halves → must write
+                               (set! (.-_bufEntries right-b) -1)
+                               (free-dropped-child this storage idx) ; diff-buf: free the split child's old blob
+                               (when-let [all (stitch-slots this idx nodes-len new-len)]
+                                 (set! (.-_slots left-b)  (.slice all 0 middle))
+                                 (set! (.-_slots right-b) (.slice all middle))))
+                             (arrays/array left-b right-b)))))))))))
 
 (defn $remove
   [^Branch this storage key left right cmp {:keys [sync?] :or {sync? true} :as opts}]
