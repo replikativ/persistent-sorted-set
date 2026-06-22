@@ -22,7 +22,10 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   public Object _root; // Object == ANode | SoftReference<ANode> | WeakReference<ANode>
   public int _count;
   public int _version;
-  public final Settings _settings;
+  // Not final: a lazily-restored root self-describes its split strategy (the boundary); root()
+  // adopts it on first materialization so conj/disj use the right splitter even when the restore
+  // opts didn't specify one (the restore-by path). Like the _root lazy cache, a one-time write.
+  public Settings _settings;
   public IStorage<Key, Address> _storage;
 
   public PersistentSortedSet() {
@@ -57,6 +60,13 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     if (root == null && _address != null) {
       root = _storage.restore(_address);
       _root = _settings.makeReference(root);
+      // self-describing boundary: a restored node carries its split strategy; adopt it so this
+      // set's own conj/disj use the right splitter even when restore opts didn't specify one.
+      // Idempotent for the root-handler restore path (settings already carry the boundary).
+      IBoundary nodeBoundary = root._settings.boundary();
+      if (nodeBoundary.contentDefined() && !_settings.boundary().contentDefined()) {
+        _settings = _settings.withBoundary(nodeBoundary);
+      }
     }
     // diff-buf: seed the projection comparator at the root; Branch.child propagates it down
     // as nodes materialize, so a leaf-parent can project buffered leaves with the set's

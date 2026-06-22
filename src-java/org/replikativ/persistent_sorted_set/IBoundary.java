@@ -42,4 +42,13 @@ public interface IBoundary {
    * and enables multi-level root promotion.
    */
   boolean contentDefined();
+
+  /**
+   * A serializable descriptor that lets a reader reconstruct this policy (e.g. the Clojure map
+   * {@code {:type :mst :lzpl 6}}), or {@code null} for the default count policy. Rides in the
+   * fressian blob's per-node config (NOT in the content hash), so a restored MST store is
+   * self-describing and cannot be silently mutated as a count tree. Returned as Object because
+   * the descriptor is consumer-domain EDN; the matching {@code boundary-resolver} rebuilds it.
+   */
+  default Object descriptor() { return null; }
 }

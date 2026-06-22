@@ -102,7 +102,20 @@ public class Settings {
 
   // Returns a copy of these settings with a different boundary policy (e.g. MST). Preserves
   // edit state so it composes with transients. Used by the Clojure API to opt into prolly mode.
+  //
+  // A content-defined boundary is INCOMPATIBLE with two features and we reject/neutralize them
+  // here so the combination can't be constructed silently:
+  //  - leafProcessor: splitOnInsert assumes a single key was inserted; a processor that rewrites
+  //    multiple entries per op would violate that invariant ⇒ reject.
+  //  - diff-buffering: a buffered spine node is addressed by hash(anchor+diff), not its canonical
+  //    content hash, which defeats the cross-peer dedup MST exists for ⇒ force off.
   public Settings withBoundary(IBoundary boundary) {
+    if (boundary != null && boundary.contentDefined()) {
+      if (_leafProcessor != null)
+        throw new IllegalArgumentException(
+          "a content-defined boundary (MST) is incompatible with a leafProcessor");
+      return new Settings(_branchingFactor, _refType, _edit, _measure, _leafProcessor, 0, boundary);
+    }
     return new Settings(_branchingFactor, _refType, _edit, _measure, _leafProcessor, _diffBufSize, boundary);
   }
 

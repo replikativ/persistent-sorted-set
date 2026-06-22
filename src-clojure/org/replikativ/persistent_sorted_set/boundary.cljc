@@ -68,7 +68,9 @@
                  (int-array [(inc ins) (- len (inc ins))]))
                (when (and (>= len 2) (>= (key-level (aget ^objects run (- len 2)) lzpl) thresh))
                  (int-array [(dec len) 1])))))
-         (contentDefined [_] true)))))
+         (contentDefined [_] true)
+         ;; self-describing: rides in the fressian blob so a restored store rebuilds this policy.
+         (descriptor [_] {:type :mst :lzpl lzpl})))))
 
 ;; ---- CLJS: implement the PBoundary protocol -------------------------------------------
 
@@ -83,10 +85,25 @@
              [(inc ins) (- len (inc ins))])
            (when (and (>= len 2) (>= (key-level (aget run (- len 2)) lzpl) thresh))
              [(dec len) 1]))))
-     (-content-defined? [_] true)))
+     (-content-defined? [_] true)
+     (-descriptor [_] {:type :mst :lzpl lzpl})))
 
 #?(:cljs
    (defn mst-boundary
      "Build an MST PBoundary (cljs). `lzpl` sets target fanout (avg node ≈ 2^lzpl keys)."
      [lzpl]
      (->MstBoundary (max 1 lzpl))))
+
+;; ---- reconstruct a boundary from its serialized descriptor (the fressian :boundary-resolver) ----
+
+(defn boundary-from-descriptor
+  "Rebuild an IBoundary/PBoundary from the descriptor stored in a node blob. Pass this as
+   `:boundary-resolver` to the fressian read-handlers so a durable MST store self-restores."
+  [descriptor]
+  (case (:type descriptor)
+    :mst (mst-boundary (:lzpl descriptor))
+    (throw (ex-info "Unknown boundary descriptor type" {:descriptor descriptor}))))
+
+;; cljs has no dynamic require, so register the resolver with the lightweight impl ns on load
+;; (the JVM resolves via requiring-resolve and needs no registration).
+#?(:cljs (b/register-resolver! boundary-from-descriptor))

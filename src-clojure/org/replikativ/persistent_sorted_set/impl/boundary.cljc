@@ -18,7 +18,8 @@
         displaced old max when appended — can be a new boundary.")
      (-key-level [_ key]
        "The level a key rises to (0 ⇒ leaf-only).")
-     (-content-defined? [_] "true for MST.")))
+     (-content-defined? [_] "true for MST.")
+     (-descriptor [_] "Serializable descriptor {:type … …} for self-describing restore.")))
 
 #?(:cljs
    (defn content-boundary
@@ -27,3 +28,25 @@
      [settings]
      (when-let [b (:boundary settings)]
        (when (-content-defined? b) b))))
+
+;; ---- internal descriptor → boundary resolution (NO consumer interaction) ------------------
+;; The descriptor→strategy mapping lives in the optional `boundary` ns (which carries hasch). We
+;; resolve it INTERNALLY so fressian restore reconstructs the strategy from the serialized data
+;; alone: JVM lazy-loads that ns on demand (count blobs never trigger it ⇒ never load hasch);
+;; cljs has no dynamic require, so `boundary` registers its resolver here when it loads (you
+;; always load `boundary` to create an MST set in the first place).
+
+#?(:cljs (defonce ^:private mst-resolver (atom nil)))
+#?(:cljs (defn register-resolver! [f] (reset! mst-resolver f)))
+
+(defn resolve-boundary
+  "Reconstruct an IBoundary/PBoundary from its serialized descriptor (e.g. {:type :mst :lzpl 6}),
+   or nil for none. Internal to PSS — never supplied by the consumer."
+  [descriptor]
+  (when descriptor
+    #?(:clj  ((requiring-resolve 'org.replikativ.persistent-sorted-set.boundary/boundary-from-descriptor)
+              descriptor)
+       :cljs (if-let [f @mst-resolver]
+               (f descriptor)
+               (throw (ex-info "node carries a content-defined boundary but the boundary ns isn't loaded — (require 'org.replikativ.persistent-sorted-set.boundary)"
+                               {:descriptor descriptor}))))))
