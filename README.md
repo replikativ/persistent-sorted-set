@@ -1,38 +1,66 @@
-A B-tree based persistent sorted set for Clojure/Script.
+# PersistentSortedSet
 
-PersistentSortedSet supports:
+<p align="center">
+<a href="https://clojurians.slack.com/archives/CB7GJAN0L"><img src="https://badgen.net/badge/-/slack?icon=slack&label"/></a>
+<a href="https://clojars.org/io.replikativ/persistent-sorted-set"><img src="https://img.shields.io/clojars/v/io.replikativ/persistent-sorted-set.svg"/></a>
+<a href="https://circleci.com/gh/replikativ/persistent-sorted-set"><img src="https://circleci.com/gh/replikativ/persistent-sorted-set.svg?style=shield"/></a>
+<a href="https://github.com/replikativ/persistent-sorted-set/tree/main"><img src="https://img.shields.io/github/last-commit/replikativ/persistent-sorted-set/main"/></a>
+</p>
 
-- transients,
-- custom comparators,
-- fast iteration,
-- efficient slices (iterator over a part of the set),
-- efficient `rseq` on slices,
-- `lookup` to retrieve actual stored keys,
-- `replace` for single-traversal key updates at same logical position,
-- durable storage with automatic garbage collection via `markFreed`.
+**A fast, durable B-tree sorted set for Clojure and ClojureScript.**
 
-Almost a drop-in replacement for `clojure.core/sorted-set`, the only difference being this one can’t store `nil`.
+PersistentSortedSet is an almost drop-in replacement for `clojure.core/sorted-set` — a
+persistent, immutable sorted set backed by a B+-tree with structural sharing. Beyond the
+standard set API it adds efficient slicing, transients, custom comparators, lazy durable
+storage on any backend, range statistics, and a content-addressed mode for CRDT sync. The only
+behavioral difference from `clojure.core/sorted-set` is that it can't store `nil`.
 
-Implementations are provided for Clojure and ClojureScript.
+Implementations are provided for both Clojure and ClojureScript.
 
-## Building
+## Key features
 
-```
-export JAVA8_HOME="/Library/Java/JavaVirtualMachines/jdk1.8.0_202.jdk/Contents/Home"
-lein jar
-```
+- **[Drop-in sorted set](#usage)** — `sorted-set`, `sorted-set-by`, `conj`, `disj`,
+  `contains?`, custom comparators, transients.
+- **[Efficient slices & seeking](#slices-and-seeking)** — `slice`/`rslice` iterate any
+  sub-range, with `rseq` and `seek` to reposition an open iterator in O(log n).
+- **[`lookup` & `replace`](#lookup-and-replace)** — retrieve the actual stored key, or update a
+  key in place at the same logical position in a single traversal.
+- **[Durable storage](#durability)** — store the tree to disk/DB/object-storage through a small
+  `IStorage` interface; restore lazily, loading only the nodes an operation touches. Automatic
+  GC of unreachable nodes via `markFreed`. Async storage on ClojureScript.
+- **[Canonical serialization](#serialization)** — optional Fressian read/write handlers so
+  konserve/kabel-backed consumers share one wire form; self-describing, content-addressed
+  nodes. See [doc/serialization.md](doc/serialization.md).
+- **[Range statistics](#range-counting-rank-access-and-aggregate-statistics)** — subtree counts
+  give O(log n) `count-slice`; a monoidal `:measure` gives O(log n) rank/percentile access
+  (`get-nth`) and range aggregates (`measure`, `measure-slice`). See
+  [doc/statistical-queries.md](doc/statistical-queries.md).
+- **[Diff buffering](#diff-buffering-write-amplification)** — opt-in write-amplification
+  reduction that brings a content-only commit on content-addressed storage down to ~1 object.
+  See [doc/diff-buffering.md](doc/diff-buffering.md).
+- **[Content-defined boundaries (Merkle Search Tree)](#content-defined-boundaries-merkle-search-tree)**
+  — opt-in *prolly* mode where equal sets are byte-identical trees regardless of history, for
+  CRDT state sync and cross-replica dedup. See
+  [doc/merkle-search-tree.md](doc/merkle-search-tree.md).
 
-## Usage
+Full documentation index: **[doc/README.md](doc/README.md)**.
 
-Dependency:
+## Installation
+
+[![Clojars Project](https://img.shields.io/clojars/v/io.replikativ/persistent-sorted-set.svg)](https://clojars.org/io.replikativ/persistent-sorted-set)
 
 ```clj
-[io.replikativ/persistent-sorted-set "0.3.100"]
+;; deps.edn
+io.replikativ/persistent-sorted-set {:mvn/version "LATEST"}
+
+;; Leiningen
+[io.replikativ/persistent-sorted-set "LATEST"]
 ```
 
-The version follows the pattern `0.3.{commit-count}` and is automatically incremented with each commit.
+The version follows the pattern `0.4.{commit-count}` and is incremented automatically on each
+commit; the Clojars badge above shows the current release.
 
-Code:
+## Usage
 
 ```clj
 (require '[org.replikativ.persistent-sorted-set :as set])
@@ -52,6 +80,15 @@ Code:
     (contains? 3))
 ;=> true
 
+(set/sorted-set-by > 1 2 3)
+;=> #{3 2 1}
+```
+
+### Slices and seeking
+
+`slice` and `rslice` return a lazy seq over a sub-range, iterating only the nodes they need:
+
+```clj
 (-> (apply set/sorted-set (range 10000))
     (set/slice 5000 5010))
 ;=> (5000 5001 5002 5003 5004 5005 5006 5007 5008 5009 5010)
@@ -59,11 +96,30 @@ Code:
 (-> (apply set/sorted-set (range 10000))
     (set/rslice 5010 5000))
 ;=> (5010 5009 5008 5007 5006 5005 5004 5003 5002 5001 5000)
+```
 
-(set/sorted-set-by > 1 2 3)
-;=> #{3 2 1}
+`seek` repositions an existing iterator forward in O(log n) without re-traversing from the
+start — useful for merge-join-style consumption:
 
-;; lookup returns the actual stored key
+```clj
+(-> (seq (into (set/sorted-set) (range 10)))
+    (set/seek 5))
+;=> (5 6 7 8 9)
+
+(-> (into (set/sorted-set) (range 100))
+    (set/rslice 75 25)
+    (set/seek 60)
+    (set/seek 30))
+;=> (30 29 28 27 26 25)
+```
+
+### lookup and replace
+
+`lookup` returns the *actual stored key* (handy when keys carry payload compared by a partial
+comparator); `replace` updates a key in place when the old and new keys compare equal, in a
+single traversal:
+
+```clj
 (-> (set/sorted-set 1 2 3 4)
     (set/lookup 3))
 ;=> 3
@@ -72,58 +128,18 @@ Code:
     (set/lookup 99 :not-found))
 ;=> :not-found
 
-;; replace updates a key at the same logical position
-;; (old-key and new-key must compare equal)
+;; replace updates a key at the same logical position (old and new must compare equal)
 (defn cmp-by-id [[id1 _] [id2 _]] (compare id1 id2))
 
 (-> (set/sorted-set-by cmp-by-id [1 :old] [2 :old] [3 :old])
     (set/replace [2 :old] [2 :new]))
 ;=> #{[1 :old] [2 :new] [3 :old]}
 ```
-One can also efficiently seek on the iterators.
-
-```clj
-(-> (seq (into (set/sorted-set) (range 10)))
-    (set/seek 5))
-;; => (5 6 7 8 9)
-
-(-> (into (set/sorted-set) (range 100))
-    (set/rslice 75 25)
-    (set/seek 60)
-    (set/seek 30))
-;; => (30 29 28 27 26 25)
-```
-
-## Development
-
-### CI/CD Pipeline
-
-This project uses CircleCI for continuous integration and deployment:
-
-- **Automated Testing**: Both Clojure and ClojureScript tests run on every commit
-- **Code Formatting**: Automatic formatting checks with cljfmt ensure consistent code style
-- **Versioning**: Releases follow semantic versioning `0.3.{commit-count}`, automatically calculated
-- **Deployment**: On the `main` branch, successful builds are automatically:
-  - Deployed to [Clojars](https://clojars.org/io.replikativ/persistent-sorted-set)
-  - Released to [GitHub](https://github.com/replikativ/persistent-sorted-set/releases)
-
-### Code Formatting
-
-To ensure consistent code style for easier PR review:
-
-```bash
-# Check formatting
-clj -M:format
-
-# Auto-fix formatting issues
-clj -M:ffix
-```
 
 ## Durability
 
-Clojure version allows efficient storage of Persistent Sorted Set on disk/DB/anywhere.
-
-To do that, implement `IStorage` interface:
+The Clojure version can store a PersistentSortedSet on disk / in a DB / anywhere, and restore
+it lazily. Implement the `IStorage` interface:
 
 ```clojure
 (defrecord Storage [*storage]
@@ -165,74 +181,49 @@ To do that, implement `IStorage` interface:
     nil))
 ```
 
-Storing Persistent Sorted Set works per node. This will save each node once:
+Storing works per node, writing each node once:
 
 ```clojure
-(def set
-  (into (set/sorted-set) (range 1000000)))
-
-(def storage
-  (Storage. (atom {})))
-
-(def root
-  (set/store set storage))
+(def set     (into (set/sorted-set) (range 1000000)))
+(def storage (Storage. (atom {})))
+(def root    (set/store set storage))
 ```
 
-If you try to store once again, no store operations will be issued:
+Storing again issues no writes — the root is unchanged:
 
 ```clojure
-(assert
-  (= root
-    (set/store set storage)))
+(assert (= root (set/store set storage)))
 ```
 
-If you modify set and store new one, only nodes that were changed will be stored. For a tree of depth 3, it’s usually just \~3 nodes. The root will be new, though:
+Modify and store again, and only the changed nodes are written. For a tree of depth 3 that's
+usually ~3 nodes; the root is always new:
 
 ```clojure
-(def set2
-  (into set [-1 -2 -3]))
-
-(assert
-  (not= root
-    (set/store set2 storage)))
+(def set2 (into set [-1 -2 -3]))
+(assert (not= root (set/store set2 storage)))
 ```
 
-Finally, one can construct a new set from its stored snapshot. You’ll need address for that:
+Reconstruct a set from a stored snapshot using its root address:
 
 ```clojure
-(def set-lazy
-  (set/restore root storage))
+(def set-lazy (set/restore root storage))
 ```
 
-Restore operation is lazy. By default it won’t do anything, but when you start accessing returned set, `IStorage::restore` operations will be issued and part of the set will be reconstructed in memory. Only nodes needed for a particular operation will be loaded.
-
-E.g. this will load \~3 nodes for a set of depth 3:
-
-```clojure
-(first set-lazy)
-```
-
-This will load \~50 nodes on default settings:
+`restore` is **lazy**: nothing loads until you access the set, and then only the nodes a
+particular operation needs are fetched via `IStorage::restore`. `(first set-lazy)` loads ~3
+nodes for a depth-3 tree; `(take 5000 set-lazy)` loads ~50 on default settings. Every operation
+that works on an in-memory set works transparently on a lazy one, which can live arbitrarily
+long without being fully realized:
 
 ```clojure
-(take 5000 set-lazy)
-```
-
-Internally Persistent Sorted Set does not caches returned nodes, so don’t be surprised if subsequent `first` loads the same nodes again. One must implement cache inside IStorage implementation for efficient retrieval of already loaded nodes. Also see `IStorage::accessed` for access stats, e.g. for LRU.
-
-Any operation that can be done on in-memory PSS can be done on a lazy one, too. It will fetch required nodes when needed, completely transparently for the user. Lazy PSS can exist arbitrary long without ever being fully realized in memory:
-
-```clojure
-(def set3
-  (conj set-lazy [-1 -2 -3]))
-
-(def set4
-  (disj set-lazy [4 5 6 7 8]))
-
+(conj set-lazy [-1 -2 -3])
+(disj set-lazy [4 5 6 7 8])
 (contains? set-lazy 5000)
 ```
 
-Last piece of the puzzle: `set/walk-addresses`. Use it to check which nodes are actually in use by current PSS and optionally clean up garbage in your storage that is not referenced by it anymore:
+PSS does not cache restored nodes itself — implement caching inside your `IStorage` (see
+`IStorage::accessed` for LRU stats). Use `walk-addresses` to enumerate the nodes a set
+actually references, e.g. to GC unreferenced objects from your storage:
 
 ```clojure
 (let [*alive-addresses (volatile! [])]
@@ -240,22 +231,103 @@ Last piece of the puzzle: `set/walk-addresses`. Use it to check which nodes are 
   @*alive-addresses)
 ```
 
-See [test_storage.clj](test-clojure/org/replikativ/persistent_sorted_set/test_storage.clj) for more examples.
+See [test-clojure/org/replikativ/persistent_sorted_set/test/storage.clj](test-clojure/org/replikativ/persistent_sorted_set/test/storage.clj)
+for more examples.
 
-### ClojureScript Durability
+### ClojureScript durability
 
-ClojureScript also supports durable storage with async operations. The `IStorage` interface works the same way, but `store` and `restore` methods return promises/async values instead of direct values. This allows integration with IndexedDB, remote storage APIs, and other async storage backends.
+ClojureScript also supports durable storage. The `IStorage` interface works the same way, but
+`store`/`restore` return promises/async values, so it integrates with IndexedDB, remote storage
+APIs, and other async backends. Async-aware operations take a `:sync?` option.
 
-## Write amplification (diff buffering)
+## Serialization
+
+For consumers that share a wire format (datahike, yggdrasil, proximum, stratum), the
+`org.replikativ.persistent-sorted-set.fressian` namespace provides an **optional, canonical**
+Fressian read/write handler set for PSS nodes (`pss/leaf`, `pss/branch`) and roots (`pss/set`),
+on both JVM (`clojure.data.fressian`) and ClojureScript (`fress`). Nodes are self-describing —
+`:branching-factor`, `:diff-buf-size`, `:ref-type`, and the content-defined boundary descriptor
+ride in the blob — so a single store can hold a mix of settings and round-trip losslessly. The
+non-serializable bits (live `IStorage`, comparator, measure-ops) resolve at read time via
+consumer-supplied resolvers or id-keyed registries. `data.fressian` is a `provided` dependency.
+
+See [doc/serialization.md](doc/serialization.md).
+
+## Range counting, rank access, and aggregate statistics
+
+Branch nodes carry subtree counts, and an optional monoidal `:measure` lets the tree answer
+range aggregates and rank queries in O(log n) without iterating. See
+[doc/statistical-queries.md](doc/statistical-queries.md) for the full model.
+
+### Range counting
+
+Count elements in a range without iterating through them — O(log n) via subtree counts:
+
+```clj
+(def s (into (set/sorted-set) (range 10000)))
+
+(set/count-slice s 1000 2000)   ;=> 1001   ; [1000, 2000]
+(set/count-slice s nil 500)     ;=> 501    ; .. to 500
+(set/count-slice s 9000 nil)    ;=> 1000   ; 9000 ..
+(set/count-slice s 1000 2000 my-comparator)
+```
+
+### Rank-based access (`get-nth`)
+
+Access elements by position (rank) in O(log n), enabling percentile/quantile queries. Requires
+a `:measure` with a `weight` implementation; the built-in `NumericStatsOps` uses count as
+weight (each element weight 1):
+
+```clj
+(def s (into (set/sorted-set* {:measure (NumericStatsOps.)}) (range 1000)))
+
+(set/get-nth s 500)   ;=> [500 0]   ; [value local-offset]
+(set/get-nth s 950)   ;=> [950 0]
+
+(defn percentile [s p]
+  (let [n (count s), rank (long (* n p))]
+    (first (set/get-nth s rank))))
+
+(percentile s 0.5)    ;=> 500   (median)
+(percentile s 0.95)   ;=> 950   (95th percentile)
+```
+
+`get-nth` returns `[entry local-offset]` (`local-offset` supports weighted statistics where an
+entry represents multiple elements), or `nil` if the rank is out of bounds. On ClojureScript
+the same API is available via `org.replikativ.persistent-sorted-set.impl.numeric-stats`, in
+both sync and async (`:sync?`) modes.
+
+### Aggregate statistics
+
+A `:measure` maintains an aggregate incrementally as elements are added/removed, giving O(log n)
+sum/count/min/max/variance over any range. The built-in numeric measure:
+
+```clj
+(import '[org.replikativ.persistent_sorted_set NumericStatsOps])
+
+(def s (into (set/sorted-set* {:measure (NumericStatsOps.)}) [1 2 3 4 5]))
+
+(set/measure s)         ;=> NumericStats{count=5, sum=15.0, min=1, max=5, ...}
+(set/measure-slice s 2 4) ;=> NumericStats{count=3, sum=9.0, min=2, max=4, ...}
+```
+
+`NumericStats` exposes `count`, `sum`, `sumSq`, `min`, `max`, plus derived `mean()`,
+`variance()`, and `stdDev()`. To implement your own, provide a **monoid** (identity +
+associative merge) via the `IMeasure` interface (JVM) or `IMeasure` protocol (ClojureScript,
+`org.replikativ.persistent-sorted-set.impl.measure`). Non-invertible aggregates like min/max
+receive a `recompute` supplier in `remove` for the case where a removed element changes the
+result. Full interface, custom examples, and the ClojureScript protocol are in
+[doc/statistical-queries.md](doc/statistical-queries.md).
+
+## Diff buffering (write amplification)
 
 On immutable, content-addressed storage (e.g. konserve on S3/GCS), each `store` of a node is a
 new object, and a commit normally rewrites the whole root→leaf path it touched (`≈ depth+1`
-objects). Where each `PUT` dominates cost/latency, **diff buffering** brings a content-only
-commit down to **~1 object per commit**: the in-memory tree stays an ordinary B-tree, and at
-the serialization boundary a rewritten branch buffers each unchanged-structure child's *diff*
-(plus an aggregate snapshot) into its own object, re-pointing to the child's existing durable
-address instead of rewriting it. Reads are unaffected (the diff is projected back lazily on
-descent, once per node). Queries, counts, ranks, and measures all work unchanged.
+objects). Where each `PUT` dominates cost, **diff buffering** brings a content-only commit down
+to **~1 object**: the in-memory tree stays an ordinary B-tree, and at the serialization
+boundary a rewritten branch buffers each unchanged-structure child's *diff* (plus an aggregate
+snapshot) into its own object, re-pointing to the child's existing durable address instead of
+rewriting it. Reads, queries, counts, and measures are unaffected.
 
 It is **off by default** and gated by a per-node budget; `0` is byte-identical to baseline.
 
@@ -265,285 +337,134 @@ It is **off by default** and gated by a per-node budget; `0` is byte-identical t
 ;; or globally via the JVM system property -Dpss.diffBufSize=256
 ```
 
-**Important:** enabling it requires an `IStorage` implementation that serializes and restores
-the per-child slots (`Branch.slotsForStorage` / reconstructing `_slots`). A storage that
-ignores them will silently drop buffered changes on write — which is why the default is off.
+Enabling it requires an `IStorage` that serializes and restores the per-child slots
+(`Branch.slotsForStorage` / reconstructing `_slots`); a storage that ignores them silently
+drops buffered changes, which is why the default is off. See
+[doc/diff-buffering.md](doc/diff-buffering.md) for the model, invariants, on-disk format, and
+storage contract.
 
-See [doc/diff-buffering.md](doc/diff-buffering.md) for the model, invariants, on-disk format,
-and the storage contract.
+## Content-defined boundaries (Merkle Search Tree)
 
-## Efficient Range Counting
+By default the tree shape depends on insertion/removal order. **Content-defined boundary mode**
+(a *Merkle Search Tree*, the family informally called *prolly trees*) decides splits from a
+deterministic hash of the keys, so the tree becomes a pure function of its contents:
 
-Count elements in a range without iterating through them:
+> Same elements ⇒ byte-identical tree — regardless of `conj`/`disj` order, bulk vs incremental
+> construction, or which JVM/JS peer built it.
 
-```clj
-(def s (into (set/sorted-set) (range 10000)))
+This is opt-in per set and the default count B-tree is unaffected. It exists for
+content-addressed **CRDT state sync and dedup**: converged replicas share nodes, so syncing
+ships zero objects and idempotence is an O(1) root-hash comparison.
 
-;; Count elements in [1000, 2000]
-(set/count-slice s 1000 2000)
-;=> 1001
+```clojure
+(require '[org.replikativ.persistent-sorted-set.boundary :as b])
 
-;; Count from beginning to 500
-(set/count-slice s nil 500)
-;=> 501
-
-;; Count from 9000 to end
-(set/count-slice s 9000 nil)
-;=> 1000
-
-;; Use custom comparator
-(set/count-slice s 1000 2000 my-comparator)
+;; lzpl = leading-zeros per level; sets target fanout (avg node ≈ 2^lzpl keys)
+(def s (into (set/sorted-set* {:boundary (b/mst-boundary 5)})
+             (shuffle (range 10000))))
 ```
 
-This uses O(log n) traversal by leveraging subtree counts stored in branch nodes.
-
-## Rank-Based Access (getNth)
-
-Access elements by their position (rank) in O(log n) time, enabling efficient percentile and quantile queries:
-
-```clj
-(def s (into (set/sorted-set* {:measure (NumericStatsOps.)})
-             (range 1000)))
-
-;; Get median (50th percentile) - O(log n)
-(set/get-nth s 500)
-;=> [500 0]  ; [value local-offset]
-
-;; Get 95th percentile
-(set/get-nth s 950)
-;=> [950 0]
-
-;; Helper function for percentiles
-(defn percentile [s p]
-  (let [n (count s)
-        rank (long (* n p))]
-    (first (set/get-nth s rank))))
-
-(percentile s 0.5)   ;=> 500  (median)
-(percentile s 0.95)  ;=> 950  (95th percentile)
-(percentile s 0.25)  ;=> 250  (first quartile)
-```
-
-`get-nth` returns `[entry local-offset]` where `local-offset` is useful for weighted statistics (each entry can represent multiple elements). Returns `nil` if the rank is out of bounds.
-
-**Requirements:** Must configure `:measure` with a `weight` implementation. The built-in `NumericStatsOps` uses count as weight (each element has weight 1).
-
-**Use cases:**
-- **Percentile queries:** Median, quartiles, deciles for statistical analysis
-- **Outlier detection:** Use IQR (Q3 - Q1) with Tukey's fences
-- **Quantile regression:** Fit models at different percentiles
-- **Weighted sampling:** Importance sampling for Monte Carlo methods
-- **CDF evaluation:** Empirical cumulative distribution functions
-
-### ClojureScript
-
-ClojureScript provides the same `get-nth` API:
-
-```cljs
-(require '[org.replikativ.persistent-sorted-set :as set])
-(require '[org.replikativ.persistent-sorted-set.impl.numeric-stats :as nstats])
-
-(def s (into (set/sorted-set* {:measure nstats/numeric-stats-ops})
-             (range 1000)))
-
-(set/get-nth s 500)
-;=> [500 0]
-```
-
-Both sync and async modes are supported via the `:sync?` option.
-
-## Aggregate Statistics
-
-PersistentSortedSet can maintain aggregate statistics that update incrementally as elements are added or removed. This enables O(log n) queries for sum, count, min, max, variance, etc. over any range.
-
-### Using Built-in Numeric Statistics
-
-```clj
-(import '[org.replikativ.persistent_sorted_set NumericStatsOps])
-
-;; Create set with numeric stats tracking
-(def s (into (set/sorted-set* {:measure (NumericStatsOps.)})
-             [1 2 3 4 5]))
-
-;; Get measure for entire set
-(set/measure s)
-;=> NumericStats{count=5, sum=15.0, min=1, max=5, ...}
-
-;; Get measure for a range [2, 4]
-(set/measure-slice s 2 4)
-;=> NumericStats{count=3, sum=9.0, min=2, max=4, ...}
-```
-
-The `NumericStats` object provides `count`, `sum`, `sumSq`, `min`, `max`, plus derived `mean()`, `variance()`, and `stdDev()` methods.
-
-### Implementing Custom Statistics
-
-Statistics must form a **monoid** - they need an identity element and an associative merge operation. Implement the `IMeasure` interface:
-
-```java
-public interface IMeasure<Key, S> {
-    // Identity element: merge(identity, x) == x
-    S identity();
-
-    // Extract measure from a single key
-    S extract(Key key);
-
-    // Associative merge: merge(a, merge(b, c)) == merge(merge(a, b), c)
-    S merge(S s1, S s2);
-
-    // Remove a key's contribution (see below)
-    S remove(S current, Key key, Supplier<S> recompute);
-}
-```
-
-**Example: Counting distinct categories**
-
-```java
-public class CategoryStats implements IMeasure<Item, Map<String, Long>> {
-    public Map<String, Long> identity() {
-        return Collections.emptyMap();
-    }
-
-    public Map<String, Long> extract(Item item) {
-        return Map.of(item.category(), 1L);
-    }
-
-    public Map<String, Long> merge(Map<String, Long> a, Map<String, Long> b) {
-        Map<String, Long> result = new HashMap<>(a);
-        b.forEach((k, v) -> result.merge(k, v, Long::sum));
-        return result;
-    }
-
-    public Map<String, Long> remove(Map<String, Long> current, Item item,
-                                     Supplier<Map<String, Long>> recompute) {
-        // For invertible stats, compute directly
-        Map<String, Long> result = new HashMap<>(current);
-        result.computeIfPresent(item.category(), (k, v) -> v > 1 ? v - 1 : null);
-        return result;
-    }
-}
-```
-
-### Handling Non-Invertible Statistics
-
-Some statistics like `min` and `max` can't be updated incrementally when removing elements - if you remove the minimum, you need to scan to find the new one. The `remove` method receives a `recompute` supplier for this:
-
-```java
-public S remove(S current, Key key, Supplier<S> recompute) {
-    if (affectsResult(current, key)) {
-        // Can't compute incrementally, recompute from children
-        return recompute.get();
-    }
-    // Safe to compute incrementally
-    return subtractKey(current, key);
-}
-```
-
-The built-in `NumericStatsOps` handles this automatically for min/max.
-
-### ClojureScript Statistics
-
-For ClojureScript, implement the `IMeasure` protocol from `org.replikativ.persistent-sorted-set.impl.measure`:
-
-```cljs
-(require '[org.replikativ.persistent-sorted-set :as set])
-(require '[org.replikativ.persistent-sorted-set.impl.stats :as stats])
-(require '[org.replikativ.persistent-sorted-set.impl.numeric-stats :as numeric-stats])
-
-;; Use built-in numeric stats
-(def s (into (set/sorted-set* {:measure numeric-stats/numeric-stats-ops})
-             [1 2 3 4 5]))
-
-;; Or implement custom measure via the IMeasure protocol
-(defrecord MyStats [count sum])
-
-(def my-stats-ops
-  (reify measure/IMeasure
-    (identity-measure [_]
-      (->MyStats 0 0))
-
-    (extract [_ key]
-      (->MyStats 1 key))
-
-    (merge-measure [_ s1 s2]
-      (->MyStats (+ (:count s1) (:count s2))
-                 (+ (:sum s1) (:sum s2))))
-
-    (remove-measure [_ current key recompute-fn]
-      (->MyStats (dec (:count current))
-                 (- (:sum current) key)))))
-
-(def s (into (set/sorted-set* {:measure my-stats-ops}) [1 2 3 4 5]))
-```
+It is determinism-compatible across Clojure and ClojureScript (a tree built on the JVM and one
+built in the browser for the same key set are node-for-node identical), serializes its policy
+self-describingly, and is intentionally incompatible with diff buffering (forced off) and leaf
+processors (rejected). See [doc/merkle-search-tree.md](doc/merkle-search-tree.md) for the level
+function, the geometric size distribution, canonicality of `conj`/`disj`, and the rationale.
 
 ## Performance
 
-To reproduce:
+To reproduce: install `[com.datomic/datomic-free "0.9.5703"]` locally and run `lein bench`.
 
-1. Install `[com.datomic/datomic-free "0.9.5703"]` locally.
-2. Run `lein bench`.
+`PersistentTreeSet` is Clojure's red-black-tree sorted-set. `BTSet` is Datomic's B-tree sorted
+set (no transients, no disjoins). `PersistentSortedSet` is this implementation. Numbers on a
+3.2 GHz i7-8700B:
 
-`PersistentTreeSet` is Clojure’s Red-black tree based sorted-set.
-`BTSet` is Datomic’s B-tree based sorted set (no transients, no disjoins).
-`PersistentSortedSet` is this implementation.
-
-Numbers I get on my 3.2 GHz i7-8700B:
-
-### Conj 100k randomly sorted Integers
+**Conj 100k randomly sorted Integers**
 
 ```
-PersistentTreeSet                 143..165ms  
-BTSet                             125..141ms  
-PersistentSortedSet               105..121ms  
-PersistentSortedSet (transient)   50..54ms    
+PersistentTreeSet                 143..165ms
+BTSet                             125..141ms
+PersistentSortedSet               105..121ms
+PersistentSortedSet (transient)   50..54ms
 ```
 
-### Call contains? 100k times with random Integer on a 100k Integers set
+**`contains?` 100k times with random Integer on a 100k set**
 
 ```
-PersistentTreeSet     51..54ms    
-BTSet                 45..47ms    
-PersistentSortedSet   46..47ms    
+PersistentTreeSet     51..54ms
+BTSet                 45..47ms
+PersistentSortedSet   46..47ms
 ```
 
-### Iterate with java.util.Iterator over a set of 1M Integers
+**Iterate with java.util.Iterator over 1M Integers**
 
 ```
-PersistentTreeSet     70..77ms    
-PersistentSortedSet   10..11ms    
+PersistentTreeSet     70..77ms
+PersistentSortedSet   10..11ms
 ```
 
-### Iterate with ISeq.first/ISeq.next over a set of 1M Integers
+**Iterate with ISeq.first/next over 1M Integers**
 
 ```
-PersistentTreeSet     116..124ms  
-BTSet                 92..105ms   
-PersistentSortedSet   56..68ms    
+PersistentTreeSet     116..124ms
+BTSet                 92..105ms
+PersistentSortedSet   56..68ms
 ```
 
-### Iterate over a part of a set from 1 to 999999 in a set of 1M Integers
+**Iterate over a part of a 1M-Integer set (1 .. 999999)**
 
-For `PersistentTreeSet` we use ISeq produced by `(take-while #(<= % 999999) (.seqFrom set 1 true))`.
-
-For `PersistentSortedSet` we use `(.slice set 1 999999)`.
-
-```
-PersistentTreeSet     238..256ms  
-PersistentSortedSet   70..91ms    
-```
-
-### Disj 100k elements in randomized order from a set of 100k Integers
+For `PersistentTreeSet`: `(take-while #(<= % 999999) (.seqFrom set 1 true))`. For
+`PersistentSortedSet`: `(.slice set 1 999999)`.
 
 ```
-PersistentTreeSet                 151..155ms  
-PersistentSortedSet               91..98ms    
-PersistentSortedSet (transient)   47..50ms    
+PersistentTreeSet     238..256ms
+PersistentSortedSet   70..91ms
+```
+
+**Disj 100k elements in randomized order from a 100k set**
+
+```
+PersistentTreeSet                 151..155ms
+PersistentSortedSet               91..98ms
+PersistentSortedSet (transient)   47..50ms
 ```
 
 ## Projects using PersistentSortedSet
 
-- [DataScript](https://github.com/tonsky/datascript), persistent in-memory database
-- [Datahike](https://github.com/replikativ/datahike), durable Datalog database with persistent storage
+- [DataScript](https://github.com/tonsky/datascript) — persistent in-memory database
+- [Datahike](https://github.com/replikativ/datahike) — durable Datalog database with persistent
+  storage
+- [yggdrasil](https://github.com/replikativ/yggdrasil) — CRDTs over content-addressed storage
+
+## Development
+
+### Building
+
+```bash
+export JAVA8_HOME="/path/to/jdk1.8.0_202"   # Java 8 required for the bootclasspath
+lein jar
+```
+
+### Testing
+
+```bash
+lein test                       # Clojure
+yarn shadow-cljs release test   # ClojureScript
+```
+
+### CI/CD
+
+This project uses CircleCI: both Clojure and ClojureScript tests run on every commit, formatting
+is checked with cljfmt, and successful `main` builds are deployed to
+[Clojars](https://clojars.org/io.replikativ/persistent-sorted-set) and released to
+[GitHub](https://github.com/replikativ/persistent-sorted-set/releases). Versions follow
+`0.4.{commit-count}`.
+
+### Code formatting
+
+```bash
+clj -M:format   # check
+clj -M:ffix     # auto-fix
+```
 
 ## License
 
