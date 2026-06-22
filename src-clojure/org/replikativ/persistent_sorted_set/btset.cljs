@@ -9,6 +9,7 @@
             [org.replikativ.persistent-sorted-set.impl.node :as node]
             [org.replikativ.persistent-sorted-set.impl.measure :as measure]
             [org.replikativ.persistent-sorted-set.impl.storage :as storage]
+            [org.replikativ.persistent-sorted-set.impl.boundary :as b]
             [org.replikativ.persistent-sorted-set.util :refer [rotate lookup-exact splice cut-n-splice binary-search-l binary-search-r return-array merge-n-split check-n-splice]]))
 
 (declare BTSet)
@@ -48,6 +49,117 @@
                (let [root (await (-root set opts))]
                  (await (node/$contains? root (.-storage set) key (.-comparator set) opts))))))
 
+;; ---- split-seam (MST / content-defined boundary) --------------------------------------
+;; Parallel of the JVM PersistentSortedSet.growRoot + ANode.removeContent/mstMergeWith.
+;; MST forces diff-buf off, so these build anchorless branches (no slots/addresses).
+
+(defn- mst-build-branch
+  "Build a level-`lvl` Branch from a seq of child nodes."
+  [lvl children-seq settings projcmp]
+  (let [carr          (arrays/into-array children-seq)
+        child-counts  (map node/subtree-count children-seq)
+        subtree-count (if (every? #(>= % 0) child-counts) (reduce + 0 child-counts) -1)
+        measure-ops   (:measure settings)
+        cmeas         (when measure-ops (map node/measure children-seq))
+        measure       (when (and measure-ops (every? some? cmeas))
+                        (reduce (fn [acc cs] (measure/merge-measure measure-ops acc cs))
+                                (measure/identity-measure measure-ops) cmeas))]
+    (Branch. lvl (arrays/amap node/max-key carr) carr nil subtree-count measure settings nil 0 projcmp)))
+
+(defn- mst-children
+  "Vector of a branch's (materialized) children. MST is storage-light: in-memory children are
+   populated directly. (Storage-backed MST remove — needing async restore — is a follow-up.)"
+  [^Branch node]
+  (let [ch (.-children node) n (arrays/alength (.-keys node))]
+    (mapv #(aget ch %) (range n))))
+
+(declare mst-merge-with mst-remove-content)
+
+(defn- mst-merge-with
+  "Combine two same-level nodes whose separating (removed) boundary is gone. The junction —
+   a's last child with b's first child — merges recursively ONLY when a's last child ended at
+   that removed boundary (its maxKey is no longer a boundary at its level). If a's last child
+   is still terminated by a LIVE boundary (e.g. a's deepest boundary leaf was dropped, leaving
+   a's tail a properly-terminated leaf), the two must NOT fuse — plain concatenation keeps the
+   live boundary. The inverse of add's promotion (≡ JVM ANode.mstMergeWith)."
+  [a b projcmp bd]
+  (if (instance? Leaf a)
+    ;; reached as a junction ⇒ a ended at the removed boundary (level 0) ⇒ concatenate
+    (let [settings    (.-settings a)
+          measure-ops (:measure settings)
+          lf          (Leaf. (arrays/aconcat (.-keys a) (.-keys b)) settings nil)]
+      (when measure-ops (node/try-compute-measure lf nil measure-ops {:sync? true}))
+      lf)
+    (let [a-ch (mst-children a)
+          b-ch (mst-children b)]
+      (if (>= (b/-key-level bd (node/max-key a)) (.-level a))
+        ;; a's last child is a live boundary ⇒ keep it; just concatenate the child lists.
+        (mst-build-branch (.-level a) (concat a-ch b-ch) (.-settings a) projcmp)
+        ;; a's last child ended at the removed boundary ⇒ merge the junction.
+        (let [junction (mst-merge-with (last a-ch) (first b-ch) projcmp bd)]
+          (mst-build-branch (.-level a) (concat (butlast a-ch) [junction] (rest b-ch))
+                            (.-settings a) projcmp))))))
+
+(defn- mst-remove-content
+  "MST remove without sibling-passing: returns the modified subtree (one node, possibly an
+   empty Leaf), or nil if key absent. A Branch merges two of its own children when the removed
+   key was a boundary at its level; the cross-parent case is handled by the grandparent.
+   Synchronous (≡ JVM ANode.removeContent)."
+  [node key cmp projcmp]
+  (if (instance? Leaf node)
+    (let [keys (.-keys node)
+          idx  (lookup-exact cmp keys key)]
+      (when (>= idx 0)
+        (let [settings    (.-settings node)
+              measure-ops (:measure settings)
+              lf          (Leaf. (splice keys idx (inc idx) (arrays/array)) settings nil)]
+          (when measure-ops (node/try-compute-measure lf nil measure-ops {:sync? true}))
+          lf)))
+    (let [keys (.-keys node)
+          n    (arrays/alength keys)
+          idx  (binary-search-l cmp keys (dec n) key)]
+      (if (== idx n)
+        nil
+        (let [children  (mst-children node)
+              new-child (mst-remove-content (nth children idx) key cmp projcmp)]
+          (if (nil? new-child)
+            nil
+            (let [bd          (b/content-boundary (.-settings node))
+                  lvl         (.-level node)
+                  empty-leaf? (and (instance? Leaf new-child) (== 0 (arrays/alength (.-keys new-child))))
+                  merge-right? (and (< idx (dec n)) (>= (b/-key-level bd key) lvl))
+                  new-children (cond
+                                 empty-leaf?  (concat (take idx children) (drop (inc idx) children))
+                                 merge-right? (let [merged (mst-merge-with new-child (nth children (inc idx)) projcmp bd)]
+                                                (concat (take idx children) [merged] (drop (+ idx 2) children)))
+                                 :else        (concat (take idx children) [new-child] (drop (inc idx) children)))]
+              (if (seq new-children)
+                (mst-build-branch lvl new-children (.-settings node) projcmp)
+                (Leaf. (arrays/array) (.-settings node) nil)))))))))
+
+(defn- mst-grow-root
+  "Promote sibling roots by boundary level until one remains (multi-level for high-level keys)."
+  [bd nodes settings projcmp]
+  (loop [nodes nodes]
+    (let [n (arrays/alength nodes)]
+      (if (< n 2)
+        (arrays/aget nodes 0)
+        (let [lvl    (inc (node/level (arrays/aget nodes 0)))
+              thresh (inc lvl)
+              branches
+              (loop [i 0 start 0 out (transient [])]
+                (if (>= i n)
+                  (persistent! out)
+                  (let [cut (and (< i (dec n))
+                                 (>= (b/-key-level bd (node/max-key (arrays/aget nodes i))) thresh))]
+                    (if (or cut (== i (dec n)))
+                      (recur (inc i) (inc i)
+                             (conj! out (mst-build-branch lvl (array-seq (.slice nodes start (inc i))) settings projcmp)))
+                      (recur (inc i) start out)))))]
+          (if (== 1 (count branches))
+            (first branches)
+            (recur (arrays/into-array branches))))))))
+
 (defn conjoin
   ([^BTSet set key]
    (conjoin set key (.-comparator set) {:sync? true}))
@@ -80,6 +192,11 @@
                                   (.-storage set)
                                   nil
                                   (.-settings set))
+                          (if-let [bd (b/content-boundary (.-settings set))]
+                            ;; split-seam (MST): multi-level boundary promotion (≡ JVM growRoot)
+                            (BTSet. (mst-grow-root bd roots (.-settings set) (.-comparator set))
+                                    new-cnt (.-comparator set) (.-meta set)
+                                    UNINITIALIZED_HASH (.-storage set) nil (.-settings set))
                           (let [child0 (arrays/aget roots 0)
                                 lvl    (inc (node/level child0))
                                 ;; Compute subtree count; propagate -1 (unknown) if any child is unknown
@@ -107,7 +224,7 @@
                                     UNINITIALIZED_HASH
                                     (.-storage set)
                                     nil
-                                    (.-settings set))))))))))))
+                                    (.-settings set)))))))))))))
 
 (defn $replace
   ([^BTSet set old-key new-key]
@@ -163,29 +280,49 @@
    (async+sync sync?
                (async
                 (let [root (await (-root set opts))
-                      new-roots (await (node/$remove root (.-storage set) key nil nil cmp opts))]
-                  (if (nil? new-roots)
-                    set
-                    (do
-                      ;; Mark old root address as freed if it exists
-                      (when (and (.-storage set) (.-address set))
-                        (storage/markFreed (.-storage set) (.-address set)))
-                      (let [new-root (arrays/aget new-roots 0)
-                            new-root (if (and (instance? Branch new-root)
-                                              (== 1 (arrays/alength (.-children new-root))))
-                                       (await (branch/child new-root (.-storage set) 0 opts))
-                                       new-root)
-                            ;; If count is unknown (-1), keep it unknown; will be computed lazily when needed
-                            current-cnt (.-cnt set)
-                            new-cnt (if (neg? current-cnt) -1 (dec current-cnt))]
-                        (BTSet. new-root
-                                new-cnt
-                                (.-comparator set)
-                                (.-meta set)
-                                UNINITIALIZED_HASH
-                                (.-storage set)
-                                nil
-                                (.-settings set))))))))))
+                      bd   (b/content-boundary (.-settings set))]
+                  (if bd
+                    ;; split-seam (MST): sibling-free removeContent + single-child root collapse
+                    ;; (≡ JVM disjoin content branch). Synchronous (in-memory MST).
+                    (let [new-root (mst-remove-content root key cmp (.-comparator set))]
+                      (if (nil? new-root)
+                        set
+                        (do
+                          (when (and (.-storage set) (.-address set))
+                            (storage/markFreed (.-storage set) (.-address set)))
+                          (let [new-root (loop [r new-root]
+                                           (if (and (instance? Branch r)
+                                                    (== 1 (arrays/alength (.-keys r))))
+                                             (recur (aget (.-children r) 0))
+                                             r))
+                                current-cnt (.-cnt set)
+                                new-cnt (if (neg? current-cnt) -1 (dec current-cnt))]
+                            (BTSet. new-root new-cnt (.-comparator set) (.-meta set)
+                                    UNINITIALIZED_HASH (.-storage set) nil (.-settings set))))))
+                    ;; count path (unchanged)
+                    (let [new-roots (await (node/$remove root (.-storage set) key nil nil cmp opts))]
+                      (if (nil? new-roots)
+                        set
+                        (do
+                          ;; Mark old root address as freed if it exists
+                          (when (and (.-storage set) (.-address set))
+                            (storage/markFreed (.-storage set) (.-address set)))
+                          (let [new-root (arrays/aget new-roots 0)
+                                new-root (if (and (instance? Branch new-root)
+                                                  (== 1 (arrays/alength (.-children new-root))))
+                                           (await (branch/child new-root (.-storage set) 0 opts))
+                                           new-root)
+                                ;; If count is unknown (-1), keep it unknown; will be computed lazily when needed
+                                current-cnt (.-cnt set)
+                                new-cnt (if (neg? current-cnt) -1 (dec current-cnt))]
+                            (BTSet. new-root
+                                    new-cnt
+                                    (.-comparator set)
+                                    (.-meta set)
+                                    UNINITIALIZED_HASH
+                                    (.-storage set)
+                                    nil
+                                    (.-settings set))))))))))))
 
 (defn store
   ([^BTSet set arg]
@@ -1584,19 +1721,52 @@
         (recur (inc i))))
     arr))
 
+(declare from-sorted-array-count)
+
+(defn- mst-partition
+  "Bulk MST partition: cut arr[0..n) into JS-array segments after each index i<n-1 whose
+   (key-of arr[i]) rises to thresh (= node-level+1). Mirrors the JVM mst-split."
+  [bd arr key-of thresh]
+  (let [n (arrays/alength arr)
+        last-i (dec n)]
+    (loop [i 0 start 0 out (transient [])]
+      (if (>= i n)
+        (persistent! (if (> n start) (conj! out (.slice arr start n)) out))
+        (if (and (< i last-i) (>= (b/-key-level bd (key-of (aget arr i))) thresh))
+          (recur (inc i) (inc i) (conj! out (.slice arr start (inc i))))
+          (recur (inc i) start out))))))
+
 (defn ^BTSet from-sorted-array
   [cmp arr _len opts]
-  (let [settings (select-keys opts [:branching-factor :measure])
+  (let [settings (select-keys opts [:branching-factor :measure :boundary])
         measure-ops (:measure settings)
-        set      (BTSet. nil 0 cmp nil nil nil nil settings)
+        storage  (:storage opts)
+        bd       (b/content-boundary settings)]
+    (if bd
+      ;; split-seam (MST): chunk by boundary level so bulk == incremental (≡ JVM mst-split).
+      (let [leaves (mapv #(let [leaf (Leaf. % settings nil)]
+                            (when measure-ops (node/try-compute-measure leaf nil measure-ops {:sync? true}))
+                            leaf)
+                         (mst-partition bd arr identity 1))]
+        (loop [nodes leaves, lvl 1]
+          (case (count nodes)
+            0 (BTSet. (Leaf. (arrays/array) settings nil) 0 cmp nil UNINITIALIZED_HASH storage nil settings)
+            1 (BTSet. (first nodes) (arrays/alength arr) cmp nil UNINITIALIZED_HASH storage nil settings)
+            (recur (mapv #(mst-build-branch lvl (array-seq %) settings cmp)
+                         (mst-partition bd (arrays/into-array nodes) node/max-key (inc lvl)))
+                   (inc lvl)))))
+      (from-sorted-array-count cmp arr _len settings storage measure-ops))))
+
+(defn- ^BTSet from-sorted-array-count
+  [cmp arr _len settings storage measure-ops]
+  (let [set      (BTSet. nil 0 cmp nil nil nil nil settings)
         leaves   (->> arr
                       (arr-partition-approx set)
                       (arr-map-inplace #(let [leaf (Leaf. % settings nil)]
                                           ;; Compute measure for leaf if measure-ops available
                                           (when measure-ops
                                             (node/try-compute-measure leaf nil measure-ops {:sync? true}))
-                                          leaf)))
-        storage  (:storage opts)]
+                                          leaf)))]
     (loop [current-level leaves
            shift 0]
       (case (count current-level)
@@ -1641,7 +1811,7 @@
    - :measure  Measure implementation (IMeasure protocol)
    - :meta     Metadata"
   [opts]
-  (let [settings (select-keys opts [:branching-factor :measure])]
+  (let [settings (select-keys opts [:branching-factor :measure :boundary])]
     (BTSet. (Leaf. (arrays/array) settings nil) 0 (or (:comparator opts) (:cmp opts) compare)
             (:meta opts) UNINITIALIZED_HASH (:storage opts) nil settings)))
 

@@ -111,6 +111,37 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   }
 
   /**
+   * Build the new root from the children the root's add() returned. Count ⇒ a single wrap
+   * (byte-identical). MST ⇒ promote by boundary level until one node remains: a separator
+   * whose key rises to level+1 ends a parent chunk, so one high-level key can grow several
+   * levels at once (rare; may leave degenerate single-child branches — history-independent,
+   * collapsing them is a follow-up). The rightmost child is never a cut (global max).
+   */
+  private ANode growRoot(ANode[] nodes) {
+    IBoundary boundary = _settings.boundary();
+    if (!boundary.contentDefined()) {
+      return makeBranchFromChildren(nodes);
+    }
+    while (nodes.length >= 2) {
+      int level = nodes[0].level() + 1;
+      int thresh = level + 1;
+      List<ANode> branches = new ArrayList<>();
+      int start = 0;
+      for (int i = 0; i < nodes.length; i++) {
+        boolean cut = i < nodes.length - 1
+                      && boundary.keyLevel(nodes[i].maxKey(), _settings) >= thresh;
+        if (cut || i == nodes.length - 1) {
+          branches.add(makeBranchFromChildren(Arrays.copyOfRange(nodes, start, i + 1)));
+          start = i + 1;
+        }
+      }
+      if (branches.size() == 1) return branches.get(0);
+      nodes = branches.toArray(new ANode[0]);
+    }
+    return nodes[0];
+  }
+
+  /**
    * Check whether all nodes in this tree have precomputed subtree counts.
    * When true, countSlice is guaranteed O(log n).
    * When false, countSlice may degrade to O(n) for subtrees missing counts.
@@ -494,7 +525,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       if (1 == nodes.length) {
         _root = nodes[0];
       } else if (nodes.length >= 2) {
-        _root = makeBranchFromChildren(nodes);
+        _root = growRoot(nodes);
       }
       // EARLY_EXIT case (nodes.length == 0): tree was modified in place, _address already cleared above
       // When processor is configured, count may differ from +1
@@ -512,7 +543,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     if (1 == nodes.length) {
       newRoot = nodes[0];
     } else {
-      newRoot = makeBranchFromChildren(nodes);
+      newRoot = growRoot(nodes);
     }
 
     // Use root's subtreeCount for exact count (works correctly even with processor)
@@ -527,6 +558,28 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   }
 
   public PersistentSortedSet disjoin(Object key, Comparator cmp) {
+    // split-seam (MST/content mode): sibling-free removeContent recursion, then collapse a
+    // single-child root (count path below is untouched / byte-identical).
+    if (_settings.boundary().contentDefined()) {
+      ANode newRoot = root().removeContent(_storage, (Key) key, cmp, _settings);
+      if (newRoot == null) return this; // not in set
+      if (_storage != null && _address != null) _storage.markFreed(_address);
+      while (newRoot instanceof Branch && newRoot._len == 1) {
+        newRoot = ((Branch) newRoot).child(_storage, 0);
+      }
+      if (editable()) {
+        _address = null;
+        _root = newRoot;
+        long rc = getSubtreeCount(newRoot);
+        _count = (rc >= 0) ? (int) rc : -1;
+        _version += 1;
+        return this;
+      }
+      long rc = getSubtreeCount(newRoot);
+      int newCount = (rc >= 0) ? (int) rc : -1;
+      return new PersistentSortedSet(_meta, _cmp, null, _storage, newRoot, newCount, _settings, _version + 1);
+    }
+
     ANode[] nodes = root().remove(_storage, (Key) key, null, null, cmp, _settings);
 
     // not in set

@@ -15,19 +15,24 @@ public class Settings {
   // entirely, so every code path is byte-identical to baseline PSS (invariant I0).
   // Design + the IStorage slots contract: doc/diff-buffering.md.
   public final int _diffBufSize;
+  // split-seam: pluggable split/merge decision. null ⇒ CountBoundary (historical count
+  // B-tree, byte-identical). A content policy (MST) makes the tree history-independent.
+  // See .internal/SPLIT_SEAM_DESIGN.md. Threaded like _diffBufSize (incl. editable carry).
+  public final IBoundary _boundary;
 
   // Canonical edit-carrying constructor (does not normalize; callers pass already-normalized
   // values). Used by editable() — which threads BOTH the set's branchingFactor and diffBufSize
   // through unchanged, so a transient preserves them. (The pre-diff-buf 5-arg edit ctor was
   // removed: it was unused and, lacking a diffBufSize arg, would have silently reset it to the
   // sysprop default.)
-  public Settings(int branchingFactor, RefType refType, AtomicBoolean edit, IMeasure measure, ILeafProcessor leafProcessor, int diffBufSize) {
+  public Settings(int branchingFactor, RefType refType, AtomicBoolean edit, IMeasure measure, ILeafProcessor leafProcessor, int diffBufSize, IBoundary boundary) {
     _branchingFactor = branchingFactor;
     _refType = refType;
     _edit = edit;
     _measure = measure;
     _leafProcessor = leafProcessor;
     _diffBufSize = diffBufSize;
+    _boundary = boundary;
   }
 
   public Settings() {
@@ -64,6 +69,7 @@ public class Settings {
     _measure = measure;
     _leafProcessor = leafProcessor;
     _diffBufSize = diffBufSize < 0 ? 0 : diffBufSize;
+    _boundary = null; // count default; MST configured via withBoundary()
   }
 
   // diff-buf: diff-buffering is OFF by default (0 ⇒ byte-identical baseline, invariant
@@ -88,6 +94,18 @@ public class Settings {
     return _branchingFactor;
   }
 
+  // split-seam: the active boundary policy. Defaults to the count B-tree (byte-identical
+  // baseline) when none is configured, so all split sites can route through the seam.
+  public IBoundary boundary() {
+    return _boundary == null ? CountBoundary.INSTANCE : _boundary;
+  }
+
+  // Returns a copy of these settings with a different boundary policy (e.g. MST). Preserves
+  // edit state so it composes with transients. Used by the Clojure API to opt into prolly mode.
+  public Settings withBoundary(IBoundary boundary) {
+    return new Settings(_branchingFactor, _refType, _edit, _measure, _leafProcessor, _diffBufSize, boundary);
+  }
+
   public int expandLen() {
     return 8;
   }
@@ -108,7 +126,7 @@ public class Settings {
   public Settings editable(boolean value) {
     assert !editable();
     assert value == true;
-    Settings s = new Settings(_branchingFactor, _refType, new AtomicBoolean(value), _measure, _leafProcessor, _diffBufSize);
+    Settings s = new Settings(_branchingFactor, _refType, new AtomicBoolean(value), _measure, _leafProcessor, _diffBufSize, _boundary);
     return s;
   }
 
