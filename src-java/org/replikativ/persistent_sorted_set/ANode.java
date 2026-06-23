@@ -207,9 +207,14 @@ public abstract class ANode<Key, Address> {
   public abstract void toString(StringBuilder sb, Address address, String indent);
 
   protected static int newLen(int len, Settings settings) {
-    if (settings.editable())
-        return Math.min(settings.branchingFactor(), len + settings.expandLen());
-    else
+    if (settings.editable()) {
+        int cap = len + settings.expandLen();
+        // split-seam: under a content-defined (MST) boundary a node's size is geometric and
+        // can exceed branchingFactor, so the editable array MUST hold the full len — capping
+        // at bf overflows large leaves (e.g. a 134-key leaf into a 64-slot array). Count keeps
+        // the historical bf cap (its nodes never exceed branchingFactor).
+        return settings.boundary().contentDefined() ? cap : Math.min(settings.branchingFactor(), cap);
+    } else
         return len;
   }
 
