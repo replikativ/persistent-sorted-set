@@ -264,3 +264,31 @@
                        (nil? (mst-violation (root-of pss) ilz))                 ; (b) invariants
                        (= (root-shape pss)                                      ; (c) canonical
                           (root-shape (iset (shuffle survivors))))))))
+
+;; =============================================================================
+;; replace on an MST set must stay canonical (the boundary-aware guard).
+;;
+;; `replace` swaps a key in place when old/new compare EQUAL under the comparator. With a
+;; PARTIAL comparator ([id payload] compared by id) the new key can hash to a DIFFERENT
+;; boundary level than the old one — an in-place swap would then leave a non-canonical tree.
+;; The implementation detects the level change and falls back to disj+conj. This spec drives
+;; random payload replacements (which shift the key hash across level boundaries ~1/5 of the
+;; time at lzpl 3) and asserts the result is byte-identical to a fresh build of the post-
+;; replace element set. Runs on BOTH platforms.
+;; =============================================================================
+
+(def ^:private cmp-id (fn [a b] (compare (first a) (first b))))
+(defn- iset-by [pairs] (reduce conj (pss/sorted-set* {:comparator cmp-id :boundary (b/mst-boundary ilz)}) pairs))
+
+(defspec prop-replace-canonical 40
+  (prop/for-all [ids  (gen/such-that #(> (count %) 2) (gen/set (gen/choose -400 400)))
+                 seed gen/nat]
+                (let [idv      (vec ids)
+                      base     (iset-by (shuffle (mapv (fn [id] [id 0]) idv)))
+                      rep-ids  (set (take (mod seed (inc (count idv))) (shuffle idv)))
+                      replaced (reduce (fn [s id] (pss/replace s [id 0] [id (inc id)])) base rep-ids)
+                      expected (sort-by first (mapv (fn [id] (if (rep-ids id) [id (inc id)] [id 0])) idv))
+                      fresh    (iset-by (shuffle expected))]
+                  (and (= (seq replaced) expected)                              ; payloads correct
+                       (nil? (mst-violation (root-of replaced) ilz))            ; canonical MST
+                       (= (root-shape replaced) (root-shape fresh))))))         ; == fresh build

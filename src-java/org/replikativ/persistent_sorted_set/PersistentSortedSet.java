@@ -649,6 +649,18 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   }
 
   public PersistentSortedSet replace(Object oldKey, Object newKey, Comparator cmp) {
+    // split-seam (MST): an in-place replace keeps the tree's boundary structure, which is canonical
+    // ONLY when oldKey and newKey rise to the same level. When a partial comparator shifts the key
+    // hash across a level boundary the node would have to re-split/merge, so fall back to
+    // disjoin+cons (the history-independent rebuild). Count mode is position-only ⇒ always in-place.
+    // See doc/merkle-search-tree.md.
+    IBoundary boundary = _settings.boundary();
+    if (boundary.contentDefined()
+        && boundary.keyLevel(oldKey, _settings) != boundary.keyLevel(newKey, _settings)) {
+      if (!root().contains(_storage, (Key) oldKey, cmp)) return this; // not found ⇒ no-op
+      return disjoin(oldKey, cmp).cons(newKey, cmp);
+    }
+
     ANode[] nodes = root().replace(_storage, (Key) oldKey, (Key) newKey, cmp, _settings);
 
     // Not in set

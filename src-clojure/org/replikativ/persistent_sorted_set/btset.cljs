@@ -29,7 +29,11 @@
                    ;; it so conj/disj use the right splitter even when restore opts omitted it.
                    (let [nb (b/content-boundary (.-settings (.-root set)))]
                      (when (and nb (not (b/content-boundary (.-settings set))))
-                       (set! (.-settings set) (assoc (.-settings set) :boundary nb))))))
+                       ;; nb is content-defined ⇒ force diff-buf OFF too (mirrors the JVM root()
+                       ;; adoption via Settings.withBoundary). Otherwise a set restored with
+                       ;; :diff-buf-size > 0 would run MST + diff-buf together, breaking canonical
+                       ;; addressing. See doc/merkle-search-tree.md (Incompatibilities).
+                       (set! (.-settings set) (assoc (.-settings set) :boundary nb :diff-buf-size 0))))))
                ;; diff-buf: seed the projection comparator at the root; branch/child propagates it
                ;; down as nodes materialize, so a leaf-parent can project buffered leaves with the
                ;; set's stable comparator. Idempotent; a Leaf root has no buffered children.
@@ -273,38 +277,49 @@
   ([^BTSet set old-key new-key cmp {:keys [sync?] :or {sync? true} :as opts}]
    (async+sync sync?
                (async
-                (let [root  (await (-root set opts))
-                      nodes (await (node/$replace root (.-storage set) old-key new-key cmp opts))]
-                  (cond
-                    (nil? nodes) set
+                (let [bd (b/content-boundary (.-settings set))]
+                  (if (and bd (not= (b/-key-level bd old-key) (b/-key-level bd new-key)))
+                    ;; split-seam (MST): an in-place replace keeps the tree's boundary structure, which
+                    ;; is canonical ONLY when old-key and new-key rise to the same level. When a partial
+                    ;; comparator shifts the key hash across a level boundary, rebuild via disj+conj so
+                    ;; the tree re-splits/merges into the history-independent shape (count mode is
+                    ;; position-only ⇒ always in-place). See doc/merkle-search-tree.md.
+                    (let [root (await (-root set opts))]
+                      (if (await (node/$contains? root (.-storage set) old-key cmp opts))
+                        (await (conjoin (await (disjoin set old-key cmp opts)) new-key cmp opts))
+                        set))
+                    (let [root  (await (-root set opts))
+                          nodes (await (node/$replace root (.-storage set) old-key new-key cmp opts))]
+                      (cond
+                        (nil? nodes) set
 
-                    ;; In-place update (transient) — root modified, just clear address
-                    (= nodes :early-exit)
-                    (do
-                      (when (and (.-storage set) (.-address set))
-                        (storage/markFreed (.-storage set) (.-address set)))
-                      (BTSet. (.-root set)
-                              (.-cnt set)
-                              (.-comparator set)
-                              (.-meta set)
-                              UNINITIALIZED_HASH
-                              (.-storage set)
-                              nil
-                              (.-settings set)))
+                        ;; In-place update (transient) — root modified, just clear address
+                        (= nodes :early-exit)
+                        (do
+                          (when (and (.-storage set) (.-address set))
+                            (storage/markFreed (.-storage set) (.-address set)))
+                          (BTSet. (.-root set)
+                                  (.-cnt set)
+                                  (.-comparator set)
+                                  (.-meta set)
+                                  UNINITIALIZED_HASH
+                                  (.-storage set)
+                                  nil
+                                  (.-settings set)))
 
-                    ;; New root node (persistent or maxKey changed)
-                    :else
-                    (do
-                      (when (and (.-storage set) (.-address set))
-                        (storage/markFreed (.-storage set) (.-address set)))
-                      (BTSet. (arrays/aget nodes 0)
-                              (.-cnt set)
-                              (.-comparator set)
-                              (.-meta set)
-                              UNINITIALIZED_HASH
-                              (.-storage set)
-                              nil
-                              (.-settings set)))))))))
+                        ;; New root node (persistent or maxKey changed)
+                        :else
+                        (do
+                          (when (and (.-storage set) (.-address set))
+                            (storage/markFreed (.-storage set) (.-address set)))
+                          (BTSet. (arrays/aget nodes 0)
+                                  (.-cnt set)
+                                  (.-comparator set)
+                                  (.-meta set)
+                                  UNINITIALIZED_HASH
+                                  (.-storage set)
+                                  nil
+                                  (.-settings set)))))))))))
 
 (defn disjoin
   ([^BTSet set key]

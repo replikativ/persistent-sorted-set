@@ -719,7 +719,15 @@
                              children      (ensure-children this)
                              addrs         (.-addresses this)
                              last-child?   (== idx (dec (arrays/alength keys)))
-                             max-key-changed (and last-child? (not (== 0 (cmp new-max-key (arrays/aget keys idx)))))]
+                             ;; split-seam (MST): the separator keys[idx] must equal the child's max for
+                             ;; canonical content-addressing, so ANY value change (even at the same
+                             ;; comparator position, and for a non-rightmost child) must rebuild keys[idx]
+                             ;; and propagate up the spine. Count mode is routing-only (by cmp), so its
+                             ;; original last-child?/cmp test is preserved byte-for-byte. Mirrors JVM
+                             ;; Branch.replace, which always writes _keys[idx] = newMaxKey.
+                             max-key-changed (if (b/content-boundary settings)
+                                               (not= new-max-key (arrays/aget keys idx))
+                                               (and last-child? (not (== 0 (cmp new-max-key (arrays/aget keys idx))))))]
                          (if max-key-changed
                            ;; maxKey changed - update keys array
                            (if editable?
