@@ -292,3 +292,20 @@
                   (and (= (seq replaced) expected)                              ; payloads correct
                        (nil? (mst-violation (root-of replaced) ilz))            ; canonical MST
                        (= (root-shape replaced) (root-shape fresh))))))         ; == fresh build
+
+;; Same property over a TRANSIENT batch of replaces — exercises the editable in-place path
+;; (and the disj!/conj! fallback) which the persistent spec above doesn't reach. The JVM and
+;; cljs propagation rules must agree here too (value-based in MST), else the trees diverge.
+(defspec prop-replace-canonical-transient 40
+  (prop/for-all [ids  (gen/such-that #(> (count %) 2) (gen/set (gen/choose -400 400)))
+                 seed gen/nat]
+                (let [idv      (vec ids)
+                      base     (iset-by (shuffle (mapv (fn [id] [id 0]) idv)))
+                      rep-ids  (set (take (mod seed (inc (count idv))) (shuffle idv)))
+                      replaced (persistent! (reduce (fn [t id] (pss/replace t [id 0] [id (inc id)]))
+                                                    (transient base) rep-ids))
+                      expected (sort-by first (mapv (fn [id] (if (rep-ids id) [id (inc id)] [id 0])) idv))
+                      fresh    (iset-by (shuffle expected))]
+                  (and (= (seq replaced) expected)
+                       (nil? (mst-violation (root-of replaced) ilz))
+                       (= (root-shape replaced) (root-shape fresh))))))

@@ -1200,7 +1200,15 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // Child was replaced (nodes.length == 1)
     ANode<Key, Address> newChild = nodes[0];
     Key newMaxKey = newChild.maxKey();
-    boolean maxKeyChanged = (idx == _len - 1) && (0 != cmp.compare(newMaxKey, _keys[idx]));
+    // Whether to propagate up (rebuild parent) vs EARLY_EXIT a transient. Count mode is
+    // routing-only (by cmp), so the rightmost child's comparator-position change is the only
+    // thing a parent cares about. MST mode content-addresses the separator VALUE, so ANY value
+    // change must propagate so every separator up the spine stays canonical (mirrors the cljs
+    // Branch.$replace value-based test). _keys[idx] is still the OLD separator here (overwritten
+    // below). See doc/merkle-search-tree.md.
+    boolean maxKeyChanged = settings.boundary().contentDefined()
+      ? !java.util.Objects.equals(newMaxKey, _keys[idx])
+      : (idx == _len - 1) && (0 != cmp.compare(newMaxKey, _keys[idx]));
     IMeasure measureOps = settings.measure();
 
     // Transient: can modify in place
