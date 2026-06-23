@@ -360,13 +360,15 @@
      (deftest mst-codec-history-independent
        (testing "two insertion orders of the same set ⇒ identical content-addressed root through the codec"
          (let [els (vec (range 4000))
-               ra  (set/store (mst-set (ca-store) 5 (shuffle els)) (ca-store))
-               rb  (set/store (mst-set (ca-store) 5 (shuffle els)) (ca-store))
+               store-mst (fn [order] (let [st (ca-store)] (set/store (mst-set st 5 order) st)))
+               store-cnt (fn [order] (let [st (ca-store)]
+                                       (set/store (reduce #(set/conj %1 %2 compare)
+                                                          (set/sorted-set* {:storage st :branching-factor 64}) order) st)))
+               ra  (store-mst (shuffle els))
+               rb  (store-mst (shuffle els))
                ;; count build of the same elements is order-dependent ⇒ generally different roots
-               rc1 (set/store (reduce #(set/conj %1 %2 compare)
-                                      (set/sorted-set* {:storage (ca-store) :branching-factor 64}) (sort els)) (ca-store))
-               rc2 (set/store (reduce #(set/conj %1 %2 compare)
-                                      (set/sorted-set* {:storage (ca-store) :branching-factor 64}) (reverse (sort els))) (ca-store))]
+               rc1 (store-cnt (sort els))
+               rc2 (store-cnt (reverse (sort els)))]
            (is (= ra rb) "MST: same key set, different order ⇒ same content-addressed root")
            (is (not= rc1 rc2) "count: different order ⇒ different root (the gap MST closes)"))))
 

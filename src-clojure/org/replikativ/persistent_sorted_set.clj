@@ -160,11 +160,12 @@
            (:leaf-processor m)
            ;; diff-buf: fall back to the shared Settings default (Settings/defaultDiffBufSize,
            ;; 0/off unless the pss.diffBufSize sysprop is set) when the caller doesn't specify.
-           ;; 0 = baseline (I0). See doc/diff-buffering.md. A content-defined boundary forces
-           ;; diff-buf OFF: the two are incompatible (a buffered spine node is addressed by
-           ;; hash(anchor+diff), not its canonical content hash, which breaks cross-peer dedup —
-           ;; the very property MST exists for; see .internal/SPLIT_SEAM_DESIGN.md two-hash note).
-           (if boundary 0 (int (or (:diff-buf-size m) (Settings/defaultDiffBufSize)))))
+           ;; 0 = baseline (I0). See doc/diff-buffering.md. The MST incompatibility (a buffered
+           ;; spine node is addressed by hash(anchor+diff), not its canonical content hash, which
+           ;; breaks the cross-peer dedup MST exists for) is enforced in ONE place — `.withBoundary`
+           ;; below forces diff-buf OFF for a *content-defined* boundary (a non-content boundary is
+           ;; left untouched). See .internal/SPLIT_SEAM_DESIGN.md two-hash note.
+           (int (or (:diff-buf-size m) (Settings/defaultDiffBufSize))))
         ;; split-seam: opt into a content-defined boundary (e.g. MST) per store. nil ⇒ the
         ;; default count B-tree (byte-identical baseline). See .internal/SPLIT_SEAM_DESIGN.md.
         s (if boundary (.withBoundary s ^IBoundary boundary) s)]
