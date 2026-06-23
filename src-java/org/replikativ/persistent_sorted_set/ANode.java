@@ -180,6 +180,18 @@ public abstract class ANode<Key, Address> {
   public abstract ANode[] add(IStorage storage, Key key, Comparator<Key> cmp, Settings settings);
   public abstract ANode[] remove(IStorage storage, Key key, ANode left, ANode right, Comparator<Key> cmp, Settings settings);
 
+  // split-seam (MST/content mode): remove without sibling-passing. Returns the modified
+  // subtree (one node, possibly an empty Leaf), or null if the key was not present. Merges
+  // are driven by keyLevel (a Branch merges two of its own children when the removed key was
+  // a boundary at its level), so the cross-parent case is handled by the grandparent's merge.
+  // See .internal/SPLIT_SEAM_DESIGN.md. Only invoked when settings.boundary().contentDefined().
+  public abstract ANode removeContent(IStorage storage, Key key, Comparator<Key> cmp, Settings settings);
+
+  // MST merge: concatenate this node with its right neighbour (same level), recursively
+  // merging the junction (this.lastChild with right.firstChild) — the inverse of add's
+  // multi-level promotion. Both nodes are the same concrete type and level.
+  public abstract ANode mstMergeWith(ANode right, IStorage storage, Settings settings);
+
   /**
    * Replace an existing key with a new key at the same position.
    * The comparator must return 0 for both oldKey and newKey (same logical position).
@@ -195,9 +207,14 @@ public abstract class ANode<Key, Address> {
   public abstract void toString(StringBuilder sb, Address address, String indent);
 
   protected static int newLen(int len, Settings settings) {
-    if (settings.editable())
-        return Math.min(settings.branchingFactor(), len + settings.expandLen());
-    else
+    if (settings.editable()) {
+        int cap = len + settings.expandLen();
+        // split-seam: under a content-defined (MST) boundary a node's size is geometric and
+        // can exceed branchingFactor, so the editable array MUST hold the full len — capping
+        // at bf overflows large leaves (e.g. a 134-key leaf into a 64-slot array). Count keeps
+        // the historical bf cap (its nodes never exceed branchingFactor).
+        return settings.boundary().contentDefined() ? cap : Math.min(settings.branchingFactor(), cap);
+    } else
         return len;
   }
 

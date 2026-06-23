@@ -9,6 +9,8 @@
   (:require [clojure.test :refer [deftest is testing]]
             [org.replikativ.persistent-sorted-set :as set]
             [org.replikativ.persistent-sorted-set.fressian :as pss-fress]
+            [org.replikativ.persistent-sorted-set.boundary :as bnd]
+            [hasch.core :as hasch]
             #?(:clj  [clojure.data.fressian :as fress]
                :cljs [fress.api :as fress])
             #?(:cljs [org.replikativ.persistent-sorted-set.impl.storage :refer [IStorage]]))
@@ -29,7 +31,8 @@
        ;; consumer's measure-ops + a default-bf fallback for pre-bf blobs.
        (-> (merge fress/clojure-read-handlers
                   (pss-fress/read-handlers {:measure-ops (.-_measure settings)
-                                            :default-bf   (.branchingFactor settings)}))
+                                            :default-bf   (.branchingFactor settings)
+                                            :boundary-resolver bnd/boundary-from-descriptor}))
            fress/associative-lookup))
      (defn- ser ^bytes [node]
        (let [out (ByteArrayOutputStream.)]
@@ -51,7 +54,8 @@
      (defn- ser [node] (fress/write node :handlers pss-fress/write-handlers))
      (defn- deser [settings bs]
        (fress/read bs :handlers (pss-fress/read-handlers {:measure-ops (:measure settings)
-                                                          :default-bf  (:branching-factor settings)})))
+                                                          :default-bf  (:branching-factor settings)
+                                                          :boundary-resolver bnd/boundary-from-descriptor})))
      (defrecord FressStorage [*disk settings]
        IStorage
        (store    [_ node _opts] (let [a (random-uuid)] (swap! *disk assoc a (ser node)) a))
@@ -97,6 +101,25 @@
           back     (vec (set/restore a2 storage))
           expected (vec (remove #(zero? (mod % 7)) elems))]
       (is (= expected back)))))
+
+(deftest mst-durable-remove-roundtrip
+  (testing "MST conj/store/restore/disj/store/restore on a fressian-backed storage (BOTH platforms).
+            Exercises the storage-aware MST remove (children materialized via branch/child, not read
+            directly) and the boundary self-restoring (root adopts the node's strategy)."
+    (let [storage  (make-fress-storage 64 0)
+          elems    (vec (range 3000))
+          s0       (reduce (fn [s e] (set/conj s e compare))
+                           (set/sorted-set* {:storage storage :branching-factor 64
+                                             :boundary (bnd/mst-boundary 5)})
+                           (shuffle elems))
+          a0       (set/store s0 storage)
+          s1       (set/restore a0 storage)                  ; boundary not in opts → self-restores
+          s2       (reduce (fn [s e] (set/disj s e compare)) s1 (range 0 3000 7))  ; storage-aware remove
+          a2       (set/store s2 storage)
+          back     (vec (set/restore a2 storage))
+          expected (vec (remove #(zero? (mod % 7)) elems))]
+      (is (= elems (vec s1)) "restored set correct before removes")
+      (is (= expected back) "durable MST remove (after store/restore) yields the right elements"))))
 
 ;; JVM-only: ref-type is policy DATA (an enum), so it rides in the blob and a node reconstructs with
 ;; its own caching policy even when the reader knows nothing about it (the konserve-sync rootless
@@ -312,3 +335,66 @@
            (is (instance? PersistentSortedSet (:root back)))
            (is (= (vec (range 200)) (vec (:root back))) "the PSS root resolves storage + lazy-loads")
            (finally (pss-fress/unregister-storage! :store/x)))))))
+
+;; ---- MST (content-defined boundary) durable round-trip (JVM) ------------------------------
+;; Content-addressed storage (address = hasch/uuid(node->map)) so equal trees share a root
+;; address: proves history-independence survives the real codec, that restore reconstructs the
+;; MST boundary from the self-describing blob, and that mutate-after-restore stays canonical.
+#?(:clj
+   (do
+     (defn- ca-store []
+       (let [*disk (atom {})
+             settings (Settings. (int 64) nil nil nil (int 0))]   ; boundary comes from the blob
+         (reify IStorage
+           (store     [_ node] (let [a (str (hasch/uuid (pss-fress/node->map node)))]
+                                 (swap! *disk assoc a (ser node)) a))
+           (accessed  [_ _addr] nil)
+           (restore   [_ addr] (deser settings (get @*disk addr)))
+           (markFreed [_ _addr] nil) (isFreed [_ _addr] false) (freedInfo [_ _addr] nil))))
+
+     (defn- mst-set [storage lzpl elems]
+       (reduce (fn [s e] (set/conj s e compare))
+               (set/sorted-set* {:storage storage :branching-factor 64 :boundary (bnd/mst-boundary lzpl)})
+               elems))
+
+     (deftest mst-codec-history-independent
+       (testing "two insertion orders of the same set ⇒ identical content-addressed root through the codec"
+         (let [els (vec (range 4000))
+               store-mst (fn [order] (let [st (ca-store)] (set/store (mst-set st 5 order) st)))
+               store-cnt (fn [order] (let [st (ca-store)]
+                                       (set/store (reduce #(set/conj %1 %2 compare)
+                                                          (set/sorted-set* {:storage st :branching-factor 64}) order) st)))
+               ra  (store-mst (shuffle els))
+               rb  (store-mst (shuffle els))
+               ;; count build of the same elements is order-dependent ⇒ generally different roots
+               rc1 (store-cnt (sort els))
+               rc2 (store-cnt (reverse (sort els)))]
+           (is (= ra rb) "MST: same key set, different order ⇒ same content-addressed root")
+           (is (not= rc1 rc2) "count: different order ⇒ different root (the gap MST closes)"))))
+
+     (deftest mst-restore-preserves-boundary
+       (testing "restore reconstructs the MST boundary ⇒ mutate-after-restore is canonical"
+         (let [els    (vec (range 3000))
+               st     (ca-store)
+               root   (set/store (mst-set st 5 (shuffle els)) st)
+               s'     (set/restore root st)                       ; restored — boundary self-restores
+               ;; mutate the restored set: add 9000 (a fresh key) and remove 1500
+               s''    (-> s' (set/conj 9000 compare) (set/disj 1500 compare))
+               r''    (set/store s'' st)                          ; same store (lazy children live here)
+               survivors (-> (into (sorted-set) els) (conj 9000) (disj 1500))
+               rfresh (set/store (mst-set (ca-store) 5 (shuffle (vec survivors))) (ca-store))]
+           (is (= (vec s') (sort els)) "restored elements correct")
+           (is (= (vec s'') (vec survivors)) "mutated-after-restore elements correct")
+           (is (= r'' rfresh)
+               "mutate-after-restore yields the SAME tree as a fresh MST build (boundary preserved)"))))
+
+     (deftest mst-self-describing-blob
+       (testing "the boundary descriptor rides in the node AND root blobs (self-describing restore)"
+         (let [s (reduce #(set/conj %1 %2 compare)
+                         (set/sorted-set* {:branching-factor 64 :boundary (bnd/mst-boundary 5)})
+                         (range 2000))]
+           (is (= {:type :mst :lzpl 5} (:boundary (#'pss-fress/node-config (.root ^PersistentSortedSet s))))
+               "node-config self-describes the MST boundary")
+           ;; reconstruct the strategy from the descriptor alone, no consumer interaction
+           (is (= true (.contentDefined (bnd/boundary-from-descriptor {:type :mst :lzpl 5})))
+               "PSS resolves the descriptor internally"))))))

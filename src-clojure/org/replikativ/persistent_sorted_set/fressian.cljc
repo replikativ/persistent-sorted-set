@@ -52,12 +52,14 @@
                                 :measure-ops nil :default-bf 512 :element-read-handlers {…}})
      (canonical-write-handlers {:element-write-handlers {…}})
    or a wire peer: pass `(registry-storage-resolver)`/`(registry-cmp-resolver)`/`(registry-measure-resolver)`."
+  #?(:clj (:require [org.replikativ.persistent-sorted-set.impl.boundary :as bnd]))
   #?(:cljs (:require [fress.api :as fress]
                      [org.replikativ.persistent-sorted-set.impl.node :as node]
+                     [org.replikativ.persistent-sorted-set.impl.boundary :as bnd]
                      [org.replikativ.persistent-sorted-set.leaf :refer [Leaf]]
                      [org.replikativ.persistent-sorted-set.branch :refer [Branch] :as branch]
                      [org.replikativ.persistent-sorted-set.btset :refer [BTSet]]))
-  #?(:clj (:import [org.replikativ.persistent_sorted_set ANode Leaf Branch Settings Slot IMeasure RefType
+  #?(:clj (:import [org.replikativ.persistent_sorted_set ANode Leaf Branch Settings Slot IMeasure IBoundary RefType
                     PersistentSortedSet]
                    [org.fressian.handlers WriteHandler ReadHandler]
                    [java.util List])))
@@ -80,16 +82,20 @@
           (case kw :strong RefType/STRONG :soft RefType/SOFT :weak RefType/WEAK nil)))
 
 #?(:clj
-   (defn- settings-for ^Settings [bf dbs ^IMeasure measure ref-type]
+   (defn- settings-for ^Settings [bf dbs ^IMeasure measure ref-type bdesc]
      ;; ref-type nil ⇒ Settings normalizes to SOFT. `measure` is the IMeasure OPS the consumer
      ;; supplied (never serialized); leaf-processor stays nil — it's the operating root's, threaded.
-     (Settings. (int bf) (kw->ref-type ref-type) measure nil (int dbs)))
+     ;; bdesc (a serialized boundary descriptor, nil for count) is resolved INTERNALLY — the
+     ;; consumer never supplies a resolver; the strategy round-trips from the blob alone.
+     (let [s (Settings. (int bf) (kw->ref-type ref-type) measure nil (int dbs))]
+       (if bdesc (.withBoundary s ^IBoundary (bnd/resolve-boundary bdesc)) s)))
    :cljs
-   (defn- settings-for [bf dbs measure ref-type]
+   (defn- settings-for [bf dbs measure ref-type bdesc]
      ;; cljs has no soft/weak refs, so ref-type is inert here — but CARRY it so it round-trips
      ;; losslessly through a cljs relay (deserialize → re-serialize) back to a JVM reader.
      (cond-> {:branching-factor bf :diff-buf-size dbs :measure measure}
-       ref-type (assoc :ref-type ref-type))))
+       ref-type (assoc :ref-type ref-type)
+       bdesc    (assoc :boundary (bnd/resolve-boundary bdesc)))))
 
 (defn- node-config
   "A node's SERIALIZABLE settings — branching-factor + diff-buf-size + (non-default) ref-type. These
@@ -97,12 +103,16 @@
    unchanged. ref-type is omitted when SOFT (the default), so common-case blobs are byte-unchanged."
   [node]
   #?(:clj  (let [^Settings s (.-_settings ^ANode node)
-                 rt (.refType s)]
+                 rt (.refType s)
+                 bdesc (.descriptor (.boundary s))]   ; nil for count, {:type :mst :lzpl n} for MST
              (cond-> {:branching-factor (.branchingFactor s) :diff-buf-size (.diffBufSize s)}
-               (and rt (not= rt RefType/SOFT)) (assoc :ref-type (ref-type->kw rt))))
-     :cljs (let [s (.-settings node)]
+               (and rt (not= rt RefType/SOFT)) (assoc :ref-type (ref-type->kw rt))
+               bdesc (assoc :boundary bdesc)))
+     :cljs (let [s (.-settings node)
+                 bdesc (when-let [bd (:boundary s)] (bnd/-descriptor bd))]
              (cond-> {:branching-factor (:branching-factor s) :diff-buf-size (:diff-buf-size s)}
-               (:ref-type s) (assoc :ref-type (:ref-type s))))))
+               (:ref-type s) (assoc :ref-type (:ref-type s))
+               bdesc (assoc :boundary bdesc)))))
 
 ;; ---------------------------------------------------------------------------
 ;; node->map — the CONTENT projection (for content-addressing). Branching-factor/diff-buf are
@@ -187,20 +197,20 @@
    blob's serialized ref-type (default: use the blob, falling back to SOFT).
    Returns {tag handler}. Comparator-free (the comparator lives on the root)."
   [{:keys [measure-ops default-bf ref-type] :or {default-bf 0}}]
-  (let [mk-settings (memoize (fn [bf dbs rt] (settings-for bf dbs measure-ops rt)))]
+  (let [mk-settings (memoize (fn [bf dbs rt bdesc] (settings-for bf dbs measure-ops rt bdesc)))]
     #?(:clj
        {leaf-tag
         (reify ReadHandler
           (read [_ rdr _tag _n]
-            (let [{:keys [keys measure branching-factor diff-buf-size] blob-rt :ref-type} (.readObject rdr)
-                  l (Leaf. ^List keys (mk-settings (or branching-factor default-bf) (or diff-buf-size 0) (or ref-type blob-rt)))]
+            (let [{:keys [keys measure branching-factor diff-buf-size] blob-rt :ref-type blob-bdry :boundary} (.readObject rdr)
+                  l (Leaf. ^List keys (mk-settings (or branching-factor default-bf) (or diff-buf-size 0) (or ref-type blob-rt) blob-bdry))]
               (when (some? measure) (set! (.-_measure ^ANode l) measure))
               l)))
         branch-tag
         (reify ReadHandler
           (read [_ rdr _tag _n]
-            (let [{:keys [level keys addresses subtree-count measure slots branching-factor diff-buf-size] blob-rt :ref-type} (.readObject rdr)
-                  b (Branch. (int level) ^List keys ^List addresses (mk-settings (or branching-factor default-bf) (or diff-buf-size 0) (or ref-type blob-rt)))]
+            (let [{:keys [level keys addresses subtree-count measure slots branching-factor diff-buf-size] blob-rt :ref-type blob-bdry :boundary} (.readObject rdr)
+                  b (Branch. (int level) ^List keys ^List addresses (mk-settings (or branching-factor default-bf) (or diff-buf-size 0) (or ref-type blob-rt) blob-bdry))]
               (set! (.-_subtreeCount b) (long (or subtree-count -1)))
               (when (some? measure) (set! (.-_measure ^ANode b) measure))
               (when slots (attach-slots! b addresses slots))
@@ -208,17 +218,17 @@
        :cljs
        {leaf-tag
         (fn [rdr _tag _n]
-          (let [{:keys [keys measure branching-factor diff-buf-size] blob-rt :ref-type} (fress/read-object rdr)]
-            (Leaf. (to-array keys) (mk-settings (or branching-factor default-bf) (or diff-buf-size 0) (or ref-type blob-rt)) measure)))
+          (let [{:keys [keys measure branching-factor diff-buf-size] blob-rt :ref-type blob-bdry :boundary} (fress/read-object rdr)]
+            (Leaf. (to-array keys) (mk-settings (or branching-factor default-bf) (or diff-buf-size 0) (or ref-type blob-rt) blob-bdry) measure)))
         branch-tag
         (fn [rdr _tag _n]
-          (let [{:keys [level keys addresses subtree-count measure slots branching-factor diff-buf-size] blob-rt :ref-type} (fress/read-object rdr)
+          (let [{:keys [level keys addresses subtree-count measure slots branching-factor diff-buf-size] blob-rt :ref-type blob-bdry :boundary} (fress/read-object rdr)
                 node (branch/from-map {:level         level
                                        :keys          (to-array keys)
                                        :addresses     (to-array addresses)
                                        :subtree-count subtree-count
                                        :measure       measure
-                                       :settings      (mk-settings (or branching-factor default-bf) (or diff-buf-size 0) (or ref-type blob-rt))})]
+                                       :settings      (mk-settings (or branching-factor default-bf) (or diff-buf-size 0) (or ref-type blob-rt) blob-bdry)})]
             (when slots (attach-slots! node addresses slots))
             node))})))
 
@@ -268,26 +278,30 @@
          (when (nil? (.-_address ^PersistentSortedSet pset))
            (throw (ex-info "PSS root must be flushed before serialization" {:type :must-be-flushed})))
          (let [^Settings s (.-_settings ^PersistentSortedSet pset)
-               rt (.refType s)]
+               rt (.refType s)
+               bdesc (.descriptor (.boundary s))]
            (.writeTag w set-tag 1)
            (.writeObject w (cond-> {:meta             (meta pset)
                                     :address          (.-_address ^PersistentSortedSet pset)
                                     :count            (count pset)
                                     :branching-factor (.branchingFactor s)
                                     :diff-buf-size    (.diffBufSize s)}
-                             (and rt (not= rt RefType/SOFT)) (assoc :ref-type (ref-type->kw rt)))))))
+                             (and rt (not= rt RefType/SOFT)) (assoc :ref-type (ref-type->kw rt))
+                             bdesc (assoc :boundary bdesc))))))
      :cljs
      (fn [w pset]
        (when (nil? (.-address pset))
          (throw (ex-info "PSS root must be flushed before serialization" {:type :must-be-flushed})))
-       (let [s (.-settings pset)]
+       (let [s (.-settings pset)
+             bdesc (when-let [bd (:boundary s)] (bnd/-descriptor bd))]
          (fress/write-tag w set-tag 1)
          (fress/write-object w (cond-> {:meta             (meta pset)
                                         :address          (.-address pset)
                                         :count            (count pset)
                                         :branching-factor (:branching-factor s)
                                         :diff-buf-size    (:diff-buf-size s)}
-                                 (:ref-type s) (assoc :ref-type (:ref-type s))))))))
+                                 (:ref-type s) (assoc :ref-type (:ref-type s))
+                                 bdesc (assoc :boundary bdesc)))))))
 
 (def root-write-handlers
   "Pre-keyed root write handler, shaped like `write-handlers` so a cljc consumer merges it WITHOUT
@@ -311,14 +325,14 @@
    #?(:clj
       (reify ReadHandler
         (read [_ rdr _tag _n]
-          (let [{:keys [meta address count branching-factor diff-buf-size] blob-rt :ref-type} (.readObject rdr)
-                settings (settings-for (or branching-factor default-bf) (or diff-buf-size 0) (resolve-measure meta) (or ref-type blob-rt))]
+          (let [{:keys [meta address count branching-factor diff-buf-size] blob-rt :ref-type blob-bdry :boundary} (.readObject rdr)
+                settings (settings-for (or branching-factor default-bf) (or diff-buf-size 0) (resolve-measure meta) (or ref-type blob-rt) blob-bdry)]
             (PersistentSortedSet. meta (resolve-cmp meta) address (resolve-storage meta)
                                   nil (int count) settings 0))))
       :cljs
       (fn [rdr _tag _n]
-        (let [{:keys [meta address count branching-factor diff-buf-size] blob-rt :ref-type} (fress/read-object rdr)
-              settings (settings-for (or branching-factor default-bf) (or diff-buf-size 0) (resolve-measure meta) (or ref-type blob-rt))]
+        (let [{:keys [meta address count branching-factor diff-buf-size] blob-rt :ref-type blob-bdry :boundary} (fress/read-object rdr)
+              settings (settings-for (or branching-factor default-bf) (or diff-buf-size 0) (resolve-measure meta) (or ref-type blob-rt) blob-bdry)]
           ;; BTSet deftype: [root cnt comparator meta _hash storage address settings]
           (BTSet. nil count (resolve-cmp meta) meta nil (resolve-storage meta) address settings))))))
 

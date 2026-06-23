@@ -9,7 +9,7 @@
    [java.lang.ref SoftReference]
    [java.util Comparator Arrays]
    [java.util.function BiConsumer]
-   [org.replikativ.persistent_sorted_set ANode ArrayUtil Branch IMeasure IStorage ISubtreeCount Leaf PersistentSortedSet RefType Settings Seq]))
+   [org.replikativ.persistent_sorted_set ANode ArrayUtil Branch IBoundary IMeasure IStorage ISubtreeCount Leaf PersistentSortedSet RefType Settings Seq]))
 
 (set! *warn-on-reflection* true)
 
@@ -125,8 +125,31 @@
            (conj! (array-from-indexed coll type from (+ from (quot len 2))))
            (conj! (array-from-indexed coll type (+ from (quot len 2)) to)))))))
 
+(defn- elem-at [coll i]
+  (if (arrays/array? coll) (aget ^objects coll i) (nth coll i)))
+
+(defn- mst-split
+  "Bulk MST partition (matches incremental conj): cut coll[0..len) AFTER index i (i<len-1)
+   whose `key-of` value rises to `thresh` (= node-level+1). `key-of` maps a coll element to
+   the key to hash (identity for leaf keys, .maxKey for child nodes). Produces arrays via
+   array-from-indexed, exactly like the count `split`."
+  [^IBoundary boundary ^Settings settings coll len type key-of thresh]
+  (let [len (long len)
+        thresh (long thresh)
+        last-i (dec len)]
+    (loop [i 0, start 0, acc (transient [])]
+      (if (>= i len)
+        (persistent! (if (> len (long start))
+                       (conj! acc (array-from-indexed coll type start len))
+                       acc))
+        (if (and (< i last-i)
+                 (>= (.keyLevel boundary (key-of (elem-at coll i)) settings) thresh))
+          (recur (inc i) (inc i) (conj! acc (array-from-indexed coll type start (inc i))))
+          (recur (inc i) start acc))))))
+
 (defn- map->settings ^Settings [m]
-  (let [s (Settings.
+  (let [boundary (:boundary m)
+        s (Settings.
            (int (or (:branching-factor m) 0))
            (case (:ref-type m)
              :strong RefType/STRONG
@@ -137,8 +160,15 @@
            (:leaf-processor m)
            ;; diff-buf: fall back to the shared Settings default (Settings/defaultDiffBufSize,
            ;; 0/off unless the pss.diffBufSize sysprop is set) when the caller doesn't specify.
-           ;; 0 = baseline (I0). See doc/diff-buffering.md.
-           (int (or (:diff-buf-size m) (Settings/defaultDiffBufSize))))]
+           ;; 0 = baseline (I0). See doc/diff-buffering.md. The MST incompatibility (a buffered
+           ;; spine node is addressed by hash(anchor+diff), not its canonical content hash, which
+           ;; breaks the cross-peer dedup MST exists for) is enforced in ONE place — `.withBoundary`
+           ;; below forces diff-buf OFF for a *content-defined* boundary (a non-content boundary is
+           ;; left untouched). See .internal/SPLIT_SEAM_DESIGN.md two-hash note.
+           (int (or (:diff-buf-size m) (Settings/defaultDiffBufSize))))
+        ;; split-seam: opt into a content-defined boundary (e.g. MST) per store. nil ⇒ the
+        ;; default count B-tree (byte-identical baseline). See .internal/SPLIT_SEAM_DESIGN.md.
+        s (if boundary (.withBoundary s ^IBoundary boundary) s)]
     ;; diff-buf: the comparator is NOT stored on Settings — it lives on the PersistentSortedSet
     ;; (_cmp) and is propagated to Branch nodes (Branch._projCmp) for leaf projection.
     s))
@@ -193,12 +223,26 @@
                                    measure
                                    cmp
                                    settings)))]
-     (loop [level 1
-            nodes (mapv ->Leaf (split keys len Object avg-branching-factor max-branching-factor))]
-       (case (count nodes)
-         0 (PersistentSortedSet. {} cmp storage settings)
-         1 (PersistentSortedSet. {} cmp nil storage (first nodes) len settings 0)
-         (recur (inc level) (mapv #(->Branch level %) (split nodes (count nodes) Object avg-branching-factor max-branching-factor))))))))
+     (if (.contentDefined (.boundary settings))
+       ;; MST bulk: chunk by boundary level so a freshly-built tree matches an incrementally
+       ;; grown one for the same key set (history-independence). key-of = identity for leaf
+       ;; keys, .maxKey for child nodes; thresh = node-level+1.
+       (let [^IBoundary boundary (.boundary settings)]
+         (loop [level 1
+                nodes (mapv ->Leaf (mst-split boundary settings keys len Object identity 1))]
+           (case (count nodes)
+             0 (PersistentSortedSet. {} cmp storage settings)
+             1 (PersistentSortedSet. {} cmp nil storage (first nodes) len settings 0)
+             (recur (inc level)
+                    (mapv #(->Branch level %)
+                          (mst-split boundary settings nodes (count nodes) Object
+                                     (fn [^ANode n] (.maxKey n)) (inc level)))))))
+       (loop [level 1
+              nodes (mapv ->Leaf (split keys len Object avg-branching-factor max-branching-factor))]
+         (case (count nodes)
+           0 (PersistentSortedSet. {} cmp storage settings)
+           1 (PersistentSortedSet. {} cmp nil storage (first nodes) len settings 0)
+           (recur (inc level) (mapv #(->Branch level %) (split nodes (count nodes) Object avg-branching-factor max-branching-factor)))))))))
 
 (defn from-sequential
   "Create a set with custom comparator and a collection of keys. Useful when you don’t want to call [[clojure.core/apply]] on [[sorted-set-by]]."

@@ -22,7 +22,10 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   public Object _root; // Object == ANode | SoftReference<ANode> | WeakReference<ANode>
   public int _count;
   public int _version;
-  public final Settings _settings;
+  // Not final: a lazily-restored root self-describes its split strategy (the boundary); root()
+  // adopts it on first materialization so conj/disj use the right splitter even when the restore
+  // opts didn't specify one (the restore-by path). Like the _root lazy cache, a one-time write.
+  public Settings _settings;
   public IStorage<Key, Address> _storage;
 
   public PersistentSortedSet() {
@@ -57,6 +60,13 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     if (root == null && _address != null) {
       root = _storage.restore(_address);
       _root = _settings.makeReference(root);
+      // self-describing boundary: a restored node carries its split strategy; adopt it so this
+      // set's own conj/disj use the right splitter even when restore opts didn't specify one.
+      // Idempotent for the root-handler restore path (settings already carry the boundary).
+      IBoundary nodeBoundary = root._settings.boundary();
+      if (nodeBoundary.contentDefined() && !_settings.boundary().contentDefined()) {
+        _settings = _settings.withBoundary(nodeBoundary);
+      }
     }
     // diff-buf: seed the projection comparator at the root; Branch.child propagates it down
     // as nodes materialize, so a leaf-parent can project buffered leaves with the set's
@@ -108,6 +118,37 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     // for a non-root branch without setting _bufEntries.
     return new Branch(nodes[0].level() + 1, n, keys, null, children,
                       countKnown ? subtreeCount : -1, measure, _cmp, _settings);
+  }
+
+  /**
+   * Build the new root from the children the root's add() returned. Count ⇒ a single wrap
+   * (byte-identical). MST ⇒ promote by boundary level until one node remains: a separator
+   * whose key rises to level+1 ends a parent chunk, so one high-level key can grow several
+   * levels at once (rare; may leave degenerate single-child branches — history-independent,
+   * collapsing them is a follow-up). The rightmost child is never a cut (global max).
+   */
+  private ANode growRoot(ANode[] nodes) {
+    IBoundary boundary = _settings.boundary();
+    if (!boundary.contentDefined()) {
+      return makeBranchFromChildren(nodes);
+    }
+    while (nodes.length >= 2) {
+      int level = nodes[0].level() + 1;
+      int thresh = level + 1;
+      List<ANode> branches = new ArrayList<>();
+      int start = 0;
+      for (int i = 0; i < nodes.length; i++) {
+        boolean cut = i < nodes.length - 1
+                      && boundary.keyLevel(nodes[i].maxKey(), _settings) >= thresh;
+        if (cut || i == nodes.length - 1) {
+          branches.add(makeBranchFromChildren(Arrays.copyOfRange(nodes, start, i + 1)));
+          start = i + 1;
+        }
+      }
+      if (branches.size() == 1) return branches.get(0);
+      nodes = branches.toArray(new ANode[0]);
+    }
+    return nodes[0];
   }
 
   /**
@@ -494,7 +535,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       if (1 == nodes.length) {
         _root = nodes[0];
       } else if (nodes.length >= 2) {
-        _root = makeBranchFromChildren(nodes);
+        _root = growRoot(nodes);
       }
       // EARLY_EXIT case (nodes.length == 0): tree was modified in place, _address already cleared above
       // When processor is configured, count may differ from +1
@@ -512,7 +553,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     if (1 == nodes.length) {
       newRoot = nodes[0];
     } else {
-      newRoot = makeBranchFromChildren(nodes);
+      newRoot = growRoot(nodes);
     }
 
     // Use root's subtreeCount for exact count (works correctly even with processor)
@@ -527,6 +568,28 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   }
 
   public PersistentSortedSet disjoin(Object key, Comparator cmp) {
+    // split-seam (MST/content mode): sibling-free removeContent recursion, then collapse a
+    // single-child root (count path below is untouched / byte-identical).
+    if (_settings.boundary().contentDefined()) {
+      ANode newRoot = root().removeContent(_storage, (Key) key, cmp, _settings);
+      if (newRoot == null) return this; // not in set
+      if (_storage != null && _address != null) _storage.markFreed(_address);
+      while (newRoot instanceof Branch && newRoot._len == 1) {
+        newRoot = ((Branch) newRoot).child(_storage, 0);
+      }
+      if (editable()) {
+        _address = null;
+        _root = newRoot;
+        long rc = getSubtreeCount(newRoot);
+        _count = (rc >= 0) ? (int) rc : -1;
+        _version += 1;
+        return this;
+      }
+      long rc = getSubtreeCount(newRoot);
+      int newCount = (rc >= 0) ? (int) rc : -1;
+      return new PersistentSortedSet(_meta, _cmp, null, _storage, newRoot, newCount, _settings, _version + 1);
+    }
+
     ANode[] nodes = root().remove(_storage, (Key) key, null, null, cmp, _settings);
 
     // not in set
@@ -586,6 +649,18 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   }
 
   public PersistentSortedSet replace(Object oldKey, Object newKey, Comparator cmp) {
+    // split-seam (MST): an in-place replace keeps the tree's boundary structure, which is canonical
+    // ONLY when oldKey and newKey rise to the same level. When a partial comparator shifts the key
+    // hash across a level boundary the node would have to re-split/merge, so fall back to
+    // disjoin+cons (the history-independent rebuild). Count mode is position-only ⇒ always in-place.
+    // See doc/merkle-search-tree.md.
+    IBoundary boundary = _settings.boundary();
+    if (boundary.contentDefined()
+        && boundary.keyLevel(oldKey, _settings) != boundary.keyLevel(newKey, _settings)) {
+      if (!root().contains(_storage, (Key) oldKey, cmp)) return this; // not found ⇒ no-op
+      return disjoin(oldKey, cmp).cons(newKey, cmp);
+    }
+
     ANode[] nodes = root().replace(_storage, (Key) oldKey, (Key) newKey, cmp, _settings);
 
     // Not in set

@@ -571,8 +571,13 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       as.copyAll(_addresses, ins + 1, _len);
     }
 
+    // split-seam: boundary policy decides overflow + cut. Count ⇒ newLen>bf, midpoint
+    // (byte-identical). MST ⇒ O(1): the one promoted separator at `ins` (the split child's new
+    // max) is the only possible new boundary; cut there if it rises to level+1. null ⇒ absorb.
+    int[] lengths = settings.boundary().splitOnInsert(allKeys, newLen, ins, _level, settings);
+
     // Absorb: fits in single branch
-    if (newLen <= settings.branchingFactor()) {
+    if (lengths == null) {
       // Use delta formula: exact and O(1), avoids scanning all children
       long count = (_subtreeCount >= 0 && oldChildCount >= 0 && newChildrenCount >= 0)
           ? _subtreeCount - oldChildCount + newChildrenCount : -1;
@@ -586,8 +591,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       return new ANode[]{ nb };
     }
 
-    // Split into two branches
-    int half1 = newLen >>> 1, half2 = newLen - half1;
+    // Split into two branches (incremental ⇒ ≤2-way; lengths[0] is the first cut)
+    int half1 = lengths[0], half2 = newLen - half1;
 
     Key[] keys1 = Arrays.copyOfRange(allKeys, 0, half1);
     Key[] keys2 = Arrays.copyOfRange(allKeys, half1, newLen);
@@ -1057,6 +1062,114 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   }
 
   @Override
+  public ANode removeContent(IStorage storage, Key key, Comparator<Key> cmp, Settings settings) {
+    int idx = search(key, cmp);
+    if (idx < 0) idx = -idx - 1;
+    if (idx == _len) return null; // key greater than everything → not present
+
+    ANode oldChild = child(storage, idx);
+    ANode newChild = oldChild.removeContent(storage, key, cmp, settings);
+    if (newChild == null) return null; // not present below
+
+    IBoundary boundary = settings.boundary();
+    IMeasure measureOps = settings.measure();
+
+    // The removed key was a boundary between child idx and idx+1 (at the children's level)
+    // iff keyLevel(key) >= this branch's level. Then those two children merge.
+    boolean mergeRight = idx < _len - 1 && boundary.keyLevel(key, settings) >= _level;
+
+    // Preserve UNCHANGED children's durable addresses (so store() doesn't re-serialize whole
+    // subtrees on a remove); the changed/merged child gets a null address (re-stored), and the
+    // dropped/consumed old children are markFreed (mirrors the count remove's GC). _addresses
+    // null ⇒ in-memory, keep it null.
+    boolean hasAddr = _addresses != null;
+    Object[] newChildren;
+    Address[] newAddresses = null;
+    if (newChild instanceof Leaf && newChild._len == 0) {
+      // Child's whole subtree is gone (it collapsed to an empty Leaf — note its level no
+      // longer matches its siblings, so it can never participate in a merge): drop it. This
+      // subsumes the mergeRight case, since merging an empty node with its sibling yields
+      // exactly that sibling.
+      newChildren = new Object[_len - 1];
+      if (hasAddr) newAddresses = (Address[]) new Object[_len - 1];
+      for (int i = 0; i < idx; i++)        { newChildren[i] = child(storage, i);     if (hasAddr) newAddresses[i] = address(i); }
+      for (int i = idx + 1; i < _len; i++) { newChildren[i - 1] = child(storage, i);  if (hasAddr) newAddresses[i - 1] = address(i); }
+      freeDroppedChild(storage, idx);
+    } else if (mergeRight) {
+      // merge newChild with the right sibling child (junction merges recursively down).
+      ANode merged = newChild.mstMergeWith(child(storage, idx + 1), storage, settings);
+      newChildren = new Object[_len - 1];
+      if (hasAddr) newAddresses = (Address[]) new Object[_len - 1];
+      for (int i = 0; i < idx; i++)            { newChildren[i] = child(storage, i);     if (hasAddr) newAddresses[i] = address(i); }
+      newChildren[idx] = merged;                                      // merged is new ⇒ null address
+      for (int i = idx + 2; i < _len; i++)     { newChildren[i - 1] = child(storage, i);  if (hasAddr) newAddresses[i - 1] = address(i); }
+      freeDroppedChild(storage, idx);
+      freeDroppedChild(storage, idx + 1);                             // both consumed into the merge
+    } else {
+      // no boundary removed at this level: just replace child idx
+      newChildren = new Object[_len];
+      if (hasAddr) { newAddresses = (Address[]) new Object[_len]; System.arraycopy(_addresses, 0, newAddresses, 0, _len); newAddresses[idx] = null; }
+      for (int i = 0; i < _len; i++) newChildren[i] = child(storage, i);
+      newChildren[idx] = newChild;
+      freeDroppedChild(storage, idx);
+    }
+
+    int n = newChildren.length;
+    if (n == 0) {
+      // everything under this branch is gone
+      return new Leaf(0, (Key[]) new Object[0], settings);
+    }
+
+    Key[] keys = (Key[]) new Object[n];
+    for (int i = 0; i < n; i++) keys[i] = ((ANode<Key, Address>) newChildren[i]).maxKey();
+    long count = tryComputeSubtreeCountFromChildren(newChildren, n, storage);
+    Object measure = tryComputeMeasureFromChildren(newChildren, n, storage, measureOps);
+    return new Branch(_level, n, keys, newAddresses, newChildren, count, measure, _projCmp, settings);
+  }
+
+  @Override
+  public ANode mstMergeWith(ANode right, IStorage storage, Settings settings) {
+    Branch r = (Branch) right;
+    IBoundary boundary = settings.boundary();
+    IMeasure measureOps = settings.measure();
+
+    boolean hasAddr = _addresses != null || r._addresses != null;
+    Object[] children;
+    Address[] addrs = null;
+    int n;
+    // The junction — this branch's last child with right's first child — fuses ONLY when this
+    // branch's last child ended at the *removed* boundary (its maxKey is no longer a boundary
+    // at its level). If this branch's last child is still terminated by a LIVE boundary (e.g.
+    // its deepest boundary leaf was dropped, leaving a properly-terminated tail), the two must
+    // NOT fuse — plain concatenation preserves the live boundary. keyLevel(maxKey) >= _level
+    // ⇔ the last child (level _level-1) is boundary-terminated.
+    if (boundary.keyLevel(maxKey(), settings) >= _level) {
+      n = _len + r._len;
+      children = new Object[n];
+      if (hasAddr) addrs = (Address[]) new Object[n];
+      for (int i = 0; i < _len; i++)   { children[i] = child(storage, i);          if (hasAddr) addrs[i] = address(i); }
+      for (int i = 0; i < r._len; i++) { children[_len + i] = r.child(storage, i);  if (hasAddr) addrs[_len + i] = (Address) r.address(i); }
+    } else {
+      ANode junction = child(storage, _len - 1).mstMergeWith(r.child(storage, 0), storage, settings);
+      n = _len + r._len - 1;
+      children = new Object[n];
+      if (hasAddr) addrs = (Address[]) new Object[n];
+      for (int i = 0; i < _len - 1; i++)  { children[i] = child(storage, i);              if (hasAddr) addrs[i] = address(i); }
+      children[_len - 1] = junction;                                    // junction is new ⇒ null address
+      for (int i = 1; i < r._len; i++)    { children[_len - 1 + i] = r.child(storage, i);  if (hasAddr) addrs[_len - 1 + i] = (Address) r.address(i); }
+      // this's last child and r's first child were consumed into the junction
+      freeDroppedChild(storage, _len - 1);
+      if (storage != null && r.address(0) != null) storage.markFreed((Address) r.address(0));
+    }
+
+    Key[] keys = (Key[]) new Object[n];
+    for (int i = 0; i < n; i++) keys[i] = ((ANode<Key, Address>) children[i]).maxKey();
+    long count = tryComputeSubtreeCountFromChildren(children, n, storage);
+    Object measure = tryComputeMeasureFromChildren(children, n, storage, measureOps);
+    return new Branch(_level, n, keys, addrs, children, count, measure, _projCmp, settings);
+  }
+
+  @Override
   public ANode[] replace(IStorage storage, Key oldKey, Key newKey, Comparator<Key> cmp, Settings settings) {
     assert 0 == cmp.compare(oldKey, newKey) : "oldKey and newKey must compare as equal (cmp.compare must return 0)";
 
@@ -1087,7 +1200,15 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // Child was replaced (nodes.length == 1)
     ANode<Key, Address> newChild = nodes[0];
     Key newMaxKey = newChild.maxKey();
-    boolean maxKeyChanged = (idx == _len - 1) && (0 != cmp.compare(newMaxKey, _keys[idx]));
+    // Whether to propagate up (rebuild parent) vs EARLY_EXIT a transient. Count mode is
+    // routing-only (by cmp), so the rightmost child's comparator-position change is the only
+    // thing a parent cares about. MST mode content-addresses the separator VALUE, so ANY value
+    // change must propagate so every separator up the spine stays canonical (mirrors the cljs
+    // Branch.$replace value-based test). _keys[idx] is still the OLD separator here (overwritten
+    // below). See doc/merkle-search-tree.md.
+    boolean maxKeyChanged = settings.boundary().contentDefined()
+      ? !java.util.Objects.equals(newMaxKey, _keys[idx])
+      : (idx == _len - 1) && (0 != cmp.compare(newMaxKey, _keys[idx]));
     IMeasure measureOps = settings.measure();
 
     // Transient: can modify in place

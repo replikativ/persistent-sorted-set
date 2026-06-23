@@ -6,6 +6,7 @@
             [org.replikativ.persistent-sorted-set.impl.node :as node :refer [INode]]
             [org.replikativ.persistent-sorted-set.impl.measure :as measure]
             [org.replikativ.persistent-sorted-set.impl.storage :as storage]
+            [org.replikativ.persistent-sorted-set.impl.boundary :as b]
             [org.replikativ.persistent-sorted-set.util :as util]))
 
 (deftype Leaf [keys settings ^:mutable _measure]
@@ -50,11 +51,32 @@
   (add [this storage key cmp {:keys [sync?] :or {sync? true}}]
     (let [branching-factor (:branching-factor settings)
           measure-ops (:measure settings)
+          bd               (b/content-boundary settings)
           idx              (util/binary-search-l cmp keys (dec (arrays/alength keys)) key)
           keys-l           (arrays/alength keys)
           result           (cond
                              (and (< idx keys-l) (== 0 (cmp key (arrays/aget keys idx))))
                              nil
+
+                             ;; split-seam (MST): build the full run, then cut at boundary keys.
+                             ;; Identical to the JVM Leaf.add seam path; key-level is shared cljc.
+                             bd
+                             (let [all-keys (util/splice keys idx idx (arrays/array key))
+                                   total    (arrays/alength all-keys)
+                                   lens     (b/-split-on-insert bd all-keys total idx 0)]  ; idx = insert pos
+                               (if (nil? lens)
+                                 (let [lf (Leaf. all-keys settings nil)]
+                                   (when (and measure-ops _measure)
+                                     (node/try-compute-measure lf nil measure-ops {:sync? true}))
+                                   (arrays/array lf))
+                                 (loop [out (transient []), pos 0, ls lens]
+                                   (if (seq ls)
+                                     (let [l  (first ls)
+                                           lf (Leaf. (.slice all-keys pos (+ pos l)) settings nil)]
+                                       (when (and measure-ops _measure)
+                                         (node/try-compute-measure lf nil measure-ops {:sync? true}))
+                                       (recur (conj! out lf) (+ pos l) (next ls)))
+                                     (arrays/into-array (persistent! out))))))
 
                              (== keys-l branching-factor)
                              (let [middle (arrays/half (inc keys-l))
