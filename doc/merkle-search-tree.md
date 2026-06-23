@@ -1,5 +1,13 @@
 # Content-defined boundaries (Merkle Search Tree / prolly mode)
 
+> **⚠️ Experimental.** This mode is new and opt-in. The public API (`mst-boundary`, the
+> `:boundary` setting) and the serialized boundary descriptor (`{:type :mst :lzpl N}`) may still
+> change; it has not yet been hardened in production sync workloads, so don't depend on the
+> on-disk format for long-lived MST data yet. The cross-platform determinism and
+> `conj`/`disj`/`replace` canonicality are property-tested on both JVM and ClojureScript, but
+> treat the feature as unstable. The default count B-tree (no `:boundary`) is unaffected and
+> stable.
+
 By default PersistentSortedSet is an ordinary B+-tree: a node splits when it reaches the
 branching factor, so the **shape of the tree depends on the order** keys were inserted and
 removed. Two sets with identical contents but different histories are equal as sets, yet they

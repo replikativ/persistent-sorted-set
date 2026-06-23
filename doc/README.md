@@ -12,7 +12,7 @@ Deep-dives behind the features summarized in the [project README](../README.md).
   contract. Opt-in, off by default.
 
 ## Content-addressing & sync
-- **[Merkle Search Tree (content-defined boundaries)](merkle-search-tree.md)** — *prolly* mode:
+- **[Merkle Search Tree (content-defined boundaries)](merkle-search-tree.md)** — _**experimental**_, *prolly* mode:
   split decisions derived from key hashes so that **equal sets are byte-identical trees**,
   independent of operation history. For CRDT state sync, cross-replica dedup, and O(1)
   idempotence. Opt-in, off by default.

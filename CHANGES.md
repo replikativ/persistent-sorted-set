@@ -1,7 +1,9 @@
 # 0.4.x
 
-- **Content-defined boundary mode (Merkle Search Tree / "prolly" trees)** — opt-in per set via
-  `{:boundary (mst-boundary lzpl)}`. Split points are derived from key hashes (`hasch.fast`,
+- **Content-defined boundary mode (Merkle Search Tree / "prolly" trees)** — _**experimental**_,
+  opt-in per set via `{:boundary (mst-boundary lzpl)}`. The API and on-disk boundary descriptor
+  may still change, and it is not yet hardened for production sync workloads; the default count
+  B-tree is unaffected. Split points are derived from key hashes (`hasch.fast`,
   byte-identical JVM↔cljs) instead of node fill, so the tree is a pure function of its element
   set: the same elements always produce the byte-identical, content-addressed structure
   regardless of `conj`/`disj` order or which platform built it. Aimed at CRDT state sync and

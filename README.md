@@ -39,8 +39,8 @@ Implementations are provided for both Clojure and ClojureScript.
   reduction that brings a content-only commit on content-addressed storage down to ~1 object.
   See [doc/diff-buffering.md](doc/diff-buffering.md).
 - **[Content-defined boundaries (Merkle Search Tree)](#content-defined-boundaries-merkle-search-tree)**
-  — opt-in *prolly* mode where equal sets are byte-identical trees regardless of history, for
-  CRDT state sync and cross-replica dedup. See
+  — _**experimental**_, opt-in *prolly* mode where equal sets are byte-identical trees regardless
+  of history, for CRDT state sync and cross-replica dedup. See
   [doc/merkle-search-tree.md](doc/merkle-search-tree.md).
 
 Full documentation index: **[doc/README.md](doc/README.md)**.
@@ -344,6 +344,13 @@ drops buffered changes, which is why the default is off. See
 storage contract.
 
 ## Content-defined boundaries (Merkle Search Tree)
+
+> **⚠️ Experimental.** This mode is new and opt-in. Its public API (`mst-boundary`, `:boundary`)
+> and the serialized boundary descriptor may still change, and it has not yet been hardened in
+> production sync workloads — don't rely on the on-disk format for long-lived MST data yet. The
+> cross-platform determinism and `conj`/`disj`/`replace` canonicality are property-tested on both
+> JVM and ClojureScript, but treat the feature as unstable. **The default count B-tree is
+> unaffected and stable.**
 
 By default the tree shape depends on insertion/removal order. **Content-defined boundary mode**
 (a *Merkle Search Tree*, the family informally called *prolly trees*) decides splits from a
