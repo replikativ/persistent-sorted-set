@@ -2,7 +2,7 @@
 
 <p align="center">
 <a href="https://clojurians.slack.com/archives/CB7GJAN0L"><img src="https://badgen.net/badge/-/slack?icon=slack&label"/></a>
-<a href="https://clojars.org/io.replikativ/persistent-sorted-set"><img src="https://img.shields.io/clojars/v/io.replikativ/persistent-sorted-set.svg"/></a>
+<a href="https://clojars.org/org.replikativ/persistent-sorted-set"><img src="https://img.shields.io/clojars/v/org.replikativ/persistent-sorted-set.svg"/></a>
 <a href="https://circleci.com/gh/replikativ/persistent-sorted-set"><img src="https://circleci.com/gh/replikativ/persistent-sorted-set.svg?style=shield"/></a>
 <a href="https://github.com/replikativ/persistent-sorted-set/tree/main"><img src="https://img.shields.io/github/last-commit/replikativ/persistent-sorted-set/main"/></a>
 </p>
@@ -47,14 +47,14 @@ Full documentation index: **[doc/README.md](doc/README.md)**.
 
 ## Installation
 
-[![Clojars Project](https://img.shields.io/clojars/v/io.replikativ/persistent-sorted-set.svg)](https://clojars.org/io.replikativ/persistent-sorted-set)
+[![Clojars Project](https://img.shields.io/clojars/v/org.replikativ/persistent-sorted-set.svg)](https://clojars.org/org.replikativ/persistent-sorted-set)
 
 ```clj
 ;; deps.edn
-io.replikativ/persistent-sorted-set {:mvn/version "LATEST"}
+org.replikativ/persistent-sorted-set {:mvn/version "LATEST"}
 
 ;; Leiningen
-[io.replikativ/persistent-sorted-set "LATEST"]
+[org.replikativ/persistent-sorted-set "LATEST"]
 ```
 
 The version follows the pattern `0.4.{commit-count}` and is incremented automatically on each
@@ -430,7 +430,7 @@ yarn shadow-cljs release test   # ClojureScript
 
 This project uses CircleCI: both Clojure and ClojureScript tests run on every commit, formatting
 is checked with cljfmt, and successful `main` builds are deployed to
-[Clojars](https://clojars.org/io.replikativ/persistent-sorted-set) and released to
+[Clojars](https://clojars.org/org.replikativ/persistent-sorted-set) and released to
 [GitHub](https://github.com/replikativ/persistent-sorted-set/releases). Versions follow
 `0.4.{commit-count}`.
 
