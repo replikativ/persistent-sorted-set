@@ -469,9 +469,19 @@
 
 (def ^:const EMPTY_PATH (js* "0n"))
 
-(defn- bits-per-level [^BTSet set]
-  (let [bf (get (.-settings set) :branching-factor)]
-    (Math/ceil (Math/log2 bf))))
+(defn- bits-per-level [^BTSet _set]
+  ;; The iterator packs one index PER TREE LEVEL into a single BigInt path,
+  ;; `bits-per-level` bits each (`path-get`/`path-set` shift+mask by this width).
+  ;; A COUNT B-tree node is always ≤ branching-factor, so `ceil(log2 bf)` bits
+  ;; sufficed historically. But an MST content-defined node can EXCEED
+  ;; branching-factor (the boundary cuts at content keys, not by size — with no
+  ;; boundary key in a range a node simply grows). Sizing the field by
+  ;; `ceil(log2 bf)` then MASKS any index ≥ bf on read (e.g. `199 & 63 = 7`),
+  ;; truncating the path and silently dropping the tail of `seq`/`slice`/`rseq`.
+  ;; Use a fixed 32-bit field per level — matching the JVM's `int[]`-per-level
+  ;; path — so an index never overflows for any realistically sized node (a node
+  ;; with > 2^32 entries is physically impossible). BigInt absorbs the wider path.
+  32)
 
 (defn- max-len [^BTSet set]
   (get (.-settings set) :branching-factor))
