@@ -95,7 +95,9 @@
                             (conj! as (branch/address node i)))
                      [(persistent! cs) (persistent! as)]))))))
 
-(declare mst-merge-with mst-remove-content)
+;; `disjoin` (defined below) is used by the MST replace path above it — forward-
+;; declare it so cljs's single-pass analyzer doesn't warn :undeclared-var.
+(declare mst-merge-with mst-remove-content disjoin)
 
 (defn- mst-merge-with
   "Combine two same-level nodes whose separating (removed) boundary is gone. The junction —
