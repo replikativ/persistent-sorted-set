@@ -33,17 +33,24 @@
 (defn- full-cmp [[k1 v1 t1] [k2 v2 t2]]
   (let [c (compare k1 k2)]
     (if-not (zero? c) c
-      (let [c (compare v1 v2)]
-        (if-not (zero? c) c (compare t1 t2))))))
+            (let [c (compare v1 v2)]
+              (if-not (zero? c) c (compare t1 t2))))))
 
 (defn- by-k [a b] (compare (nth a 0) (nth b 0)))
 
 (defn- mem-storage
   "In-memory IStorage: fresh address per store, no reads (the whole tree stays resident —
-   the set is built with :ref-type :strong so restore is never needed)."
+   the set is built with :ref-type :strong so restore is never needed). `accessed` must be
+   a real no-op: Branch.child LRU-touches storage on every descent through a child that
+   HAS an address — and thread B's settle assigns addresses on shared nodes mid-race, so
+   thread A's descents call it."
   []
   (reify IStorage
     (store [_ _node] (str (UUID/randomUUID)))
+    (accessed [_ _address])
+    (markFreed [_ _address])
+    (isFreed [_ _address] false)
+    (freedInfo [_ _address] nil)
     (restore [_ address]
       (throw (ex-info "unexpected restore — tree should be fully resident" {:address address})))))
 
@@ -67,7 +74,10 @@
             the diff-buf {slots, entries} pair must never be observed torn (-ea oracle in
             Branch.store), and the final content must equal the model"
     (let [storage (mem-storage)
+          ;; the set must CARRY the storage: post-settle descents through addressed
+          ;; children LRU-touch it (a null here NPEs the moment B's settle lands)
           s0      (into (ss/sorted-set* {:comparator       full-cmp
+                                         :storage          storage
                                          :branching-factor bf
                                          :diff-buf-size    diff-buf
                                          :ref-type         :strong})
