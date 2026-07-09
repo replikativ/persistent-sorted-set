@@ -26,25 +26,56 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // diff-buf (only used when _settings.diffBufSize() > 0; null/false otherwise, so
   // diffBufSize==0 is byte-identical to baseline — invariant I0).
   //
-  // Per-child diff slot: _slots[i], when non-null, is the buffered logical diff of
-  // child i against its durable version (a Slot holding a PersistentTreeMap<Key,Op>
-  // + a cached (count, measure) snapshot ĝ). null == child i has no buffered diff.
-  public Object[] _slots;
-
-  // diff-buf store-time bookkeeping: this node's subtree buffered-diff size, in *entries*
-  // (number of buffered element-changes summed over the whole subtree — the budget-B unit).
-  // Maintained by delta on the deposit return path, mirroring _subtreeCount. Three states:
-  //   >= 0   : content-only — the exact buffered-entry count (what the old deep walk returned);
+  // diff-buf state snapshot: {slots, entries} always mutually consistent.
+  // Immutable with final fields; published via a single volatile reference
+  // write (_buf) so a concurrent reader (copier/deposit on a shared node) can never
+  // observe the pair torn — the copier gets either the pre-settle or the
+  // post-settle snapshot, each internally consistent. Replaces the plain
+  // (_slots, _bufEntries) pair whose store()-time compound settle raced
+  // structural sharing under a pipelining writer (the datahike writer applies
+  // tx N+1 while committing tx N: store() nulls flushed children's slots and
+  // only later resets the running total, so a concurrent copy could bake in a
+  // phantom total — slots already nulled but still counted — that the delta
+  // maintenance then preserved forever).
+  //
+  // slots[i], when non-null, is the buffered logical diff of child i against its
+  // durable version (a Slot holding a PersistentTreeMap<Key,Op> + a cached
+  // (count, measure) snapshot ĝ). null == child i has no buffered diff.
+  //
+  // entries is this node's subtree buffered-diff size, in *entries* (number of buffered
+  // element-changes summed over the whole subtree — the budget-B unit), maintained by
+  // delta on the deposit return path, mirroring _subtreeCount. Three states:
+  //   >= 0   : content-only — the exact buffered-entry count (== sum of slot entry sizes);
   //   WRITE  : must be WRITTEN, not buffered — a split/merge/borrow happened in this subtree.
   //            Set at the rebuild site; PROPAGATES UP automatically because a parent's deposit
   //            folds the child's value into this sum (a WRITE child poisons the parent), so the
   //            store-time gate is an O(1) field read instead of a recursive subtree walk.
-  //   LAZY   : restored from storage, not yet derived — bufEntries() resolves it from _slots
+  //   LAZY   : restored from storage, not yet derived — bufEntries() resolves it from slots
   //            (IO-free, the diffs are already in memory). Mirrors _subtreeCount's -1/lazy.
-  // Cleared to 0 at store (the node then equals its durable object). Untouched at diffBufSize==0.
-  public long _bufEntries;
+  // Settled to the embedded total at store (the node then equals its durable object).
+  static final class BufState {
+    final Object[] slots;   // may be null (no slots)
+    final long entries;     // settled total, or BUF_WRITE / BUF_LAZY sentinel
+    BufState(Object[] slots, long entries) { this.slots = slots; this.entries = entries; }
+  }
+
+  // The ONE mutable diff-buf reference. null ⇒ no diff-buf state at all (fresh node:
+  // slots == null, entries == 0). Discipline: readers take ONE local snapshot per
+  // method and use only its fields; writers compute the new {slots, entries} fully
+  // (copy-on-write of the array unless it is provably unpublished) and publish with
+  // ONE volatile write. Untouched at diffBufSize==0.
+  public volatile BufState _buf;
+
+  // CAS access to _buf for the ONE publisher that can race the store()-time settle on a
+  // SHARED node: bufEntries()'s LAZY resolution (a transaction-thread deposit reading a
+  // shared child's total while the commit thread settles that child). All other publishers
+  // write to unshared nodes (fresh copies, editable transients, restore-time installs) or
+  // are the settle itself. Java-8-compatible (no VarHandle).
+  @SuppressWarnings("rawtypes")
+  private static final java.util.concurrent.atomic.AtomicReferenceFieldUpdater<Branch, BufState> BUF_UPDATER =
+      java.util.concurrent.atomic.AtomicReferenceFieldUpdater.newUpdater(Branch.class, BufState.class, "_buf");
   public static final long BUF_WRITE = -1;   // must write (rebalanced subtree)
-  public static final long BUF_LAZY  = Slot.LAZY;  // restored, derive from _slots on first read
+  public static final long BUF_LAZY  = Slot.LAZY;  // restored, derive from slots on first read
 
   // diff-buf: the SET's stable comparator, used to PROJECT a buffered leaf (projectLeaf rebuilds
   // it in stored order). It is the set's comparator — NOT any per-operation/navigation comparator
@@ -75,9 +106,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     _children     = children;
     _subtreeCount = subtreeCount;
     // diff-buf: this ctor backs restore (the List ctor) and bulk build — slots, if any, are
-    // attached afterwards by the storage layer, so the buffered-entry count is derived lazily
-    // from _slots on first read (mirrors _subtreeCount = -1). Mutation ctors set it explicitly.
-    _bufEntries   = BUF_LAZY;
+    // attached afterwards by the storage layer (installSlots), so the buffered-entry count is
+    // derived lazily from the slots on first read (mirrors _subtreeCount = -1). Mutation ctors
+    // publish an explicit snapshot instead.
+    _buf          = new BufState(null, BUF_LAZY);
   }
 
   // diff-buf: this ctor and the (level, len, settings) one below take the set's projection
@@ -174,7 +206,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // leaf-parent projects its buffered leaves with its own _projCmp — independent of whatever
       // operation (lookup with a prefix cmp, slice, count, …) drove this descent.
       if (base instanceof Branch) ((Branch) base)._projCmp = _projCmp;
-      Slot sl = (_slots != null) ? (Slot) _slots[idx] : null;
+      Object[] slots = slots();                                // one snapshot
+      Slot sl = (slots != null) ? (Slot) slots[idx] : null;
       // diff-buf push-down: project this parent's buffered diff onto the freshly loaded child —
       // leaf: batch-rebuild keys (with this leaf-parent's _projCmp); branch: install the nested
       // diff as the child's own _slots + set its aggregates from ĝ. Runs once, here, at
@@ -225,20 +258,59 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     return _subtreeCount;
   }
 
-  // diff-buf: this node's buffered-diff size in entries (see _bufEntries). Resolves a restored
-  // node's LAZY value from its slots once (IO-free — the slot diffs are already in memory),
-  // then caches; passes BUF_WRITE (must-write) through. O(1) once resolved. Mirrors count().
+  // diff-buf: this node's current slots array — ONE volatile snapshot; may be null.
+  // READ-ONLY: callers must never mutate the returned array (it may be shared via a
+  // published BufState); writers publish a fresh array through _buf instead.
+  public Object[] slots() {
+    BufState b = _buf;
+    return (b != null) ? b.slots : null;
+  }
+
+  // diff-buf restore: install reconstructed slots (fressian read side / storage impls)
+  // as ONE atomically-published snapshot. entries is usually BUF_LAZY (derived from the
+  // slots on first read), unless the caller knows the settled total.
+  public void installSlots(Object[] slots, long entries) {
+    _buf = new BufState(slots, entries);
+  }
+
+  // diff-buf: this node's buffered-diff size in entries (see BufState.entries). Resolves a
+  // restored node's LAZY value from its slots once (IO-free — the slot diffs are already in
+  // memory), then caches; passes BUF_WRITE (must-write) through. O(1) once resolved. Mirrors
+  // count(). The cache write publishes a NEW snapshot carrying the same slots — racing
+  // resolvers compute identical values from the same immutable snapshot, so the race is benign.
   public long bufEntries() {
-    if (_bufEntries == BUF_LAZY) {
-      long s = 0;
-      if (_slots != null)
-        for (int j = 0; j < _len; j++) {
-          Slot sl = (Slot) _slots[j];
-          if (sl != null) s += slotBE(sl);
-        }
-      _bufEntries = s;
+    for (;;) {
+      BufState b = _buf;
+      if (b == null) return 0;
+      if (b.entries != BUF_LAZY) return b.entries;
+      long s = sumSlotBE(b.slots);
+      // CAS, not a plain publish: a concurrent store() settle may have replaced the state
+      // since we read b — a plain write would CLOBBER the settled {slots, entries} with
+      // this pre-settle snapshot (re-buffering already-flushed children: double projection
+      // on read, phantom totals). The reverse direction is safe — a settle overwriting our
+      // resolution is strictly newer and its per-slot arithmetic never depended on the
+      // node-level LAZY. On CAS failure re-read: the winner's value is typically already
+      // settled (non-LAZY) and we just return it.
+      if (BUF_UPDATER.compareAndSet(this, b, new BufState(b.slots, s))) return s;
     }
-    return _bufEntries;
+  }
+
+  // Pure snapshot variant of bufEntries(): resolve LAZY from the GIVEN snapshot without
+  // publishing — used where the caller must pair the entries with that snapshot's slots
+  // (the carry sites), so the pair can never mix two generations of the state.
+  private long bufEntriesOf(BufState b) {
+    if (b == null) return 0;
+    return (b.entries == BUF_LAZY) ? sumSlotBE(b.slots) : b.entries;
+  }
+
+  private long sumSlotBE(Object[] slots) {
+    long s = 0;
+    if (slots != null)
+      for (int j = 0; j < _len; j++) {
+        Slot sl = (Slot) slots[j];
+        if (sl != null) s += slotBE(sl);
+      }
+    return s;
   }
 
   // Entry count contributed by one slot of THIS node: its cached value, or — for a slot
@@ -250,31 +322,35 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
   // diff-buf oracle (assert-only, -ea): recompute a content-only node's buffered-entry total by
   // walking the live subtree (the work the old store-time deep walk did), to cross-check the
-  // delta-maintained _bufEntries. Skipped for BUF_WRITE/BUF_LAZY (negative ⇒ not a settled size).
+  // delta-maintained entries. Skipped for BUF_WRITE/BUF_LAZY (negative ⇒ not a settled size).
   // A >=0 node can't have a rebalanced descendant (the poison would have made it negative), so the
   // walk never hits a must-write child. Runs only under -ea (e.g. the :dev alias), never in :test.
   private boolean assertBufEntries(IStorage storage) {
-    if (_bufEntries < 0) return true;
+    BufState b = _buf;                                          // one snapshot
+    long e = (b != null) ? b.entries : 0;
+    if (e < 0) return true;
+    Object[] slots = (b != null) ? b.slots : null;
     // Post-order: check dirty (resident, marker) children first so the DEEPEST mismatch throws.
-    if (_slots != null)
+    if (slots != null)
       for (int j = 0; j < _len; j++) {
-        Slot s = (Slot) _slots[j];
+        Slot s = (Slot) slots[j];
         if (s != null && s.diff == null) {
           ANode gc = child(storage, j);
           if (gc instanceof Branch) ((Branch) gc).assertBufEntries(storage);
         }
       }
     long slow = bufEntriesSlow(storage);
-    if (_bufEntries != slow)
-      throw new AssertionError("diff-buf: _bufEntries " + _bufEntries + " != recomputed " + slow + " (level " + _level + ")");
+    if (e != slow)
+      throw new AssertionError("diff-buf: bufEntries " + e + " != recomputed " + slow + " (level " + _level + ")");
     return true;
   }
 
   private long bufEntriesSlow(IStorage storage) {
-    if (_slots == null) return 0;
+    Object[] slots = slots();                                   // one snapshot
+    if (slots == null) return 0;
     long total = 0;
     for (int j = 0; j < _len; j++) {
-      Slot sl = (Slot) _slots[j];
+      Slot sl = (Slot) slots[j];
       if (sl == null) continue;
       if (sl.anchor == null) continue;                        // anchorless child ⇒ written wholesale at
                                                               // store ⇒ embeds nothing here (deposit set newBE=0)
@@ -539,8 +615,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           ? _subtreeCount - oldChildCount + newChildrenCount : -1;
       Object newMeasure = tryComputeMeasureFromChildren(newChildren, _len, storage, measureOps);
       Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, newCount, newMeasure, _projCmp, settings);
-      if (settings.diffBufSize() > 0) { nb._bufEntries = bufEntries(); // carry this node's running total (or BUF_WRITE) onto the successor
-                                      nb.carryAndDeposit(storage, _slots, ins, key, key, anchor0); } // content-only: Present(key) / branch marker
+      // ONE snapshot of this shared node's {slots, entries} pair — carried together so the
+      // successor can never mix a pre-settle total with post-settle slots (or vice versa).
+      if (settings.diffBufSize() > 0) nb.carryAndDeposit(storage, _buf, ins, key, key, anchor0); // content-only: Present(key) / branch marker
       return new ANode[]{ nb };
     }
 
@@ -584,8 +661,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       Object measure = tryComputeMeasureFromChildren(allChildren, newLen, storage, measureOps);
       Branch<Key, Address> nb = new Branch(_level, newLen, allKeys, allAddresses, allChildren, count, measure, _projCmp, settings);
       if (settings.diffBufSize() > 0) {
-        nb._bufEntries = BUF_WRITE; // absorbed a child split: structural → written, but it still buffers surviving siblings
-        nb._slots = stitchSlots(ins, nodes.length, newLen); // carry buffered siblings' slots through the rebuild
+        // absorbed a child split: structural → written (BUF_WRITE), but it still buffers
+        // surviving siblings — carry their slots through the rebuild. nb is unpublished,
+        // so this single publish installs the consistent {slots, BUF_WRITE} pair.
+        nb._buf = new BufState(stitchSlots(ins, nodes.length, newLen), BUF_WRITE);
         freeDroppedChild(storage, ins); // diff-buf: free the split child's old blob (replaced by N new nodes)
       }
       return new ANode[]{ nb };
@@ -613,13 +692,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     Branch<Key, Address> sb1 = new Branch(_level, half1, keys1, addresses1, children1, count1, measure1, _projCmp, settings);
     Branch<Key, Address> sb2 = new Branch(_level, half2, keys2, addresses2, children2, count2, measure2, _projCmp, settings);
     if (settings.diffBufSize() > 0) {
-      sb1._bufEntries = BUF_WRITE; sb2._bufEntries = BUF_WRITE; // split: structural → written, still buffer surviving siblings
+      // split: structural → written (BUF_WRITE), still buffer surviving siblings' slots.
+      // sb1/sb2 are unpublished: one consistent publish each.
       freeDroppedChild(storage, ins); // diff-buf: free the split child's old blob (replaced by N new nodes)
       Object[] all = stitchSlots(ins, nodes.length, newLen); // carry buffered siblings' slots through the split
-      if (all != null) {
-        sb1._slots = Arrays.copyOfRange(all, 0, half1);
-        sb2._slots = Arrays.copyOfRange(all, half1, newLen);
-      }
+      sb1._buf = new BufState(all != null ? Arrays.copyOfRange(all, 0, half1) : null, BUF_WRITE);
+      sb2._buf = new BufState(all != null ? Arrays.copyOfRange(all, half1, newLen) : null, BUF_WRITE);
     }
     return new ANode[]{ sb1, sb2 };
   }
@@ -723,14 +801,24 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         if (newLen != _len)
           cs.copyAll(_children, idx+2, _len);
 
-        if (_settings.diffBufSize() > 0 && _slots != null
-            && (leftChanged || rightChanged || newLen != _len)) { // structural only: mirror the address Stitch
-          Stitch ss = new Stitch(_slots, Math.max(idx - 1, 0));   // (content-only keeps _slots[idx] so the deposit below accumulates)
-          if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(idx - 1));
-                                ss.copyOne(null);
-          if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(idx + 1));
-          if (newLen != _len)
-            ss.copyAll(_slots, idx+2, _len);
+        // diff-buf: STRUCTURAL only — mirror the address Stitch. Build the stitched slots
+        // array on a copy-on-write of one snapshot; published below TOGETHER with the
+        // BUF_WRITE poison as a single consistent {slots, entries} pair. (Content-only keeps
+        // the slot at idx so the deposit below accumulates.) `structural` is computed before
+        // `_len = newLen` overwrites the comparison basis.
+        boolean structural = leftChanged || rightChanged || newLen != _len;
+        Object[] stitched = null;
+        if (_settings.diffBufSize() > 0 && structural) {
+          BufState rb = _buf;                                    // one snapshot
+          if (rb != null && rb.slots != null) {
+            stitched = Arrays.copyOf(rb.slots, rb.slots.length); // prefix [0, idx-1) already right
+            Stitch ss = new Stitch(stitched, Math.max(idx - 1, 0));
+            if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(rb.slots, idx - 1));
+                                  ss.copyOne(null);
+            if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(rb.slots, idx + 1));
+            if (newLen != _len)
+              ss.copyAll(rb.slots, idx+2, _len);
+          }
         }
 
         _len = newLen;
@@ -741,10 +829,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           _measure = tryComputeMeasure(storage);
         }
         if (_settings.diffBufSize() > 0) {
-          if (!leftChanged && !rightChanged && newLen == _len) {
+          if (!structural) {
             depositInto(storage, idx, key, Slot.ABSENT, anchor0); // content-only: Absent(key) / branch marker
           } else {
-            _bufEntries = BUF_WRITE; // a child merged/borrowed with a sibling: structural → write in full
+            // a child merged/borrowed with a sibling: structural → write in full. Single
+            // publish of the stitched slots + BUF_WRITE poison.
+            _buf = new BufState(stitched, BUF_WRITE);
           }
         }
         return PersistentSortedSet.EARLY_EXIT;
@@ -781,25 +871,27 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       newCenter._measure = tryComputeMeasureFromChildren(newCenter._children, newLen, storage, measureOps);
       if (settings.diffBufSize() > 0) {
         if (!leftChanged && !rightChanged && newLen == _len) {
-          // content-only: carry slots aligned and ACCUMULATE Absent onto the center's
-          // existing diff (it may already hold buffered Present/Absent for this leaf).
-          newCenter._bufEntries = bufEntries(); // carry this node's running total (or BUF_WRITE) onto the successor
-          newCenter.carryAndDeposit(storage, _slots, idx, key, Slot.ABSENT, anchor0);
+          // content-only: carry ONE snapshot of this shared node's {slots, entries} pair
+          // aligned and ACCUMULATE Absent onto the center's existing diff (it may already
+          // hold buffered Present/Absent for this leaf).
+          newCenter.carryAndDeposit(storage, _buf, idx, key, Slot.ABSENT, anchor0);
         } else {
-          newCenter._bufEntries = BUF_WRITE;                   // structural: mirror the address Stitch
+          // structural: mirror the address Stitch; newCenter is unpublished, so one publish
+          // installs the consistent {slots, BUF_WRITE} pair.
           // diff-buf: free this node's dropped children (consumed into the new structure,
           // never re-pointed) so they don't leak — store has no slot/anchor for them.
           freeDroppedChild(storage, idx);
           if (leftChanged && idx > 0) freeDroppedChild(storage, idx - 1);
           if (rightChanged) freeDroppedChild(storage, idx + 1);
+          final Object[] mySlots = slots();                    // one snapshot of this shared node
           Object[] ns = new Object[newCenter._keys.length];    // (center/changed siblings materialized → null slot)
           Stitch ss = new Stitch(ns, 0);
-          slotCopyAll(ss, _slots, 0, idx - 1);
-          if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(idx - 1));
+          slotCopyAll(ss, mySlots, 0, idx - 1);
+          if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(mySlots, idx - 1));
                                 ss.copyOne(null);
-          if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(idx + 1));
-          slotCopyAll(ss, _slots, idx + 2, _len);
-          newCenter._slots = ns;
+          if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(mySlots, idx + 1));
+          slotCopyAll(ss, mySlots, idx + 2, _len);
+          newCenter._buf = new BufState(ns, BUF_WRITE);
         }
       }
       return new ANode[] { left, newCenter, right };
@@ -840,19 +932,21 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       join._subtreeCount = tryComputeSubtreeCountFromChildren(join._children, left._len + newLen, storage);
       join._measure = tryComputeMeasureFromChildren(join._children, left._len + newLen, storage, measureOps);
       if (settings.diffBufSize() > 0) {
-        join._bufEntries = BUF_WRITE; // merged with left: structural → written, still buffers surviving siblings
+        // merged with left: structural → written (BUF_WRITE), still buffers surviving
+        // siblings. join is unpublished: one consistent publish.
         freeDroppedChild(storage, idx);                        // diff-buf: free dropped (merged) children
         if (leftChanged && idx > 0) freeDroppedChild(storage, idx - 1);
         if (rightChanged) freeDroppedChild(storage, idx + 1);
+        final Object[] mySlots = slots(), leftSlots = left.slots(); // one snapshot per shared source
         Object[] ns = new Object[join._keys.length];           // mirror the address Stitch above
         Stitch ss = new Stitch(ns, 0);
-        slotCopyAll(ss, left._slots, 0, left._len);
-        slotCopyAll(ss, _slots,      0, idx - 1);
-        if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(idx - 1));
+        slotCopyAll(ss, leftSlots, 0, left._len);
+        slotCopyAll(ss, mySlots,   0, idx - 1);
+        if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(mySlots, idx - 1));
                               ss.copyOne(null);
-        if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(idx + 1));
-        slotCopyAll(ss, _slots, idx + 2, _len);
-        join._slots = ns;
+        if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(mySlots, idx + 1));
+        slotCopyAll(ss, mySlots, idx + 2, _len);
+        join._buf = new BufState(ns, BUF_WRITE);
       }
       return new ANode[] { null, join, right };
     }
@@ -892,19 +986,21 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       join._subtreeCount = tryComputeSubtreeCountFromChildren(join._children, newLen + right._len, storage);
       join._measure = tryComputeMeasureFromChildren(join._children, newLen + right._len, storage, measureOps);
       if (settings.diffBufSize() > 0) {
-        join._bufEntries = BUF_WRITE; // merged with right: structural → written, still buffers surviving siblings
+        // merged with right: structural → written (BUF_WRITE), still buffers surviving
+        // siblings. join is unpublished: one consistent publish.
         freeDroppedChild(storage, idx);                        // diff-buf: free dropped (merged) children
         if (leftChanged && idx > 0) freeDroppedChild(storage, idx - 1);
         if (rightChanged) freeDroppedChild(storage, idx + 1);
+        final Object[] mySlots = slots(), rightSlots = right.slots(); // one snapshot per shared source
         Object[] ns = new Object[join._keys.length];           // mirror the address Stitch above
         Stitch ss = new Stitch(ns, 0);
-        slotCopyAll(ss, _slots, 0, idx - 1);
-        if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(idx - 1));
+        slotCopyAll(ss, mySlots, 0, idx - 1);
+        if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(mySlots, idx - 1));
                               ss.copyOne(null);
-        if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(idx + 1));
-        slotCopyAll(ss, _slots, idx + 2, _len);
-        slotCopyAll(ss, right._slots, 0, right._len);
-        join._slots = ns;
+        if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(mySlots, idx + 1));
+        slotCopyAll(ss, mySlots, idx + 2, _len);
+        slotCopyAll(ss, rightSlots, 0, right._len);
+        join._buf = new BufState(ns, BUF_WRITE);
       }
       return new ANode[] { left, join, null };
     }
@@ -961,24 +1057,27 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       newCenter._subtreeCount = tryComputeSubtreeCountFromChildren(newCenter._children, newCenterLen, storage);
       newCenter._measure = tryComputeMeasureFromChildren(newCenter._children, newCenterLen, storage, measureOps);
       if (settings.diffBufSize() > 0) {
-        newLeft._bufEntries = BUF_WRITE; newCenter._bufEntries = BUF_WRITE; // borrowed from left: structural
+        // borrowed from left: structural → BUF_WRITE. newLeft/newCenter are unpublished:
+        // one consistent {slots, entries} publish each.
         freeDroppedChild(storage, idx);                          // diff-buf: free dropped (rebalanced) children
         if (leftChanged && idx > 0) freeDroppedChild(storage, idx - 1);
         if (rightChanged) freeDroppedChild(storage, idx + 1);
-        if (left._slots != null) {                               // newLeft keeps left's first newLeftLen slots
-          Object[] nl = new Object[newLeft._keys.length];
-          ArrayUtil.copy(left._slots, 0, newLeftLen, nl, 0);
-          newLeft._slots = nl;
+        final Object[] mySlots = slots(), leftSlots = left.slots(); // one snapshot per shared source
+        Object[] nl = null;
+        if (leftSlots != null) {                                 // newLeft keeps left's first newLeftLen slots
+          nl = new Object[newLeft._keys.length];
+          ArrayUtil.copy(leftSlots, 0, newLeftLen, nl, 0);
         }
+        newLeft._buf = new BufState(nl, BUF_WRITE);
         Object[] nc = new Object[newCenter._keys.length];        // mirror the newCenter address Stitch above
         Stitch ss = new Stitch(nc, 0);
-        slotCopyAll(ss, left._slots, newLeftLen, left._len);
-        slotCopyAll(ss, _slots, 0, idx - 1);
-        if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(idx - 1));
+        slotCopyAll(ss, leftSlots, newLeftLen, left._len);
+        slotCopyAll(ss, mySlots, 0, idx - 1);
+        if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(mySlots, idx - 1));
                               ss.copyOne(null);
-        if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(idx + 1));
-        slotCopyAll(ss, _slots, idx + 2, _len);
-        newCenter._slots = nc;
+        if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(mySlots, idx + 1));
+        slotCopyAll(ss, mySlots, idx + 2, _len);
+        newCenter._buf = new BufState(nc, BUF_WRITE);
       }
       return new ANode[] { newLeft, newCenter, right };
     }
@@ -1036,24 +1135,27 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         newRight._measure = tryComputeMeasureFromChildren(newRight._children, newRightLen, storage, measureOps);
       }
       if (settings.diffBufSize() > 0) {
-        newCenter._bufEntries = BUF_WRITE; newRight._bufEntries = BUF_WRITE; // borrowed from right: structural
+        // borrowed from right: structural → BUF_WRITE. newCenter/newRight are unpublished:
+        // one consistent {slots, entries} publish each.
         freeDroppedChild(storage, idx);                          // diff-buf: free dropped (rebalanced) children
         if (leftChanged && idx > 0) freeDroppedChild(storage, idx - 1);
         if (rightChanged) freeDroppedChild(storage, idx + 1);
+        final Object[] mySlots = slots(), rightSlots = right.slots(); // one snapshot per shared source
         Object[] nc = new Object[newCenter._keys.length];        // mirror the newCenter address Stitch above
         Stitch ss = new Stitch(nc, 0);
-        slotCopyAll(ss, _slots, 0, idx - 1);
-        if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(idx - 1));
+        slotCopyAll(ss, mySlots, 0, idx - 1);
+        if (nodes[0] != null) ss.copyOne(leftChanged ? null : slotAt(mySlots, idx - 1));
                               ss.copyOne(null);
-        if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(idx + 1));
-        slotCopyAll(ss, _slots, idx + 2, _len);
-        slotCopyAll(ss, right._slots, 0, rightHead);
-        newCenter._slots = nc;
-        if (right._slots != null) {                              // newRight keeps right's tail slots
-          Object[] nr = new Object[newRight._keys.length];
-          ArrayUtil.copy(right._slots, rightHead, right._len, nr, 0);
-          newRight._slots = nr;
+        if (nodes[2] != null) ss.copyOne(rightChanged ? null : slotAt(mySlots, idx + 1));
+        slotCopyAll(ss, mySlots, idx + 2, _len);
+        slotCopyAll(ss, rightSlots, 0, rightHead);
+        newCenter._buf = new BufState(nc, BUF_WRITE);
+        Object[] nr = null;
+        if (rightSlots != null) {                                // newRight keeps right's tail slots
+          nr = new Object[newRight._keys.length];
+          ArrayUtil.copy(rightSlots, rightHead, right._len, nr, 0);
         }
+        newRight._buf = new BufState(nr, BUF_WRITE);
       }
       return new ANode[] { left, newCenter, newRight };
     }
@@ -1251,8 +1353,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (measureOps != null && _measure != null) {
       newBranch._measure = newBranch.tryComputeMeasure(storage);
     }
-    if (settings.diffBufSize() > 0) { newBranch._bufEntries = bufEntries(); // carry this node's running total (or BUF_WRITE) onto the successor
-                                    newBranch.carryAndDepositReplace(storage, _slots, idx, oldKey, newKey, anchor0); } // content-only: Present(newKey)
+    // ONE snapshot of this shared node's {slots, entries} pair — carried together so the
+    // successor can never mix a pre-settle total with post-settle slots (or vice versa).
+    if (settings.diffBufSize() > 0) newBranch.carryAndDepositReplace(storage, _buf, idx, oldKey, newKey, anchor0); // content-only: Present(newKey)
 
     return new ANode[]{newBranch};
   }
@@ -1275,9 +1378,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // ---- diff-buf deposit (active only when _settings.diffBufSize() > 0) ----
   //
   // On the mutation return path, a content-only change to child i is recorded
-  // into _slots[i] as Present(element) | Absent, with ĝ refreshed from the
+  // into slot i as Present(element) | Absent, with ĝ refreshed from the
   // (already-mutated, in-memory) child's count/measure. Structural returns
-  // (split/merge/borrow) instead set _bufEntries = BUF_WRITE and never deposit —
+  // (split/merge/borrow) instead publish a BUF_WRITE snapshot and never deposit —
   // that node will be written in full, materializing the new structure (see store()).
 
   // Exact subtree count of the in-memory child i (cheap: maintained by add/remove).
@@ -1315,10 +1418,14 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // the only one projectLeaf uses. Keying by _projCmp (not the operation comparator) is what makes
   // the diff a self-contained "remove/upsert these elements" language that replays without logic.
   private void depositKV(IStorage storage, int i, Object[] kv, Object anchor0) {
-    if (_slots == null) {
-      _slots = new Object[_keys.length];
-    }
-    Slot prev = (Slot) _slots[i];
+    // Single-snapshot read + single-publish write (see BufState): compute the new slots
+    // array (copy-on-write) AND the new entries total from ONE snapshot, then publish the
+    // pair with ONE volatile write, so a concurrent reader never sees them torn.
+    BufState b = _buf;
+    Object[] slots = (b == null || b.slots == null)
+        ? new Object[_keys.length]
+        : Arrays.copyOf(b.slots, b.slots.length);
+    Slot prev = (Slot) slots[i];
     Object anchor = (prev != null && prev.anchor != null) ? prev.anchor : anchor0;
     ANode child = child(storage, i);
     Object diff;
@@ -1360,18 +1467,20 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // diff-buf: maintain this node's running buffered-entry total by delta (mirrors _subtreeCount).
     // A BUF_WRITE child poisons us → the must-write signal climbs to the nearest written ancestor
     // with no extra propagation code (this is the deposit sum doing the work the old deep walk did).
-    long cur = bufEntries();                    // resolve our own LAZY (restored) value first
-    if (cur != BUF_WRITE) {
-      if (newBE == BUF_WRITE) _bufEntries = BUF_WRITE;
-      else                    _bufEntries = cur - (prev != null ? slotBE(prev) : 0) + newBE;
-    }
-    _slots[i] = new Slot(diff, childCount(storage, i), child.measure(), anchor, newBE);
+    long cur = bufEntriesOf(b);                 // resolve our own LAZY (restored) value from the SAME snapshot
+    long entries;
+    if (cur == BUF_WRITE || newBE == BUF_WRITE) entries = BUF_WRITE;
+    else                                        entries = cur - (prev != null ? slotBE(prev) : 0) + newBE;
+    slots[i] = new Slot(diff, childCount(storage, i), child.measure(), anchor, newBE);
+    _buf = new BufState(slots, entries);        // single publish: slots + total together
   }
 
   // diff-buf: a child's slot travels with its address. These mirror the per-element /
   // bulk copies of the address Stitch so a structural REMOVE rebuild carries surviving
-  // siblings' buffered slots (null-source tolerant: a sibling branch may have no _slots).
-  private Object slotAt(int i) { return (_slots != null) ? _slots[i] : null; }
+  // siblings' buffered slots (null-source tolerant: a sibling branch may have no slots).
+  // Both take the source slots ARRAY (from one caller-held snapshot) rather than re-reading
+  // _buf, so a rebuild reads each source node's state exactly once.
+  private static Object slotAt(Object[] slots, int i) { return (slots != null) ? slots[i] : null; }
   private static void slotCopyAll(Stitch ss, Object[] src, int from, int to) {
     if (src == null) { for (int i = from; i < to; ++i) ss.copyOne(null); }
     else ss.copyAll(src, from, to);
@@ -1387,8 +1496,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   private void freeDroppedChild(IStorage storage, int i) {
     if (storage == null) return;
     if (_addresses != null && _addresses[i] != null) { storage.markFreed(_addresses[i]); return; }
-    if (_slots != null && _slots[i] instanceof Slot) {
-      Object a = ((Slot) _slots[i]).anchor;
+    Object[] slots = slots();                                   // one snapshot
+    if (slots != null && slots[i] instanceof Slot) {
+      Object a = ((Slot) slots[i]).anchor;
       if (a != null) storage.markFreed((Address) a);
     }
   }
@@ -1398,31 +1508,32 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // like the rebuilt _children: surviving siblings keep their slot; the new nodes get none
   // (they are materialized/written, no durable anchor). Null if this node has no slots.
   private Object[] stitchSlots(int ins, int nNodes, int newLen) {
-    if (_slots == null) return null;
+    Object[] slots = slots();                                   // one snapshot
+    if (slots == null) return null;
     Object[] out = new Object[newLen];
     Stitch s = new Stitch(out, 0);
-    s.copyAll(_slots, 0, ins);
+    s.copyAll(slots, 0, ins);
     for (int k = 0; k < nNodes; k++) s.copyOne(null);
-    s.copyAll(_slots, ins + 1, _len);
+    s.copyAll(slots, ins + 1, _len);
     return out;
   }
 
-  // For persistent (non-editable) returns: carry the source branch's slots into
-  // this freshly-built branch, then deposit at i. (1-for-1 child replacement, so
-  // indices are aligned with the source.)
-  private void carrySlots(Object[] srcSlots) {
-    if (srcSlots != null) {
-      _slots = Arrays.copyOf(srcSlots, _keys.length);
-    }
+  // For persistent (non-editable) returns: carry the source branch's diff-buf state — ONE
+  // caller-held snapshot, so slots and entries can never mix two generations — onto this
+  // freshly-built (unpublished) branch, then deposit at i. (1-for-1 child replacement, so
+  // indices are aligned with the source; the array is copied, never shared.)
+  private void carryBuf(BufState src) {
+    Object[] slots = (src != null && src.slots != null) ? Arrays.copyOf(src.slots, _keys.length) : null;
+    _buf = new BufState(slots, bufEntriesOf(src)); // carry the source's running total (or BUF_WRITE)
   }
 
-  private void carryAndDeposit(IStorage storage, Object[] srcSlots, int i, Object mapKey, Object val, Object anchor0) {
-    carrySlots(srcSlots);
+  private void carryAndDeposit(IStorage storage, BufState src, int i, Object mapKey, Object val, Object anchor0) {
+    carryBuf(src);
     depositInto(storage, i, mapKey, val, anchor0);
   }
 
-  private void carryAndDepositReplace(IStorage storage, Object[] srcSlots, int i, Object oldKey, Object newKey, Object anchor0) {
-    carrySlots(srcSlots);
+  private void carryAndDepositReplace(IStorage storage, BufState src, int i, Object oldKey, Object newKey, Object anchor0) {
+    carryBuf(src);
     depositReplace(storage, i, oldKey, newKey, anchor0);
   }
 
@@ -1490,9 +1601,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // result can be written back into the parent's slot (survives eviction / passthrough).
   private Object assembleNested(IStorage storage, Branch c) {
     IPersistentMap m = PersistentHashMap.EMPTY;
-    if (c._slots != null) {
+    Object[] cSlots = c.slots();                                // one snapshot per node
+    if (cSlots != null) {
       for (int j = 0; j < c._len; j++) {
-        Slot sl = (Slot) c._slots[j];
+        Slot sl = (Slot) cSlots[j];
         if (sl == null) continue;
         Object d = (sl.diff != null)
             ? (c._level == 1 ? leafDiffForStorage(sl.diff) : sl.diff)   // leaf child ⇒ comparator-agnostic storage form
@@ -1511,10 +1623,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // Serializable slots for THIS node (diffs already assembled during store); null if none.
   // Storage backends call this to persist the per-child buffered diffs alongside addresses.
   public Object slotsForStorage() {
-    if (_slots == null) return null;
+    Object[] slots = slots();                                   // one snapshot
+    if (slots == null) return null;
     IPersistentMap m = PersistentHashMap.EMPTY;
     for (int i = 0; i < _len; ++i) {
-      Slot sl = (Slot) _slots[i];
+      Slot sl = (Slot) slots[i];
       if (sl == null) continue;
       // _level==1 ⇒ this slot's child is a leaf ⇒ sl.diff is a leaf-diff: emit the comparator-agnostic
       // storage form {:absent :present}. _level>1 ⇒ sl.diff is null or a (restored) nested map ⇒ as-is.
@@ -1574,7 +1687,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // search/contains route against a phantom max-key (the verified diff-buf-v5 read bug).
       if (mk != null) base._keys[i] = (Key) mk;
     }
-    base._slots = slots;
+    // single publish; entries stay LAZY (derived from the installed slots on first read,
+    // exactly as after the restore ctor).
+    base._buf = new BufState(slots, BUF_LAZY);
     base._subtreeCount = sl.count;        // ĝ.count — no child summing
     base._measure = sl.measure;           // ĝ.measure
     return base;
@@ -1608,6 +1723,16 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     final int budget = _settings.diffBufSize();
     assert assertBufEntries(storage);  // -ea oracle: delta-maintained total == fresh subtree walk
 
+    // Single-snapshot / single-publish settle (see BufState): all three passes read ONE
+    // snapshot of the diff-buf state and stage their slot updates on a LOCAL copy of the
+    // array; the settled {slots, entries} pair is published with ONE volatile write before
+    // serialization. A concurrent structural-sharing reader (a pipelining writer copying
+    // this shared node while it is being committed) therefore observes either the
+    // pre-settle or the post-settle snapshot — never flushed children's slots already
+    // nulled with the running total still counting them.
+    final BufState b0 = _buf;
+    final Object[] slots0 = (b0 != null) ? b0.slots : null;
+
     // Pass 1: account clean passthrough diffs, and classify each dirty child as bufferable
     // (content-only) or must-write — both now O(1) per child: the size is the slot's cached
     // bufEntries (resolved from the diff for a restored slot), and the must-write gate is the
@@ -1618,7 +1743,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     java.util.ArrayList<Integer> bufferable = new java.util.ArrayList<>();
     java.util.ArrayList<Integer> writeList = new java.util.ArrayList<>();
     for (int i = 0; i < _len; ++i) {
-      Slot sl = (_slots != null) ? (Slot) _slots[i] : null;
+      Slot sl = (slots0 != null) ? (Slot) slots0[i] : null;
       if (_addresses[i] != null) {
         if (sl != null) passthrough += slotBE(sl);             // clean buffered-passthrough subtree total
         continue;
@@ -1638,13 +1763,15 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
     // Pass 2: buffer the SMALLEST bufferable children while the running total (passthrough +
     // buffered) stays within budget; the rest — the largest — are flushed (biggest-first).
+    // Staged on newSlots, a local copy — nothing is visible to other threads yet.
     bufferable.sort((x, y) -> Integer.compare(csz[x], csz[y]));
+    Object[] newSlots = (slots0 != null) ? Arrays.copyOf(slots0, slots0.length) : null;
     int embedded = passthrough;
     for (int i : bufferable) {
-      Slot sl = (Slot) _slots[i];
+      Slot sl = (Slot) slots0[i];
       if (embedded + csz[i] <= budget) {
         _addresses[i] = (Address) sl.anchor;                    // re-point to durable anchor (no write)
-        _slots[i] = new Slot(cnested[i], sl.count, sl.measure, sl.anchor, csz[i]); // write back assembled diff + its size
+        newSlots[i] = new Slot(cnested[i], sl.count, sl.measure, sl.anchor, csz[i]); // write back assembled diff + its size
         embedded += csz[i];
       } else {
         writeList.add(i);                                       // doesn't fit ⇒ flush
@@ -1654,18 +1781,20 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // Pass 3: write the flushed/structural children (all resident ⇒ no read).
     for (int i : writeList) {
       ANode child = (ANode) _settings.readReference(_children[i]);
-      Slot sl = (_slots != null) ? (Slot) _slots[i] : null;
+      Slot sl = (slots0 != null) ? (Slot) slots0[i] : null;
       if (sl != null && sl.anchor != null) storage.markFreed((Address) sl.anchor);
       _addresses[i] = ((ANode<Key, Address>) child).store(storage);
-      if (_slots != null) _slots[i] = null;
+      if (newSlots != null) newSlots[i] = null;
     }
-    Address a = storage.store(this);
-    // Written ⇒ this node now equals its durable object, whose remaining slots are exactly the
-    // children we BUFFERED (passthrough + newly buffered) — the flushed ones were nulled. So the
-    // settled buffered-entry total is `embedded`, not 0 (a later commit deltas from here). This
-    // also clears any BUF_WRITE poison: the new structure is now materialized on disk.
-    _bufEntries = embedded;
-    return a;
+    // Settle: this node now equals its durable object, whose remaining slots are exactly the
+    // children we BUFFERED (passthrough + newly buffered) — the flushed ones were nulled. So
+    // the settled buffered-entry total is `embedded`, not 0 (a later commit deltas from here).
+    // This also clears any BUF_WRITE poison: the new structure is now materialized on disk.
+    // ONE publish replaces the old per-slot nulling + late total reset (the torn window);
+    // it happens BEFORE storage.store(this) so the serializer (slotsForStorage) sees the
+    // settled slots, exactly as the old in-place mutation did.
+    _buf = new BufState(newSlots, embedded);
+    return storage.store(this);
   }
 
   public String str(IStorage storage, int lvl) {

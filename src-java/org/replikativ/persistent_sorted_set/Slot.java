@@ -53,7 +53,7 @@ public class Slot {
 
   /** diff-buf budget accounting (in-memory only — never serialized). The number of buffered
    *  element-changes in this child's WHOLE subtree (= {@code diffSize(diff, childLevel)}), used to
-   *  enforce the per-node budget B at store and to delta-maintain {@link Branch#_bufEntries}.
+   *  enforce the per-node budget B at store and to delta-maintain {@link Branch#bufEntries()}.
    *  {@link #LAZY} (-2) marks a slot reconstructed from storage whose count hasn't been derived
    *  yet — {@code Branch.slotBE} resolves it from {@code diff} on demand (IO-free, the blob is
    *  already in memory), so the durable format carries no redundant count. Live slots (built by

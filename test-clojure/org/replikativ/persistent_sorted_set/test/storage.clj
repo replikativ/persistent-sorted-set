@@ -55,15 +55,16 @@
            node (if addresses
                   (Branch. (int level) ^java.util.List keys ^java.util.List addresses settings)
                   (Leaf. keys settings))]
-       ;; diff-buf: reconstruct per-child buffered diffs into _slots (anchor = the child's
-       ;; durable address). Branch.child projects them on descent (M5). Absent when diffBufSize=0.
+       ;; diff-buf: reconstruct per-child buffered diffs into the Branch's slots (anchor = the
+       ;; child's durable address), installed via installSlots (one volatile publish).
+       ;; Branch.child projects them on descent (M5). Absent when diffBufSize=0.
        (when (and slots (instance? Branch node))
          (let [^Branch b node
                arr (object-array (alength (.-_keys b)))]
            (doseq [[idx entry] slots]
              (aset arr (int idx)
                    (Slot. (:diff entry) (long (:count entry)) (:measure entry) (nth addresses (int idx)))))
-           (set! (.-_slots b) arr)))
+           (.installSlots b arr Branch/BUF_LAZY)))
        (swap! *stats update :reads inc)
        (swap! *memory assoc address node)
        node)))
