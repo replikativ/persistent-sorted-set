@@ -203,14 +203,16 @@
         (reify ReadHandler
           (read [_ rdr _tag _n]
             (let [{:keys [keys measure branching-factor diff-buf-size] blob-rt :ref-type blob-bdry :boundary} (.readObject rdr)
-                  l (Leaf. ^List keys (mk-settings (or branching-factor default-bf) (or diff-buf-size 0) (or ref-type blob-rt) blob-bdry))]
+                  ^Settings settings (mk-settings (or branching-factor default-bf) (or diff-buf-size 0) (or ref-type blob-rt) blob-bdry)
+                  l (Leaf. ^List keys settings)]
               (when (some? measure) (set! (.-_measure ^ANode l) measure))
               l)))
         branch-tag
         (reify ReadHandler
           (read [_ rdr _tag _n]
             (let [{:keys [level keys addresses subtree-count measure slots branching-factor diff-buf-size] blob-rt :ref-type blob-bdry :boundary} (.readObject rdr)
-                  b (Branch. (int level) ^List keys ^List addresses (mk-settings (or branching-factor default-bf) (or diff-buf-size 0) (or ref-type blob-rt) blob-bdry))]
+                  ^Settings settings (mk-settings (or branching-factor default-bf) (or diff-buf-size 0) (or ref-type blob-rt) blob-bdry)
+                  b (Branch. (int level) ^List keys ^List addresses settings)]
               (set! (.-_subtreeCount b) (long (or subtree-count -1)))
               (when (some? measure) (set! (.-_measure ^ANode b) measure))
               (when slots (attach-slots! b addresses slots))
