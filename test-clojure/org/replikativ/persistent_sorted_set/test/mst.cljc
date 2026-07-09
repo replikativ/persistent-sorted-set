@@ -208,7 +208,7 @@
       (is (= (seq a) (seq (sort (range 3000))))))))
 
 (defspec prop-order-independence 20
-  (prop/for-all [ks (gen/such-that seq (gen/set gen/large-integer))]
+  (prop/for-all [ks (gen/set gen/large-integer {:min-elements 1})]
                 (let [v (vec ks)
                       sets (map mst-set [(sort v) (reverse (sort v)) (shuffle v)])]
                   (and (apply = (map root-shape sets))
@@ -216,7 +216,7 @@
                        (= (seq (mst-set (shuffle v))) (seq (sort v)))))))
 
 (defspec prop-remove-independence 20
-  (prop/for-all [ks (gen/such-that #(> (count %) 2) (gen/set gen/large-integer))
+  (prop/for-all [ks (gen/set gen/large-integer {:min-elements 3})
                  seed gen/nat]
                 (let [v (vec ks)
                       drop-set (set (take (mod seed (count v)) (shuffle v)))
@@ -281,7 +281,7 @@
 (defn- iset-by [pairs] (reduce conj (pss/sorted-set* {:comparator cmp-id :boundary (b/mst-boundary ilz)}) pairs))
 
 (defspec prop-replace-canonical 40
-  (prop/for-all [ids  (gen/such-that #(> (count %) 2) (gen/set (gen/choose -400 400)))
+  (prop/for-all [ids  (gen/set (gen/choose -400 400) {:min-elements 3})
                  seed gen/nat]
                 (let [idv      (vec ids)
                       base     (iset-by (shuffle (mapv (fn [id] [id 0]) idv)))
@@ -297,7 +297,7 @@
 ;; (and the disj!/conj! fallback) which the persistent spec above doesn't reach. The JVM and
 ;; cljs propagation rules must agree here too (value-based in MST), else the trees diverge.
 (defspec prop-replace-canonical-transient 40
-  (prop/for-all [ids  (gen/such-that #(> (count %) 2) (gen/set (gen/choose -400 400)))
+  (prop/for-all [ids  (gen/set (gen/choose -400 400) {:min-elements 3})
                  seed gen/nat]
                 (let [idv      (vec ids)
                       base     (iset-by (shuffle (mapv (fn [id] [id 0]) idv)))

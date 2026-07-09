@@ -270,7 +270,15 @@
 (defn root-write-handler
   "Canonical write handler for a PSS root → `{:meta :address :count :branching-factor :diff-buf-size}`
    under `pss/set`. `:meta` carries whatever ids the consumer stamped (`:pss/storage-id` etc.). The set
-   MUST be flushed (root address realized) first."
+   MUST be flushed (root address realized) first.
+
+   `:count` is the set's CACHED count and may be -1 (unknown): a restore+mutate
+   invalidates ancestor subtree counts, and recomputing here would need the
+   set's storage to materialize lazy children — but serialization must work on
+   a storage-DETACHED root (consumers detach before storing so a stored value
+   never carries a live storage handle). The read ctor already treats -1 as
+   compute-lazily-on-demand (with storage attached), so the count comes back
+   right on the reader."
   []
   #?(:clj
      (reify WriteHandler
@@ -283,7 +291,7 @@
            (.writeTag w set-tag 1)
            (.writeObject w (cond-> {:meta             (meta pset)
                                     :address          (.-_address ^PersistentSortedSet pset)
-                                    :count            (count pset)
+                                    :count            (.-_count ^PersistentSortedSet pset)
                                     :branching-factor (.branchingFactor s)
                                     :diff-buf-size    (.diffBufSize s)}
                              (and rt (not= rt RefType/SOFT)) (assoc :ref-type (ref-type->kw rt))
@@ -297,7 +305,7 @@
          (fress/write-tag w set-tag 1)
          (fress/write-object w (cond-> {:meta             (meta pset)
                                         :address          (.-address pset)
-                                        :count            (count pset)
+                                        :count            (.-cnt pset)
                                         :branching-factor (:branching-factor s)
                                         :diff-buf-size    (:diff-buf-size s)}
                                  (:ref-type s) (assoc :ref-type (:ref-type s))

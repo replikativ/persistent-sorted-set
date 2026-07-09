@@ -222,6 +222,44 @@
          (is (instance? PersistentSortedSet s2) "the pss/set pointer restores a PersistentSortedSet")
          (is (= elems (vec s2)) "elements load lazily from the resolved storage")))))
 
+#?(:clj
+   (deftest detached-root-lazy-count-serializes
+     (testing "the root write handler must not force a count recomputation: a restore+mutate
+               leaves the cached count unknown (-1), recomputing needs storage to materialize
+               lazy children, and consumers serialize storage-DETACHED roots (a stored value
+               never carries a live storage handle). :count rides as the cached value (-1 ok);
+               the read ctor computes it lazily once storage is attached."
+       (let [settings (Settings. (int 4) nil)
+             storage  (->FressStorage (atom {}) settings)
+             elems    (vec (range 100))
+             s        (reduce (fn [s e] (set/conj s e compare))
+                              (set/sorted-set* {:storage storage :branching-factor 4}) elems)
+             addr     (set/store s storage)
+             ;; lazy restore starts at count -1; a mutation keeps it unknown
+             restored (set/restore addr storage)
+             _        (is (neg? (.-_count ^PersistentSortedSet restored)) "restored set has unknown count")
+             mutated  (set/conj restored 1000 compare)
+             _        (set/store mutated storage)
+             ;; detach: storage nil — exactly what consumers hand the write handler
+             ^PersistentSortedSet m mutated
+             detached (PersistentSortedSet. (meta m) compare (.-_address m) nil (.-_root m)
+                                            (.-_count m) (.-_settings m) 0)
+             root-wl  (-> (merge fress/clojure-write-handlers
+                                 {PersistentSortedSet {pss-fress/set-tag (pss-fress/root-write-handler)}})
+                          fress/associative-lookup fress/inheritance-lookup)
+             out      (ByteArrayOutputStream.)
+             ;; before the fix this NPE'd in Branch.child (computeSubtreeCount with nil storage)
+             _        (.writeObject (fress/create-writer out :handlers root-wl) detached)
+             root-rl  (-> (merge fress/clojure-read-handlers
+                                 {pss-fress/set-tag
+                                  (pss-fress/root-read-handler {:resolve-storage (constantly storage)
+                                                                :resolve-cmp     (constantly compare)
+                                                                :default-bf 4})})
+                          fress/associative-lookup)
+             s2       (.readObject (fress/create-reader (ByteArrayInputStream. (.toByteArray out)) :handlers root-rl))]
+         (is (= 101 (count s2)) "count recomputes lazily on the reader, with storage attached")
+         (is (= (vec (sort (conj elems 1000))) (vec s2)) "elements intact")))))
+
 ;; ---- bf self-describes per node ⇒ many branching-factors in ONE store/serializer --------------
 
 #?(:clj
