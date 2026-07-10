@@ -1,5 +1,15 @@
 # 0.4.x
 
+- **Complete freed-address (`markFreed`) tracking on the JVM at `diff-buf-size 0`** — a parent
+  replacing a durable child pointer now frees the old address at EVERY level of the root→leaf
+  unwind (persistent copy AND editable in-place, across add/replace/remove, including
+  split/absorb), not just the old root and a few scattered sites. Consumers running online GC
+  previously leaked 51–84% of superseded blobs per flush cycle. The current tree never contains
+  a freed address, frees are exactly-once, and the accounting identity
+  `stored = freed ⊎ reachable` is now enforced by a regression test at both `diff-buf-size` 0
+  and 256 (diff-buf deferral semantics unchanged). The cljs implementation already tracked
+  these; this brings the JVM to parity.
+
 - **Content-defined boundary mode (Merkle Search Tree / "prolly" trees)** — _**experimental**_,
   opt-in per set via `{:boundary (mst-boundary lzpl)}`. The API and on-disk boundary descriptor
   may still change, and it is not yet hardened for production sync workloads; the default count
