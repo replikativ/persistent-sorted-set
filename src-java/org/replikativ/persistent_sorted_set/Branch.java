@@ -596,6 +596,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // same len, not editable
     if (1 == nodes.length) {
       ANode<Key, Address> node = nodes[0];
+      // Baseline: the successor branch supersedes the old durable child at ins — free it
+      // (mirrors the editable in-place hook above; per-level copy-unwind supersession).
+      // diff-buf: DEFERRED to store (the old address is re-pointed as the buffered anchor).
+      if (_settings.diffBufSize() <= 0 && storage != null && _addresses != null && _addresses[ins] != null) {
+        storage.markFreed(_addresses[ins]);
+      }
       // Always copy arrays — sharing them would allow a later transient
       // editable() path to mutate the original persistent branch's arrays
       Key[] newKeys = Arrays.copyOfRange(_keys, 0, _len);
@@ -622,6 +628,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     }
 
     // nodes.length >= 2: replace 1 child with N children
+    // Baseline: the split child's old durable blob is superseded by the N new nodes in BOTH
+    // the absorb and split outcomes below — free it exactly once here. (diff-buf frees it in
+    // its own gated branches below via freeDroppedChild, which also covers slot anchors.)
+    if (_settings.diffBufSize() <= 0 && storage != null && _addresses != null && _addresses[ins] != null) {
+      storage.markFreed(_addresses[ins]);
+    }
     int extra = nodes.length - 1;
     int newLen = _len + extra;
 
@@ -745,6 +757,19 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     boolean leftChanged = leftChild != nodes[0] || leftChildLen != safeLen(nodes[0]);
     boolean rightChanged = rightChild != nodes[2] || rightChildLen != safeLen(nodes[2]);
 
+    // Baseline: child idx was superseded by this remove, and the left/right siblings'
+    // durable versions are superseded iff the rebalance consumed/changed them — on EVERY
+    // outcome below (editable in-place, persistent rebuild, join, borrow). Free them here,
+    // exactly once, before any path overwrites _addresses. (rightChanged implies
+    // idx < _len - 1, so _addresses[idx + 1] is in the valid range.)
+    // diff-buf keeps its own per-path discipline: content-only defers to store (anchor
+    // re-point); structural drops via freeDroppedChild in each branch below.
+    if (_settings.diffBufSize() <= 0 && storage != null && _addresses != null) {
+      if (_addresses[idx] != null) storage.markFreed(_addresses[idx]);
+      if (leftChanged && idx > 0 && _addresses[idx - 1] != null) storage.markFreed(_addresses[idx - 1]);
+      if (rightChanged && _addresses[idx + 1] != null) storage.markFreed(_addresses[idx + 1]);
+    }
+
     IMeasure measureOps = _settings.measure();
 
     // nodes[1] always not nil
@@ -759,22 +784,16 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (newLen >= _settings.minBranchingFactor() || (left == null && right == null)) {
       // can update in place
       if (editable() && idx < _len-2) {
-        // Mark freed addresses before clearing them.
-        //  - baseline (diffBufSize<=0): free the replaced child + changed siblings immediately.
-        //  - diff-buf: the CONTENT-ONLY sub-case re-points _addresses[idx] to the child's anchor
-        //    (deferred to store); a STRUCTURAL sub-case (merge/borrow) consumes idx / changed
-        //    siblings — never re-pointed — so free them now (store has no slot/anchor for the
-        //    materialized structural child, so it can't free them later → they would leak).
-        if (storage != null && _addresses != null) {
-          if (_settings.diffBufSize() <= 0) {
-            if (_addresses[idx] != null) storage.markFreed(_addresses[idx]);
-            if (leftChanged && idx > 0 && _addresses[idx - 1] != null) storage.markFreed(_addresses[idx - 1]);
-            if (rightChanged && _addresses[idx + 1] != null) storage.markFreed(_addresses[idx + 1]);
-          } else if (leftChanged || rightChanged || newLen != _len) { // diff-buf, structural
-            freeDroppedChild(storage, idx);
-            if (leftChanged && idx > 0) freeDroppedChild(storage, idx - 1);
-            if (rightChanged) freeDroppedChild(storage, idx + 1);
-          }
+        // Baseline frees were handled by the uniform hook above (before the path dispatch).
+        // diff-buf: the CONTENT-ONLY sub-case re-points _addresses[idx] to the child's anchor
+        // (deferred to store); a STRUCTURAL sub-case (merge/borrow) consumes idx / changed
+        // siblings — never re-pointed — so free them now (store has no slot/anchor for the
+        // materialized structural child, so it can't free them later → they would leak).
+        if (storage != null && _addresses != null && _settings.diffBufSize() > 0
+            && (leftChanged || rightChanged || newLen != _len)) { // diff-buf, structural
+          freeDroppedChild(storage, idx);
+          if (leftChanged && idx > 0) freeDroppedChild(storage, idx - 1);
+          if (rightChanged) freeDroppedChild(storage, idx + 1);
         }
 
         Stitch ks = new Stitch(_keys, Math.max(idx-1, 0));
@@ -1335,6 +1354,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     }
 
     // Persistent: create new branch with updated child
+    // Baseline: the successor branch supersedes the old durable child at idx — free it
+    // (per-level copy-unwind supersession, mirrors the editable in-place hook above).
+    // diff-buf: DEFERRED to store (the old address is re-pointed as the buffered anchor).
+    if (_settings.diffBufSize() <= 0 && storage != null && _addresses != null && _addresses[idx] != null) {
+      storage.markFreed(_addresses[idx]);
+    }
     // Always copy — sharing arrays would allow a later transient
     // editable() path to mutate the original persistent branch's arrays
     Key[] newKeys = Arrays.copyOfRange(_keys, 0, _len);
