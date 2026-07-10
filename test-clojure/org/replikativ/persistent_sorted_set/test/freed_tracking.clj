@@ -136,11 +136,11 @@
 
 (deftest persistent-replace-frees-complete
   (let [r (run-scenario 0
-            (fn [s round]
-              (reduce (fn [s i]
-                        (let [k (+ (* round 32) i)]
-                          (.replace ^PersistentSortedSet s [k 0] [k (inc round)] ^java.util.Comparator cmp-k)))
-                      s (range 32))))]
+                        (fn [s round]
+                          (reduce (fn [s i]
+                                    (let [k (+ (* round 32) i)]
+                                      (.replace ^PersistentSortedSet s [k 0] [k (inc round)] ^java.util.Comparator cmp-k)))
+                                  s (range 32))))]
     (assert-accounting r "persistent-replace")
     (assert-content r
                     (vec (for [k (range 10000)]
@@ -149,13 +149,13 @@
 
 (deftest transient-replace-frees-complete
   (let [r (run-scenario 0
-            (fn [s round]
-              (let [t (reduce (fn [t i]
-                                (let [k (+ (* round 32) i)]
-                                  (.replace ^PersistentSortedSet t [k 0] [k (inc round)] ^java.util.Comparator cmp-k)))
-                              (.asTransient ^PersistentSortedSet s)
-                              (range 32))]
-                (.persistent ^PersistentSortedSet t))))]
+                        (fn [s round]
+                          (let [t (reduce (fn [t i]
+                                            (let [k (+ (* round 32) i)]
+                                              (.replace ^PersistentSortedSet t [k 0] [k (inc round)] ^java.util.Comparator cmp-k)))
+                                          (.asTransient ^PersistentSortedSet s)
+                                          (range 32))]
+                            (.persistent ^PersistentSortedSet t))))]
     (assert-accounting r "transient-replace")
     (assert-content r
                     (vec (for [k (range 10000)]
@@ -164,12 +164,12 @@
 
 (deftest transient-conj-growth-frees-complete
   (let [r (run-scenario 0
-            (fn [s round]
-              (let [t (reduce (fn [t i]
-                                (pset/conj t [(+ 100000 (* round 32) i) 0] cmp-full))
-                              (.asTransient ^PersistentSortedSet s)
-                              (range 32))]
-                (.persistent ^PersistentSortedSet t))))]
+                        (fn [s round]
+                          (let [t (reduce (fn [t i]
+                                            (pset/conj t [(+ 100000 (* round 32) i) 0] cmp-full))
+                                          (.asTransient ^PersistentSortedSet s)
+                                          (range 32))]
+                            (.persistent ^PersistentSortedSet t))))]
     (assert-accounting r "transient-conj-growth")
     (assert-content r
                     (vec (concat (for [k (range 10000)] [k 0])
@@ -178,12 +178,12 @@
 
 (deftest transient-disj-frees-complete
   (let [r (run-scenario 0
-            (fn [s round]
-              (let [t (reduce (fn [t i]
-                                (pset/disj t [(+ (* round 32) i) 0] cmp-full))
-                              (.asTransient ^PersistentSortedSet s)
-                              (range 32))]
-                (.persistent ^PersistentSortedSet t))))]
+                        (fn [s round]
+                          (let [t (reduce (fn [t i]
+                                            (pset/disj t [(+ (* round 32) i) 0] cmp-full))
+                                          (.asTransient ^PersistentSortedSet s)
+                                          (range 32))]
+                            (.persistent ^PersistentSortedSet t))))]
     (assert-accounting r "transient-disj")
     (assert-content r
                     (vec (for [k (range 640 10000)] [k 0]))
@@ -199,19 +199,19 @@
 
 (deftest diff-buf-256-mixed-frees
   (let [r (run-scenario 256
-            (fn [s round]
-              (let [t (.asTransient ^PersistentSortedSet s)
-                    t (reduce (fn [t i]
-                                (let [k (+ (* round 32) i)]
-                                  (.replace ^PersistentSortedSet t [k 0] [k (inc round)] ^java.util.Comparator cmp-k)))
-                              t (range 10))
-                    t (reduce (fn [t i]
-                                (pset/conj t [(+ 100000 (* round 32) i) 0] cmp-full))
-                              t (range 11))
-                    t (reduce (fn [t i]
-                                (pset/disj t [(+ 5000 (* round 32) i) 0] cmp-full))
-                              t (range 11))]
-                (.persistent ^PersistentSortedSet t))))]
+                        (fn [s round]
+                          (let [t (.asTransient ^PersistentSortedSet s)
+                                t (reduce (fn [t i]
+                                            (let [k (+ (* round 32) i)]
+                                              (.replace ^PersistentSortedSet t [k 0] [k (inc round)] ^java.util.Comparator cmp-k)))
+                                          t (range 10))
+                                t (reduce (fn [t i]
+                                            (pset/conj t [(+ 100000 (* round 32) i) 0] cmp-full))
+                                          t (range 11))
+                                t (reduce (fn [t i]
+                                            (pset/disj t [(+ 5000 (* round 32) i) 0] cmp-full))
+                                          t (range 11))]
+                            (.persistent ^PersistentSortedSet t))))]
     ;; safety: unconditional at any diff-buf size
     (assert-safety r "diff-buf-256-mixed")
     ;; coverage: full accounting identity, achieved by the existing deferral
