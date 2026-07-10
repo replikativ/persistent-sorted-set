@@ -25,7 +25,7 @@
      (defn make-storage [disk bf b] (tstore/->Storage (atom {}) disk (Settings. (int bf) nil nil nil (int b))))
      (defn restore* [addr storage opts] (set/restore-by cmp addr storage opts))
      (defn- deref-c [c] (cond (instance? ANode c) c (instance? Reference c) (.get ^Reference c) :else c))
-     (defn- kids [^Branch b] (when-let [ch (.-_children b)] (->> (range (.-_len b)) (map #(deref-c (aget ^objects ch %))) (remove nil?))))
+     (defn- kids [^Branch b] (when-let [ch (.childrenArray b)] (->> (range (.-_len b)) (map #(deref-c (aget ^objects ch %))) (remove nil?))))
      (defn- root-of [s] (.root ^PersistentSortedSet s))
      (defn- branch? [n] (instance? Branch n))
      (defn- blevel [b] (.-_level ^Branch b))

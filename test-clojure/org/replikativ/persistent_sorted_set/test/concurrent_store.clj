@@ -23,7 +23,7 @@
    JVM-only by nature (the cljs implementation is single-threaded)."
   (:require [clojure.test :refer [deftest is testing]]
             [org.replikativ.persistent-sorted-set :as ss])
-  (:import [org.replikativ.persistent_sorted_set IStorage PersistentSortedSet]
+  (:import [org.replikativ.persistent_sorted_set ANode Branch IStorage PersistentSortedSet]
            [java.util UUID]))
 
 ;; Elements are [k v t] triples (datom-shaped). The SET's comparator orders by k, then v,
@@ -112,3 +112,154 @@
           (is (= (+ n-init rounds) (count s)) "final count matches model")
           (is (= (sort-by first (vals model)) (seq s))
               "final content equals the model map"))))))
+
+;; ---------------------------------------------------------------------------
+;; Pair-tearing oracle: the BASELINE (diffBufSize=0) settle two-step
+;; ---------------------------------------------------------------------------
+
+;; Reflection-based access to a Branch's per-child {addresses, children} pair so this
+;; test runs unchanged against BOTH the pre-fix layout (plain `_addresses`/`_children`
+;; fields) and the post-fix layout (one volatile `_state` NodeState snapshot).
+(def ^:private state-field
+  (try (doto (.getDeclaredField Branch "_state") (.setAccessible true))
+       (catch NoSuchFieldException _ nil)))
+
+(def ^:private legacy-addresses-field
+  (when-not state-field (doto (.getDeclaredField Branch "_addresses") (.setAccessible true))))
+
+(def ^:private legacy-children-field
+  (when-not state-field (doto (.getDeclaredField Branch "_children") (.setAccessible true))))
+
+(def ^:private nodestate-addresses-field
+  (when state-field
+    (doto (.getDeclaredField (.getType ^java.lang.reflect.Field state-field) "addresses")
+      (.setAccessible true))))
+
+(def ^:private nodestate-children-field
+  (when state-field
+    (doto (.getDeclaredField (.getType ^java.lang.reflect.Field state-field) "children")
+      (.setAccessible true))))
+
+(defn- node-pair
+  "[addresses children] of b — post-fix from ONE NodeState snapshot; pre-fix the two
+   plain arrays (whose mutual consistency is exactly what this test challenges)."
+  [^Branch b]
+  (if state-field
+    (let [st (.get ^java.lang.reflect.Field state-field b)]
+      [(.get ^java.lang.reflect.Field nodestate-addresses-field st)
+       (.get ^java.lang.reflect.Field nodestate-children-field st)])
+    [(.get ^java.lang.reflect.Field legacy-addresses-field b)
+     (.get ^java.lang.reflect.Field legacy-children-field b)]))
+
+(defn- validate-pairs!
+  "Resident walk of the tree under `node`: for every Branch slot assert the
+   {address, child} pair is coherent — addresses[i] == null (dirty) ⇒ children[i] is a
+   bare ANode or null. A dirty slot holding a Soft/WeakReference wrapper is the torn
+   state: the copy mixed a pre-settle address with a post-settle (wrapped) child. Only
+   descends into resident children (no IO)."
+  [node path]
+  (when (instance? Branch node)
+    (let [^Branch b node
+          [^objects addrs ^objects kids] (node-pair b)
+          len (.-_len b)]
+      (dotimes [i len]
+        (let [addr (when addrs (aget addrs i))
+              kid  (when kids (aget kids i))]
+          (when (and (nil? addr)
+                     (not (or (nil? kid) (instance? ANode kid))))
+            (throw (ex-info "TORN PAIR: dirty child slot holds a Reference wrapper"
+                            {:path (conj path i)
+                             :level (.level b)
+                             :child (class kid)})))
+          ;; recurse into resident branches (bare or still-referenced wrapper)
+          (let [child (if (instance? java.lang.ref.Reference kid)
+                        (.get ^java.lang.ref.Reference kid)
+                        kid)]
+            (when (instance? Branch child)
+              (validate-pairs! child (conj path i)))))))))
+
+(defn- resident-storage
+  "In-memory IStorage holding stored NODES strongly (so :soft wrappers never clear
+   mid-test and restore is exact). Fresh address per store — like the real backends."
+  []
+  (let [disk (atom {})]
+    (reify IStorage
+      (store [_ node] (let [a (str (UUID/randomUUID))] (swap! disk assoc a node) a))
+      (accessed [_ _address])
+      (markFreed [_ _address])
+      (isFreed [_ _address] false)
+      (freedInfo [_ _address] nil)
+      (restore [_ address] (or (@disk address)
+                               (throw (ex-info "missing node" {:address address})))))))
+
+(def ^:private ^:const pt-n-init   100000)
+(def ^:private ^:const pt-bf       128)
+(def ^:private ^:const pt-rounds   400)
+(def ^:private ^:const pt-replaces 64)
+(def ^:private ^:const pt-min-derives 8)
+
+(defn- pt-replace-cycle
+  "One transient derive from s: `pt-replaces` k-only upserts on random ks. Each FIRST
+   touch of a shared branch goes through the persistent copy path (copyOfRange of the
+   source's addresses, then of its children — the two reads whose coherence is under
+   test) while thread B's settle rewrites that same shared node."
+  ^PersistentSortedSet [^PersistentSortedSet s ^java.util.Random rnd round]
+  (let [t (reduce (fn [^PersistentSortedSet t _]
+                    (let [k (.nextInt rnd (int pt-n-init))]
+                      (.replace t [k 0 0] [k (inc round) round] by-k)))
+                  (.asTransient s) (range pt-replaces))]
+    (.persistent ^PersistentSortedSet t)))
+
+(deftest baseline-settle-pair-tearing
+  (testing "store()'s settle of a SHARED node (write addresses[i], then wrap children[i])
+            races an apply-thread copy (copyOfRange of addresses, then of children):
+            every tree the apply thread derives must satisfy, per slot, the pair
+            invariant addresses[i] == null => children[i] is a bare ANode or null.
+
+            Pre-fix failure recorded on 2026-07-10 (commit 2b7db29, 16-core linux),
+            5/5 consecutive runs, e.g.:
+              pair invariant violated (or other failure): clojure.lang.ExceptionInfo:
+              TORN PAIR: dirty child slot holds a Reference wrapper
+              {:path [11 6], :level 1, :child java.lang.ref.SoftReference}
+            (other runs: paths [1 63] [6 10] [0 18] [3 1] — always a level-1
+            leaf-parent copied while the settle rewrote it). The derived copy mixed a
+            pre-settle (null) address with the settle's post-wrap SoftReference child,
+            the exact #17-class state that crashed baseline commits under heap
+            pressure."
+    (let [storage (resident-storage)
+          s0 (into (ss/sorted-set* {:comparator       full-cmp
+                                    :storage          storage
+                                    :branching-factor pt-bf
+                                    :diff-buf-size    0      ; BASELINE settle (the two-step)
+                                    :ref-type         :soft}) ; wrapping must actually happen
+                   (map (fn [k] [k 0 0]) (range pt-n-init)))
+          rnd-a (java.util.Random. 42)
+          rnd-d (java.util.Random. 7)
+          result
+          (try
+            (loop [round 0, s s0]
+              (if (== round pt-rounds)
+                {:ok true :s s}
+                ;; s1: freshly-derived tree with a dirty spine (what B settles);
+                ;; A keeps deriving from s1 while B stores it, validating every result.
+                (let [s1    (pt-replace-cycle s rnd-d round)
+                      fut-b (future (ss/store s1 storage))
+                      fut-a (future
+                              (loop [j 0, last s1]
+                                (if (and (>= j pt-min-derives) (future-done? fut-b))
+                                  last
+                                  (let [t (pt-replace-cycle s1 rnd-a round)]
+                                    (validate-pairs! (.root ^PersistentSortedSet t) [])
+                                    (recur (inc j) t)))))]
+                  @fut-b
+                  (let [s' @fut-a]
+                    (validate-pairs! (.root ^PersistentSortedSet s') [])
+                    (recur (inc round) s')))))
+            (catch java.util.concurrent.ExecutionException e
+              {:ok false :error (.getCause e)})
+            (catch Throwable e
+              {:ok false :error e}))]
+      (is (:ok result)
+          (str "pair invariant violated (or other failure): " (:error result)
+               (when-let [^Throwable e (:error result)]
+                 (str " " (ex-data e))))))))
