@@ -1726,8 +1726,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       ensureAddresses();
       for (int i = 0; i < _len; ++i) {
         if (_addresses[i] == null) {
-          assert _children != null && _children[i] != null && _children[i] instanceof ANode;
-          address(i, ((ANode<Key, Address>) _children[i]).store(storage));
+          // _children[i] may be a Soft/WeakReference wrapper (a restored child cached by
+          // child() that later went dirty in place): unwrap via readReference like every
+          // other consumer — the raw cast crashed baseline commits under heap pressure.
+          ANode<Key, Address> dirtyChild = (ANode<Key, Address>) _settings.readReference(_children[i]);
+          assert dirtyChild != null : "dirty child collected — dirty nodes must be strongly reachable";
+          address(i, dirtyChild.store(storage));
         }
       }
       return storage.store(this);
