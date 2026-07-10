@@ -271,7 +271,7 @@
         (let [^Branch b node arr (object-array (alength (.-_keys b)))]
           (doseq [[idx entry] slots]
             (aset arr (int idx) (Slot. (:diff entry) (long (:count entry)) (:measure entry) (nth addresses (int idx)))))
-          (set! (.-_slots b) arr)))
+          (.installSlots b arr Branch/BUF_LAZY)))
       node))
   (markFreed [_ _a] nil)
   (isFreed [_ _a] false)

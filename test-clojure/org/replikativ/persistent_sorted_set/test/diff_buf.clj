@@ -48,7 +48,7 @@
 
 (defn- find-leaf-slot [brs k]
   (some (fn [^Branch b]
-          (when-let [slots (.-_slots b)]
+          (when-let [slots (.slots b)]
             (some (fn [i]
                     (when-let [^Slot sl (aget ^objects slots i)]
                       (when (some? (slot-val sl k)) [b i sl])))
@@ -105,7 +105,7 @@
       (let [s2 (ss/replace s1 [k 111] [k 222])
             v2 (some #(slot-val % k)
                      (mapcat (fn [^Branch bb]
-                               (when-let [sl (.-_slots bb)]
+                               (when-let [sl (.slots bb)]
                                  (keep #(aget ^objects sl %) (range (.-_len bb)))))
                              (walk-branches (root-of s2))))]
         (is (= [k 222] v2) "later op on the same key overwrites (net latest-wins)")))))
@@ -155,9 +155,10 @@
           brs (walk-branches (root-of s))
           depth (apply max (map (fn [^Branch b] (.-_level b)) brs))
           slotted (for [^Branch b brs
-                        :when (.-_slots b)
+                        :let [slots (.slots b)]
+                        :when slots
                         i (range (.-_len b))
-                        :let [^Slot sl (aget ^objects (.-_slots b) i)]
+                        :let [^Slot sl (aget ^objects slots i)]
                         :when sl]
                     [(.-_level b) sl])
           leaf-slots   (filter (fn [[lvl ^Slot sl]] (and (= 1 lvl) (instance? PersistentTreeMap (.-diff sl)))) slotted)

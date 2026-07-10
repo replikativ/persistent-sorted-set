@@ -110,12 +110,13 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       }
     }
     Object measure = computeMeasureFromChildren(nodes);
-    // diff-buf: this ctor leaves _bufEntries at its default 0 (no diff-buf block). That is correct
-    // here precisely because the result is ALWAYS the root (both callers assign it to _root): the
-    // root is always written, so its _bufEntries is never read by a parent to decide buffering, and
-    // it has no slots (nothing buffered). If it is mutated further this txn the first deposit folds
-    // its children's values in (poisoning it to BUF_WRITE if a child rebalanced). Do not reuse this
-    // for a non-root branch without setting _bufEntries.
+    // diff-buf: this ctor leaves Branch._buf at its default null (settled-empty: no slots, zero
+    // buffered entries). That is correct here precisely because the result is ALWAYS the root
+    // (both callers assign it to _root): the root is always written, so its bufEntries() is never
+    // read by a parent to decide buffering, and it has no slots (nothing buffered). If it is
+    // mutated further this txn the first deposit folds its children's values in (poisoning it to
+    // BUF_WRITE if a child rebalanced). Do not reuse this for a non-root branch without
+    // publishing a diff-buf snapshot.
     return new Branch(nodes[0].level() + 1, n, keys, null, children,
                       countKnown ? subtreeCount : -1, measure, _cmp, _settings);
   }

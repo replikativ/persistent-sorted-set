@@ -169,15 +169,17 @@
 
 #?(:clj
    (defn- attach-slots!
-     "Rebuild a restored Branch's _slots from the stored {idx -> entry} map.
-      anchor = addresses[idx] (re-derived, not stored — matches the reference codec)."
+     "Rebuild a restored Branch's slots from the stored {idx -> entry} map.
+      anchor = addresses[idx] (re-derived, not stored — matches the reference codec).
+      Installed via Branch.installSlots — ONE volatile publish of the {slots, entries}
+      snapshot (entries BUF_LAZY: derived from the slots on first read)."
      [^Branch b ^List addresses slots]
      (let [arr (object-array (alength (.-_keys b)))]
        (doseq [[idx entry] slots]
          (aset arr (int idx)
                (Slot. (:diff entry) (long (:count entry)) (:measure entry)
                       (nth addresses (int idx)))))
-       (set! (.-_slots b) arr)))
+       (.installSlots b arr Branch/BUF_LAZY)))
    :cljs
    (defn- attach-slots!
      [node addresses slots]
