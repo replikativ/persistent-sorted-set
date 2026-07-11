@@ -66,7 +66,7 @@
   [node i]
   #?(:clj
      (let [^Branch b node
-           children (.-_children b)]
+           children (.childrenArray b)]  ; one snapshot; read-only
        (when children
          (let [ref (aget ^objects children i)]
            (when ref

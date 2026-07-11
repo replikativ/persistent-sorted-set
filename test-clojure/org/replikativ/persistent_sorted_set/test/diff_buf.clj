@@ -30,7 +30,7 @@
         :else c))
 
 (defn- branch-children [^Branch b]
-  (when-let [ch (.-_children b)]
+  (when-let [ch (.childrenArray b)]
     (->> (range (.-_len b)) (map #(deref-child (aget ^objects ch %))) (remove nil?))))
 
 (defn- walk-branches [node]
@@ -96,10 +96,10 @@
       (is (some? hit) "a leaf-parent slot carries a leaf-diff for the replaced key")
       (when hit
         (let [[^Branch b _ ^Slot sl] hit
-              child (deref-child (aget ^objects (.-_children b) (first (keep-indexed (fn [i c] (when (some? (slot-val ^Slot c k)) i)) [sl]))))]
+              child (deref-child (aget ^objects (.childrenArray b) (first (keep-indexed (fn [i c] (when (some? (slot-val ^Slot c k)) i)) [sl]))))]
           (is (= 1 (.-_level b)) "leaf-diff sits at a leaf-parent (level 1)")
           (is (= [k 111] (slot-val sl k)) "Present payload is the replacement element")
-          (is (= (.-count sl) (.count ^ANode (deref-child (aget ^objects (.-_children b) 0)) nil))
+          (is (= (.-count sl) (.count ^ANode (deref-child (aget ^objects (.childrenArray b) 0)) nil))
               "ĝ.count tracks the child subtree count")))
       ;; latest-wins: a second replace on the same key overwrites the buffered Present
       (let [s2 (ss/replace s1 [k 111] [k 222])

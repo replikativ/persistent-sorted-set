@@ -26,7 +26,7 @@
     (let [a (h/uuid {:level 0 :keys (keys-of node)})]
       {:addr a :addrs #{a} :leaves [(.-_len ^Leaf node)]})
     (let [n (.-_len ^Branch node)
-          children (mapv #(aget ^objects (.-_children ^Branch node) %) (range n))
+          children (mapv #(aget ^objects (.childrenArray ^Branch node) %) (range n))
           sub (mapv collect children)
           a (h/uuid {:level (.-_level ^Branch node)
                      :keys (keys-of node)

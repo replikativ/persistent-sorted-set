@@ -114,8 +114,8 @@
                  (fn [_ child-addr child]
                    (loaded-ratio memory child-addr child))
                  (range len)
-                 (or (.-_addresses node) (repeat len nil))
-                 (or (.-_children node) (repeat len nil)))
+                 (or (.addressArray node) (repeat len nil))
+                 (or (.childrenArray node) (repeat len nil)))
                 (reduce + 0))
                len))))))))
 
@@ -133,8 +133,8 @@
             (fn [_ child-addr child]
               (durable-ratio child-addr child))
             (range len)
-            (.-_addresses ^Branch node)
-            (.-_children ^Branch node))
+            (.addressArray ^Branch node)
+            (.childrenArray ^Branch node))
            (reduce + 0))
           len)))))
 
@@ -178,7 +178,7 @@
                        (let [node ^Branch o
                              len (.len node)]
                          (doseq [i (range len)
-                                 :let [addr   (nth (.-_addresses node) i)
+                                 :let [addr   (nth (.addressArray node) i)
                                        child  (.child node storage (int i))
                                        {:keys [keys addresses]} (edn/read-string (@*disk addr))]]
                            ;; nodes inside stored? has to ALL be stored
@@ -189,7 +189,7 @@
                                     (take (.len ^ANode child) (.-_keys ^ANode child))))
                              (is (= addresses
                                     (when (instance? Branch child)
-                                      (take (.len ^Branch child) (.-_addresses ^Branch child))))))
+                                      (take (.len ^Branch child) (.addressArray ^Branch child))))))
                            (invariant child (some? addr))))
                        Leaf
                        true)))]

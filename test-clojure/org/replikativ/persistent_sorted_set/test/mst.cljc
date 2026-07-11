@@ -29,7 +29,7 @@
 (defn- node-level [node]
   #?(:clj (.-_level ^Branch node) :cljs (.-level node)))
 (defn- node-child [node i]
-  #?(:clj (aget ^objects (.-_children ^Branch node) i) :cljs (aget (.-children node) i)))
+  #?(:clj (aget ^objects (.childrenArray ^Branch node) i) :cljs (aget (.-children node) i)))
 (defn- root-of [s]
   #?(:clj (.root ^PersistentSortedSet s) :cljs (.-root s)))
 

@@ -17,10 +17,10 @@
   (unwrap (.-_root set)))
 
 (defn addresses [node]
-  (some->> (.-_addresses ^Branch (unwrap node)) (mapv unwrap) (filter some?)))
+  (some->> (.addressArray ^Branch (unwrap node)) (mapv unwrap) (filter some?)))
 
 (defn children [node]
-  (some->> (.-_children ^Branch (unwrap node)) (mapv unwrap) (filter some?)))
+  (some->> (.childrenArray ^Branch (unwrap node)) (mapv unwrap) (filter some?)))
 
 (defn ks [node]
   (some->> (.-_keys ^ANode (unwrap node)) (filterv some?)))
