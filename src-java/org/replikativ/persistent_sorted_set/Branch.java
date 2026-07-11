@@ -1803,11 +1803,23 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // diff + ĝ, anchored at base's durable child address) and set base's aggregates from ĝ.
   // Grandchildren project lazily on their own descent.
   private Branch<Key, Address> projectBranch(Branch<Key, Address> base, Slot sl) {
-    // base is freshly restored (not yet published — this runs before the caller's
-    // cache-fill makes it reachable), so the plain read-modify-write publish is
-    // single-threaded by contract.
+    // Project onto a COPY — never mutate `base`. Caching IStorage impls (e.g. datahike's
+    // CachedStorage) return restored nodes SHARED BY ADDRESS across tree versions, and this
+    // projection is VERSION-SPECIFIC: consecutive commits buffer against the same durable
+    // anchor with different accumulated diffs (version N's exact child at address B is the
+    // very object version N+1 projects {B, δ} onto). Mutating the shared object in place —
+    // installing slots, rewriting separators/count/measure, cache-filling projected
+    // children into it — leaked one version's projection into every other version's reads
+    // (cross-version clobber; nondeterministic under an evicting cache). The cached object
+    // must stay the pristine durable content; the projected copy is what the caller
+    // cache-fills into ITS (version-specific) children. Mirrors projectLeaf, which has
+    // always returned a fresh Leaf. children stay null on the copy: a grandchild with a
+    // nested slot must be projected by the copy's own descent, and a passthrough
+    // grandchild re-restores through the (pristine) cache.
     Object[] slots = new Object[base._keys.length];
-    Address[] baseAddresses = base._state.addresses;             // one snapshot of base
+    final NodeState<Address> bs = base._state;                   // one snapshot of base
+    Address[] baseAddresses = bs.addresses;
+    Key[] newKeys = Arrays.copyOf(base._keys, base._keys.length);
     for (ISeq s = RT.seq(sl.diff); s != null; s = s.next()) {
       IMapEntry e = (IMapEntry) s.first();
       int i = ((Number) e.key()).intValue();
@@ -1817,17 +1829,21 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       Object d = entry.valAt(KW_DIFF);
       Object mk = entry.valAt(KW_MAXKEY);
       slots[i] = new Slot(d, cnt, measure, baseAddresses[i]);    // anchor = grandchild's durable address
-      // Restore the separator: base came from the anchor (old durable object) whose _keys[i] is
-      // the PRE-diff max. The diff changed child i's max, so fix the separator here — otherwise
-      // search/contains route against a phantom max-key (the verified diff-buf-v5 read bug).
-      if (mk != null) base._keys[i] = (Key) mk;
+      // Restore the separator ON THE COPY: base came from the anchor (old durable object)
+      // whose _keys[i] is the PRE-diff max. The diff changed child i's max, so fix the
+      // separator here — otherwise search/contains route against a phantom max-key (the
+      // verified diff-buf-v5 read bug).
+      if (mk != null) newKeys[i] = (Key) mk;
     }
-    // single publish; entries stay LAZY (derived from the installed slots on first read,
-    // exactly as after the restore ctor).
-    base.installSlots(slots, BUF_LAZY);
-    base._subtreeCount = sl.count;        // ĝ.count — no child summing
-    base._measure = sl.measure;           // ĝ.measure
-    return base;
+    // The copy's slots REPLACE any slots base's own blob carried (parent's nested diff is
+    // the complete superseding state — same semantics as the historical in-place install).
+    // ĝ.count / ĝ.measure — no child summing. The copy aliases base's addresses array
+    // (read-only by the shared-snapshot contract; the copy is sealed, never edited in
+    // place). installSlots on the unpublished copy is single-threaded by construction.
+    Branch<Key, Address> proj = new Branch<>(base._level, base._len, newKeys, baseAddresses,
+                                             null, sl.count, sl.measure, _projCmp, base._settings);
+    proj.installSlots(slots, BUF_LAZY);
+    return proj;
   }
 
   @Override
