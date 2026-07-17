@@ -891,6 +891,41 @@
   (-pr-writer [this writer opts]
     (-write writer (str this))))
 
+(defprotocol PAsyncChunkedSeq
+  "Chunk-level traversal of an async seq: one await per LEAF instead of one
+   per element (element-wise anext allocates a continuation per element —
+   measured ~4x slower than a chunk loop on warm data). `achunk-next`
+   resolves to `[keys-array start end next]`: consume `(arrays/aget keys i)`
+   for start <= i < end in a synchronous loop, then continue with `next`
+   (an async seq positioned at the next leaf, or nil) — or resolves nil when
+   the seq is exhausted. Boundary semantics mirror the sync Iter's
+   IChunkedSeq exactly (-chunked-first / -chunked-next)."
+  (achunk-next [this]))
+
+(extend-type AsyncSeq
+  PAsyncChunkedSeq
+  (achunk-next [this]
+    (async
+     (let [set   (.-set this)
+           left  (.-left this)
+           right (.-right this)]
+       (when (and left (path-lt left right))
+         (when (nil? (.-keys this))
+           (set! (.-keys this) (await (-keys-for set left {:sync? false})))
+           (set! (.-idx this) (path-get set left 0)))
+         (let [keys  (.-keys this)
+               start (.-idx this)
+               end   (if (path-same-leaf set left right)
+                       ;; right is in the same node (exclusive bound)
+                       (path-get set right 0)
+                       ;; right is in a different node
+                       (arrays/alength keys))
+               last-path (path-set set left 0 (dec (arrays/alength keys)))
+               next-path (await (-next-path set last-path {:sync? false}))]
+           [keys start end
+            (when (and next-path (path-lt next-path right))
+              (AsyncSeq. set next-path right nil nil))]))))))
+
 #!------------------------------------------------------------------------------
 
 (declare -iter)
@@ -964,15 +999,18 @@
 (deftype AsyncReverseSeq [^BTSet set left right ^:mutable keys ^:mutable idx]
   aseq/PAsyncSeq
   (anext [this]
+    ;; PAsyncSeq termination contract: an exhausted seq resolves nil — the
+    ;; guard must enclose the WHOLE tuple. A bare two-slot vector of `when`
+    ;; forms yields a truthy [nil nil] at exhaustion, which consumers
+    ;; written against AsyncSeq's contract treat as one more (nil) element.
     (async
-     [(when (and right (path-lt left right))
-        (when (nil? keys)
-          (set! keys (await (-keys-for set right {:sync? false})))
-          (let [i (path-get set right 0)
-                n (arrays/alength keys)]
-            (set! idx (if (< i n) i (dec n)))))
-        (arrays/aget keys idx))
-      (when keys
+     (when (and right (path-lt left right))
+       (when (nil? keys)
+         (set! keys (await (-keys-for set right {:sync? false})))
+         (let [i (path-get set right 0)
+               n (arrays/alength keys)]
+           (set! idx (if (< i n) i (dec n)))))
+       [(arrays/aget keys idx)
         (if (> idx 0)
           (let [right' (path-dec right)]
             (when (path-lt left right')
@@ -980,7 +1018,7 @@
           (let [right' (await (-prev-path set right {:sync? false}))]
             (when (path-lt left right')
               (let [ks (await (-keys-for set right' {:sync? false}))]
-                (AsyncReverseSeq. set left right' ks (path-get set right' 0)))))))]))
+                (AsyncReverseSeq. set left right' ks (path-get set right' 0))))))])))
   Object
   (toString [_] (str "AsyncReverseSeq[" (path-str set right) " <- " (path-str set left) "]"))
   IPrintWithWriter
