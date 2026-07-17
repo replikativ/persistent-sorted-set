@@ -7,11 +7,12 @@
 (deftype AsyncRange [^number current ^number end ^number step]
   aseq/PAsyncSeq
   (anext [_]
+    ;; guard encloses the whole tuple: exhausted → nil, never [nil nil]
     (async
-     [(when (< current end)
-        current)
-      (when (< (+ current step) end)
-        (AsyncRange. (+ current step) end step))])))
+     (when (< current end)
+       [current
+        (when (< (+ current step) end)
+          (AsyncRange. (+ current step) end step))]))))
 
 (defn async-range
   ([end] (AsyncRange. 0 end 1))

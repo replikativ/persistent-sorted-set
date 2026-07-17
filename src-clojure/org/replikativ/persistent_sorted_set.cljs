@@ -72,11 +72,14 @@
 
 (defn lookup
   "Look up key in the set. Returns key if present, else nil.
-   3-arity version accepts a custom comparator."
+   3-arity version accepts a custom comparator;
+   returns continuation yielding the result when {:sync? false}."
   ([^BTSet set key]
    (btset/lookup set key nil {:sync? true}))
   ([^BTSet set key cmp]
-   (btset/lookup set key cmp {:sync? true})))
+   (btset/lookup set key cmp {:sync? true}))
+  ([^BTSet set key cmp opts]
+   (btset/lookup set key cmp opts)))
 
 (defn equiv?
   "Is _other_ a set with the same items?
