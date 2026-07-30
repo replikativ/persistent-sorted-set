@@ -37,7 +37,7 @@
        ids needed, old roots (without ids) just read. The convenient default.
      REGISTRY (a shared/wire serializer over MANY stores): `(registry-storage-resolver)` etc. resolve
        by an id the root stamps in its meta (`:pss/storage-id` / `:pss/comparator-id` / `:pss/measure-id`) from
-       the registries below. The consumer `register-*!`s its storage (per-connect) and its
+       the registries in `impl.nodes`. The consumer `register-*!`s its storage (per-connect) and its
        comparator/measure (static, ns-load).
 
    ELEMENT-AGNOSTIC. `:keys`, the diff-buf `:slots`, and slot values are the consumer's domain
@@ -51,146 +51,78 @@
      (canonical-read-handlers  {:resolve-storage (fn [_] my-storage) :resolve-cmp my-cmp-fn
                                 :measure-ops nil :default-bf 512 :element-read-handlers {…}})
      (canonical-write-handlers {:element-write-handlers {…}})
-   or a wire peer: pass `(registry-storage-resolver)`/`(registry-cmp-resolver)`/`(registry-measure-resolver)`."
-  #?(:clj (:require [org.replikativ.persistent-sorted-set.impl.boundary :as bnd]))
+   or a wire peer: pass `(registry-storage-resolver)`/`(registry-cmp-resolver)`/`(registry-measure-resolver)`.
+
+   NOTE ON STRUCTURE. Everything above the tag plumbing — the projections, the settings
+   reconstruction, the slots re-attachment, the registries — now lives in
+   `org.replikativ.persistent-sorted-set.impl.nodes` and is SHARED with the boring (CBOR) and
+   transit handler modules. Three copies of that logic would reintroduce precisely the drift this
+   namespace was written to prevent. The names below are re-exported so existing consumers are
+   unaffected."
+  (:require [org.replikativ.persistent-sorted-set.impl.nodes :as nodes])
   #?(:cljs (:require [fress.api :as fress]
-                     [org.replikativ.persistent-sorted-set.impl.node :as node]
-                     [org.replikativ.persistent-sorted-set.impl.boundary :as bnd]
                      [org.replikativ.persistent-sorted-set.leaf :refer [Leaf]]
-                     [org.replikativ.persistent-sorted-set.branch :refer [Branch] :as branch]
+                     [org.replikativ.persistent-sorted-set.branch :refer [Branch]]
                      [org.replikativ.persistent-sorted-set.btset :refer [BTSet]]))
-  #?(:clj (:import [org.replikativ.persistent_sorted_set ANode Leaf Branch Settings Slot IMeasure IBoundary RefType
-                    PersistentSortedSet]
-                   [org.fressian.handlers WriteHandler ReadHandler]
-                   [java.util List])))
-
-(def ^:const leaf-tag "pss/leaf")
-(def ^:const branch-tag "pss/branch")
-(def ^:const set-tag "pss/set")
+  #?(:clj (:import [org.replikativ.persistent_sorted_set Leaf Branch PersistentSortedSet]
+                   [org.fressian.handlers WriteHandler ReadHandler])))
 
 ;; ---------------------------------------------------------------------------
-;; Settings (de)construction. A Settings splits into DATA and FUNCTIONS:
-;;   DATA (serialized, ride in the blob):     branching-factor, diff-buf-size, ref-type (an enum).
-;;   FUNCTIONS (never serialized — code):      measure-ops (IMeasure), leaf-processor, comparator.
-;; The functions + the live storage are bound by the consumer at the operating root / its per-store
-;; reader; a node carries only data. ref-type travels as data (default SOFT omitted to keep common
-;; blobs unchanged); a read-time `:ref-type` may override what was serialized.
+;; Re-exports. These were this namespace's public API before the shared core was
+;; extracted; consumers (datahike) reference them by this name.
 ;; ---------------------------------------------------------------------------
 
-#?(:clj (defn- ref-type->kw [^RefType rt] (when rt (keyword (.toLowerCase (.name rt))))))
-#?(:clj (defn- kw->ref-type ^RefType [kw]
-          (case kw :strong RefType/STRONG :soft RefType/SOFT :weak RefType/WEAK nil)))
+(def ^:const leaf-tag   nodes/leaf-tag)
+(def ^:const branch-tag nodes/branch-tag)
+(def ^:const set-tag    nodes/set-tag)
 
-#?(:clj
-   (defn- settings-for ^Settings [bf dbs ^IMeasure measure ref-type bdesc]
-     ;; ref-type nil ⇒ Settings normalizes to SOFT. `measure` is the IMeasure OPS the consumer
-     ;; supplied (never serialized); leaf-processor stays nil — it's the operating root's, threaded.
-     ;; bdesc (a serialized boundary descriptor, nil for count) is resolved INTERNALLY — the
-     ;; consumer never supplies a resolver; the strategy round-trips from the blob alone.
-     (let [s (Settings. (int bf) (kw->ref-type ref-type) measure nil (int dbs))]
-       (if bdesc (.withBoundary s ^IBoundary (bnd/resolve-boundary bdesc)) s)))
-   :cljs
-   (defn- settings-for [bf dbs measure ref-type bdesc]
-     ;; cljs has no soft/weak refs, so ref-type is inert here — but CARRY it so it round-trips
-     ;; losslessly through a cljs relay (deserialize → re-serialize) back to a JVM reader.
-     (cond-> {:branching-factor bf :diff-buf-size dbs :measure measure}
-       ref-type (assoc :ref-type ref-type)
-       bdesc    (assoc :boundary (bnd/resolve-boundary bdesc)))))
+(def ^:const storage-id-key    nodes/storage-id-key)
+(def ^:const comparator-id-key nodes/comparator-id-key)
+(def ^:const measure-id-key    nodes/measure-id-key)
 
-(defn- node-config
-  "A node's SERIALIZABLE settings — branching-factor + diff-buf-size + (non-default) ref-type. These
-   ride in the blob (self-describing) but NOT in `node->map` (the content hash), so addresses are
-   unchanged. ref-type is omitted when SOFT (the default), so common-case blobs are byte-unchanged."
-  [node]
-  #?(:clj  (let [^Settings s (.-_settings ^ANode node)
-                 rt (.refType s)
-                 bdesc (.descriptor (.boundary s))]   ; nil for count, {:type :mst :lzpl n} for MST
-             (cond-> {:branching-factor (.branchingFactor s) :diff-buf-size (.diffBufSize s)}
-               (and rt (not= rt RefType/SOFT)) (assoc :ref-type (ref-type->kw rt))
-               bdesc (assoc :boundary bdesc)))
-     :cljs (let [s (.-settings node)
-                 bdesc (when-let [bd (:boundary s)] (bnd/-descriptor bd))]
-             (cond-> {:branching-factor (:branching-factor s) :diff-buf-size (:diff-buf-size s)}
-               (:ref-type s) (assoc :ref-type (:ref-type s))
-               bdesc (assoc :boundary bdesc)))))
+(def node->map
+  "See `impl.nodes/node->map` — the CONTENT projection used for content-addressing."
+  nodes/node->map)
+
+(def node-config
+  "See `impl.nodes/node-config` — the node's SERIALIZABLE settings."
+  nodes/node-config)
+
+(def node->blob
+  "See `impl.nodes/node->blob` — what a write handler actually emits."
+  nodes/node->blob)
+
+(def storage-registry    nodes/storage-registry)
+(def comparator-registry nodes/comparator-registry)
+(def measure-registry    nodes/measure-registry)
+
+(def register-storage!      nodes/register-storage!)
+(def unregister-storage!    nodes/unregister-storage!)
+(def registered-storage     nodes/registered-storage)
+(def register-comparator!   nodes/register-comparator!)
+(def unregister-comparator! nodes/unregister-comparator!)
+(def registered-comparator  nodes/registered-comparator)
+(def register-measure!      nodes/register-measure!)
+(def unregister-measure!    nodes/unregister-measure!)
+(def registered-measure     nodes/registered-measure)
+
+(def registry-storage-resolver nodes/registry-storage-resolver)
+(def registry-cmp-resolver     nodes/registry-cmp-resolver)
+(def registry-measure-resolver nodes/registry-measure-resolver)
 
 ;; ---------------------------------------------------------------------------
-;; node->map — the CONTENT projection (for content-addressing). Branching-factor/diff-buf are
-;; deliberately absent here (config, not content); the write handler appends them to the blob.
+;; Write handlers — tag plumbing over `nodes/node->blob`.
 ;; ---------------------------------------------------------------------------
-
-(defn node->map
-  "Project a PSS node to its canonical CONTENT map — for content-addressing (hash this map) or
-   storing the map directly. Leaf → {:keys …}; Branch → {:level :keys :addresses :subtree-count
-   (:measure) (:slots)}. Comparator/storage/settings-free; element values stay raw. NOTE: this is
-   the CONTENT projection — the serialized blob additionally carries :branching-factor/:diff-buf-size
-   (see the write handlers), which are NOT part of the content hash."
-  [node]
-  #?(:clj
-     ;; `vec` the keys/addresses: the raw trimmed Java List isn't hash-coercible (hasch) and differs
-     ;; from the cljs vector form — a Clojure vector is both, and fressian reads either back as a vector.
-     (if (instance? Branch node)
-       (let [^Branch b node
-             slots (.slotsForStorage b)]
-         (cond-> {:level         (.level b)
-                  :keys          (vec (.keys b))
-                  :addresses     (vec (.addresses b))
-                  :subtree-count (.subtreeCount b)}
-           (some? (.-_measure b)) (assoc :measure (.-_measure b))
-           slots                  (assoc :slots slots)))
-       (cond-> {:keys (vec (.keys ^ANode node))}
-         (some? (.-_measure ^ANode node)) (assoc :measure (.-_measure ^ANode node))))
-     :cljs
-     (if (instance? Branch node)
-       (let [slots (branch/slots-for-storage node)]
-         (cond-> {:level         (node/level node)
-                  :keys          (vec (.-keys node))
-                  :addresses     (vec (.-addresses node))
-                  :subtree-count (.-subtree-count node)}
-           (some? (.-_measure node)) (assoc :measure (.-_measure node))
-           slots                     (assoc :slots slots)))
-       (cond-> {:keys (vec (.-keys node))}
-         (some? (.-_measure node)) (assoc :measure (.-_measure node))))))
 
 (def write-handlers
   "Fressian write handlers for PSS nodes. JVM: {Class {tag WriteHandler}}; cljs: {Type fn}. Each
-   emits `node->map` PLUS the node's own :branching-factor/:diff-buf-size (so reads self-describe)."
+   emits `node->blob` — the content projection PLUS the node's own settings, so reads self-describe."
   #?(:clj
-     {Leaf   {leaf-tag   (reify WriteHandler (write [_ w leaf] (.writeTag w leaf-tag 1)   (.writeObject w (merge (node->map leaf) (node-config leaf)))))}
-      Branch {branch-tag (reify WriteHandler (write [_ w node] (.writeTag w branch-tag 1) (.writeObject w (merge (node->map node) (node-config node)))))}}
+     {Leaf   {nodes/leaf-tag   (reify WriteHandler (write [_ w leaf] (.writeTag w nodes/leaf-tag 1)   (.writeObject w (nodes/node->blob leaf))))}
+      Branch {nodes/branch-tag (reify WriteHandler (write [_ w node] (.writeTag w nodes/branch-tag 1) (.writeObject w (nodes/node->blob node))))}}
      :cljs
-     {Leaf   (fn [w leaf] (fress/write-tag w leaf-tag 1)   (fress/write-object w (merge (node->map leaf) (node-config leaf))))
-      Branch (fn [w node] (fress/write-tag w branch-tag 1) (fress/write-object w (merge (node->map node) (node-config node))))}))
-
-;; ---------------------------------------------------------------------------
-;; Read handlers — blob → Leaf/Branch, settings reconstructed PER NODE from the blob's
-;; bf/diff-buf (+ the consumer's measure-ops + default ref-type); diff-buf `_slots` re-attached.
-;; ---------------------------------------------------------------------------
-
-#?(:clj
-   (defn- attach-slots!
-     "Rebuild a restored Branch's slots from the stored {idx -> entry} map.
-      anchor = addresses[idx] (re-derived, not stored — matches the reference codec).
-      Installed via Branch.installSlots — ONE volatile publish of the {slots, entries}
-      snapshot (entries BUF_LAZY: derived from the slots on first read)."
-     [^Branch b ^List addresses slots]
-     (let [arr (object-array (alength (.-_keys b)))]
-       (doseq [[idx entry] slots]
-         (aset arr (int idx)
-               (Slot. (:diff entry) (long (:count entry)) (:measure entry)
-                      (nth addresses (int idx)))))
-       (.installSlots b arr Branch/BUF_LAZY)))
-   :cljs
-   (defn- attach-slots!
-     [node addresses slots]
-     (let [arr (make-array (count addresses))
-           av  (vec addresses)]
-       (doseq [[idx entry] slots]
-         (aset arr (int idx) {:diff    (:diff entry)
-                              :count   (:count entry)
-                              :measure (:measure entry)
-                              :anchor  (nth av (int idx))}))
-       (set! (.-_slots node) arr))))
+     {Leaf   (fn [w leaf] (fress/write-tag w nodes/leaf-tag 1)   (fress/write-object w (nodes/node->blob leaf)))
+      Branch (fn [w node] (fress/write-tag w nodes/branch-tag 1) (fress/write-object w (nodes/node->blob node)))}))
 
 (defn read-handlers
   "Fressian read handlers for PSS nodes. Each node's `Settings` are reconstructed from its blob's
@@ -198,127 +130,40 @@
    consumer's `:measure-ops` (non-serializable IMeasure, nil for most). `:ref-type` overrides the
    blob's serialized ref-type (default: use the blob, falling back to SOFT).
    Returns {tag handler}. Comparator-free (the comparator lives on the root)."
-  [{:keys [measure-ops default-bf ref-type] :or {default-bf 0}}]
-  (let [mk-settings (memoize (fn [bf dbs rt bdesc] (settings-for bf dbs measure-ops rt bdesc)))]
+  [opts]
+  (let [ctx (nodes/reader-context opts)]
     #?(:clj
-       {leaf-tag
-        (reify ReadHandler
-          (read [_ rdr _tag _n]
-            (let [{:keys [keys measure branching-factor diff-buf-size] blob-rt :ref-type blob-bdry :boundary} (.readObject rdr)
-                  ^Settings settings (mk-settings (or branching-factor default-bf) (or diff-buf-size 0) (or ref-type blob-rt) blob-bdry)
-                  l (Leaf. ^List keys settings)]
-              (when (some? measure) (set! (.-_measure ^ANode l) measure))
-              l)))
-        branch-tag
-        (reify ReadHandler
-          (read [_ rdr _tag _n]
-            (let [{:keys [level keys addresses subtree-count measure slots branching-factor diff-buf-size] blob-rt :ref-type blob-bdry :boundary} (.readObject rdr)
-                  ^Settings settings (mk-settings (or branching-factor default-bf) (or diff-buf-size 0) (or ref-type blob-rt) blob-bdry)
-                  b (Branch. (int level) ^List keys ^List addresses settings)]
-              (set! (.-_subtreeCount b) (long (or subtree-count -1)))
-              (when (some? measure) (set! (.-_measure ^ANode b) measure))
-              (when slots (attach-slots! b addresses slots))
-              b)))}
+       {nodes/leaf-tag
+        (reify ReadHandler (read [_ rdr _tag _n] (nodes/blob->leaf ctx (.readObject rdr))))
+        nodes/branch-tag
+        (reify ReadHandler (read [_ rdr _tag _n] (nodes/blob->branch ctx (.readObject rdr))))}
        :cljs
-       {leaf-tag
-        (fn [rdr _tag _n]
-          (let [{:keys [keys measure branching-factor diff-buf-size] blob-rt :ref-type blob-bdry :boundary} (fress/read-object rdr)]
-            (Leaf. (to-array keys) (mk-settings (or branching-factor default-bf) (or diff-buf-size 0) (or ref-type blob-rt) blob-bdry) measure)))
-        branch-tag
-        (fn [rdr _tag _n]
-          (let [{:keys [level keys addresses subtree-count measure slots branching-factor diff-buf-size] blob-rt :ref-type blob-bdry :boundary} (fress/read-object rdr)
-                node (branch/from-map {:level         level
-                                       :keys          (to-array keys)
-                                       :addresses     (to-array addresses)
-                                       :subtree-count subtree-count
-                                       :measure       measure
-                                       :settings      (mk-settings (or branching-factor default-bf) (or diff-buf-size 0) (or ref-type blob-rt) blob-bdry)})]
-            (when slots (attach-slots! node addresses slots))
-            node))})))
+       {nodes/leaf-tag   (fn [rdr _tag _n] (nodes/blob->leaf ctx (fress/read-object rdr)))
+        nodes/branch-tag (fn [rdr _tag _n] (nodes/blob->branch ctx (fress/read-object rdr)))})))
 
 ;; ---------------------------------------------------------------------------
-;; The three runtime registries — the non-serializable bits, keyed by an id a root stamps in its
-;; meta. A LEXICAL (one-store) serializer can ignore these and close over its own context; a
-;; shared/WIRE serializer resolves by these via the `registry-*-resolver` helpers.
-;; ---------------------------------------------------------------------------
-
-;; Namespaced under `pss/` (matching the `pss/leaf`/`pss/branch`/`pss/set` tags) so the codec never
-;; squats a BARE keyword in the consumer's root-metadata namespace — these keys are library-owned.
-(def ^:const storage-id-key    :pss/storage-id)
-(def ^:const comparator-id-key :pss/comparator-id)
-(def ^:const measure-id-key    :pss/measure-id)
-
-(defonce ^{:doc "storage-id → IStorage (live; per-connect lifecycle)."}    storage-registry    (atom {}))
-(defonce ^{:doc "comparator-id → Comparator (static fn; ns-load)."}        comparator-registry (atom {}))
-(defonce ^{:doc "measure-id → IMeasure (static fn; ns-load, usually empty)."} measure-registry  (atom {}))
-
-(defn register-storage!     [id storage] (swap! storage-registry assoc id storage) storage)
-(defn unregister-storage!   [id] (swap! storage-registry dissoc id) nil)
-(defn registered-storage    [id] (get @storage-registry id))
-(defn register-comparator!  [id cmp] (swap! comparator-registry assoc id cmp) cmp)
-(defn unregister-comparator! [id] (swap! comparator-registry dissoc id) nil)
-(defn registered-comparator [id] (get @comparator-registry id))
-(defn register-measure!     [id m] (swap! measure-registry assoc id m) m)
-(defn unregister-measure!   [id] (swap! measure-registry dissoc id) nil)
-(defn registered-measure    [id] (get @measure-registry id))
-
-(defn registry-storage-resolver "Wire resolver: storage by (:pss/storage-id meta)."    [] (fn [meta] (registered-storage    (get meta storage-id-key))))
-(defn registry-cmp-resolver     "Wire resolver: comparator by (:pss/comparator-id meta)." [] (fn [meta] (registered-comparator (get meta comparator-id-key))))
-(defn registry-measure-resolver "Wire resolver: measure-ops by (:pss/measure-id meta)."  [] (fn [meta] (registered-measure    (get meta measure-id-key))))
-
-;; ---------------------------------------------------------------------------
-;; ROOT handlers. The root blob = {:meta :address :count :branching-factor :diff-buf-size}; the
-;; reconstruction context (storage/cmp/measure) is resolved per read via the consumer's resolvers.
+;; ROOT handlers.
 ;; ---------------------------------------------------------------------------
 
 (defn root-write-handler
   "Canonical write handler for a PSS root → `{:meta :address :count :branching-factor :diff-buf-size}`
    under `pss/set`. `:meta` carries whatever ids the consumer stamped (`:pss/storage-id` etc.). The set
-   MUST be flushed (root address realized) first.
-
-   `:count` is the set's CACHED count and may be -1 (unknown): a restore+mutate
-   invalidates ancestor subtree counts, and recomputing here would need the
-   set's storage to materialize lazy children — but serialization must work on
-   a storage-DETACHED root (consumers detach before storing so a stored value
-   never carries a live storage handle). The read ctor already treats -1 as
-   compute-lazily-on-demand (with storage attached), so the count comes back
-   right on the reader."
+   MUST be flushed (root address realized) first — `nodes/root->blob` throws otherwise."
   []
   #?(:clj
      (reify WriteHandler
        (write [_ w pset]
-         (when (nil? (.-_address ^PersistentSortedSet pset))
-           (throw (ex-info "PSS root must be flushed before serialization" {:type :must-be-flushed})))
-         (let [^Settings s (.-_settings ^PersistentSortedSet pset)
-               rt (.refType s)
-               bdesc (.descriptor (.boundary s))]
-           (.writeTag w set-tag 1)
-           (.writeObject w (cond-> {:meta             (meta pset)
-                                    :address          (.-_address ^PersistentSortedSet pset)
-                                    :count            (.-_count ^PersistentSortedSet pset)
-                                    :branching-factor (.branchingFactor s)
-                                    :diff-buf-size    (.diffBufSize s)}
-                             (and rt (not= rt RefType/SOFT)) (assoc :ref-type (ref-type->kw rt))
-                             bdesc (assoc :boundary bdesc))))))
+         (.writeTag w nodes/set-tag 1)
+         (.writeObject w (nodes/root->blob pset))))
      :cljs
      (fn [w pset]
-       (when (nil? (.-address pset))
-         (throw (ex-info "PSS root must be flushed before serialization" {:type :must-be-flushed})))
-       (let [s (.-settings pset)
-             bdesc (when-let [bd (:boundary s)] (bnd/-descriptor bd))]
-         (fress/write-tag w set-tag 1)
-         (fress/write-object w (cond-> {:meta             (meta pset)
-                                        :address          (.-address pset)
-                                        :count            (.-cnt pset)
-                                        :branching-factor (:branching-factor s)
-                                        :diff-buf-size    (:diff-buf-size s)}
-                                 (:ref-type s) (assoc :ref-type (:ref-type s))
-                                 bdesc (assoc :boundary bdesc)))))))
+       (fress/write-tag w nodes/set-tag 1)
+       (fress/write-object w (nodes/root->blob pset)))))
 
 (def root-write-handlers
   "Pre-keyed root write handler, shaped like `write-handlers` so a cljc consumer merges it WITHOUT
    importing the root type. JVM: {PersistentSortedSet {tag WriteHandler}}; cljs: {BTSet fn}."
-  #?(:clj  {PersistentSortedSet {set-tag (root-write-handler)}}
+  #?(:clj  {PersistentSortedSet {nodes/set-tag (root-write-handler)}}
      :cljs {BTSet (root-write-handler)}))
 
 (defn root-read-handler
@@ -331,22 +176,10 @@
    `:default-bf` is the fallback branching-factor for pre-bf root blobs. Pass lexical closures
    (a one-store serializer) or the `registry-*-resolver`s (a shared/wire serializer)."
   ([] (root-read-handler {}))
-  ([{:keys [resolve-storage resolve-cmp resolve-measure default-bf ref-type]
-     :or {resolve-storage (constantly nil) resolve-cmp (constantly nil)
-          resolve-measure (constantly nil) default-bf 0}}]
-   #?(:clj
-      (reify ReadHandler
-        (read [_ rdr _tag _n]
-          (let [{:keys [meta address count branching-factor diff-buf-size] blob-rt :ref-type blob-bdry :boundary} (.readObject rdr)
-                settings (settings-for (or branching-factor default-bf) (or diff-buf-size 0) (resolve-measure meta) (or ref-type blob-rt) blob-bdry)]
-            (PersistentSortedSet. meta (resolve-cmp meta) address (resolve-storage meta)
-                                  nil (int count) settings 0))))
-      :cljs
-      (fn [rdr _tag _n]
-        (let [{:keys [meta address count branching-factor diff-buf-size] blob-rt :ref-type blob-bdry :boundary} (fress/read-object rdr)
-              settings (settings-for (or branching-factor default-bf) (or diff-buf-size 0) (resolve-measure meta) (or ref-type blob-rt) blob-bdry)]
-          ;; BTSet deftype: [root cnt comparator meta _hash storage address settings]
-          (BTSet. nil count (resolve-cmp meta) meta nil (resolve-storage meta) address settings))))))
+  ([opts]
+   (let [ctx (nodes/reader-context opts)]
+     #?(:clj  (reify ReadHandler (read [_ rdr _tag _n] (nodes/blob->root ctx (.readObject rdr))))
+        :cljs (fn [rdr _tag _n] (nodes/blob->root ctx (fress/read-object rdr)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Bundle builders — assemble a consumer's full canonical handler maps in one call.
@@ -358,14 +191,9 @@
    (nil for most); `:resolve-storage`/`:resolve-cmp`/`:resolve-measure` resolve the root's
    non-serializable bits (lexical closures for a one-store serializer, `registry-*-resolver`s for a
    wire peer); `:default-bf` is the pre-bf fallback."
-  [{:keys [resolve-storage resolve-cmp resolve-measure measure-ops default-bf ref-type element-read-handlers]
-    :or {default-bf 0}}]
-  (merge (read-handlers {:measure-ops measure-ops :default-bf default-bf :ref-type ref-type})
-         {set-tag (root-read-handler {:resolve-storage resolve-storage
-                                      :resolve-cmp     resolve-cmp
-                                      :resolve-measure resolve-measure
-                                      :default-bf      default-bf
-                                      :ref-type        ref-type})}
+  [{:keys [element-read-handlers] :as opts}]
+  (merge (read-handlers opts)
+         {nodes/set-tag (root-read-handler opts)}
          element-read-handlers))
 
 (defn canonical-write-handlers

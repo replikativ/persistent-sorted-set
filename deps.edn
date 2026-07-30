@@ -39,6 +39,15 @@
   :fressian
   {:extra-deps {org.clojure/data.fressian {:mvn/version "1.1.0"}}}
 
+  ;; Same arrangement for the boring (CBOR) and transit node-handler namespaces:
+  ;; `provided` for consumers, plain dev/test deps here. A consumer pulls in only
+  ;; the codec it actually uses.
+  :boring
+  {:extra-deps {org.replikativ/boring {:local/root "../boring"}}}
+
+  :transit
+  {:extra-deps {com.cognitect/transit-clj {:mvn/version "1.0.333"}}}
+
   :test
   {:extra-paths ["test-clojure"]
    :extra-deps  {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}
