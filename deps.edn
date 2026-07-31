@@ -39,10 +39,11 @@
   :fressian
   {:extra-deps {org.clojure/data.fressian {:mvn/version "1.1.0"}}}
 
-  ;; Same arrangement for the boring (CBOR) and transit node-handler namespaces:
+  ;; Same arrangement for the cbor and transit node-handler namespaces:
   ;; `provided` for consumers, plain dev/test deps here. A consumer pulls in only
-  ;; the codec it actually uses.
-  :boring
+  ;; the codec it actually uses. The namespace is named for the FORMAT; boring is
+  ;; the library that implements it.
+  :cbor
   {:extra-deps {org.replikativ/boring {:local/root "../boring"}}}
 
   :transit

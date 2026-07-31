@@ -1,5 +1,9 @@
-(ns org.replikativ.persistent-sorted-set.boring
-  "Canonical, OPTIONAL boring (CBOR) read/write handlers for PSS B-tree nodes AND roots.
+(ns org.replikativ.persistent-sorted-set.cbor
+  "Canonical, OPTIONAL CBOR read/write handlers for PSS B-tree nodes AND roots.
+
+   Named for the FORMAT, like its `fressian` and `transit` siblings, not for
+   the library that implements it (boring). A consumer of these bytes cares
+   that they are CBOR; which Clojure library produced them is our business.
 
    The wire CONTENT is identical to the Fressian module's — both write
    `impl.nodes/node->blob` and read it back through `impl.nodes/blob->leaf` /
@@ -36,11 +40,11 @@
    than merged from maps:
 
        (require '[boring.core :as boring]
-                '[org.replikativ.persistent-sorted-set.boring :as pss-boring])
+                '[org.replikativ.persistent-sorted-set.cbor :as pss-cbor])
 
        (def registry
          (-> (boring/tag-registry)
-             (pss-boring/install {:resolve-storage (fn [_] my-storage)
+             (pss-cbor/install {:resolve-storage (fn [_] my-storage)
                                   :resolve-cmp     my-cmp-fn
                                   :default-bf      512})
              (boring/register-record \"my.ns.Datom\" map->Datom)))
