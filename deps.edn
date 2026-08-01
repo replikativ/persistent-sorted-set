@@ -24,7 +24,7 @@
    :extra-deps {thheller/shadow-cljs {:mvn/version "3.2.0"}
                 org.clojure/test.check {:mvn/version "1.1.1"}
                 com.github.pkpkpk/fress {:mvn/version "0.4.312"}
-                org.replikativ/boring {:mvn/version "0.1.4"}
+                org.replikativ/boring {:mvn/version "0.1.6"}
                 org.replikativ/hasch {:mvn/version "0.4.98"}}}
 
   :node-stress
@@ -49,7 +49,7 @@
   ;; the codec it actually uses. The namespace is named for the FORMAT; boring is
   ;; the library that implements it.
   :cbor
-  {:extra-deps {org.replikativ/boring {:mvn/version "0.1.4"}}}
+  {:extra-deps {org.replikativ/boring {:mvn/version "0.1.6"}}}
 
   :transit
   {:extra-deps {com.cognitect/transit-clj {:mvn/version "1.0.333"}}}
@@ -63,7 +63,7 @@
                  ;; `provided` for consumers, but their handler tests are part of
                  ;; the suite. Without this, test.cbor-handlers fails to LOAD and
                  ;; takes the whole run with it.
-                 org.replikativ/boring {:mvn/version "0.1.4"}
+                 org.replikativ/boring {:mvn/version "0.1.6"}
                  org.replikativ/hasch {:mvn/version "0.4.98"}}
    ;; diff-buf: library default is 0 (baseline). Run the suite with diff-buf ON so it
    ;; gates the buffering path; baseline-only invariant tests pin {:diff-buf-size 0} to override.
