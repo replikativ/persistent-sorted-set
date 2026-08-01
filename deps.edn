@@ -17,14 +17,15 @@
 
   :node-tests
   {:extra-paths ["test-clojure"]
-   ;; fress and boring are the ClojureScript sides of the two codec handler
-   ;; tests. shadow-cljs takes its classpath from these aliases, so a codec
+   ;; fress, boring and transit-cljs are the ClojureScript sides of the three codec
+   ;; handler tests. shadow-cljs takes its classpath from these aliases, so a codec
    ;; missing here is a build failure ("The required namespace is not
    ;; available"), not a skipped test.
    :extra-deps {thheller/shadow-cljs {:mvn/version "3.2.0"}
                 org.clojure/test.check {:mvn/version "1.1.1"}
                 com.github.pkpkpk/fress {:mvn/version "0.4.312"}
                 org.replikativ/boring {:mvn/version "0.1.6"}
+                com.cognitect/transit-cljs {:mvn/version "0.8.280"}
                 org.replikativ/hasch {:mvn/version "0.4.98"}}}
 
   :node-stress
@@ -51,11 +52,20 @@
   :cbor
   {:extra-deps {org.replikativ/boring {:mvn/version "0.1.6"}}}
 
+  ;; BOTH transit artifacts: `transit.cljc` requires `cognitect.transit` from shared
+  ;; (non-reader-conditional) code, and the two platforms ship it in two different
+  ;; jars -- transit-clj carries only `cognitect/transit.clj`. With transit-clj
+  ;; alone the module loads on the JVM and a ClojureScript consumer gets
+  ;; "namespace cognitect.transit is not available", so the JVM half of the alias
+  ;; silently certified a module that could not build for half its platforms.
   :transit
-  {:extra-deps {com.cognitect/transit-clj {:mvn/version "1.0.333"}}}
+  {:extra-deps {com.cognitect/transit-clj  {:mvn/version "1.0.333"}
+                com.cognitect/transit-cljs {:mvn/version "0.8.280"}}}
 
   :test
-  {:extra-paths ["test-clojure"]
+  ;; test-resources carries the golden pre-refactor Fressian blobs that
+  ;; test.fressian-compat asserts against (as a classpath resource).
+  {:extra-paths ["test-clojure" "test-resources"]
    :extra-deps  {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}
                  org.clojure/test.check {:mvn/version "1.1.1"}
                  org.clojure/data.fressian {:mvn/version "1.1.0"}
@@ -64,6 +74,7 @@
                  ;; the suite. Without this, test.cbor-handlers fails to LOAD and
                  ;; takes the whole run with it.
                  org.replikativ/boring {:mvn/version "0.1.6"}
+                 com.cognitect/transit-clj {:mvn/version "1.0.333"}
                  org.replikativ/hasch {:mvn/version "0.4.98"}}
    ;; diff-buf: library default is 0 (baseline). Run the suite with diff-buf ON so it
    ;; gates the buffering path; baseline-only invariant tests pin {:diff-buf-size 0} to override.

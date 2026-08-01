@@ -17,7 +17,10 @@
             [org.replikativ.persistent-sorted-set.cbor :as pss-cbor]
             [org.replikativ.persistent-sorted-set.boundary :as bnd]
             [boring.core :as boring]
-            #?(:cljs [org.replikativ.persistent-sorted-set.impl.storage :refer [IStorage]]))
+            #?@(:cljs [[org.replikativ.persistent-sorted-set.impl.storage :refer [IStorage]]
+                       ;; BTSet is NOT re-exported from the main namespace; the root
+                       ;; test asserts on the concrete type, so require it from its own.
+                       [org.replikativ.persistent-sorted-set.btset :refer [BTSet]]]))
   #?(:clj (:import [org.replikativ.persistent_sorted_set IStorage Settings PersistentSortedSet])))
 
 ;; ---- CBOR storage shim (the only codec-specific code) --------------------------------
@@ -124,27 +127,79 @@
 ;; because a PSS root implements java.util.Set, and boring will happily encode it
 ;; structurally as a CBOR set of elements unless the explicit registration wins --
 ;; which it silently did not at one point.
-#?(:clj
-   (deftest root-roundtrip
-     (testing "a flushed root serializes as a pointer and restores lazily, with storage
-               resolved per-call and bf self-describing from the blob"
-       (let [bf       8
-             storage  (make-cbor-storage bf)
-             elems    (vec (range 500))
-             s        (reduce (fn [s e] (set/conj s e compare))
-                              (set/sorted-set* {:storage storage :branching-factor bf})
-                              elems)
-             _        (set/store s storage)                 ; flush ⇒ address realized
-             reg      (-> (boring/tag-registry)
-                          pss-cbor/install-node-writers
-                          pss-cbor/install-root-writer
-                          (pss-cbor/install-node-readers {:default-bf bf})
-                          (pss-cbor/install-root-reader
-                           {:default-bf bf :resolve-storage (constantly storage)}))
-             bs       (boring/encode s {:registry reg})
-             s2       (boring/decode bs {:registry reg})]
-         (is (instance? PersistentSortedSet s2)
-             "the root pointer restores a PersistentSortedSet, not a CBOR set")
-         (is (= elems (vec s2)) "elements load lazily from the resolved storage")
-         (is (< (alength ^bytes bs) 512)
-             "a pointer, not a copy: 500 elements do not fit in the blob")))))
+;; Runs on BOTH platforms. It was JVM-only, which left the cljs side of the very
+;; registration this comment warns about — root-as-pointer vs root-as-set — with no
+;; coverage at all, on the platform where BTSet is a different type entirely.
+(defn- root-registry [bf storage]
+  (-> (boring/tag-registry)
+      pss-cbor/install-node-writers
+      pss-cbor/install-root-writer
+      (pss-cbor/install-node-readers {:default-bf bf})
+      (pss-cbor/install-root-reader
+       {:default-bf bf :resolve-storage (constantly storage)
+        :resolve-cmp (constantly compare)})))
+
+(defn- blob-size [bs] #?(:clj (alength ^bytes bs) :cljs (.-length bs)))
+
+(deftest root-roundtrip
+  (testing "a flushed root serializes as a pointer and restores lazily, with storage
+            resolved per-call and bf self-describing from the blob"
+    (let [bf      8
+          storage (make-cbor-storage bf)
+          elems   (vec (range 500))
+          s       (reduce (fn [s e] (set/conj s e compare))
+                          (set/sorted-set* {:storage storage :branching-factor bf})
+                          elems)
+          _       (set/store s storage)                 ; flush ⇒ address realized
+          reg     (root-registry bf storage)
+          bs      (boring/encode s {:registry reg})
+          s2      (boring/decode bs {:registry reg})]
+      (is (instance? #?(:clj PersistentSortedSet :cljs BTSet) s2)
+          "the root pointer restores a PSS root, not a CBOR set")
+      (is (= elems (vec s2)) "elements load lazily from the resolved storage")
+      (is (< (blob-size bs) 512)
+          "a pointer, not a copy: 500 elements do not fit in the blob"))))
+
+(deftest re-encoding-a-root-touches-no-storage
+  (testing "decode a root pointer, then re-encode it WITHOUT forcing the tree.
+
+            A root is a pointer plus settings, so relaying one — decode on a peer,
+            re-encode to pass along — must not materialize a single node. If it
+            did, every hop through a relay would fault the whole B-tree into
+            memory and hit storage O(nodes) times, which at datahike scale is the
+            difference between forwarding a message and loading a database.
+
+            Asserted by making every `restore` throw: the previous test could not
+            catch this because it re-encoded a root whose nodes were already
+            materialized in the same process."
+    (let [bf      8
+          storage (make-cbor-storage bf)
+          elems   (vec (range 500))
+          s       (reduce (fn [s e] (set/conj s e compare))
+                          (set/sorted-set* {:storage storage :branching-factor bf})
+                          elems)
+          _       (set/store s storage)
+          reg     (root-registry bf storage)
+          bs      (boring/encode s {:registry reg})
+          ;; A storage that refuses to serve anything: any lazy load is now a failure.
+          exploding (reify IStorage
+                      #?@(:clj  [(store [_ _] (throw (ex-info "must not store" {})))
+                                 (accessed [_ _] nil)
+                                 (restore [_ _] (throw (ex-info "must not restore" {})))]
+                          :cljs [(store [_ _ _] (throw (ex-info "must not store" {})))
+                                 (accessed [_ _] nil)
+                                 (delete [_ _] nil)
+                                 (restore [_ _ _] (throw (ex-info "must not restore" {})))])
+                      (markFreed [_ _] nil) (isFreed [_ _] false) (freedInfo [_ _] nil))
+          lazy-reg (-> (boring/tag-registry)
+                       pss-cbor/install-node-writers
+                       pss-cbor/install-root-writer
+                       (pss-cbor/install-node-readers {:default-bf bf})
+                       (pss-cbor/install-root-reader
+                        {:default-bf bf :resolve-storage (constantly exploding)
+                         :resolve-cmp (constantly compare)}))
+          relayed (boring/decode bs {:registry lazy-reg})]
+      ;; `vec`, not `seq`: on cljs these are js/Uint8Array, and comparing two
+      ;; seqs over typed arrays does not reliably yield value equality.
+      (is (= (vec bs) (vec (boring/encode relayed {:registry lazy-reg})))
+          "relaying a root reproduces the same pointer blob, touching no node"))))

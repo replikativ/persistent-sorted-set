@@ -81,7 +81,11 @@
                bdesc (assoc :boundary bdesc)))
      :cljs (let [s (.-settings node)
                  bdesc (when-let [bd (:boundary s)] (bnd/-descriptor bd))]
-             (cond-> {:branching-factor (:branching-factor s) :diff-buf-size (:diff-buf-size s)}
+             ;; `(or … 0)`: the cljs settings map simply lacks the key when no diff-buf was
+             ;; configured, so this emitted nil where the JVM -- whose Settings.diffBufSize is
+             ;; an int -- emits 0. Same logical node, two different blobs, and a decode+encode
+             ;; on cljs was not idempotent (nil in, 0 back out, because the reader defaults it).
+             (cond-> {:branching-factor (:branching-factor s) :diff-buf-size (or (:diff-buf-size s) 0)}
                (:ref-type s) (assoc :ref-type (:ref-type s))
                bdesc (assoc :boundary bdesc)))))
 
@@ -259,7 +263,10 @@
                   :address          (.-address pset)
                   :count            (.-cnt pset)
                   :branching-factor (:branching-factor s)
-                  :diff-buf-size    (:diff-buf-size s)}
+                  ;; `(or … 0)` for the same reason as in `node-config` — match the JVM,
+                  ;; which writes an int here, so a root relayed through a cljs peer keeps
+                  ;; the bytes it arrived with.
+                  :diff-buf-size    (or (:diff-buf-size s) 0)}
            (:ref-type s) (assoc :ref-type (:ref-type s))
            bdesc (assoc :boundary bdesc))))))
 
@@ -305,6 +312,30 @@
 (defn unregister-measure!    [id] (swap! measure-registry dissoc id) nil)
 (defn registered-measure     [id] (get @measure-registry id))
 
-(defn registry-storage-resolver "Wire resolver: storage by (:pss/storage-id meta)."       [] (fn [meta] (registered-storage    (get meta storage-id-key))))
-(defn registry-cmp-resolver     "Wire resolver: comparator by (:pss/comparator-id meta)." [] (fn [meta] (registered-comparator (get meta comparator-id-key))))
-(defn registry-measure-resolver "Wire resolver: measure-ops by (:pss/measure-id meta)."   [] (fn [meta] (registered-measure    (get meta measure-id-key))))
+(defn- resolve-or-throw
+  "Look `id-key` up in `registry`, distinguishing the two nil cases.
+
+   NO id in the root's meta means the writer deliberately had none — a lexically-scoped
+   serializer, or a root with no storage — so nil is the answer.
+
+   An id that IS present but unregistered is a MISCONFIGURATION, and returning nil for it
+   used to defer the failure: `blob->root` accepted the nil, decode reported success, and the
+   first traversal called a method on nil somewhere inside the tree walk. The result was an
+   opaque NullPointerException at a point arbitrarily far from the cause, in a lazy structure
+   where the cause (a store not registered, or unregistered early) is invisible. Failing here
+   names the id and the registry."
+  [registry meta id-key what]
+  (if-let [id (get meta id-key)]
+    (or (get @registry id)
+        (throw (ex-info (str "PSS: no " what " registered for " id-key " " (pr-str id)
+                             " — register it before deserializing this root")
+                        {:type ::unregistered :id id :id-key id-key
+                         :registered (vec (keys @registry))})))
+    nil))
+
+(defn registry-storage-resolver "Wire resolver: storage by (:pss/storage-id meta). Throws on an id that is present but unregistered."
+  [] (fn [meta] (resolve-or-throw storage-registry meta storage-id-key "storage")))
+(defn registry-cmp-resolver     "Wire resolver: comparator by (:pss/comparator-id meta). Throws on an id that is present but unregistered."
+  [] (fn [meta] (resolve-or-throw comparator-registry meta comparator-id-key "comparator")))
+(defn registry-measure-resolver "Wire resolver: measure-ops by (:pss/measure-id meta). Throws on an id that is present but unregistered."
+  [] (fn [meta] (resolve-or-throw measure-registry meta measure-id-key "measure")))
