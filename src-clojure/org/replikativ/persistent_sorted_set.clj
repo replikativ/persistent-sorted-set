@@ -215,6 +215,14 @@
    (let [settings             (map->settings opts)
          max-branching-factor (.branchingFactor settings)
          avg-branching-factor (-> (.minBranchingFactor settings) (+ max-branching-factor) (quot 2))
+         ;; avg >= 2 or the level count never reduces and this loops forever.
+         ;; `min = bf >>> 1`, so branching factors 1 and 2 both yield avg 1.
+         ;; Verified: bf=2 ran to OutOfMemoryError rather than failing. The
+         ;; streaming builder got this guard first; the arithmetic is shared.
+         _                    (assert (>= avg-branching-factor 2)
+                                      (str "branching-factor must be >= 3 (got avg fanout "
+                                           avg-branching-factor "); a fanout of 1 never "
+                                           "reduces the level count"))
          storage              (:storage opts)
          ^IMeasure measure-ops  (.measure settings)
          ->Leaf               (fn [keys]
