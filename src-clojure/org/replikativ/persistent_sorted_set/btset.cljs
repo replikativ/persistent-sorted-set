@@ -489,7 +489,11 @@
   (get (.-settings set) :branching-factor))
 
 (defn- min-len [set]
-  (/ (max-len set) 2))
+  ;; `half`, not `/`: the JVM spells this `_branchingFactor >>> 1`, and plain
+  ;; division yields 256.5 for an odd branching factor where the JVM yields 256.
+  ;; Every fanout decision downstream is then off by half an element on one
+  ;; runtime and not the other.
+  (arrays/half (max-len set)))
 
 (defn- avg-len [set]
   (arrays/half (+ (max-len set) (min-len set))))
@@ -1724,10 +1728,33 @@
 
 (defn- arr-partition-approx
   "Splits `arr` into arrays of size between min-len and max-len,
-   trying to stick to (min+max)/2"
+   trying to stick to (min+max)/2.
+
+   The three cases, and their ORDER, are `persistent-sorted-set/split`'s on the
+   JVM. They used to differ, and the difference was not cosmetic: this asked
+   whether `chunk-len + min-len` remained where the JVM asks whether `2*avg`
+   does, and tested `<= max-len` first rather than second. Since
+   `2*avg = min+max > avg+min`, the two disagreed for every remainder in
+   `[avg+min, 2*avg)` — at the default branching factor of 512, measured on both
+   runtimes rather than reasoned about:
+
+       n     JVM              ClojureScript
+       640   [320 320]        [384 256]
+       700   [350 350]        [384 316]
+       767   [383 384]        [384 383]
+
+   Same elements, same settings, different trees. Under content-addressed
+   storage that means different node addresses and so a different merkle root
+   for the same data, so a set built on Node could not share nodes with one
+   built on the JVM — which is the whole point of addressing them by content.
+   Sizes outside that window (512, 513, 768, 900) already agreed, which is why
+   it went unnoticed.
+
+   The `:else` branch recurs where the JVM emits both halves and stops; that is
+   the same partition, because after taking `half rest` the remainder is at most
+   `max-len` and the next iteration takes it whole."
   [set arr]
   (let [chunk-len (avg-len set)
-        min-len   (min-len set)
         max-len   (max-len set)
         len       (arrays/alength arr)
         acc       (transient [])]
@@ -1735,12 +1762,12 @@
       (loop [pos 0]
         (let [rest (- len pos)]
           (cond
-            (<= rest max-len)
-            (conj! acc (.slice arr pos))
-            (>= rest (+ chunk-len min-len))
+            (>= rest (* 2 chunk-len))
             (do
               (conj! acc (.slice arr pos (+ pos chunk-len)))
               (recur (+ pos chunk-len)))
+            (<= rest max-len)
+            (conj! acc (.slice arr pos))
             :else
             (let [piece-len (arrays/half rest)]
               (conj! acc (.slice arr pos (+ pos piece-len)))

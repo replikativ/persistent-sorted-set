@@ -410,6 +410,34 @@
         (throw-errors errors "B-tree structural invariant violations")
         true))))
 
+(defn fanout-profile
+  "The tree's SHAPE, bottom level first: a vector of vectors giving the element
+   count of every node at each level, root last.
+
+   Contents equality cannot see a shape difference — two trees holding the same
+   elements with different cuts are `=` and iterate identically, and differ only
+   in how they are stored. That difference is not cosmetic under
+   content-addressed storage, where the node bytes ARE the address: a different
+   cut is a different address, a different merkle root, and no node sharing
+   between two databases that hold the same data.
+
+   Reads only nodes already in memory (`child-node` returns nil for one that is
+   not), so it describes a resident tree and is not a substitute for walking
+   storage."
+  [set]
+  (let [root (get-root set)]
+    (if (or (nil? root) (zero? (nlen root)))
+      []
+      (loop [level [root] acc []]
+        (let [widths (mapv subtree-count* level)
+              acc (clojure.core/conj acc widths)
+              kids (when (every? branch? level)
+                     (let [cs (into [] (mapcat children-seq) level)]
+                       (when (every? some? cs) cs)))]
+          (if (seq kids)
+            (recur kids acc)
+            (vec (reverse acc))))))))
+
 (defn validate-full
   "Full integrity check including subtree counts, measures, and element-wise
    navigation. Every key in the tree is re-looked up from the root to verify
