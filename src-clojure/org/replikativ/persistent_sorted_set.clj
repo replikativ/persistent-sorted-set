@@ -281,6 +281,13 @@
      <= max remaining    take all of it as the last node
      otherwise           halve it, so the last two nodes are both >= min"
   [coll avg max]
+  ;; avg >= 2 or the build never terminates: with avg = 1 every branch gets one
+  ;; child, so a level with k nodes produces k nodes again and the tree grows
+  ;; upward forever. avg = (min+max)/2 with min = bf>>>1, so this means bf >= 3.
+  ;; Checked rather than left to hang — bf=2 spun until OOM.
+  (assert (>= avg 2)
+          (str "branching-factor must be >= 3 for a streaming build (got avg fanout "
+               avg "); a fanout of 1 never reduces the level count"))
   (let [need (* 2 avg)
         fill (fn [buf s]
                (loop [buf buf s s]
@@ -293,10 +300,17 @@
               n (count buf)]
           (cond
             (zero? n) nil
-            (>= n need) (cons (subvec buf 0 avg) (step (subvec buf avg) s))
+            ;; `(into [] (subvec ...))` and NOT the bare subvec: a SubVector shares
+            ;; its base, and `conj` on one does `base.assocN(end, o)` — so the base
+            ;; grows without bound and every element ever consumed stays reachable.
+            ;; That silently makes this O(n), which is the one thing the function
+            ;; exists not to be. Measured: 4M elements OOM'd at -Xmx128m before
+            ;; this copy, and complete comfortably after it.
+            (>= n need) (cons (into [] (subvec buf 0 avg))
+                              (step (into [] (subvec buf avg)) s))
             (<= n max) (list buf)
             :else (let [h (quot n 2)]
-                    (list (subvec buf 0 h) (subvec buf h)))))))
+                    (list (into [] (subvec buf 0 h)) (into [] (subvec buf h))))))))
      [] (seq coll))))
 
 (defn from-sorted-seq

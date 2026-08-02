@@ -8,8 +8,10 @@
    Both halves are asserted directly. Contents alone would not do it — a tree with
    the right elements and the wrong fanout passes every `=` check and then behaves
    differently under slicing, counting and later inserts. So the structural test
-   compares the SHAPE (level and fanout of every node), and the memory test grows
-   n by 40× and watches the heap stay flat."
+   compares the SHAPE (level and fanout of every node), and the memory test samples
+   live heap MID-BUILD — measuring after the build returns sees only the residue and
+   misses retention entirely, which is how the first version of it passed against an
+   implementation that OOM'd at -Xmx128m."
   (:require [clojure.test :refer [deftest testing is]]
             [org.replikativ.persistent-sorted-set :as set])
   (:import [org.replikativ.persistent_sorted_set IStorage ANode Branch PersistentSortedSet]))
@@ -96,34 +98,60 @@
 ;; ---------------------------------------------------------------------------
 ;; the property that justifies the function existing
 
-(deftest memory-is-bounded-by-depth-not-by-count
-  (testing "n grows 40x; the heap does not.
+(deftest streaming-split-does-not-retain-its-input
+  (testing "the emitted chunk must be a real vector, not a SubVector view.
 
-            This is the whole reason `from-sorted-seq` exists next to
-            `from-sorted-array`, which materialises the element array, every leaf
-            and every branch level. If this regresses the function has no purpose,
-            so it is asserted rather than assumed."
-    (let [used (fn [] (let [r (Runtime/getRuntime)]
-                        (System/gc) (Thread/sleep 150)
-                        (- (.totalMemory r) (.freeMemory r))))
-          ;; storage that DISCARDS nodes: if the builder retains them the heap
-          ;; grows regardless of what storage does with them.
-          discarding (let [c (atom 0)]
-                       (reify IStorage
-                         (store [_ _] (str "a" (swap! c inc)))
-                         (accessed [_ _] nil)
-                         (restore [_ _] (throw (ex-info "build must not read back" {})))
-                         (markFreed [_ _] nil) (isFreed [_ _] false) (freedInfo [_ _] nil)))
-          measure (fn [n]
-                    (let [before (used)
-                          s (set/from-sorted-seq compare (range n)
-                                                 {:storage discarding :branching-factor 32})]
-                      (is (= n (count s)))
-                      (- (used) before)))
-          small (measure 100000)
-          large (measure 4000000)]
-      (is (< large (+ (* 4 (max small 1048576)) 33554432))
-          (str "heap grew with n: " small " B at 100k vs " large " B at 4M")))))
+            This is the deterministic guard on a defect that a heap measurement
+            nearly missed twice. `subvec` returns a view sharing its base, and
+            `conj` on a view does `base.assocN(end, o)` — so feeding the remainder
+            forward as a SubVector grows the BASE without bound and retains every
+            element ever consumed, silently making the build O(n).
+
+            Measured before the fix: live heap at mid-stream grew 2.7x from 250k
+            to 2M elements, and a 4M build died under -Xmx128m. After: 0.99x, and
+            the same build completes. A type check has none of that noise."
+    (let [chunks (take 5 (#'set/streaming-split (range 10000) 12 16))]
+      (is (seq chunks))
+      (doseq [c chunks]
+        (is (instance? clojure.lang.PersistentVector c)
+            (str "chunk is a " (class c) " — a view retains the whole input"))))))
+
+(deftest memory-is-bounded-by-depth-not-by-count
+  (testing "live heap DURING the build does not scale with n.
+
+            Sampled MID-STREAM from inside the storage callback, not after the
+            build returns — the first version of this test measured the residue
+            (an address and a count) once every intermediate was already garbage,
+            so it passed at 4M while the same build died under a 128 MB heap.
+
+            The threshold is calibrated against a measured defect rather than
+            guessed: the retaining implementation grows 2.7x from 250k to 2M, the
+            streaming one 0.99x. 1.5x separates them with room for GC noise."
+    (let [live-at-midpoint
+          (fn [n]
+            (let [stores (atom 0)
+                  sample (atom nil)
+                  target (long (/ n 64))
+                  st (reify IStorage
+                       (store [_ _]
+                         (let [c (swap! stores inc)]
+                           (when (and (= c target) (nil? @sample))
+                             (System/gc) (Thread/sleep 150)
+                             (let [r (Runtime/getRuntime)]
+                               (reset! sample (- (.totalMemory r) (.freeMemory r)))))
+                           "a"))
+                       (accessed [_ _] nil)
+                       (restore [_ _] (throw (ex-info "build must not read back" {})))
+                       (markFreed [_ _] nil) (isFreed [_ _] false) (freedInfo [_ _] nil))]
+              (set/from-sorted-seq compare (range n) {:storage st :branching-factor 32})
+              @sample))
+          small (live-at-midpoint 250000)
+          large (live-at-midpoint 2000000)]
+      (is (some? small))
+      (is (some? large))
+      (is (< (/ (double large) small) 1.5)
+          (str "live heap grew with n: " (int (/ small 1048576)) " MB at 250k vs "
+               (int (/ large 1048576)) " MB at 2M — the stream is being retained")))))
 
 (deftest build-never-reads-back
   (testing "a bulk build writes; it must not restore. A `restore` during the build
@@ -215,3 +243,23 @@
         s (set/from-sorted-seq compare [42] {:storage storage})]
     (is (= [42] (vec s)))
     (is (= 1 (count s)))))
+
+(deftest tiny-branching-factors-are-refused-not-hung
+  (testing "a fanout of 1 never reduces the level count, so the build grows
+            upward forever.
+
+            `avg = (min + max) / 2` with `min = bf >>> 1`, so bf 1 and 2 both give
+            avg 1. Before the check, bf=2 spun until OOM rather than failing —
+            which is the worst way for a bulk build to be wrong, because it looks
+            like the slow-but-working case it is meant to replace."
+    (let [{:keys [storage]} (mk-storage)]
+      (doseq [bf [1 2]]
+        (is (thrown-with-msg? AssertionError #"branching-factor must be >= 3"
+                              (count (set/from-sorted-seq compare (range 200)
+                                                          {:storage storage :branching-factor bf})))
+            (str "bf=" bf " must be refused")))
+      (testing "and the smallest workable factor does work"
+        (doseq [bf [3 5 7]]
+          (is (= 200 (count (set/from-sorted-seq compare (range 200)
+                                                 {:storage storage :branching-factor bf})))
+              (str "bf=" bf)))))))
