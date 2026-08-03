@@ -485,18 +485,22 @@
   ;; with > 2^32 entries is physically impossible). BigInt absorbs the wider path.
   32)
 
-(defn- max-len [^BTSet set]
-  (get (.-settings set) :branching-factor))
+;; These take SETTINGS, not a set. They used to take a `BTSet`, which forced
+;; `from-sorted-array-count` to fabricate a throwaway one just to ask its fanout
+;; (`(BTSet. nil 0 cmp nil nil nil nil settings)`), and would have forced the
+;; streaming builder to do the same before it has a set to speak of.
+(defn- max-len [settings]
+  (get settings :branching-factor))
 
-(defn- min-len [set]
+(defn- min-len [settings]
   ;; `half`, not `/`: the JVM spells this `_branchingFactor >>> 1`, and plain
   ;; division yields 256.5 for an odd branching factor where the JVM yields 256.
   ;; Every fanout decision downstream is then off by half an element on one
   ;; runtime and not the other.
-  (arrays/half (max-len set)))
+  (arrays/half (max-len settings)))
 
-(defn- avg-len [set]
-  (arrays/half (+ (max-len set) (min-len set))))
+(defn- avg-len [settings]
+  (arrays/half (+ (max-len settings) (min-len settings))))
 
 (defn- path-inc [path]
   (+ path (js* "1n")))
@@ -633,7 +637,7 @@
     (== (bit-shift-right path1 (js/BigInt bpl)) (bit-shift-right path2 (js/BigInt bpl)))))
 
 (defn- path-str [set path]
-  (let [ml (js/BigInt (max-len set))]
+  (let [ml (js/BigInt (max-len (.-settings set)))]
     (loop [res ()
            path path]
       (if (not= path (js* "0n"))
@@ -1753,9 +1757,9 @@
    The `:else` branch recurs where the JVM emits both halves and stops; that is
    the same partition, because after taking `half rest` the remainder is at most
    `max-len` and the next iteration takes it whole."
-  [set arr]
-  (let [chunk-len (avg-len set)
-        max-len   (max-len set)
+  [settings arr]
+  (let [chunk-len (avg-len settings)
+        max-len   (max-len settings)
         len       (arrays/alength arr)
         acc       (transient [])]
     (when (pos? len)
@@ -1850,9 +1854,8 @@
 
 (defn- ^BTSet from-sorted-array-count
   [cmp arr _len settings storage measure-ops]
-  (let [set      (BTSet. nil 0 cmp nil nil nil nil settings)
-        leaves   (->> arr
-                      (arr-partition-approx set)
+  (let [leaves   (->> arr
+                      (arr-partition-approx settings)
                       (arr-map-inplace #(let [leaf (Leaf. % settings nil)]
                                           ;; Compute measure for leaf if measure-ops available
                                           (when measure-ops
@@ -1865,7 +1868,7 @@
         1 (BTSet. (first current-level) (arrays/alength arr) cmp nil UNINITIALIZED_HASH storage nil settings)
         (recur
          (->> current-level
-              (arr-partition-approx set)
+              (arr-partition-approx settings)
               (arr-map-inplace #(let [subtree-count (reduce + 0 (map node/subtree-count %))
                                       ;; Compute measure from children if measure-ops available
                                       measure-ops (:measure settings)
@@ -1894,6 +1897,221 @@
   (when (some nil? seq) (throw (ex-info "PersistentSortedSet cannot store nil" {})))
   (let [arr (-> (into-array seq) (arrays/asort cmp) (sorted-arr-distinct cmp))]
     (from-sorted-array cmp arr (alength arr) opts)))
+
+;; ---------------------------------------------------------------------------
+;; streaming bulk build
+
+;; One per level, as a JS array so the hot loop does no allocation:
+;;   [keys addrs counts measures emitted last-address last-count]
+;; At level 0 `keys` holds raw ELEMENTS and slots 1-3 stay empty.
+;;
+;; JS arrays and not vectors, deliberately. `.splice` and `.push` copy, so the
+;; head handed to a node does not alias what remains. The JVM builder had to
+;; write `(into [] (subvec buf 0 avg))` for exactly this reason — a SubVector
+;; shares its base, and `conj` on one does `base.assocN(end, o)`, so the base
+;; grows without bound and every element ever consumed stays reachable, making
+;; the build silently O(n). ClojureScript's `Subvec` retains identically
+;; (`-conj` is `(-assoc-n v end o)`), so "simplifying" this to vectors would
+;; reintroduce that bug on a second runtime.
+;; The driver's four states, as INTEGERS.
+;;
+;; Keywords with `identical?` would be the obvious spelling and are a trap: it
+;; compiles to `===`, which holds only where the compiler has hoisted keyword
+;; literals into shared constants. That depends on build options — it held in
+;; this project's own `:advanced` build and NOT in datahike's, where every
+;; comparison silently returned false, every iteration fell through to the drain
+;; branch, and an 800-element build produced an empty set with no error. Ints
+;; compare the same way under every optimization setting.
+(def ^:private ^:const SBB-INPUT 0)
+(def ^:private ^:const SBB-PUSH 1)
+(def ^:private ^:const SBB-CUT 2)
+(def ^:private ^:const SBB-DRAIN 3)
+
+(def ^:private ^:const SBB-KEYS 0)
+(def ^:private ^:const SBB-ADDRS 1)
+(def ^:private ^:const SBB-CNTS 2)
+(def ^:private ^:const SBB-MEAS 3)
+(def ^:private ^:const SBB-EMITTED 4)
+(def ^:private ^:const SBB-LAST-ADDR 5)
+(def ^:private ^:const SBB-LAST-CNT 6)
+
+(defn- sbb-level [bufs lvl]
+  (or (aget bufs lvl)
+      (let [lv #js [#js [] #js [] #js [] #js [] 0 nil 0]]
+        (aset bufs lvl lv)
+        lv)))
+
+(defn- ^Leaf sbb-leaf [ks settings measure-ops]
+  (let [leaf (Leaf. ks settings nil)]
+    ;; `{:sync? true}` is right even in the async arm: Leaf/try-compute-measure
+    ;; ignores `storage` entirely, folds the keys and `set!`s the result. No IO.
+    ;; Same call `from-sorted-array-count` makes.
+    (when measure-ops
+      (node/try-compute-measure leaf nil measure-ops {:sync? true}))
+    leaf))
+
+(defn- ^Branch sbb-branch [lvl ks as cs ms settings measure-ops cmp]
+  (let [n    (arrays/alength ks)
+        cnt  (loop [i 0 acc 0]
+               (if (< i n) (recur (inc i) (+ acc (aget cs i))) acc))
+        ;; Folded here rather than by the node, because Branch/try-compute-measure
+        ;; is guarded by `(when (some? children) ...)` — for an address-only
+        ;; branch it returns nil and sets NOTHING. `from-sorted-array-count` and
+        ;; `mst-build-branch` fold the same way; the nil short-circuit is theirs.
+        meas (when measure-ops
+               (loop [i 0 acc (measure/identity-measure measure-ops)]
+                 (if (< i n)
+                   (when-some [m (aget ms i)]
+                     (recur (inc i) (measure/merge-measure measure-ops acc m)))
+                   acc)))]
+    ;; children = nil: the parent holds an ADDRESS and never a child pointer,
+    ;;   which is the whole reason peak memory is O(depth x branching-factor).
+    ;; _bufEntries = 0, not -2: -2 is `branch/from-map`'s LAZY marker for a node
+    ;;   whose slots the storage layer will back-fill. We built this one and it
+    ;;   has no slots, so it is clean and written wholesale.
+    ;; _projCmp = cmp: matches every other bulk-built branch (from-sorted-array-count).
+    (Branch. lvl ks nil as cnt meas settings nil 0 cmp)))
+
+(defn ^BTSet from-sorted-seq
+  "Bulk-build a set from a SORTED, DISTINCT seq, storing every node as it fills.
+
+   The ClojureScript counterpart of the JVM's `from-sorted-seq`, and it builds
+   the SAME tree: same cuts, same levels, same node contents, so a node address
+   means the same thing whichever runtime produced it.
+
+   ## Why this is a push machine and not the JVM's lazy seqs
+
+   The JVM version is `(map (fn [ks] ... store-node! ...) (streaming-split ...))`
+   — IO inside a function literal. partial-cps refuses that outright: `await`
+   inside a `fn` can never suspend, because closures are opaque to the CPS
+   transform. A literal port would not compile in the async arm.
+
+   So `streaming-split`'s lookahead buffer is turned inside out. It asks only
+   whether `2*avg` elements remain, so pushing one element at a time and cutting
+   when a level reaches `2*avg` answers the same question, yields the identical
+   cut sequence, and keeps the identical O(depth x branching-factor) bound —
+   while putting every `node/store` at a statement position inside one `async`
+   block. `async+sync` then emits both arms from this one source.
+
+   A cut hands its entry up by pushing at `lvl+1`, so cascades happen by
+   themselves. That is what a naive 'finish each level, then move up' version
+   gets wrong: it would store every leaf before any branch.
+
+   ## Options
+
+   `:storage` is required — without somewhere to put nodes there is nothing to
+   stream to, and `from-sorted-array` is the right call instead.
+
+   `:flush-fn` is optional, called after each node is stored and AWAITED. The
+   await is the point: it is backpressure, so a caller buffering writes can
+   drain without the buffer growing without bound. Return a value under
+   `{:sync? true}`, a continuation under `{:sync? false}`.
+
+   Input MUST be sorted and distinct under `cmp`; this is checked, because the
+   alternative is a silently corrupt tree."
+  [cmp xs {:keys [sync? storage flush-fn] :or {sync? true} :as opts}]
+  (let [settings    (select-keys opts [:branching-factor :measure :boundary :diff-buf-size])
+        measure-ops (:measure settings)
+        max-bf      (max-len settings)
+        avg-bf      (avg-len settings)
+        need        (* 2 avg-bf)]
+    ;; Eagerly, outside async+sync, so misuse throws at the CALL SITE in both
+    ;; arms instead of becoming a rejected continuation nobody looks at.
+    (when (nil? storage)
+      (throw (ex-info "from-sorted-seq requires :storage — use from-sorted-array for an in-memory build"
+                      {:type :pss/requires-storage})))
+    (when (b/content-boundary settings)
+      (throw (ex-info "from-sorted-seq does not support content-defined (MST) boundaries"
+                      {:type :pss/unsupported-boundary})))
+    ;; `throw`, not `assert`: :advanced elides asserts in a consumer release, and
+    ;; an elided guard here means a branching factor of 2 spins until it OOMs
+    ;; instead of failing — with avg = 1 every branch gets one child, so a level
+    ;; of k nodes produces k nodes again and the tree grows upward forever. The
+    ;; JVM can afford `assert` here; ClojureScript cannot.
+    (when (< avg-bf 2)
+      (throw (ex-info (str "branching-factor must be >= 3 for a streaming build (got avg fanout "
+                           avg-bf "); a fanout of 1 never reduces the level count")
+                      {:type :pss/branching-factor-too-small :avg avg-bf})))
+    (async+sync
+     sync?
+     (async
+      (let [bufs #js []]
+        ;; `cond` + `identical?` rather than `case`: `if` is unambiguously
+        ;; inverted by partial-cps, so the state machine cannot depend on how
+        ;; cljs `case` expands inside a CPS'd loop.
+        (loop [s (seq xs), prev nil, seen? false
+               op SBB-INPUT, lvl 0, width 0, k nil, addr nil, cnt 0, meas nil]
+          (cond
+            ;; ---- pull one element, checking the input contract as we go ----
+            (== op SBB-INPUT)
+            (if (nil? s)
+              (recur s prev seen? SBB-DRAIN 0 0 nil nil 0 nil)
+              (let [x (first s)]
+                (when (nil? x)
+                  (throw (ex-info "PersistentSortedSet cannot store nil" {:type :pss/nil-key})))
+                (when (and seen? (>= 0 (cmp x prev)))
+                  (throw (ex-info (str "from-sorted-seq requires strictly ascending input; "
+                                       (pr-str prev) " was followed by " (pr-str x))
+                                  {:type :pss/unsorted :prev prev :next x})))
+                (recur (next s) x true SBB-PUSH 0 0 x nil 0 nil)))
+
+            ;; ---- append at `lvl`; a full level owes a cut of exactly `avg` ----
+            (== op SBB-PUSH)
+            (let [lv (sbb-level bufs lvl)]
+              (.push (aget lv SBB-KEYS) k)
+              (when (pos? lvl)
+                (.push (aget lv SBB-ADDRS) addr)
+                (.push (aget lv SBB-CNTS) cnt)
+                (.push (aget lv SBB-MEAS) meas))
+              (if (>= (arrays/alength (aget lv SBB-KEYS)) need)
+                (recur s prev seen? SBB-CUT lvl avg-bf nil nil 0 nil)
+                (recur s prev seen? SBB-INPUT 0 0 nil nil 0 nil)))
+
+            ;; ---- the ONE IO site: build the node, store it, hand its entry up ----
+            (== op SBB-CUT)
+            (let [lv   (sbb-level bufs lvl)
+                  hks  (.splice (aget lv SBB-KEYS) 0 width)
+                  node (if (zero? lvl)
+                         (sbb-leaf hks settings measure-ops)
+                         (sbb-branch lvl hks
+                                     (.splice (aget lv SBB-ADDRS) 0 width)
+                                     (.splice (aget lv SBB-CNTS) 0 width)
+                                     (.splice (aget lv SBB-MEAS) 0 width)
+                                     settings measure-ops cmp))
+                  a    (await (node/store node storage opts))
+                  _    (when flush-fn (await (flush-fn)))
+                  c    (node/subtree-count node)]
+              (aset lv SBB-EMITTED (inc (aget lv SBB-EMITTED)))
+              (aset lv SBB-LAST-ADDR a)
+              (aset lv SBB-LAST-CNT c)
+              (recur s prev seen? SBB-PUSH (inc lvl) 0
+                     (node/max-key node) a c (node/measure node)))
+
+            ;; ---- input exhausted: finish levels bottom-up ----
+            ;; A level that ends having emitted exactly ONE node is the root.
+            :else
+            (let [lv (sbb-level bufs lvl)
+                  n  (arrays/alength (aget lv SBB-KEYS))]
+              (cond
+                ;; streaming-split's two terminal cases, in its order. `half`,
+                ;; not `quot`, to match arr-partition-approx exactly.
+                (pos? n)
+                (recur s prev seen? SBB-CUT lvl (if (<= n max-bf) n (arrays/half n)) nil nil 0 nil)
+
+                (zero? (aget lv SBB-EMITTED))
+                (BTSet. (Leaf. (arrays/array) settings nil) 0 cmp (:meta opts)
+                        UNINITIALIZED_HASH storage nil settings)
+
+                (== 1 (aget lv SBB-EMITTED))
+                ;; Address-rooted, exactly as a restore is: the root loads on
+                ;; first access. `cnt` is exact, so `count` never has to walk —
+                ;; an address-rooted set with cnt -1 restores the whole tree on
+                ;; the first `count`.
+                (BTSet. nil (aget lv SBB-LAST-CNT) cmp (:meta opts)
+                        UNINITIALIZED_HASH storage (aget lv SBB-LAST-ADDR) settings)
+
+                :else
+                (recur s prev seen? SBB-DRAIN (inc lvl) 0 nil nil 0 nil))))))))))
 
 (defn ^BTSet from-opts
   "Create a set with options map containing:

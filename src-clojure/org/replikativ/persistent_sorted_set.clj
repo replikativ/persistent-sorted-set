@@ -365,6 +365,7 @@
          max-bf   (.branchingFactor settings)
          avg-bf   (-> (.minBranchingFactor settings) (+ max-bf) (quot 2))
          storage  (:storage opts)
+         flush-fn (:flush-fn opts)
          ^IMeasure measure-ops (.measure settings)
          _ (when (nil? storage)
              (throw (IllegalArgumentException.
@@ -388,6 +389,13 @@
          ;; ---- level 0: leaves ----
          store-node! (fn [^ANode node]
                        (let [addr (.store node ^IStorage storage)]
+                         ;; Called after each node is stored, so a caller that
+                         ;; buffers writes can drain instead of accumulating the
+                         ;; whole tree — otherwise this function's memory bound
+                         ;; is real for the TREE and nominal for the caller.
+                         ;; Same seam as the ClojureScript builder, which awaits
+                         ;; it; here it is an ordinary call.
+                         (when flush-fn (flush-fn))
                          {:key (.maxKey node)
                           :address addr
                           :count (if (instance? ISubtreeCount node)

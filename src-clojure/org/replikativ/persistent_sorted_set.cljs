@@ -37,6 +37,27 @@
   ([cmp seq opts]
    (btset/from-sequential cmp seq (with-defaults opts))))
 
+(defn from-sorted-seq
+  "Bulk-build a set from a SORTED, DISTINCT seq, storing every node to `:storage`
+   as it fills. Peak memory is O(depth x branching-factor), independent of the
+   element count — which is what makes it the right builder for a restore, where
+   the data does not fit in memory and `from-sorted-array` therefore cannot run.
+
+   The result is address-rooted, the same shape a restore produces: nodes hold
+   child ADDRESSES, not child pointers, and load lazily. `(store set)` returns
+   the root address without re-storing anything.
+
+   Builds the same tree as the JVM's `from-sorted-seq` — same cuts, same node
+   contents — so an address means the same thing on either runtime.
+
+   Options beyond the usual: `:storage` (required), `:flush-fn` (called and
+   awaited after each node is stored, for backpressure), `:sync?`.
+
+   Three-arity only, matching the JVM: `:storage` is mandatory, so a call
+   without opts is always an error."
+  ([cmp xs opts]
+   (btset/from-sorted-seq cmp xs (with-defaults opts))))
+
 (defn sorted-set-by
   ([cmp]
    (btset/from-opts (with-defaults {:comparator cmp})))
