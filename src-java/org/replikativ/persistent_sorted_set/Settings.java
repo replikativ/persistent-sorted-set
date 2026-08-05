@@ -8,7 +8,12 @@ import java.util.concurrent.atomic.*;
 public class Settings {
   public final int _branchingFactor;
   public final RefType _refType;
-  public final AtomicBoolean _edit;
+  /** Transient ownership, in Clojure's own model: the owning Thread while editable,
+   *  null once `persistent!` has been called, and the whole field null for a set that was
+   *  never transient. Was an AtomicBoolean, which recorded THAT a set was editable but not
+   *  BY WHOM — so `editable()` answered true on any thread and every mutating operation
+   *  silently took the in-place path from anywhere. */
+  public final AtomicReference<Thread> _edit;
   public final IMeasure _measure;
   public final ILeafProcessor _leafProcessor;
   // diff-buf: per-node diff budget B. 0 (default) disables the write-opt path
@@ -25,7 +30,7 @@ public class Settings {
   // through unchanged, so a transient preserves them. (The pre-diff-buf 5-arg edit ctor was
   // removed: it was unused and, lacking a diffBufSize arg, would have silently reset it to the
   // sysprop default.)
-  public Settings(int branchingFactor, RefType refType, AtomicBoolean edit, IMeasure measure, ILeafProcessor leafProcessor, int diffBufSize, IBoundary boundary) {
+  public Settings(int branchingFactor, RefType refType, AtomicReference<Thread> edit, IMeasure measure, ILeafProcessor leafProcessor, int diffBufSize, IBoundary boundary) {
     _branchingFactor = branchingFactor;
     _refType = refType;
     _edit = edit;
@@ -145,14 +150,64 @@ public class Settings {
     return _refType;
   }
 
+  /** Opt-in ownership enforcement, for test suites. OFF by default, and a `static final`
+   *  read from a system property so the JIT folds the branch away entirely when it is —
+   *  the hot transient paths pay nothing.
+   *
+   *  It is off by default on purpose. The corruption below comes from CONCURRENT use;
+   *  a HANDOFF (one thread finishes, publishes across a happens-before edge, another
+   *  continues) is sequential and safe, and Clojure permits it — `PersistentVector`
+   *  carries this very check commented out. An owner comparison sees only thread
+   *  IDENTITY, so it cannot tell handoff from concurrency and would forbid the safe
+   *  pattern to prevent the unsafe one. Enable it where you know no handoff occurs. */
+  private static final boolean STRICT_TRANSIENTS = Boolean.getBoolean("pss.strictTransients");
+
+  /** Is this set editable in place BY THE CALLING THREAD?
+   *
+   *  Throws rather than answering false for a foreign thread: answering false would send
+   *  it down the persistent path, which is a silent wrong answer, not a safe one. Measured
+   *  before this check existed — 4 threads x 5000 `conj!` on one transient — 19 262 of
+   *  20 000 elements present, `count` disagreeing with `seq` (13 942 vs 19 262), and
+   *  `sorted?` FALSE: a sorted set whose keys are not in order, so every later
+   *  binarySearch is arbitrary, and durable once stored. Clojure's transients have always
+   *  thrown here; this one silently corrupted.
+   *
+   *  KNOWN GAP: using a transient AFTER `persistent!` still degrades silently to the
+   *  persistent path rather than throwing, because `persistent()` returns `this` — the
+   *  stale handle and the persistent result are the same object, so they cannot be told
+   *  apart. Clojure can throw because its two are different objects. Fixing that means
+   *  changing what `persistent()` returns, which is a wider change than this. */
   public boolean editable() {
-    return _edit != null && _edit.get();
+    if (_edit == null) return false;
+    Thread owner = _edit.get();
+    // Sealed by persistent!. Answering FALSE here is required, not lax: nodes share these
+    // settings and `Branch.child` asks `editable()` on READ paths, so throwing would break
+    // every read of a formerly-transient set. The stale-handle check belongs at the set's
+    // mutation entry points — see PersistentSortedSet.ensureLiveTransient, which is where
+    // Clojure puts its `ensureEditable` too.
+    if (owner == null) return false;
+    if (STRICT_TRANSIENTS && owner != Thread.currentThread()) {
+      throw new IllegalAccessError("Transient used by non-owner thread");
+    }
+    return true;
+  }
+
+  /** Settings for a PERSISTENT set: same configuration, no edit reference. */
+  public Settings sealed() {
+    return new Settings(_branchingFactor, _refType, null, _measure, _leafProcessor, _diffBufSize, _boundary);
+  }
+
+  /** Did these settings belong to a transient that `persistent!` has since sealed?
+   *  Distinguishes a STALE TRANSIENT HANDLE from a set that was never transient
+   *  (`_edit == null`) and from a live one (`_edit.get() != null`). */
+  public boolean sealedTransient() {
+    return _edit != null && _edit.get() == null;
   }
 
   public Settings editable(boolean value) {
     assert !editable();
     assert value == true;
-    Settings s = new Settings(_branchingFactor, _refType, new AtomicBoolean(value), _measure, _leafProcessor, _diffBufSize, _boundary);
+    Settings s = new Settings(_branchingFactor, _refType, new AtomicReference<>(Thread.currentThread()), _measure, _leafProcessor, _diffBufSize, _boundary);
     return s;
   }
 
@@ -166,7 +221,7 @@ public class Settings {
 
   public void persistent() {
     assert _edit != null;
-    _edit.set(false);
+    _edit.set(null);
   }
 
   public <T> Object makeReference(T value) {

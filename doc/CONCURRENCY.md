@@ -99,9 +99,39 @@ plain working arrays with a seal point:
   transient paths, and the shared-node rules above are unaffected because
   editability is per-node (`ANode.editable()` reads the node's own settings): a
   committed node is never editable, an editable node is never shared.
-- The seal point is `persistent!` (`Settings.persistent()` flips the shared
-  `AtomicBoolean`), after which every node that carried those settings answers
-  `editable() == false` and falls under the shared-node rules.
+- The seal point is `persistent!` (`Settings.persistent()` nulls the shared
+  `AtomicReference<Thread>`), after which every node that carried those settings
+  answers `editable() == false` and falls under the shared-node rules.
+- `persistent!` returns a NEW `PersistentSortedSet` — as every Clojure transient
+  does — and the stale handle then throws `IllegalAccessError("Transient used
+  after persistent! call")` on any mutation. While the two were the same object
+  the stale handle could only degrade silently: `conj!` took the persistent path
+  and returned a new set, so the caller's mutation landed somewhere they were not
+  looking.
+
+### Transient ownership
+
+A transient may be mutated by **one thread at a time**. A HANDOFF is fine — one
+thread finishes, publishes across a happens-before edge, another continues, which
+is what `fold` does and what a parking core.async block does. CONCURRENT mutation
+is undefined.
+
+This is a contract, **not enforced by default**, following Clojure: an owner
+comparison sees thread IDENTITY and so cannot tell handoff from concurrency, and
+enforcing it would forbid the safe pattern to prevent the unsafe one. Clojure's
+`PersistentVector.persistent()` carries exactly this check commented out.
+
+Breaking the rule is not a near-miss. Measured, 4 threads x 5000 `conj!` on one
+transient: `sorted?` **false** — the keys come out of order, so every later
+`binarySearch` is arbitrary — with `seq` and `count` disagreeing (19 318 vs
+14 793), and one trial throwing `ArrayIndexOutOfBoundsException` from
+`Seq/first`. Unlike Clojure's, this corruption becomes **durable** the moment the
+set is stored.
+
+Set `-Dpss.strictTransients=true` to have a foreign thread refused with
+`IllegalAccessError("Transient used by non-owner thread")`. Intended for test
+suites that know no handoff occurs; the flag is a `static final` read at class
+init, so the branch folds away when it is off.
 
 ## Single-writer settle
 

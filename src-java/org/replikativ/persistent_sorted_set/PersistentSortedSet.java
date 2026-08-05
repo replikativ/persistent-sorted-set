@@ -563,6 +563,19 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
    *  STRONGLY even when the set is configured `:soft`/`:weak`. That is the point.
    *  A dirty root is the only copy in existence, so allowing the collector to take
    *  it is never correct. */
+  /** Refuse a STALE TRANSIENT HANDLE — a set that was made transient and has since been
+   *  sealed by `persistent!`. Clojure throws here (`ensureEditable`, identical in
+   *  PersistentVector/HashMap/ArrayMap); this used to answer `editable() == false` and
+   *  quietly take the persistent path instead, returning a NEW set from what looked like
+   *  an in-place `conj!` — so the caller's mutation went somewhere they were not looking.
+   *
+   *  A set that was never transient has no edit reference and passes straight through. */
+  private void ensureLiveTransient() {
+    if (_settings.sealedTransient()) {
+      throw new IllegalAccessError("Transient used after persistent! call");
+    }
+  }
+
   private void markDirty(ANode<Key, Address> root) {
     _address = null;
     _root = root;                      // bare node, never a Reference
@@ -572,6 +585,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     // nil is not a storable value (matches upstream persistent-sorted-set; nil would also be
     // ambiguous against the null "not found"/sentinel returns and comparator-dependent ordering).
     if (key == null) throw new IllegalArgumentException("PersistentSortedSet cannot store nil");
+    ensureLiveTransient();
     final ANode<Key, Address> r = root();
     ANode[] nodes = r.add(_storage, (Key) key, cmp, _settings);
 
@@ -644,6 +658,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       return new PersistentSortedSet(_meta, _cmp, null, _storage, newRoot, newCount, _settings, _version + 1);
     }
 
+    ensureLiveTransient();
     final ANode<Key, Address> r = root();
     ANode[] nodes = r.remove(_storage, (Key) key, null, null, cmp, _settings);
 
@@ -717,6 +732,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       return disjoin(oldKey, cmp).cons(newKey, cmp);
     }
 
+    ensureLiveTransient();
     final ANode<Key, Address> r = root();
     ANode[] nodes = r.replace(_storage, (Key) oldKey, (Key) newKey, cmp, _settings);
 
@@ -1015,12 +1031,24 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     return cons(key, _cmp);
   }
 
+  /** Seal the transient and return the persistent set.
+   *
+   *  Returns a NEW PersistentSortedSet rather than `this`, as every Clojure transient
+   *  does. That is what lets a stale handle be DETECTED: while the two were the same
+   *  object, "the transient after persistent!" and "the persistent result" were
+   *  indistinguishable, so `conj!` on the stale handle could only degrade silently.
+   *  The result carries sealed settings (no edit reference); `this` keeps the sealed
+   *  edit reference and so answers `ensureLiveTransient` by throwing.
+   *
+   *  Shared nodes keep the old settings object, whose `editable()` is now false — which
+   *  is exactly the committed-node state they should be in. */
   public PersistentSortedSet persistent() {
     if (!editable()) {
       throw new IllegalStateException("Expected transient set");
     }
-    _settings.persistent();
-    return this;
+    Settings sealed = _settings.sealed();
+    _settings.persistent();                 // null the shared owner: this handle is now stale
+    return new PersistentSortedSet(_meta, _cmp, _address, _storage, _root, _count, sealed, _version);
   }
 
   // Iterable
