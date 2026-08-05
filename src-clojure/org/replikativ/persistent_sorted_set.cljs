@@ -237,6 +237,36 @@
   ([^BTSet set arg] (btset/store set arg))
   ([^BTSet set storage opts] (btset/store set storage opts)))
 
+(defn diff
+  "Keys added and removed between two sets that SHARE STRUCTURE.
+
+   Returns `{:added [...] :removed [...]}`, both in the sets' sort order, or a
+   continuation yielding it when `{:sync? false}`.
+
+   Cost is proportional to what CHANGED, not to set size, in NODES READ — which
+   here means async round trips. Two versions of a persistent set share every
+   node they have in common, so a subtree whose address appears on both sides
+   cannot contain a difference and is dropped without being loaded. Measured on
+   the JVM against a serializing storage, sets one two-element transaction
+   apart: 3-4 nodes read whether the set holds 1 000 elements or 100 000. Two
+   identical stored roots are answered without touching storage at all.
+
+   Both sets must come from the same lineage (one derived from the other, or
+   both from a common ancestor) and must be STORED for pruning to work — an
+   in-memory set has no addresses, so every node is walked. Diffing unrelated
+   sets is CORRECT but degrades to a full walk of both.
+
+   Membership is decided by the set's comparator, so two keys that compare equal
+   are treated as the same key even if they are not `=`.
+
+   Same algorithm and same answers as the JVM `diff`."
+  ([^BTSet a ^BTSet b]
+   (btset/diff a b (.-storage b) {:sync? true}))
+  ([^BTSet a ^BTSet b storage]
+   (btset/diff a b storage {:sync? true}))
+  ([^BTSet a ^BTSet b storage opts]
+   (btset/diff a b storage opts)))
+
 (defn restore
   "Restore a set from storage given root-address-or-info and storage.
    This operation is always synchronous and does not initiate io.

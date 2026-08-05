@@ -628,3 +628,176 @@
         len   (alength arr)
         opts  (settings->map (.-_settings set))]
     (from-sorted-array (.comparator set) arr len opts)))
+
+;; ---------------------------------------------------------------------------
+;; diff — what changed between two versions of a set that share structure.
+;;
+;; The walk is LEVEL-SYNCHRONIZED and never loads a node it can prove it does
+;; not need. A frontier entry names a node without loading it:
+;;
+;;     [node parent idx addr prunable?]
+;;
+;; `node` is nil until materialized, `addr` is the stored address (nil for a
+;; node that has never been stored), and `prunable?` says whether that address
+;; can be trusted to stand for the contents.
+;;
+;; Each round: intersect the two frontiers' addresses, drop what both sides
+;; hold, and load only the remainder. The addresses come from the parents,
+;; which are already loaded, so pruning itself costs no IO. That is what makes
+;; the READ count proportional to the change — an earlier version collected
+;; every address of both trees first, which is correct but loads both trees
+;; whole, and on a 100 000-element set read all 392 nodes to report a
+;; two-element delta.
+
+(defn- child-refs
+  "Frontier entries for every child of `branches` (already materialized)."
+  [branches]
+  (into []
+        (mapcat (fn [[node]]
+                  (let [^Branch b node
+                        addrs (.addressArray b)
+                        ;; diff-buf: a branch buffers a child's changes in its
+                        ;; OWN slots and leaves the child's ADDRESS untouched,
+                        ;; so for a buffered child an address match no longer
+                        ;; proves the subtrees are equal. Measured before this
+                        ;; guard existed: a 5000-element set with 7 additions
+                        ;; reported NONE of them under -Dpss.diffBufSize=256.
+                        ;;
+                        ;; The guard is per CHILD, not per branch. `bufEntries`
+                        ;; is a whole-branch count, and using it made one
+                        ;; buffered child poison all 390 of its siblings —
+                        ;; correct, but it read every node of a 100 000-element
+                        ;; set for a two-element delta. `slots` is indexed by
+                        ;; child and equally IO-free: a nil slot means that
+                        ;; child has no buffered diff, so its address still
+                        ;; stands for its contents. A non-nil slot is
+                        ;; unprunable whatever its shape — for a BRANCH child
+                        ;; `diff` is null and the real diff lives in the
+                        ;; subtree, so nil-diff does not mean nil-change.
+                        slots (.slots b)]
+                    (map (fn [i] [nil b i (when addrs (aget ^objects addrs i))
+                                  (or (nil? slots) (nil? (aget ^objects slots i)))])
+                         (range (.len b))))))
+        branches))
+
+(defn- materialize
+  "Load every entry that is not resident. One `restore` each, at most."
+  [^IStorage storage refs]
+  (mapv (fn [[node ^Branch parent idx :as ref]]
+          (if (some? node) ref (assoc ref 0 (.child parent storage (int idx)))))
+        refs))
+
+(defn- prune-shared
+  "Drop from each frontier the entries the other side holds at the same
+   address — identical subtrees, which cannot contain a difference. No IO."
+  [fa fb]
+  (let [addrs   (fn [f] (into #{} (keep (fn [[_ _ _ addr prunable?]]
+                                          (when (and (some? addr) prunable?) addr)))
+                              f))
+        sa      (addrs fa)
+        sb      (addrs fb)
+        shared? (fn [other] (fn [[_ _ _ addr prunable?]]
+                              (and (some? addr) prunable? (contains? other addr))))]
+    ;; an entry the OTHER side marked unprunable never entered its address set,
+    ;; so neither side prunes against a buffered branch.
+    [(into [] (remove (shared? sb)) fa)
+     (into [] (remove (shared? sa)) fb)]))
+
+(defn- descend
+  "One level down. At level 0 the entries are leaves and contribute their keys
+   to `cand`; above it they contribute their children to the next frontier."
+  [storage refs level cand]
+  (let [nodes (materialize storage refs)]
+    (if (zero? (long level))
+      [[] (reduce (fn [c [node]] (reduce clojure.core/conj c (.keys ^ANode node))) cand nodes)]
+      [(child-refs nodes) cand])))
+
+(defn- sorted-diff
+  "Elements of `xs` absent from `ys`. Both ascending under `cmp`; O(n+m), no IO."
+  [^java.util.Comparator cmp xs ys]
+  (loop [xs (clojure.core/seq xs) ys (clojure.core/seq ys) out (transient [])]
+    (cond
+      (nil? xs) (persistent! out)
+      (nil? ys) (persistent! (reduce conj! out xs))
+      :else     (let [c (.compare cmp (first xs) (first ys))]
+                  (cond
+                    (neg? c) (recur (next xs) ys (conj! out (first xs)))
+                    (pos? c) (recur xs (next ys) out)
+                    :else    (recur (next xs) (next ys) out))))))
+
+(defn diff
+  "Keys added and removed between two sets that SHARE STRUCTURE.
+
+   Returns `{:added [...] :removed [...]}`, both in the sets' sort order.
+
+   ## Why this is not `clojure.set/difference`
+
+   Cost is proportional to what CHANGED, not to set size — in NODES READ, which
+   is the cost that matters for a set backed by storage. Two versions of a
+   persistent set share every node they have in common, so a subtree whose
+   address appears on both sides cannot contain a difference and is dropped
+   without being loaded. Measured on sets one two-element transaction apart,
+   against a storage that actually serializes:
+
+       elements   nodes on disk   nodes read
+          1 000               5          3-4
+        100 000             392          3-4
+
+   Two identical stored roots are answered without touching storage at all.
+
+   That is the property an incremental consumer needs — replication, an audit
+   trail, catching a migration target up — to be proportional to the delta
+   rather than to the database.
+
+   The answer is exact without any membership lookups: a key that lives in a
+   pruned (shared) leaf is present on BOTH sides and therefore appears as a
+   candidate on neither, so differencing the two candidate lists is the same
+   answer differencing against the full sets would give.
+
+   ## Requirements and limits
+
+   Both sets must come from the same lineage (one derived from the other by
+   `conj`/`disj`, or both from a common ancestor). Diffing unrelated sets is
+   CORRECT but pointless: nothing is shared, so nothing prunes and it degrades
+   to a full walk of both.
+
+   Sets must be STORED for pruning to work — an in-memory set has no addresses,
+   so every node is walked. Call `store` first, or diff two restored sets.
+
+   A rebalance that repartitions keys across leaves without changing them will
+   read those leaves and find no difference: pruning is an optimization on
+   reads, never on the answer.
+
+   Membership is decided by the set's comparator, so two keys that compare
+   equal are treated as the same key even if they are not `=`."
+  ([a b] (diff a b (.-_storage ^PersistentSortedSet b)))
+  ([^PersistentSortedSet a ^PersistentSortedSet b ^IStorage storage]
+   (let [addr-a (.-_address a)
+         addr-b (.-_address b)]
+     (if (and (some? addr-a) (= addr-a addr-b))
+       {:added [] :removed []}                       ; same root: zero reads
+       (let [cmp    (.comparator b)
+             ;; roots go through `root()` rather than a bare restore: it stamps
+             ;; the projection comparator that diff-buf needs on descent.
+             root-a (.root a)
+             root-b (.root b)]
+         (loop [fa [[root-a nil nil addr-a true]] la (.level ^ANode root-a)
+                fb [[root-b nil nil addr-b true]] lb (.level ^ANode root-b)
+                ca [] cb []]
+           (let [la (if (clojure.core/seq fa) (long la) -1)
+                 lb (if (clojure.core/seq fb) (long lb) -1)]
+             (if (and (neg? la) (neg? lb))
+               {:added (sorted-diff cmp cb ca) :removed (sorted-diff cmp ca cb)}
+               ;; addresses only mean the same thing at the same level, and a
+               ;; shared node keeps its level, so pruning across unequal levels
+               ;; would find nothing. Walk the deeper side down until they meet.
+               (let [[fa fb]   (if (== la lb) (prune-shared fa fb) [fa fb])
+                     la        (if (clojure.core/seq fa) la -1)
+                     lb        (if (clojure.core/seq fb) lb -1)
+                     down-a?   (and (>= la 0) (>= la lb))
+                     down-b?   (and (>= lb 0) (>= lb la))
+                     [fa' ca'] (if down-a? (descend storage fa la ca) [fa ca])
+                     [fb' cb'] (if down-b? (descend storage fb lb cb) [fb cb])]
+                 (recur fa' (if down-a? (dec la) la)
+                        fb' (if down-b? (dec lb) lb)
+                        ca' cb'))))))))))
