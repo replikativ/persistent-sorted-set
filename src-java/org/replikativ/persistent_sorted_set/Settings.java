@@ -119,6 +119,19 @@ public class Settings {
     return new Settings(_branchingFactor, _refType, _edit, _measure, _leafProcessor, _diffBufSize, boundary);
   }
 
+  /** A copy with `diffBufSize` replaced. Used by `PersistentSortedSet.root()` to adopt a
+   *  restored node's own budget — nodes are self-describing, and a set running at 0 over
+   *  nodes that carry slots drops their buffered elements on the next write.
+   *
+   *  Refuses to enable buffering under a content-defined boundary (MST), for the same
+   *  reason `withBoundary` forces it off: a buffered spine node is addressed by
+   *  hash(anchor+diff) rather than its canonical content hash, which breaks the
+   *  cross-peer dedup MST exists for. */
+  public Settings withDiffBufSize(int diffBufSize) {
+    int effective = (_boundary != null && _boundary.contentDefined()) ? 0 : diffBufSize;
+    return new Settings(_branchingFactor, _refType, _edit, _measure, _leafProcessor, effective, _boundary);
+  }
+
   public int expandLen() {
     return 8;
   }

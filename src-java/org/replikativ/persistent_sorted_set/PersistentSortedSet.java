@@ -67,6 +67,21 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       if (nodeBoundary.contentDefined() && !_settings.boundary().contentDefined()) {
         _settings = _settings.withBoundary(nodeBoundary);
       }
+      // diff-buf: self-describing in exactly the same way, and adopted for a stronger
+      // reason. A node carries its own budget in its blob, so a set restored WITHOUT
+      // `:diff-buf-size` ran at 0 over nodes at N: reads were fine (projection is driven
+      // by the NODE's settings through child()), but the next write rebuilt through the
+      // set's settings and dropped every surviving sibling's buffered elements. Measured
+      // before this adoption, bf 16 / budget 512 / 6000 elements, a tree stored WITH
+      // slots and then restored bare: 81 elements silently gone; zero when the caller
+      // passed the budget. The caller cannot be expected to remember a number the data
+      // already knows.
+      //
+      // Only ever ADOPTS upward from 0 — an explicit budget wins, and `withDiffBufSize`
+      // refuses to enable buffering under a content-defined boundary.
+      if (_settings.diffBufSize() <= 0 && root._settings.diffBufSize() > 0) {
+        _settings = _settings.withDiffBufSize(root._settings.diffBufSize());
+      }
     }
     // A DIRTY root (no address) must be held strongly — see markDirty. If it is gone
     // there is no durable copy to fall back on, so say so rather than dereference null
