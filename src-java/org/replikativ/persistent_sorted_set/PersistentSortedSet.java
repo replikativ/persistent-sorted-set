@@ -68,6 +68,14 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
         _settings = _settings.withBoundary(nodeBoundary);
       }
     }
+    // A DIRTY root (no address) must be held strongly — see markDirty. If it is gone
+    // there is no durable copy to fall back on, so say so rather than dereference null
+    // three frames later.
+    if (root == null) {
+      throw new IllegalStateException(
+          "PersistentSortedSet has neither a resident root nor an address: a dirty root's "
+          + "reference was cleared. `_address == null` must imply a strongly-held root.");
+    }
     // diff-buf: seed the projection comparator at the root; Branch.child propagates it down
     // as nodes materialize, so a leaf-parent can project buffered leaves with the set's
     // comparator. (Idempotent; no-op for a Leaf root, which has no buffered children.)
@@ -425,6 +433,11 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
 
     if (_address == null) {
       ANode<Key, Address> root = (ANode) _settings.readReference(_root);
+      if (root == null) {
+        throw new IllegalStateException(
+            "PersistentSortedSet cannot be stored: it has no address and its root reference "
+            + "was cleared. `_address == null` must imply a strongly-held root (see markDirty).");
+      }
       address(root.store(_storage));
       _root = _settings.makeReference(root);
     }
@@ -516,11 +529,36 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     return result;
   }
 
+  /** INVARIANT: `_address == null` implies `_root` holds a STRONG reference.
+   *
+   *  A dirty root has no durable copy. If its Soft/WeakReference were cleared the
+   *  tree would be unrecoverable, and `root()`/`store()` would dereference null.
+   *  Every site that clears `_address` therefore publishes the root strongly, in
+   *  one place, rather than each remembering to.
+   *
+   *  This matters most for the EARLY_EXIT paths, where a node is mutated IN PLACE
+   *  and so no new root is produced to assign: those used to clear `_address` and
+   *  leave `_root` as whatever the last `store()` wrapped it in. That state was
+   *  not reachable through the public API when this was written — a just-stored
+   *  tree is not mutable in place, so the first mutation after a store always
+   *  returns a node — but nothing enforced it, and the cost of holding the
+   *  invariant is one assignment.
+   *
+   *  Note the reference type deliberately changes here: a dirty root is held
+   *  STRONGLY even when the set is configured `:soft`/`:weak`. That is the point.
+   *  A dirty root is the only copy in existence, so allowing the collector to take
+   *  it is never correct. */
+  private void markDirty(ANode<Key, Address> root) {
+    _address = null;
+    _root = root;                      // bare node, never a Reference
+  }
+
   public PersistentSortedSet cons(Object key, Comparator cmp) {
     // nil is not a storable value (matches upstream persistent-sorted-set; nil would also be
     // ambiguous against the null "not found"/sentinel returns and comparator-dependent ordering).
     if (key == null) throw new IllegalArgumentException("PersistentSortedSet cannot store nil");
-    ANode[] nodes = root().add(_storage, (Key) key, cmp, _settings);
+    final ANode<Key, Address> r = root();
+    ANode[] nodes = r.add(_storage, (Key) key, cmp, _settings);
 
     if (UNCHANGED == nodes) return this;
 
@@ -530,15 +568,15 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     }
 
     if (editable()) {
-      // Clear address - must always clear when tree is modified (including EARLY_EXIT case)
-      _address = null;
-
       if (1 == nodes.length) {
-        _root = nodes[0];
+        markDirty(nodes[0]);
       } else if (nodes.length >= 2) {
-        _root = growRoot(nodes);
+        markDirty(growRoot(nodes));
+      } else {
+        // EARLY_EXIT (nodes.length == 0): `r` was modified IN PLACE, so it is the
+        // new root and must be published strongly — see markDirty.
+        markDirty(r);
       }
-      // EARLY_EXIT case (nodes.length == 0): tree was modified in place, _address already cleared above
       // When processor is configured, count may differ from +1
       if (_settings.leafProcessor() != null) {
         long rootCount = getSubtreeCount(root());
@@ -591,7 +629,8 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       return new PersistentSortedSet(_meta, _cmp, null, _storage, newRoot, newCount, _settings, _version + 1);
     }
 
-    ANode[] nodes = root().remove(_storage, (Key) key, null, null, cmp, _settings);
+    final ANode<Key, Address> r = root();
+    ANode[] nodes = r.remove(_storage, (Key) key, null, null, cmp, _settings);
 
     // not in set
     if (UNCHANGED == nodes) return this;
@@ -603,8 +642,9 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
 
     // in place update
     if (nodes == EARLY_EXIT) {
-      // Clear address
-      _address = null;
+      // `r` was modified IN PLACE, so it is the new root and must be published
+      // strongly — see markDirty.
+      markDirty(r);
       _count = alterCount(-1);
       _version += 1;
       return this;
@@ -662,7 +702,8 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       return disjoin(oldKey, cmp).cons(newKey, cmp);
     }
 
-    ANode[] nodes = root().replace(_storage, (Key) oldKey, (Key) newKey, cmp, _settings);
+    final ANode<Key, Address> r = root();
+    ANode[] nodes = r.replace(_storage, (Key) oldKey, (Key) newKey, cmp, _settings);
 
     // Not in set
     if (UNCHANGED == nodes) return this;
@@ -674,8 +715,9 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
 
     // In-place update (transient)
     if (EARLY_EXIT == nodes) {
-      // Clear address
-      _address = null;
+      // `r` was modified IN PLACE, so it is the new root and must be published
+      // strongly — see markDirty.
+      markDirty(r);
       _version += 1;
       return this;
     }
@@ -683,9 +725,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     // New root node (persistent case or maxKey changed in transient)
     ANode newRoot = nodes[0];
     if (editable()) {
-      // Clear address
-      _address = null;
-      _root = newRoot;
+      markDirty(newRoot);
       _version += 1;
       return this;
     }
