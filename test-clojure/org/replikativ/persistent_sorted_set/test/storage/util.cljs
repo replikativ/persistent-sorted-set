@@ -101,10 +101,27 @@
     (async
      (or
       (@*memory address)
-      (let [{:keys [keys addresses level measure] :as m} (edn/read-string (@*disk address))
+      (let [{:keys [keys addresses level measure slots] :as m} (edn/read-string (@*disk address))
             node (if addresses
                    (branch/from-map (assoc m :settings settings))
-                   (Leaf. keys settings measure))]
+                   (Leaf. keys settings measure))
+            ;; diff-buf: reconstruct per-child buffered diffs, exactly as the SYNC
+            ;; storage above does. This half was missing while `store` wrote
+            ;; `:slots` faithfully — a storage that persists buffered diffs and
+            ;; never reads them back, which is indistinguishable from a storage
+            ;; that lost them. It stayed invisible because the cljs set-level
+            ;; `:diff-buf-size` was being dropped by `select-keys`, so nothing
+            ;; buffered in the first place; with that fixed it showed up
+            ;; immediately as the async arm of the diff test reporting `:added []`
+            ;; where the sync arm reported the two added keys.
+            _    (when (and slots addresses)
+                   (let [arr (make-array (count keys))]
+                     (doseq [[idx entry] slots]
+                       (aset arr (int idx) {:diff    (:diff entry)
+                                            :count   (:count entry)
+                                            :measure (:measure entry)
+                                            :anchor  (nth (vec addresses) (int idx))}))
+                     (set! (.-_slots node) arr)))]
         (dbg "restored<" (type node) ">")
         (swap! *stats update :reads inc)
         (swap! *memory assoc address node)

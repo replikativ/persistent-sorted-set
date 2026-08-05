@@ -607,7 +607,16 @@
         cmp     (if (map? root-address-or-info)
                   (or (:comparator root-address-or-info) compare)
                   (or (:comparator opts) (:cmp opts) compare))
-        settings (select-keys (merge (when (map? root-address-or-info) root-address-or-info) opts) [:branching-factor :measure])]
+        settings (select-keys (merge (when (map? root-address-or-info) root-address-or-info) opts)
+                              ;; :diff-buf-size and :boundary were dropped here. The JVM's
+                              ;; `map->settings` keeps both, so a restored cljs set silently
+                              ;; disagreed with the same call on the JVM: ask for
+                              ;; {:diff-buf-size 256} and get 0. `-root` recovers :boundary
+                              ;; from the root NODE (self-describing), which is why the MST
+                              ;; half never showed; nothing recovers :diff-buf-size, so
+                              ;; freshly created nodes stopped buffering after a restore
+                              ;; while restored ones kept doing it.
+                              [:branching-factor :measure :boundary :diff-buf-size])]
     (BTSet. nil -1 cmp meta UNINITIALIZED_HASH storage address settings)))
 
 #!------------------------------------------------------------------------------
@@ -1976,7 +1985,7 @@
 
 (defn ^BTSet from-sorted-array
   [cmp arr _len opts]
-  (let [settings (select-keys opts [:branching-factor :measure :boundary])
+  (let [settings (select-keys opts [:branching-factor :measure :boundary :diff-buf-size])
         measure-ops (:measure settings)
         storage  (:storage opts)
         bd       (b/content-boundary settings)]
@@ -2263,7 +2272,7 @@
    - :measure  Measure implementation (IMeasure protocol)
    - :meta     Metadata"
   [opts]
-  (let [settings (select-keys opts [:branching-factor :measure :boundary])]
+  (let [settings (select-keys opts [:branching-factor :measure :boundary :diff-buf-size])]
     (BTSet. (Leaf. (arrays/array) settings nil) 0 (or (:comparator opts) (:cmp opts) compare)
             (:meta opts) UNINITIALIZED_HASH (:storage opts) nil settings)))
 
