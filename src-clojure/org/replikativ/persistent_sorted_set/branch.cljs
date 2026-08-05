@@ -67,13 +67,34 @@
     (Leaf. (into-array (vals m1)) (.-settings base) nil)))
 
 (defn- project-branch
-  "Push one level down: install the nested diff as base's own _slots (each grandchild's
-  diff + ĝ, anchored at base's durable child address) and set base's aggregates from ĝ.
-  Grandchildren project lazily on their own descent. Mirrors JVM Branch.projectBranch."
-  [^Branch base sl]
+  "Push one level down onto a COPY — never mutate `base`. Mirrors JVM
+  Branch.projectBranch, whose comment is the reference explanation for why.
+
+  Caching IStorage impls (datahike's CachedStorage, and this project's own test
+  storage) return restored nodes SHARED BY ADDRESS across tree versions, and this
+  projection is VERSION-SPECIFIC: consecutive commits buffer against the same
+  durable anchor with different accumulated diffs, so version N's exact child at
+  address B is the very object version N+1 projects {B, δ} onto. This used to
+  install slots, rewrite separators, count and measure directly on `base` and
+  return it, which leaked one version's projection into every other version's
+  reads. Measured on cljs before the fix (bf 8, 4000 elements, diff-buf 512, one
+  cache shared across two versions): v2 missing 115-121 elements, v1 missing
+  64-65, in both read orders; zero at diff-buf 0 and zero with a non-caching
+  storage. The JVM had and fixed the same bug (#19).
+
+  `children` stays nil on the copy: a grandchild with a nested slot must be
+  projected by the copy's own descent, and a passthrough grandchild re-restores
+  through the (pristine) cache. Leaving base's children in place handed version
+  N's already-projected grandchild to version N+1.
+
+  The copy aliases base's `addresses` — read-only by the shared-snapshot
+  contract — and takes the PARENT's projection comparator, since that is whose
+  diff is being projected."
+  [^Branch base sl proj-cmp]
   (let [diff      (:diff sl)
         base-keys (.-keys base)
         base-addr (.-addresses base)
+        new-keys  (arrays/aclone base-keys)
         slots     (make-array (arrays/alength base-keys))]
     (doseq [[k entry] (seq diff)]
       (let [i  (int k)
@@ -82,14 +103,16 @@
                        :count   (long (:count entry))
                        :measure (:measure entry)
                        :anchor  (arrays/aget base-addr i)})   ; anchor = grandchild's durable address
-        ;; Restore the separator: base came from the anchor whose _keys[i] is the PRE-diff
-        ;; max; the diff changed child i's max, so fix the separator here (the verified read bug).
+        ;; Restore the separator ON THE COPY: base came from the anchor whose _keys[i] is
+        ;; the PRE-diff max; the diff changed child i's max, so fix the separator here
+        ;; (the verified read bug) — without writing through to the shared node.
         (when (some? mk)
-          (arrays/aset base-keys i mk))))
-    (set! (.-_slots base) slots)
-    (set! (.-subtree-count base) (long (:count sl)))   ; ĝ.count — no child summing
-    (set! (.-_measure base) (:measure sl))             ; ĝ.measure
-    base))
+          (arrays/aset new-keys i mk))))
+    ;; _bufEntries -2 = LAZY, derived from the slots on first read (mirrors from-map).
+    (Branch. (.-level base) new-keys nil base-addr
+             (long (:count sl))                      ; ĝ.count — no child summing
+             (:measure sl)                           ; ĝ.measure
+             (.-settings base) slots -2 proj-cmp)))
 
 (defn- project-child
   "Project a freshly-restored child against this parent's buffered slot (if any). Returns
@@ -101,7 +124,7 @@
       ;; operation/navigation comparator that drove the descent. Mirrors JVM Branch.child.
       (if (instance? Leaf base)
         (project-leaf base (:diff sl) (.-_projCmp node))
-        (project-branch base sl))
+        (project-branch base sl (.-_projCmp node)))
       base)))
 
 (defn ensure-children
