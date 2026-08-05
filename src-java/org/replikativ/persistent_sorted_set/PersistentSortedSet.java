@@ -460,6 +460,19 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     return _address;
   }
 
+  /** Attach `storage` and store whatever is not yet stored.
+   *
+   *  This does NOT copy an already-stored tree to a different backend, though the
+   *  signature invites that reading. `store()` returns early when `_address != null`,
+   *  so calling this with a second storage writes ZERO blobs and returns the FIRST
+   *  storage's address — a later restore from the second backend then fails on a
+   *  missing node. Verified.
+   *
+   *  It is left as-is deliberately: the address alone cannot say which backend it
+   *  belongs to, and two handles onto the same underlying store are a normal thing to
+   *  pass here (datahike constructs a CachedStorage per connection), so refusing on
+   *  identity would reject correct calls. To copy a tree to another backend, build a
+   *  fresh set there. */
   public Address store(IStorage<Key, Address> storage) {
     _storage = storage;
     return store();

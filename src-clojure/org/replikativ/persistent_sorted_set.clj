@@ -181,7 +181,12 @@
                        RefType/WEAK   :weak)
    :measure          ^IMeasure (.measure s)
    :leaf-processor   (.leafProcessor s)
-   :diff-buf-size      (.diffBufSize s)})
+   :diff-buf-size      (.diffBufSize s)
+   ;; The boundary was dropped here, so anything round-tripping settings through this
+   ;; map silently became a count B-tree — `compact` turned an MST set into one. Note
+   ;; `map->settings` re-applies it through `withBoundary`, which forces diff-buf off
+   ;; for a content-defined boundary; that is the correct pairing, not a loss.
+   :boundary         (.boundary s)})
 
 (defn- assert-sorted!
   "Under `*assert*` only: verify strictly ascending order.
@@ -395,7 +400,14 @@
                          ;; is real for the TREE and nominal for the caller.
                          ;; Same seam as the ClojureScript builder, which awaits
                          ;; it; here it is an ordinary call.
-                         (when flush-fn (flush-fn))
+                         (when flush-fn
+                           ;; AWAIT a deref-able result. Discarding it meant a flush-fn
+                           ;; returning a future gave neither backpressure nor error
+                           ;; propagation — it was called once per node and every failure
+                           ;; was dropped. The ClojureScript builder awaits its flush; this
+                           ;; makes the JVM agree for the case it can express.
+                           (let [r (flush-fn)]
+                             (when (instance? clojure.lang.IDeref r) @r)))
                          {:key (.maxKey node)
                           :address addr
                           :count (if (instance? ISubtreeCount node)
@@ -618,16 +630,27 @@
 (defn compact
   "Rebuild the tree with optimal fill factors from the current elements.
    Useful after heavy insert/delete churn that may have degraded node
-   fill ratios. Preserves comparator, settings, and metadata.
+   fill ratios. Preserves comparator, settings, storage and metadata.
    Returns a new set with the same elements in a freshly built tree.
+
+   It did not always preserve those last three, while claiming to. The
+   boundary was dropped by `settings->map`, so compacting an MST set
+   returned a count B-tree; the storage was never passed on, so a later
+   `(store compacted)` threw NullPointerException; and the metadata was
+   reset to `{}`, dropping the `:pss/storage-id` the wire codec resolves
+   on. All three verified before the fix.
 
    Note: currently materializes all elements in memory. For large
    IStorage-backed sets, ensure sufficient heap space."
   [^PersistentSortedSet set]
   (let [arr   (to-array (clojure.core/seq set))
         len   (alength arr)
-        opts  (settings->map (.-_settings set))]
-    (from-sorted-array (.comparator set) arr len opts)))
+        opts  (assoc (settings->map (.-_settings set)) :storage (.-_storage set))
+        ^PersistentSortedSet compacted (from-sorted-array (.comparator set) arr len opts)]
+    ;; the builder constructs without storage and it is attached afterwards, the same
+    ;; way `datahike.index.persistent-set` does after `from-sorted-seq`
+    (set! (.-_storage compacted) (.-_storage set))
+    (with-meta compacted (meta set))))
 
 ;; ---------------------------------------------------------------------------
 ;; diff — what changed between two versions of a set that share structure.

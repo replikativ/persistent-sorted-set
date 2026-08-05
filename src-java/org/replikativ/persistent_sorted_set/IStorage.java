@@ -22,8 +22,13 @@ public interface IStorage<Key, Address> {
      *
      * For node instanceof Leaf, store node.keys()
      * For node instanceof Branch, store node.level(), node.keys() and node.addresses()
-     * Generate and return new address for node
-     * Return null if doesn't need to be stored
+     * Generate and return new address for node.
+     *
+     * MUST return a non-null address. An earlier version of this doc said "return
+     * null if doesn't need to be stored", which is not implementable: the null is
+     * propagated into the parent's serialized addresses(), and a later cold restore
+     * calls restore(null). If a store wants to skip work for a node it already holds,
+     * it should return that node's existing address.
      */
     Address store(ANode<Key, Address> node);
 
