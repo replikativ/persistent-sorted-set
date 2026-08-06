@@ -33,10 +33,24 @@ public interface IStorage<Key, Address> {
     Address store(ANode<Key, Address> node);
 
     /**
-     * Mark an address as freed/obsolete during tree modifications,
-     * including when the root address is updated.
-     * Called when a stored node's address is being replaced (node no longer reachable).
-     * Storage implementations can track these for later deletion or compaction.
+     * Mark an address as SUPERSEDED BY THE VERSION BEING PRODUCED — including the
+     * root address when it is updated. Storage implementations can track these for
+     * later deletion or compaction.
+     *
+     * This is a HINT, not a reachability claim. An earlier version of this doc said
+     * "node no longer reachable", which is not what the call site knows: only STORED
+     * nodes have addresses, a stored node belongs to some published version, and
+     * deriving a new version never makes the old one's nodes unreachable. A consumer
+     * must establish for itself that no live version needs an address before acting
+     * on it.
+     *
+     * It is also NOT at-most-once. Two versions derived from one stored parent both
+     * legitimately supersede its nodes, so both report them — ordinary structural
+     * sharing, not a race. Treat the stream as a MULTISET: measured on plain
+     * `(conj base x)` / `(conj base y)`, 6 calls for 3 addresses, every one doubled.
+     * A consumer that reuses addresses must de-duplicate, or it will hand one address
+     * to two different nodes.
+     *
      * This may be invoked in both persistent and editable/transient modes.
      */
     default void markFreed(Address address) {
