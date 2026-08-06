@@ -281,7 +281,16 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       if (left.editable()) {
         newLeft  = left;
         left._len = newLeftLen;
-        if (measureOps != null && _measure != null) {
+        // Guarded on the measure of the node being MODIFIED, not on `this`.
+        // `left` is shrunk IN PLACE here, so its cached measure describes keys it
+        // no longer holds; testing `_measure` (this leaf's) meant that whenever
+        // this leaf had no cached measure and the sibling did, the sibling kept a
+        // PRE-SHRINK total forever. Measured: a leaf holding [413 414] (sum 827)
+        // carrying `_measure` 1659 = 413+414+415+417, its content before the
+        // rebalance moved two keys out. `forceComputeMeasure` then trusts that
+        // cache (it only recurses when the child's measure is null) and writes the
+        // wrong aggregate up to the root.
+        if (measureOps != null && newLeft._measure != null) {
           newLeft._measure = newLeft.tryComputeMeasure(storage);
         }
       } else {
@@ -328,7 +337,9 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         newRight = right;
         ArrayUtil.copy(right._keys, rightHead, right._len, right._keys, 0);
         right._len = newRightLen;
-        if (measureOps != null && _measure != null) {
+        // Same wrong-guard as the left branch above: `right` is mutated in place,
+        // so the test must be on ITS cached measure, not on this leaf's.
+        if (measureOps != null && newRight._measure != null) {
           newRight._measure = newRight.tryComputeMeasure(storage);
         }
       } else {
@@ -376,13 +387,62 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     return merged;
   }
 
+  /**
+   * `replace` PRECONDITION: the element being replaced must be the only one in
+   * its leaf that `cmp` considers equal to it.
+   *
+   * `replace` writes `newKey` into the OLD element's slot. That keeps the set
+   * sorted only while the replacement belongs in that same position. When `cmp`
+   * is coarser than the SET's comparator -- datahike's datom upsert searches
+   * `[e a _ _]` and replaces the whole datom -- a leaf may hold several elements
+   * `cmp` calls equal, `search` picks an ARBITRARY one, and writing over it can
+   * move it past a sibling. The set is then left UNSORTED, and on the JVM an
+   * element still present becomes unfindable, because every later lookup binary
+   * searches an array that is no longer ordered.
+   *
+   * Checked rather than prevented: repositioning would make `replace` a
+   * disj+conj with a different cost, and every in-tree caller (datahike upserts
+   * only CARDINALITY-ONE attributes, where no second datom shares `[e a]`) is
+   * already within the precondition. So this costs nothing when assertions are
+   * off, and turns a silent corruption into a named failure for anyone
+   * developing against `-ea`.
+   *
+   * Leaf-local, so a sibling in the ADJACENT leaf is not caught. That bounds it
+   * to two comparisons; the same-leaf case is the one that actually arises,
+   * since elements equal under `cmp` are adjacent and a leaf holds many.
+   */
+  private boolean noEqualSibling(int idx, Key key, Comparator<Key> cmp) {
+    if (idx > 0 && 0 == cmp.compare(_keys[idx - 1], key)) return false;
+    if (idx < _len - 1 && 0 == cmp.compare(_keys[idx + 1], key)) return false;
+    return true;
+  }
+
+  private String replaceAmbiguous(int idx, Key oldKey, Key newKey) {
+    return "replace(" + oldKey + " -> " + newKey + "): the leaf holds another element"
+      + " the operation comparator calls equal (at or next to index " + idx + " of " + _len
+      + "), so which element is replaced is arbitrary and the result may be UNSORTED."
+      + " `replace` requires at most one cmp-equal element per leaf; use disj+conj instead.";
+  }
+
   @Override
   public ANode[] replace(IStorage storage, Key oldKey, Key newKey, Comparator<Key> cmp, Settings settings) {
+    return replace(storage, oldKey, newKey, cmp, settings, null);
+  }
+
+  /**
+   * Reports the element actually removed into `removedOut[0]`. See ANode.
+   */
+  @Override
+  public ANode[] replace(IStorage storage, Key oldKey, Key newKey, Comparator<Key> cmp, Settings settings, Object[] removedOut) {
     assert 0 == cmp.compare(oldKey, newKey) : "oldKey and newKey must compare as equal (cmp.compare must return 0)";
 
     int idx = search(oldKey, cmp);
     if (idx < 0) // not in set
       return PersistentSortedSet.UNCHANGED;
+
+    assert noEqualSibling(idx, oldKey, cmp) : replaceAmbiguous(idx, oldKey, newKey);
+
+    if (removedOut != null) removedOut[0] = _keys[idx];
 
     IMeasure measureOps = settings.measure();
 

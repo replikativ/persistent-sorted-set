@@ -201,6 +201,29 @@ public abstract class ANode<Key, Address> {
    *         or array with updated node(s) if maxKey changed
    */
   public abstract ANode[] replace(IStorage storage, Key oldKey, Key newKey, Comparator<Key> cmp, Settings settings);
+
+  /**
+   * `replace`, additionally reporting the element it actually REMOVED into
+   * `removedOut[0]` (left untouched if the key was not found).
+   *
+   * Exists so a diff-buf parent can deposit `Absent(<the element the leaf really
+   * held>)` without searching the leaf a second time. The caller's `oldKey` is
+   * not that element whenever `cmp` is coarser than the set's comparator — see
+   * `Branch.replace`. 
+   *
+   * Reported rather than searched for from the parent because the leaf binary
+   * search is comparator-bound, and doing it twice was measurable: 200k
+   * elements, 200k transient replaces, best of 3 runs of 9, a parent-side second
+   * search cost +18% at bf 512, +10% at bf 64 and +4% at bf 32 against the
+   * unfixed baseline. Reporting instead lands within noise of that baseline
+   * (120/125/134 ms vs 115/125/137), so the correctness fix is free.
+   *
+   * The default ignores `removedOut`; only `Leaf` fills it, which is the only
+   * level whose slots carry element diffs.
+   */
+  public ANode[] replace(IStorage storage, Key oldKey, Key newKey, Comparator<Key> cmp, Settings settings, Object[] removedOut) {
+    return replace(storage, oldKey, newKey, cmp, settings);
+  }
   public abstract String str(IStorage storage, int lvl);
   public abstract void walkAddresses(IStorage storage, IFn onAddress);
   public abstract Address store(IStorage<Key, Address> storage);

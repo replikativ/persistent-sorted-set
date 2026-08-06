@@ -132,12 +132,35 @@
                                (measure/remove-measure measure-ops _measure key
                                                        #(node/try-compute-measure new-leaf storage measure-ops {:sync? true}))))
                        (util/rotate new-leaf root? left right settings)))))))
-  ($replace [this storage old-key new-key cmp {:keys [sync?] :or {sync? true}}]
+  ;; `removed-out`, when given, is a 1-element array this fills with the element
+  ;; ACTUALLY removed. A diff-buf parent needs it to deposit Absent(<what the leaf
+  ;; really held>), which is not the caller's `old-key` once `cmp` is coarser than
+  ;; the set's comparator. Reported rather than searched for from the parent so the
+  ;; comparator-bound binary search runs once, not twice (mirrors ANode's overload
+  ;; on the JVM, where the second search measured +18% at bf 512).
+  ($replace [this storage old-key new-key cmp {:keys [sync? removed-out] :or {sync? true}}]
     (assert (== 0 (cmp old-key new-key)) "old-key and new-key must compare as equal (cmp must return 0)")
     (async+sync sync?
                 (async
                  (let [idx (garr/binarySearch keys old-key cmp)]
                    (when (<= 0 idx)
+                     ;; PRECONDITION, checked only when assertions are live (release
+                     ;; builds elide it): `replace` writes new-key into the OLD
+                     ;; element's slot, which keeps the set sorted only while the
+                     ;; replacement belongs in that same position. If the leaf holds
+                     ;; another element `cmp` calls equal, binarySearch picks an
+                     ;; ARBITRARY one and writing over it can move it past a sibling,
+                     ;; leaving the set UNSORTED. See the Java `noEqualSibling`.
+                     (assert (not (or (and (< 0 idx)
+                                           (== 0 (cmp (arrays/aget keys (dec idx)) old-key)))
+                                      (and (< idx (dec (arrays/alength keys)))
+                                           (== 0 (cmp (arrays/aget keys (inc idx)) old-key)))))
+                             (str "replace(" (pr-str old-key) " -> " (pr-str new-key) "): the leaf holds"
+                                  " another element the operation comparator calls equal, so which one is"
+                                  " replaced is arbitrary and the result may be UNSORTED."
+                                  " `replace` requires at most one cmp-equal element per leaf;"
+                                  " use disj+conj instead."))
+                     (when removed-out (aset removed-out 0 (arrays/aget keys idx)))
                      (let [new-keys (arrays/aclone keys)
                            _        (aset new-keys idx new-key)
                            new-leaf (Leaf. new-keys settings nil)

@@ -445,12 +445,16 @@
        (let [s (seq entries)]
          (cond
            (nil? s)
-           (PersistentSortedSet. {} cmp storage settings)
+           ;; `(:meta opts)`, not `{}`: `sorted-set*` and the ClojureScript
+           ;; `from-sorted-seq` both honour it, and this silently dropped it —
+           ;; measured, JVM `(meta (from-sorted-seq … {:meta {:x 1}}))` was `{}`
+           ;; against `{:x 1}` from `sorted-set*` and from cljs.
+           (PersistentSortedSet. (:meta opts) cmp storage settings)
 
            (nil? (next s))
            (let [{:keys [address count]} (first s)]
              ;; root is referenced by address and loaded on demand, like a restore
-             (PersistentSortedSet. {} cmp address storage nil (int count) settings 0))
+             (PersistentSortedSet. (:meta opts) cmp address storage nil (int count) settings 0))
 
            :else
            (recur (inc level) (branch-level level s))))))))
@@ -678,7 +682,14 @@
   (into []
         (mapcat (fn [[node]]
                   (let [^Branch b node
-                        addrs (.addressArray b)
+                        ;; ONE snapshot for the pair. `addressArray` and `slots` are two
+                        ;; independent volatile reads, and this decides prunability from
+                        ;; BOTH — a pre-settle address paired with post-settle slots names
+                        ;; a stale address and marks it prunable, so the other side prunes
+                        ;; against it and the buffered delta vanishes from the answer. See
+                        ;; Branch.addressesAndSlots.
+                        pair  (.addressesAndSlots b)
+                        addrs (aget ^objects pair 0)
                         ;; diff-buf: a branch buffers a child's changes in its
                         ;; OWN slots and leaves the child's ADDRESS untouched,
                         ;; so for a buffered child an address match no longer
@@ -697,7 +708,7 @@
                         ;; unprunable whatever its shape — for a BRANCH child
                         ;; `diff` is null and the real diff lives in the
                         ;; subtree, so nil-diff does not mean nil-change.
-                        slots (.slots b)]
+                        slots (aget ^objects pair 1)]
                     (map (fn [i] [nil b i (when addrs (aget ^objects addrs i))
                                   (or (nil? slots) (nil? (aget ^objects slots i)))])
                          (range (.len b))))))

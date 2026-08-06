@@ -13,7 +13,8 @@
   (:require [clojure.test :refer [deftest testing is]]
             [clojure.set :as set]
             [org.replikativ.persistent-sorted-set :as s]
-            [org.replikativ.persistent-sorted-set.test.storage :as ts]))
+            [org.replikativ.persistent-sorted-set.test.storage :as ts])
+  (:import [org.replikativ.persistent_sorted_set PersistentSortedSet]))
 
 ;; `ts/storage` SERIALIZES: `store` writes an EDN projection and `restore`
 ;; rebuilds the node. That is load-bearing for every read count below. A
@@ -60,10 +61,49 @@
         (is (= (naive a b) (s/diff a b storage))
             (str "n=" n))))))
 
+(defn- build-bf
+  "Like `build` but with an explicit fanout, so a test can force a MULTI-LEVEL
+   tree. At the default branching factor a few hundred elements are one leaf, and
+   a diff over one leaf per side exercises none of the level-synchronised walk."
+  [storage bf xs]
+  (let [st (reduce #(s/conj %1 %2 compare)
+                   (s/sorted-set* {:comparator compare :branching-factor bf}) xs)]
+    (s/store st storage)
+    st))
+
+(defn- root-level [^PersistentSortedSet st] (.level (.root st)))
+
 (deftest diff-of-a-set-with-itself-is-empty
-  (let [{:keys [storage]} (mk-storage)
-        a (build storage (range 1000))]
-    (is (= {:added [] :removed []} (s/diff a a storage)))))
+  (testing "the SHORT-CIRCUIT: identical root addresses answer without touching
+            storage at all"
+    (let [{:keys [storage]} (mk-storage)
+          a (build storage (range 1000))]
+      (reset-reads!)
+      (is (= {:added [] :removed []} (s/diff a a storage)))
+      (is (zero? (reads)) "same root address must cost zero reads")))
+
+  (testing "and the WALK, which the case above never reaches. `(diff a a)` returns
+            on the `(= addr-a addr-b)` early-out before the algorithm starts, so on
+            its own it asserts nothing about differencing equal content.
+
+            Two INDEPENDENTLY built sets with identical contents get distinct root
+            addresses from this storage, so nothing prunes at the root and the walk
+            has to run and come back empty."
+    (let [{:keys [storage] :as st} (mk-storage)
+          ra (s/store (build-bf storage 8 (range 1000)) storage)
+          rb (s/store (build-bf storage 8 (range 1000)) storage)
+          ;; a COLD handle, so the trees come back address-only and descending
+          ;; them actually restores. Built-then-diffed sets are fully resident,
+          ;; and the read counter would sit at 0 however far the walk went.
+          c  (cold st)
+          a  (s/restore-by compare ra c)
+          b  (s/restore-by compare rb c)]
+      (is (not= ra rb)
+          "precondition: distinct roots, or this is the short-circuit again")
+      (is (pos? (root-level a)) "precondition: a multi-level tree, not one leaf")
+      (reset-reads!)
+      (is (= {:added [] :removed []} (s/diff a b c)))
+      (is (pos? (reads)) "precondition: it really walked"))))
 
 (deftest diff-handles-empty-on-either-side
   (let [{:keys [storage]} (mk-storage)
@@ -136,8 +176,28 @@
 (deftest diff-of-unrelated-sets-is-correct-if-not-cheap
   (testing "no shared structure means nothing prunes. The answer must still be
             right — a caller who diffs unrelated sets gets a slow correct result,
-            not a wrong fast one."
+            not a wrong fast one.
+
+            Measured: the previous version used 100 elements at the default
+            branching factor, which is ONE LEAF per side (`:nodes-on-disk 1,
+            :root-level 0`). It compared two leaves and never descended, never
+            pruned, and never met the level-synchronisation this test's name is
+            about. Small fanout and enough elements to force several levels, with
+            both preconditions asserted so it cannot silently degrade again."
     (let [{:keys [storage]} (mk-storage)
-          a (build storage (range 0 200 2))
-          b (build storage (range 1 201 2))]
+          a (build-bf storage 8 (range 0 4000 2))
+          b (build-bf storage 8 (range 1 4001 2))]
+      (is (pos? (root-level a)) "precondition: a is a real tree")
+      (is (pos? (root-level b)) "precondition: b is a real tree")
+      (is (= (naive a b) (s/diff a b storage)))))
+
+  (testing "unrelated sets of DIFFERENT depth, so the walk has to bring the two
+            frontiers to a common level before any address comparison means
+            anything — the `down-a?`/`down-b?` branch, which equal-depth cases
+            never exercise"
+    (let [{:keys [storage]} (mk-storage)
+          a (build-bf storage 8 (range 0 4000 2))
+          b (build-bf storage 8 (range 1 41 2))]
+      (is (not= (root-level a) (root-level b))
+          "precondition: the two roots really are at different levels")
       (is (= (naive a b) (s/diff a b storage))))))

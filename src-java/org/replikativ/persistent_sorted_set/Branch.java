@@ -193,6 +193,42 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   public Object[] addressArray() { return _state.addresses; }
   public Object[] childrenArray() { return _state.children; }
 
+  /**
+   * ONE snapshot's {addresses, slots} pair: `[0]` the address array (may be null),
+   * `[1]` the diff-buf slot array (may be null). Callers must NOT mutate either.
+   *
+   * Exists because `addressArray()` and `slots()` are two independent volatile reads,
+   * and a caller deciding something from BOTH must not straddle a settle. `diff`'s
+   * frontier does exactly that: it pairs each child's address with that child's slot to
+   * decide whether the address still stands for the subtree's contents. A pre-settle
+   * address paired with post-settle slots would name a stale address while reporting the
+   * child as unbuffered -- prunable -- and the other side of the diff, holding that same
+   * old address, would prune with it. The delta buffered in that slot would simply be
+   * missing from the answer.
+   *
+   * NOT reachable today, and the reason is worth writing down because it is not local.
+   * store()'s settle skips every child whose pre-settle address is NON-null (the
+   * "clean passthrough" branch): such a child keeps both its address and its slot, so
+   * there is nothing to tear. A child that IS settled had a null address going in --
+   * the mutation moved it into the slot's anchor -- and `prune-shared` ignores a null
+   * address outright (`(some? addr)`), so that entry never prunes whatever the slot
+   * says. Measured: a child mutated in the current generation reads [nil, SLOT]
+   * pre-settle and [ADDR, SLOT] after; an untouched one stays [ADDR, SLOT] across a
+   * sibling's overflow and across a structural split elsewhere.
+   *
+   * So this is a latent contract violation rather than a live defect. It is fixed
+   * anyway: the pairing is correct here by construction instead of by a coupling to
+   * which children the settle happens to touch, which is a property of a DIFFERENT
+   * method that no test pinned and a future change could quietly drop.
+   *
+   * `_len` is a plain field, not part of the snapshot, so it needs no pairing here.
+   */
+  public Object[] addressesAndSlots() {
+    final NodeState<Address> s = _state;
+    final BufState b = s.buf;
+    return new Object[]{ s.addresses, (b != null) ? b.slots : null };
+  }
+
   public Address address(int idx) {
     assert 0 <= idx && idx < _len;
 
@@ -241,7 +277,22 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // leaf: batch-rebuild keys (with this leaf-parent's _projCmp); branch: install the nested
     // diff as the child's own slots + set its aggregates from ĝ. Runs once, here, at
     // materialization (reads stay baseline). Parent's slot supersedes any diff in the child.
-    if (_settings.diffBufSize() > 0 && sl != null && sl.diff != null) {
+    //
+    // Gated on the SLOT, not on `_settings.diffBufSize()`. The budget is a WRITE-side
+    // policy — how much this node may buffer before it must flush. Projection is a
+    // READ-side obligation: a slot carrying a diff describes the difference between the
+    // durable child and the current one, so skipping it does not "disable buffering", it
+    // returns the wrong data.
+    //
+    // The two came apart whenever a node's settings disagreed with the set's, which a
+    // storage decides — nodes are reconstructed with whatever `Settings` the IStorage
+    // hands them. A set at `:diff-buf-size 128` over a storage rebuilding nodes at 0
+    // silently DROPPED every buffered diff on read here, and then crashed at the next
+    // store in `assembleNested`, casting a Leaf to a Branch.
+    //
+    // Invariant I0 is untouched: at diffBufSize 0 no slot is ever created, so `sl` is
+    // always null and this is the same `child = base` it always was.
+    if (sl != null && sl.diff != null) {
       child = (base instanceof Leaf) ? (ANode) projectLeaf((Leaf) base, sl.diff, _projCmp)
                                      : (ANode) projectBranch((Branch) base, sl);
     } else {
@@ -322,6 +373,24 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // BUF_LAZY (derived from the slots on first read), unless the caller knows the
   // settled total.
   public void installSlots(Object[] slots, long entries) {
+    // A node carrying buffered diffs whose SETTINGS say buffering is off is an
+    // incoherent reconstruction: the storage persisted `:slots` and is now
+    // rebuilding the node declaring there is no buffer. Every read of it is
+    // then subtly wrong rather than loudly broken — measured on the diff-buf
+    // stress sweep (bf 8, set budget 64, node budget 0): content mismatch with
+    // a MATCHING count, i.e. substituted elements, on 5 of 5 seeds.
+    //
+    // Refused rather than accommodated. The settings are the storage's to get
+    // right — they come from the blob the storage itself wrote — and a library
+    // that silently returns the wrong set is worse than one that says which
+    // half of the contract was broken.
+    if (slots != null && _settings.diffBufSize() <= 0) {
+      throw new IllegalStateException(
+          "diff-buf: a node reconstructed with diffBufSize=" + _settings.diffBufSize()
+          + " was handed buffered slots. The storage persisted this node's diff buffer "
+          + "and must reconstruct it with the same budget — see IStorage.restore and "
+          + "Settings.diffBufSize().");
+    }
     NodeState<Address> s = _state;
     _state = new NodeState<>(s.addresses, s.children, new BufState(slots, entries));
   }
@@ -1383,6 +1452,28 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     return new Branch(_level, n, keys, addrs, children, count, measure, _projCmp, settings);
   }
 
+  /**
+   * -ea only: the cross-leaf half of `replace`'s no-equal-sibling precondition.
+   *
+   * `Leaf.replace` checks the neighbours INSIDE the leaf; this checks the two that sit
+   * across a leaf boundary, which the leaf cannot see. Only meaningful at level 1, where
+   * the children are leaves.
+   */
+  private boolean noEqualSiblingAcrossBoundary(IStorage storage, int idx, Key oldKey, Comparator<Key> cmp) {
+    ANode<Key, Address> leaf = child(storage, idx);
+    int j = leaf.search(oldKey, cmp);
+    if (j < 0) return true;
+    if (j == 0 && idx > 0) {
+      ANode<Key, Address> prev = child(storage, idx - 1);
+      if (prev._len > 0 && 0 == cmp.compare(prev._keys[prev._len - 1], oldKey)) return false;
+    }
+    if (j == leaf._len - 1 && idx < _len - 1) {
+      ANode<Key, Address> next = child(storage, idx + 1);
+      if (next._len > 0 && 0 == cmp.compare(next._keys[0], oldKey)) return false;
+    }
+    return true;
+  }
+
   @Override
   public ANode[] replace(IStorage storage, Key oldKey, Key newKey, Comparator<Key> cmp, Settings settings) {
     assert 0 == cmp.compare(oldKey, newKey) : "oldKey and newKey must compare as equal (cmp.compare must return 0)";
@@ -1398,8 +1489,51 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     final NodeState<Address> s0 = _state;
     // diff-buf: capture child idx's durable address before the mutation nulls it.
     Object anchor0 = (_settings.diffBufSize() > 0 && s0.addresses != null) ? s0.addresses[idx] : null;
+    // diff-buf: the element this replace will actually REMOVE, captured before the
+    // mutation removes it. Not the same thing as `oldKey`.
+    //
+    // `oldKey` is the caller's SEARCH key, matched under the operation comparator `cmp`,
+    // which may be COARSER than the set's own (datahike's value-changing datom upsert
+    // searches [e a _ _] and replaces the whole datom). The leaf-diff is keyed by the
+    // SET's comparator, so `Absent(oldKey)` only cancels the element in the leaf when the
+    // two happen to be equal under _projCmp — i.e. only while the leaf still holds the
+    // element the caller searched for.
+    //
+    // After ONE buffered replace it no longer does: the leaf holds the previous
+    // replacement, `Absent(oldKey)` matches nothing, and the new Present is ADDED
+    // alongside the old one. Measured, 16 elements, two replaces of one key in a single
+    // transient cycle, store, restore: [[5 1] [5 2]] for key 5, count 16 against a seq of
+    // 17. In memory it looked right — the transient leaf is mutated in place, so nothing
+    // projects the diff until a restore, and the corruption only surfaces on reload.
+    //
+    // Only at level 1 (leaf children) and only with buffering on: above level 1 the slot
+    // is a branch anchor whose diff is null, so the key is unused, and at diffBufSize 0
+    // there is no diff at all.
+    // The CROSS-LEAF half of replace's no-equal-sibling precondition; `Leaf` checks the
+    // in-leaf half. Assertion only -- it re-searches the leaf and may materialise a
+    // sibling, so it is exactly the work the reporting overload below exists to avoid,
+    // and it costs nothing once assertions are off.
+    //
+    // Needed because the two cmp-equal elements are NOT reliably in one leaf: measured at
+    // bf 4, a set of [k 0] for k in 0..39 plus [5 7] splits as ... [[4 0] [5 0]] |
+    // [[5 7] [6 0] [7 0]] ..., putting them either side of a boundary. A leaf-local check
+    // alone silently passed that case, which is the case this precondition exists for.
+    assert _level != 1 || noEqualSiblingAcrossBoundary(storage, idx, oldKey, cmp)
+      : "replace(" + oldKey + " -> " + newKey + "): the ADJACENT leaf holds another element the"
+      + " operation comparator calls equal, so which element is replaced is arbitrary and the"
+      + " result may be UNSORTED. `replace` requires at most one cmp-equal element;"
+      + " use disj+conj instead.";
+
+    // Asking the child to REPORT what it removed, rather than searching it here first:
+    // the leaf binary search is comparator-bound, and doing it twice cost +18% at bf 512,
+    // +10% at bf 64 and +4% at bf 32 on a replace-heavy workload (see ANode). Only at level 1
+    // and only with buffering on -- above level 1 the slot is a branch anchor whose diff
+    // is null, so the key is unused, and at diffBufSize 0 there is no diff at all.
+    Object[] removedOut = (_settings.diffBufSize() > 0 && _level == 1) ? new Object[1] : null;
     // Recursively replace in child
-    ANode[] nodes = child(storage, idx).replace(storage, oldKey, newKey, cmp, settings);
+    ANode[] nodes = child(storage, idx).replace(storage, oldKey, newKey, cmp, settings, removedOut);
+    @SuppressWarnings("unchecked")
+    Key removedKey = (removedOut != null && removedOut[0] != null) ? (Key) removedOut[0] : oldKey;
 
     if (PersistentSortedSet.UNCHANGED == nodes) // key not found
       return PersistentSortedSet.UNCHANGED;
@@ -1410,7 +1544,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.diffBufSize() > 0) depositReplace(storage, idx, oldKey, newKey, anchor0); // content-only: Absent(oldKey)+Present(newKey) / branch marker
+      if (_settings.diffBufSize() > 0) depositReplace(storage, idx, removedKey, newKey, anchor0); // Absent(removedKey)+Present(newKey) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
     }
 
@@ -1442,7 +1576,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.diffBufSize() > 0) depositReplace(storage, idx, oldKey, newKey, anchor0); // content-only: Absent(oldKey)+Present(newKey) / branch marker
+      if (_settings.diffBufSize() > 0) depositReplace(storage, idx, removedKey, newKey, anchor0); // Absent(removedKey)+Present(newKey) / branch marker
       if (maxKeyChanged)
         return new ANode[]{this};
       else
@@ -1477,7 +1611,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     }
     // The SAME snapshot's {slots, entries} pair — carried together so the successor
     // can never mix a pre-settle total with post-settle slots (or vice versa).
-    if (settings.diffBufSize() > 0) newBranch.carryAndDepositReplace(storage, s0.buf, idx, oldKey, newKey, anchor0); // content-only: Present(newKey)
+    if (settings.diffBufSize() > 0) newBranch.carryAndDepositReplace(storage, s0.buf, idx, removedKey, newKey, anchor0); // Absent(removedKey)+Present(newKey)
 
     return new ANode[]{newBranch};
   }
@@ -1737,9 +1871,27 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       for (int j = 0; j < c._len; j++) {
         Slot sl = (Slot) cSlots[j];
         if (sl == null) continue;
-        Object d = (sl.diff != null)
-            ? (c._level == 1 ? leafDiffForStorage(sl.diff) : sl.diff)   // leaf child ⇒ comparator-agnostic storage form
-            : assembleNested(storage, (Branch) c.child(storage, j));
+        // A null `anchor` means this child has NO durable base to diff against, so store()
+        // Pass 1 writes it WHOLESALE and `depositKV` leaves its diff null for exactly that
+        // reason. There is no buffered difference to assemble, at any level.
+        //
+        // `Slot`'s javadoc says a null diff marks "a BRANCH anchor marker", and the
+        // recursion below read it that way — casting the child to a Branch. But the
+        // anchor-null case produces a null diff on a LEAF child too, and then the cast is
+        // a ClassCastException out of a plain store. Measured: `c.level=1 j=22
+        // childClass=Leaf slotDiffNull=true slotAnchor=false`.
+        if (sl.anchor == null) continue;
+        Object d;
+        if (sl.diff != null) {
+          d = (c._level == 1) ? leafDiffForStorage(sl.diff) : sl.diff;  // leaf child ⇒ comparator-agnostic storage form
+        } else {
+          // Null diff WITH an anchor: the branch-anchor marker proper. A leaf child cannot
+          // be one — say so here rather than let the cast below report it three frames on.
+          assert c._level > 1
+              : "diff-buf: level-1 slot has a null diff but a non-null anchor — a leaf child "
+              + "cannot be a branch-anchor marker (slot " + j + " of a level-" + c._level + " branch)";
+          d = assembleNested(storage, (Branch) c.child(storage, j));
+        }
         // c._keys[j] = grandchild j's CURRENT (post-diff) separator; carry it so a reconstructed
         // (buffered) c restores its separators instead of keeping the anchor's stale ones.
         IPersistentMap entry = (IPersistentMap) PersistentHashMap.EMPTY

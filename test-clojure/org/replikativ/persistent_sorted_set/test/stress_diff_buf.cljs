@@ -61,7 +61,7 @@
     (isFreed  [_ a] (contains? @freed a))
     (freedInfo [_ a] nil)))
 
-(defn run-trial [seed {:keys [bf b keyrange init cycles ops restore-prob transient-prob measure? gc?] :as params}]
+(defn run-trial [seed {:keys [bf b node-b keyrange init cycles ops restore-prob transient-prob measure? gc?] :as params}]
   (let [rng    (make-rng (inc seed))
         rd     (fn [] (/ (rng 1000000) 1000000.0))
         disk   (atom {})
@@ -69,7 +69,18 @@
         freed  (when gc? (atom #{}))
         sopts  (cond-> {:comparator cmp :branching-factor bf :diff-buf-size b} meas (assoc :measure meas))
         ropts  sopts
-        mk     (fn [] (let [s (util/storage (atom {}) disk sopts)] (if freed (recording s freed) s)))
+        ;; ONE node cache for the whole trial. `mk` used to build `(atom {})` per
+        ;; call, so no restored node was ever SHARED between two versions of the
+        ;; tree — exactly the condition D-F2 needed (a caching IStorage handing
+        ;; one node object to consecutive versions, the datahike CachedStorage
+        ;; shape). That is why this sweep never saw the projection clobber.
+        mem    (atom {})
+        ;; The budget the STORAGE stamps on reconstructed nodes, which need not
+        ;; equal the set's — it used to be `sopts` on both sides by construction,
+        ;; so the two could never disagree. That is the blind spot that hid D-F1.
+        nb     (if (some? node-b) node-b b)
+        nopts  (cond-> {:comparator cmp :branching-factor bf :diff-buf-size nb} meas (assoc :measure meas))
+        mk     (fn [] (let [s (util/storage mem disk nopts)] (if freed (recording s freed) s)))
         cov    (atom {:stores 0 :restores 0 :adds 0 :removes 0 :replaces 0 :ops 0 :measure-checks 0})
         ref    (atom (sorted-set-by cmp))
         s0     (reduce (fn [s _] (let [k (rng keyrange)] (swap! ref conj [k 0]) (set/conj s [k 0])))
@@ -168,9 +179,20 @@
     {:fails (vec fails) :cov cov}))
 
 (deftest stress-diff-buf-cljs
-  (let [grid (for [bf [4 16 64] b [0 32 256] kr [80 800]]
-               {:bf bf :b b :keyrange kr :init (min kr 300) :cycles 8 :ops 25
-                :restore-prob 0.5 :transient-prob 0.3 :measure? true :gc? true})
+  (let [grid (concat
+              (for [bf [4 16 64] b [0 32 256] kr [80 800]]
+                {:bf bf :b b :keyrange kr :init (min kr 300) :cycles 8 :ops 25
+                 :restore-prob 0.5 :transient-prob 0.3 :measure? true :gc? true})
+              ;; The set declares no budget while its NODES carry one — D-F1's
+              ;; direction, and the realizable one: a node's blob knows its
+              ;; budget, a caller restoring without opts does not. The reverse
+              ;; (set buffers, storage rebuilds nodes at 0) is an INCOHERENT
+              ;; storage — it persisted slots and then reconstructs saying there
+              ;; is no buffering — and is currently read as wrong content rather
+              ;; than refused. Not swept here; see the JVM harness and the task.
+              (for [bf [4 16]]
+                {:bf bf :b 0 :node-b 256 :keyrange 800 :init 300 :cycles 8 :ops 25
+                 :restore-prob 0.5 :transient-prob 0.3 :measure? true :gc? true}))
         {:keys [fails cov]} (sweep grid 5)]
     (is (empty? fails) (str "cljs diff-buf stress: " (count fails) " failure(s): "
                             (pr-str (vec (take 8 fails)))))

@@ -63,10 +63,43 @@
         (is (= (naive a b) (s/diff a b storage))
             (str "n=" n))))))
 
+(defn- build-bf
+  "Like `build` but with an explicit fanout, so a test can force a MULTI-LEVEL
+   tree. At the default branching factor a few hundred elements are ONE LEAF, and
+   a diff over one leaf per side exercises none of the level-synchronised walk."
+  [storage bf xs]
+  (let [st (reduce #(s/conj %1 %2 compare)
+                   (s/sorted-set* {:comparator compare :branching-factor bf}) xs)]
+    (s/store st storage)
+    st))
+
 (deftest diff-of-a-set-with-itself-is-empty
-  (let [storage (u/storage)
-        a (build storage (range 1000))]
-    (is (= {:added [] :removed []} (s/diff a a storage)))))
+  (testing "the SHORT-CIRCUIT: identical root addresses answer without touching
+            storage at all"
+    (let [storage (u/storage)
+          a (build storage (range 1000))]
+      (reset-reads!)
+      (is (= {:added [] :removed []} (s/diff a a storage)))
+      (is (zero? (reads)) "same root address must cost zero reads")))
+
+  (testing "and the WALK, which the case above never reaches. `(diff a a)` returns
+            on the identical-address early-out before the algorithm starts, so on
+            its own it asserts nothing about differencing equal content.
+
+            Two INDEPENDENTLY built sets with identical contents get distinct root
+            addresses, restored on a COLD handle so descending them really reads."
+    (let [disk (atom {})
+          w    (u/storage disk)
+          ra   (s/store (build-bf w 8 (range 1000)) w)
+          rb   (s/store (build-bf w 8 (range 1000)) w)
+          c    (u/storage disk)
+          a    (s/restore ra c {:comparator compare :branching-factor 8})
+          b    (s/restore rb c {:comparator compare :branching-factor 8})]
+      (is (not= ra rb)
+          "precondition: distinct roots, or this is the short-circuit again")
+      (reset-reads!)
+      (is (= {:added [] :removed []} (s/diff a b c)))
+      (is (pos? (reads)) "precondition: it really walked"))))
 
 (deftest diff-handles-empty-on-either-side
   (let [storage (u/storage)
@@ -79,10 +112,23 @@
 (deftest diff-of-unrelated-sets-is-correct-if-not-cheap
   (testing "no shared structure means nothing prunes. The answer must still be
             right — a caller who diffs unrelated sets gets a slow correct result,
-            not a wrong fast one."
+            not a wrong fast one.
+
+            Measured on the JVM twin of this test: 100 elements at the default
+            branching factor is ONE LEAF per side (`:nodes-on-disk 1,
+            :root-level 0`). It compared two leaves and never descended, never
+            pruned, and never met the level-synchronisation the name is about."
     (let [storage (u/storage)
-          a (build storage (range 0 200 2))
-          b (build storage (range 1 201 2))]
+          a (build-bf storage 8 (range 0 4000 2))
+          b (build-bf storage 8 (range 1 4001 2))]
+      (is (= (naive a b) (s/diff a b storage)))))
+
+  (testing "unrelated sets of DIFFERENT depth, so the walk must bring the two
+            frontiers to a common level before any address comparison means
+            anything — the branch equal-depth cases never exercise"
+    (let [storage (u/storage)
+          a (build-bf storage 8 (range 0 4000 2))
+          b (build-bf storage 8 (range 1 41 2))]
       (is (= (naive a b) (s/diff a b storage))))))
 
 (deftest diff-reads-only-the-nodes-that-changed

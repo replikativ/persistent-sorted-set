@@ -705,6 +705,38 @@
   (when measure-ops
     (node/try-compute-measure branch storage measure-ops {:sync? true})))
 
+(defn- no-equal-sibling-across-boundary?
+  "-ea only (see `$replace`): does no ADJACENT leaf hold an element `cmp` calls
+   equal to `old-key`?
+
+   `leaf.cljs` checks the neighbours inside the leaf; those are invisible to it.
+   The two cmp-equal elements are not reliably in one leaf — measured at bf 4, a
+   set of [k 0] for k in 0..39 plus [5 7] splits as ... [[4 0] [5 0]] |
+   [[5 7] [6 0] [7 0]] ..., either side of a boundary — so a leaf-local check
+   alone silently passes the very case the precondition exists for.
+
+   Best-effort by design: it reads only children that are already RESIDENT, so it
+   stays synchronous inside an assert and never provokes a restore. A cold
+   sibling is simply not checked."
+  [^Branch this child idx old-key cmp]
+  (let [children (.-children this)
+        n        (arrays/alength (.-keys this))
+        resident (fn [i] (when (and children (<= 0 i) (< i n)) (aget children i)))
+        ks       (.-keys child)
+        j        (garr/binarySearch ks old-key cmp)]
+    (if (neg? j)
+      true
+      (let [left  (when (== j 0) (resident (dec idx)))
+            right (when (== j (dec (arrays/alength ks))) (resident (inc idx)))
+            eq?   (fn [node pick]
+                    (when node
+                      (let [nks (.-keys node)
+                            len (arrays/alength nks)]
+                        (when (pos? len)
+                          (== 0 (cmp (arrays/aget nks (pick len)) old-key))))))]
+        (not (or (eq? left (fn [len] (dec len)))
+                 (eq? right (fn [_] 0))))))))
+
 (defn $replace
   [^Branch this storage old-key new-key cmp {:keys [sync?] :or {sync? true} :as opts}]
   (assert (== 0 (cmp old-key new-key)) "old-key and new-key must compare as equal (cmp must return 0)")
@@ -722,7 +754,44 @@
                      anchor0 (when (and diff-buf? (.-addresses this) (not= -1 idx)) (aget (.-addresses this) idx))]
                  (when-not (== -1 idx)
                    (let [child  (await (child this storage idx opts))
-                         nodes  (await (node/$replace child storage old-key new-key cmp opts))]
+                         ;; diff-buf: the element this replace will actually REMOVE. NOT the
+                         ;; same as `old-key`, which is the caller's SEARCH key under a possibly
+                         ;; COARSER operation comparator. The leaf-diff is keyed by the SET's
+                         ;; comparator, so Absent(old-key) only cancels the leaf's element while
+                         ;; the leaf still holds the element the caller searched for — after one
+                         ;; buffered replace it does not, and the new Present is added ALONGSIDE
+                         ;; the old. Mirrors the JVM fix in Branch.replace; see
+                         ;; test/diff_buf_restore_cycle.clj for the measured shape.
+                         ;;
+                         ;; The leaf REPORTS it (via `:removed-out`) rather than being searched
+                         ;; again here. Both for cost — the comparator-bound binary search runs
+                         ;; once, not twice, worth +18% at bf 512 on the JVM — and because the
+                         ;; two searches must agree: `binarySearch` is arbitrary among elements
+                         ;; equal under the operation comparator, so a second search could name
+                         ;; a different element than the one the leaf overwrote, recording
+                         ;; Absent for one while replacing another.
+                         ;;
+                         ;; Only at level 1 — above it the slot is a branch anchor whose diff is
+                         ;; null, so the key is unused.
+                         removed-out (when (and diff-buf? (== 1 (.-level this)))
+                                       (arrays/make-array 1))
+                         ;; PRECONDITION (assertion only; release builds elide it): the
+                         ;; cross-leaf half of replace's no-equal-sibling rule — `leaf.cljs`
+                         ;; checks the in-leaf half. Best-effort: only inspects siblings already
+                         ;; RESIDENT, so it stays synchronous and never triggers a restore.
+                         ;; Mirrors Branch.noEqualSiblingAcrossBoundary on the JVM.
+                         _ (assert (or (not= 1 (.-level this))
+                                       (no-equal-sibling-across-boundary? this child idx old-key cmp))
+                                   (str "replace(" (pr-str old-key) " -> " (pr-str new-key) "): the"
+                                        " ADJACENT leaf holds another element the operation comparator"
+                                        " calls equal, so which element is replaced is arbitrary and the"
+                                        " result may be UNSORTED. `replace` requires at most one"
+                                        " cmp-equal element; use disj+conj instead."))
+                         nodes  (await (node/$replace child storage old-key new-key cmp
+                                                      (if removed-out
+                                                        (assoc opts :removed-out removed-out)
+                                                        opts)))
+                         removed-key (or (some-> removed-out (arrays/aget 0)) old-key)]
                      (cond
                        ;; Not found in child
                        (nil? nodes)
@@ -732,7 +801,7 @@
                        ;; deposit Present(new-key) at this level (mirrors JVM EARLY_EXIT path).
                        (= nodes :early-exit)
                        (do
-                         (when diff-buf? (await (deposit-replace this storage idx old-key new-key anchor0 opts)))
+                         (when diff-buf? (await (deposit-replace this storage idx removed-key new-key anchor0 opts)))
                          :early-exit)
 
                        ;; Child returned updated node
@@ -766,7 +835,7 @@
                                (when (and measure-ops (.-_measure this))
                                  (set! (.-_measure this)
                                        (replace-measure this storage measure-ops)))
-                               (when diff-buf? (await (deposit-replace this storage idx old-key new-key anchor0 opts)))
+                               (when diff-buf? (await (deposit-replace this storage idx removed-key new-key anchor0 opts)))
                                (arrays/array this))
                              ;; Persistent: clone arrays
                              (let [new-keys     (arrays/aclone keys)
@@ -787,7 +856,7 @@
                                ;; diff-buf: content-only replace ⇒ carry source slots + deposit Present(new-key).
                                (when diff-buf?
                                  (set! (.-_bufEntries new-branch) (buf-entries this)) ; carry running total (or -1) onto successor
-                                 (await (carry-and-deposit-replace new-branch storage (.-_slots this) idx old-key new-key anchor0 opts)))
+                                 (await (carry-and-deposit-replace new-branch storage (.-_slots this) idx removed-key new-key anchor0 opts)))
                                (arrays/array new-branch)))
                            ;; maxKey unchanged - reuse keys array
                            (if editable?
@@ -802,7 +871,7 @@
                                (when (and measure-ops (.-_measure this))
                                  (set! (.-_measure this)
                                        (replace-measure this storage measure-ops)))
-                               (when diff-buf? (await (deposit-replace this storage idx old-key new-key anchor0 opts)))
+                               (when diff-buf? (await (deposit-replace this storage idx removed-key new-key anchor0 opts)))
                                (if last-child?
                                  (arrays/array this)  ; Last child, need to propagate
                                  :early-exit))        ; Not last child, early exit
@@ -825,7 +894,7 @@
                                ;; diff-buf: content-only replace ⇒ carry source slots + deposit Present(new-key).
                                (when diff-buf?
                                  (set! (.-_bufEntries new-branch) (buf-entries this)) ; carry running total (or -1) onto successor
-                                 (await (carry-and-deposit-replace new-branch storage (.-_slots this) idx old-key new-key anchor0 opts)))
+                                 (await (carry-and-deposit-replace new-branch storage (.-_slots this) idx removed-key new-key anchor0 opts)))
                                (arrays/array new-branch))))))))))))
 
 ;; ---- diff-buf store-side helpers (mirror JVM Branch) ----
