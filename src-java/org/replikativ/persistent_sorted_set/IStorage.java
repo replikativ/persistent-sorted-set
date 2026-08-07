@@ -99,6 +99,15 @@ public interface IStorage<Key, Address> {
      * A consumer that reuses addresses must de-duplicate, or it will hand one address
      * to two different nodes.
      *
+     * Concretely, under a content-addressed regime the SAME commit that reports an address
+     * here can go on to publish it as live: a free is reported at MUTATION time (the old
+     * root address is handed over inside `cons`/`disjoin`, before `store` has decided any
+     * new addresses), and a commit that ends holding the content it started with hashes
+     * back to the address it just superseded. Measured in datahike under `:crypto-hash?`,
+     * one entity transacted and then retracted at bf 8: 6 of 39 reachable addresses were on
+     * the freed list. The cheap enforcement is at the storage: publishing an address makes
+     * it live, so a write should cancel any pending free of that address.
+     *
      * This may be invoked in both persistent and editable/transient modes.
      */
     default void markFreed(Address address) {
