@@ -224,6 +224,26 @@ public abstract class ANode<Key, Address> {
   public ANode[] replace(IStorage storage, Key oldKey, Key newKey, Comparator<Key> cmp, Settings settings, Object[] removedOut) {
     return replace(storage, oldKey, newKey, cmp, settings);
   }
+
+  /**
+   * `remove`, additionally reporting the element it actually REMOVED into
+   * `removedOut[0]` (left untouched if the key was not found).
+   *
+   * Same reason as the `replace` overload above, and the same defect: a diff-buf parent
+   * deposits `Absent(...)` for the removed child, and the caller's search key is NOT that
+   * element whenever `cmp` is coarser than the set's comparator. `projectLeaf` replays the
+   * diff under the SET's comparator, so `Absent(<search key>)` cancels nothing and the
+   * removed element comes back on the next reload.
+   *
+   * Reproduced: 40 elements `[i 0]` bulk-built at bf 8 with diff-buf 256, cold-restored,
+   * then `(disj s [17 999] by-first)` — in memory count 39 without `[17 0]`; reloaded,
+   * count 40 WITH `[17 0]`, while `contains?` still answers false because the separator
+   * was updated. A LEVEL-1 root is required: at level 2 the slot is a branch marker whose
+   * diff is null, which is why conj-built trees (deeper, underfull leaves) hid it.
+   */
+  public ANode[] remove(IStorage storage, Key key, ANode left, ANode right, Comparator<Key> cmp, Settings settings, Object[] removedOut) {
+    return remove(storage, key, left, right, cmp, settings);
+  }
   public abstract String str(IStorage storage, int lvl);
   public abstract void walkAddresses(IStorage storage, IFn onAddress);
   public abstract Address store(IStorage<Key, Address> storage);

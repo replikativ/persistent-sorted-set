@@ -33,7 +33,28 @@
                        ;; adoption via Settings.withBoundary). Otherwise a set restored with
                        ;; :diff-buf-size > 0 would run MST + diff-buf together, breaking canonical
                        ;; addressing. See doc/merkle-search-tree.md (Incompatibilities).
-                       (set! (.-settings set) (assoc (.-settings set) :boundary nb :diff-buf-size 0))))))
+                       (set! (.-settings set) (assoc (.-settings set) :boundary nb :diff-buf-size 0))))
+                   ;; diff-buf: adopt the NODE's budget too, mirroring the JVM's
+                   ;; PersistentSortedSet.root(). A node is self-describing, and a set
+                   ;; restored WITHOUT :diff-buf-size ran at 0 over nodes at N: reads were
+                   ;; fine (projection is driven by the node's own settings through child),
+                   ;; but the next write rebuilt through the SET's settings and dropped
+                   ;; every surviving sibling's buffered elements. The JVM records the
+                   ;; measurement for this exact shape — bf 16, budget 512, 6000 elements,
+                   ;; stored WITH slots then restored bare: 81 elements silently gone.
+                   ;; ClojureScript adopted the boundary above and not this, so the bare-
+                   ;; address restore path was exposed. (The root-BLOB path already carries
+                   ;; the budget via impl.nodes; only a restore from a bare address was.)
+                   ;;
+                   ;; Skipped under a content-defined boundary: the branch above has just
+                   ;; forced buffering off there, and MST + diff-buf is incompatible.
+                   (let [node-dbs (:diff-buf-size (.-settings (.-root set)))
+                         set-dbs  (:diff-buf-size (.-settings set))]
+                     (when (and (number? node-dbs) (pos? node-dbs)
+                                (not (pos? (or set-dbs 0)))
+                                (not (b/content-boundary (.-settings set))))
+                       (set! (.-settings set)
+                             (assoc (.-settings set) :diff-buf-size node-dbs))))))
                ;; diff-buf: seed the projection comparator at the root; branch/child propagates it
                ;; down as nodes materialize, so a leaf-parent can project buffered leaves with the
                ;; set's stable comparator. Idempotent; a Leaf root has no buffered children.

@@ -628,7 +628,17 @@
                          ;; the-stored-element defect as the leaf's, one level up. The JVM
                          ;; branch does not have it because it RECOMPUTES from children
                          ;; (`tryComputeMeasure`) instead of subtracting.
-                         removed-out (when (:measure (.-settings this)) (arrays/make-array 1))
+                         ;; Needed by BOTH the measure subtraction below and the diff-buf
+                         ;; Absent deposit — the deposit records the element the leaf really
+                         ;; held, not the caller's search key, which differ under a coarse
+                         ;; operation comparator. Allocating this only when a measure was
+                         ;; configured left the deposit falling back to `key`, which is the
+                         ;; JVM defect reproduced in ANode's six-arg `remove`.
+                         ;; NB `diff-buf?` is a LOCAL boolean here (bound above), not the
+                         ;; predicate fn of the same name — calling it threw TypeError.
+                         removed-out (when (or (:measure (.-settings this))
+                                               (and diff-buf? (== 1 (.-level this))))
+                                       (arrays/make-array 1))
                          disjoined   (await (node/$remove child storage key left-child right-child cmp
                                                           (if removed-out
                                                             (assoc opts :removed-out removed-out)
@@ -707,7 +717,7 @@
                          (when diff-buf?
                            (if content-only?
                              (do (set! (.-_bufEntries center) (buf-entries this)) ; carry running total (or -1) onto successor
-                                 (await (carry-and-deposit center storage (.-_slots this) idx key ABSENT anchor0 opts)))
+                                 (await (carry-and-deposit center storage (.-_slots this) idx removed-element ABSENT anchor0 opts)))
                              (do (set! (.-_bufEntries center) -1) ; child merged/borrowed: structural → must write
                                  ;; diff-buf: free this node's dropped (merged/borrowed) children — the
                                  ;; range [left-idx, right-idx) minus unchanged surviving siblings (the
@@ -987,7 +997,21 @@
                        (if (>= j len)
                          m
                          (let [sl (aget slots j)]
-                           (if (nil? sl)
+                           (if (or (nil? sl) (nil? (:anchor sl)))
+                             ;; Skip an ANCHORLESS slot, mirroring JVM assembleNested. A null
+                             ;; anchor means the child has no durable base to diff against, so
+                             ;; store() writes it WHOLESALE and `deposit-kv` leaves its diff nil
+                             ;; for that reason — there is no buffered difference to assemble,
+                             ;; at any level.
+                             ;;
+                             ;; Without the skip a nil diff was read as "branch marker" and this
+                             ;; recursed: it awaited a restore the JVM never performs, and for a
+                             ;; LEAF child `(.-_slots c)` is undefined so the recursion returned
+                             ;; {} — emitting an entry anchored at `(aget base-addr j)`, an
+                             ;; address belonging to a DIFFERENT, older child. The JVM hit the
+                             ;; same shape as a ClassCastException out of a plain store
+                             ;; (`c.level=1 j=22 childClass=Leaf slotDiffNull=true
+                             ;; slotAnchor=false`), which is what put the guard there.
                              (recur (inc j) m)
                              (let [gc     (when (nil? (:diff sl)) (await (child c storage j opts)))
                                    d      (if (some? (:diff sl))

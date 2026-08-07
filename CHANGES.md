@@ -65,6 +65,137 @@
   one the leaf overwrote — recording `Absent` for one while replacing another, reintroducing the
   very duplicate this fixes.
 
+### store() never wrote a child that was mutated in place — INHERITED FROM UPSTREAM
+
+  Three `EARLY_EXIT` arms — in `add`, `remove` and `replace` — mutated a child IN PLACE and
+  returned without clearing `addresses[i]`. That address asserts "this child's whole subtree is
+  already durable", and `store()` reads it exactly that way, so the subtree was skipped at every
+  depth and the mutation NEVER REACHED DISK.
+
+  Reachable from the public API: `store` a live transient, mutate it further, `store` again — the
+  checkpointed bulk-ingest shape. `persistent!` between the stores is clean, which is why nothing
+  caught it. Measured:
+
+      bf 64 dbs 0    level 1   in-mem 220  reloaded 219  missing [21]
+      bf  8 dbs 0    level 3   in-mem 1220 reloaded 1219 missing [21]
+      bf  8 dbs 256  level 2   in-mem 218  reloaded 219  extra   [5]
+
+  BASELINE — it does not depend on diff-buf. Under diff-buf, level 1 is masked (the slot carries
+  the real leaf-diff) while level >= 2 deposits a MARKER whose content lives only in the live
+  child, so the loss returns.
+
+  Every other mutation path already cleared the address; these three did not, because they install
+  no new node. Fixed with `child(idx, mutatedChild)` — the existing idiom that clears the address
+  AND unwraps the child. (Nulling the address alone trips the settle's own assertion, "dirty child
+  must be a bare resident ANode": the child was still a SoftReference from an earlier settle.)
+
+  Git archaeology: introduced by Nikita Prokopov's durability work — born 2022-08-31 (765d9b3),
+  modern shape 2022-10-13 (dfce4c9), shipped in upstream 0.2.0 and 0.3.0. Reproduced at every one
+  of those revisions. The fork point is 461df32 (0.3.0, 2023-08-04), which already has it, so this
+  is INHERITED, not introduced here. Upstream still has it today. Notably, upstream commit 3d1837a
+  (2022-10-08) audited this very invariant — replacing three `// FIXME check if left really
+  changed` sites — and left the EARLY_EXIT arms untouched.
+
+### disj recorded the caller's search key, resurrecting deleted elements
+
+  `Branch.remove` deposited `Absent(<the caller's search key>)`. Under an operation comparator
+  coarser than the set's, that is not the element the leaf holds; `projectLeaf` replays the diff
+  under the SET's comparator, so the Absent cancels nothing. Measured, 40 elements bulk-built at
+  bf 8 with diff-buf 256, cold-restored, `(disj s [17 999] by-first)`: in memory 39 without
+  [17 0]; reloaded, 40 WITH it, while `contains?` still answered false because the separator was
+  updated. So `seq` yields an element that `contains?`, `lookup` and `slice` cannot find.
+
+  Needs a LEVEL-1 root — at level 2+ the slot is a branch marker whose diff is null. Six earlier
+  attempts used conj-built trees, which are deeper with underfull leaves at these sizes, put the
+  deposit at level 2, and came back green; the conclusion drawn from them (that the deposit was
+  unreachable) was wrong and had been written into the source as fact.
+
+  Fixed by the same reporting channel `replace` uses: `ANode`/`Leaf` gained a six-arg `remove`
+  that reports the element actually removed. ClojureScript had already plumbed `:removed-out`
+  through for the measure, bound it, and then deposited `key` anyway.
+
+### :ref-type stopped bounding the tree after the first disj
+
+  `Branch.remove` writes an UNCHANGED sibling into the successor as a bare strong ANode while
+  keeping that sibling's still-valid address, and both settles only ever wrapped NULL-address
+  children. So each disj permanently converted up to two slots per level on its path into strong
+  references. Measured at bf 16 over 20000 elements with `:ref-type :soft`, after 400 disj and a
+  store: `{:ref 780, :bare-STRONG-with-address 119}` — the 119 never shrank. Now `{:ref 899}`.
+  Present at diffBufSize 0, so it predates diff-buf.
+
+### The measure produced a negative variance and a NaN standard deviation
+
+  `NumericStatsOps.remove` called the recompute supplier, got the exact answer, and DISCARDED it,
+  keeping the subtracted `sum`/`sumSq` — which are only invertible in exact arithmetic. Measured
+  through the public API (build and remove inside ONE transient, so the leaf is editable when the
+  remove lands): elements [1.0 2.0], cached sum 4.0 against a truth of 3.0, sumSq 0.0 against 5.0,
+  variance -4.0, stdDev NaN. `node->map` serializes `:measure`, so that lands on disk and is read
+  back as authoritative.
+
+### A leafProcessor with diff-buf corrupts, and is refused
+
+  Every deposit records the ONE element the caller named; a processor rewrites the WHOLE leaf, and
+  when it does not expand past the branching factor the parent classifies the change as
+  content-only and buffers it. Every entry the processor added, dropped or rewrote is then absent
+  from the diff while `Slot.count` still counts them. Measured, compacting processor at bf 4 with
+  diff-buf 100: a set of 8 came back from store/restore with 9 elements; under `:ref-type :weak`
+  the same corruption appears IN PROCESS at the next GC.
+
+  diff-buf is now forced off when a processor is configured — NEUTRALISE rather than throw,
+  because the `:test` alias sets `-Dpss.diffBufSize=256` and 41 existing processor tests inherit a
+  budget they never asked for. That also shows the broken combination has been silently ACTIVE
+  across the suite all along; those tests pass only because none drives a store/restore or an
+  eviction. This is a STOPGAP — enabling the combination properly is planned.
+
+  `withDiffBufSize` REFUSES rather than neutralising, because the stopgap otherwise reintroduced
+  the loss one level up: `PersistentSortedSet.root()` adopts a restored node's budget through it,
+  and measured, it returned 256 without a processor and 0 with one — silently running at 0 over
+  nodes carrying slots, which is the "81 elements gone" shape the adoption exists to prevent.
+
+### node->map is not a content address; node->identity is
+
+  `node->map`'s docstring said "for content-addressing (hash this map)". Two of its keys are
+  CACHES: `:measure` is null until forced (and `forceComputeMeasure` ASSIGNS, so a read-only query
+  changes what a node later serializes as), and `:subtree-count` reaches storage as -1 whenever a
+  child's count was unavailable. Hashing the map gives an address that is not a function of
+  content — measured, the same set under the same operation produced 0 of 4 addresses in common
+  between two stores differing only in which caches were populated.
+
+  Both real consumers already avoid this independently, which is the strongest evidence the advice
+  was the bug: datahike hashes `[addresses (canon slots)]`, stratum hashes the address vector.
+  `node->identity` is that subset, named — `{:level :keys :addresses :slots}`. `:slots` is
+  deliberately IN: buffered diffs are content, and a hash omitting them collides on logically
+  different trees.
+
+### IStorage told storage authors to write a blob that loses data
+
+  The javadoc said: "For Leaf, store node.keys(). For Branch, store node.level(), node.keys() and
+  node.addresses()." That list omits `slotsForStorage()` — the diff-buf diffs. A buffered child is
+  anchor PLUS slot; persist only the address and every buffered element is gone on the next
+  restore. Measured with a storage written strictly to the old list: 40 elements, bf 8, diff-buf
+  256, three added and committed — in memory 43, after restore 40, elements 100 and 101 silently
+  absent. Now points at `node->blob`/`blob->leaf` and says what each omission costs.
+
+  `markFreed` now also states that under a CONTENT-ADDRESSED store an address reported there may
+  be re-issued as live, including by the same commit — not allocator reuse, but content addressing
+  working as intended. `(-> s (conj x) (disj x))` reproduces the old node exactly; measured, 2 of
+  2 freed addresses came back live in the same commit, one of them the published root. The two
+  in-tree GC tests assert the opposite; they are correct for THEIR storages, which allocate fresh
+  addresses, and now say so.
+
+### ClojureScript parity repairs
+
+  * `-root` adopted the boundary but not the diff-buf budget, so a set restored from a bare
+    address ran at 0 over nodes at N — the JVM's "81 elements silently gone" shape, on the one
+    path cljs left exposed.
+  * `assemble-nested` lacked the JVM's anchorless-slot skip, so it recursed into a Leaf whose
+    `_slots` is undefined and emitted an entry anchored at a DIFFERENT, older child's address.
+  * `from-sorted-array`/`from-sequential` dropped `:meta` on both runtimes — the same defect fixed
+    in `from-sorted-seq` one builder over.
+  * `map->settings` silently ignored a `Settings` INSTANCE (every keyword lookup returns nil), so
+    a configured one produced all-defaults: measured, branching-factor 4 came back as 512. It is
+    now honoured.
+
 ### `replace` under a coarse comparator left a stale separator, and elements became unfindable
 
   `maxKeyChanged` asked the OPERATION comparator whether a child's max had moved. Routing uses the

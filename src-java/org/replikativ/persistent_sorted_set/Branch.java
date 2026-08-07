@@ -681,6 +681,28 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
+      // The child was mutated IN PLACE, so this node's addresses[ins] — which asserts
+      // "that child's whole subtree is already durable" — is now a LIE. store() reads it
+      // exactly that way (baseline Pass at :2073 `if (newAddresses[i] == null)`, diff-buf
+      // Pass 1 at :2138 `if (newAddresses[i] != null) continue`), so without this clear the
+      // subtree is skipped at every depth and the mutation NEVER REACHES DISK.
+      //
+      // Reachable from the public API: `store` a live transient, mutate it further, `store`
+      // again — the checkpointed bulk-ingest shape. Measured before this clear, second store
+      // silently missing the second batch:
+      //     bf 64 dbs 0   level 1   in-mem 220  reloaded 219  missing [21]
+      //     bf  8 dbs 0   level 3   in-mem 1220 reloaded 1219 missing [21]
+      //     bf  8 dbs 256 level 2   in-mem 218  reloaded 219  extra   [5]
+      // Baseline loses at every level; under diff-buf level 1 is masked because the slot
+      // carries the real leaf-diff, while level >= 2 deposits a MARKER (diff == null) whose
+      // content lives only in the live child, so the loss returns.
+      //
+      // Every other mutation path already clears it — child(int,ANode) at :328-337,
+      // newAddresses[ins] = null at :749 and :1655, as.copyOne(null) in each rebuild stitch.
+      // The EARLY_EXIT arms were the only ones that did not, because they install no new
+      // node. `anchor0` was captured above, so under diff-buf the child now classifies as
+      // dirty and Pass 2 re-points the address to that anchor.
+      child(ins, oldChild);  // clears addresses[ins] AND unwraps the child (a dirty child must be bare)
       if (_settings.diffBufSize() > 0) depositInto(storage, ins, key, key, anchor0); // content-only: Present(key) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
     }
@@ -867,7 +889,15 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           rightChild = idx < _len-1 ? child(storage, idx + 1) : null;
     int leftChildLen = safeLen(leftChild);
     int rightChildLen = safeLen(rightChild);
-    ANode[] nodes = child(storage, idx).remove(storage, key, leftChild, rightChild, cmp, settings);
+    // Ask the child to REPORT the element it removed, so the diff-buf deposits below record
+    // Absent(<what the leaf actually held>) rather than Absent(<the caller's search key>).
+    // Only at level 1: above it the slot is a branch marker whose diff is null, so the key
+    // is unused. See ANode's six-arg `remove` for the measured failure.
+    Object[] removedOut = (_settings.diffBufSize() > 0 && _level == 1) ? new Object[1] : null;
+    ANode<Key, Address> mutatedChild = child(storage, idx);
+    ANode[] nodes = mutatedChild.remove(storage, key, leftChild, rightChild, cmp, settings, removedOut);
+    @SuppressWarnings("unchecked")
+    Key removedKey = (removedOut != null && removedOut[0] != null) ? (Key) removedOut[0] : key;
 
     if (PersistentSortedSet.UNCHANGED == nodes) // child signalling element not in set
       return PersistentSortedSet.UNCHANGED;
@@ -896,17 +926,47 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // under the SET's comparator, so `Absent(<search key>)` would cancel nothing and the
       // removal would be lost on reload.
       //
-      // NOT corrected, deliberately, because it could not be shown to be reachable. Six
-      // constructions were tried — conj-built and bulk-built, bf 4/8/64, cold-restored
-      // with the STORAGE's node settings carrying the same budget as the set — and `disj`
-      // produced no slot at all in any of them, so this line never ran and no reload ever
-      // resurrected an element. Threading a removed-element channel through `remove` the
-      // way `replace` now has one would be a signature change on a path with no test to
-      // hold it, which is the trade that put the last two defects here in the first place.
+      // NOT corrected, deliberately — but the earlier claim here that `disj` "produced no
+      // slot at all" was WRONG and is corrected: a 40-element set at bf 8 with
+      // diff-buf 256 DOES deposit, and this line does run. What has not been shown is any
+      // resulting data loss. At level > 1 the slot is a branch marker whose diff is null,
+      // so the key is unused; at level 1 no construction tried has produced a wrong
+      // reload. Attempts: conj-built and bulk-built, bf 4/8/64, 40 and 400 elements,
+      // 2- and 3-level trees, persistent and transient, cold-restored with the storage's
+      // node settings carrying the same budget as the set, and searching with a COARSE
+      // operation comparator whose key is not equal to the stored element — every reload
+      // matched memory exactly.
+      //
+      // So this is a latent mismatch, not a demonstrated defect. Threading a
+      // removed-element channel through `remove` the way `replace` has one is the fix if
+      // it is ever shown to bite; doing it blind would be a signature change on a path
+      // with no test to hold it, which is the trade that put the last two defects here.
       //
       // If a construction is ever found that makes `disj` deposit, fix this first and
       // treat the reproduction as the regression test.
-      if (_settings.diffBufSize() > 0) depositInto(storage, idx, key, Slot.ABSENT, anchor0); // content-only: Absent(key) / branch marker
+      // The child was mutated IN PLACE, so this node's addresses[idx] — which asserts
+      // "that child's whole subtree is already durable" — is now a LIE. store() reads it
+      // exactly that way (baseline Pass at :2073 `if (newAddresses[i] == null)`, diff-buf
+      // Pass 1 at :2138 `if (newAddresses[i] != null) continue`), so without this clear the
+      // subtree is skipped at every depth and the mutation NEVER REACHES DISK.
+      //
+      // Reachable from the public API: `store` a live transient, mutate it further, `store`
+      // again — the checkpointed bulk-ingest shape. Measured before this clear, second store
+      // silently missing the second batch:
+      //     bf 64 dbs 0   level 1   in-mem 220  reloaded 219  missing [21]
+      //     bf  8 dbs 0   level 3   in-mem 1220 reloaded 1219 missing [21]
+      //     bf  8 dbs 256 level 2   in-mem 218  reloaded 219  extra   [5]
+      // Baseline loses at every level; under diff-buf level 1 is masked because the slot
+      // carries the real leaf-diff, while level >= 2 deposits a MARKER (diff == null) whose
+      // content lives only in the live child, so the loss returns.
+      //
+      // Every other mutation path already clears it — child(int,ANode) at :328-337,
+      // newAddresses[ins] = null at :749 and :1655, as.copyOne(null) in each rebuild stitch.
+      // The EARLY_EXIT arms were the only ones that did not, because they install no new
+      // node. `anchor0` was captured above, so under diff-buf the child now classifies as
+      // dirty and Pass 2 re-points the address to that anchor.
+      child(idx, mutatedChild);  // clears addresses[idx] AND unwraps the child (a dirty child must be bare)
+      if (_settings.diffBufSize() > 0) depositInto(storage, idx, removedKey, Slot.ABSENT, anchor0); // content-only: Absent(removedKey) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
     }
 
@@ -1011,7 +1071,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         }
         if (_settings.diffBufSize() > 0) {
           if (!structural) {
-            depositInto(storage, idx, key, Slot.ABSENT, anchor0); // content-only: Absent(key) / branch marker
+            depositInto(storage, idx, removedKey, Slot.ABSENT, anchor0); // content-only: Absent(removedKey) / branch marker
           } else {
             // a child merged/borrowed with a sibling: structural → write in full. Single
             // publish of the stitched slots + BUF_WRITE poison (owner thread; carries the
@@ -1059,7 +1119,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           // content-only: carry the SAME snapshot's {slots, entries} pair aligned and
           // ACCUMULATE Absent onto the center's existing diff (it may already hold
           // buffered Present/Absent for this leaf).
-          newCenter.carryAndDeposit(storage, s0.buf, idx, key, Slot.ABSENT, anchor0);
+          newCenter.carryAndDeposit(storage, s0.buf, idx, removedKey, Slot.ABSENT, anchor0);
         } else {
           // structural: mirror the address Stitch; newCenter is unpublished, so one publish
           // installs the consistent {slots, BUF_WRITE} pair.
@@ -1547,7 +1607,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // is null, so the key is unused, and at diffBufSize 0 there is no diff at all.
     Object[] removedOut = (_settings.diffBufSize() > 0 && _level == 1) ? new Object[1] : null;
     // Recursively replace in child
-    ANode[] nodes = child(storage, idx).replace(storage, oldKey, newKey, cmp, settings, removedOut);
+    ANode<Key, Address> mutatedChild = child(storage, idx);
+    ANode[] nodes = mutatedChild.replace(storage, oldKey, newKey, cmp, settings, removedOut);
     @SuppressWarnings("unchecked")
     Key removedKey = (removedOut != null && removedOut[0] != null) ? (Key) removedOut[0] : oldKey;
 
@@ -1560,6 +1621,28 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
+      // The child was mutated IN PLACE, so this node's addresses[idx] — which asserts
+      // "that child's whole subtree is already durable" — is now a LIE. store() reads it
+      // exactly that way (baseline Pass at :2073 `if (newAddresses[i] == null)`, diff-buf
+      // Pass 1 at :2138 `if (newAddresses[i] != null) continue`), so without this clear the
+      // subtree is skipped at every depth and the mutation NEVER REACHES DISK.
+      //
+      // Reachable from the public API: `store` a live transient, mutate it further, `store`
+      // again — the checkpointed bulk-ingest shape. Measured before this clear, second store
+      // silently missing the second batch:
+      //     bf 64 dbs 0   level 1   in-mem 220  reloaded 219  missing [21]
+      //     bf  8 dbs 0   level 3   in-mem 1220 reloaded 1219 missing [21]
+      //     bf  8 dbs 256 level 2   in-mem 218  reloaded 219  extra   [5]
+      // Baseline loses at every level; under diff-buf level 1 is masked because the slot
+      // carries the real leaf-diff, while level >= 2 deposits a MARKER (diff == null) whose
+      // content lives only in the live child, so the loss returns.
+      //
+      // Every other mutation path already clears it — child(int,ANode) at :328-337,
+      // newAddresses[ins] = null at :749 and :1655, as.copyOne(null) in each rebuild stitch.
+      // The EARLY_EXIT arms were the only ones that did not, because they install no new
+      // node. `anchor0` was captured above, so under diff-buf the child now classifies as
+      // dirty and Pass 2 re-points the address to that anchor.
+      child(idx, mutatedChild);  // clears addresses[idx] AND unwraps the child (a dirty child must be bare)
       if (_settings.diffBufSize() > 0) depositReplace(storage, idx, removedKey, newKey, anchor0); // Absent(removedKey)+Present(newKey) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
     }
@@ -2071,6 +2154,22 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
             if (newChildren == s0.children) newChildren = Arrays.copyOf(s0.children, s0.children.length);
             newChildren[i] = _settings.makeReference(newChildren[i]);
           }
+        } else if (newChildren != null && newChildren[i] instanceof ANode) {
+          // CLEAN passthrough, but still a BARE (strong) child. `Branch.remove` writes an
+          // UNCHANGED sibling into its successor as a bare ANode while keeping that
+          // sibling's still-valid address (as.copyOne(s0.addresses[...]) next to
+          // cs.copyOne(nodes[...]) in every arm), and copy-on-write carries it into every
+          // later version. Skipping it here — the settle only ever wrapped null-address
+          // children — meant each disj permanently converted up to two slots per level on
+          // its path into strong references, so `:ref-type :soft`/`:weak` stopped bounding
+          // the tree. Measured at bf 16 over 20000 elements, :ref-type :soft: after 400
+          // disj and a store, {:ref 780, :bare-STRONG-with-address 119} — the 119 never
+          // shrink. Present at diffBufSize 0 too, so it predates diff-buf.
+          //
+          // Safe to wrap for the same reason Pass 2 is: the address is non-null and still
+          // durable, so a cleared reference reloads.
+          if (newChildren == s0.children) newChildren = Arrays.copyOf(s0.children, s0.children.length);
+          newChildren[i] = _settings.makeReference(newChildren[i]);
         }
       }
       if (dirty || s0.addresses == null) {
@@ -2105,6 +2204,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     final BufState b0 = s0.buf;
     final Object[] slots0 = (b0 != null) ? b0.slots : null;
     final Object[] children0 = s0.children;
+    // Declared here rather than at Pass 2: Pass 1 now also wraps clean passthrough children,
+    // so the copy-on-write array must exist before that loop.
+    Object[] newChildren = children0;
     final Address[] newAddresses = (s0.addresses != null)
         ? Arrays.copyOf(s0.addresses, s0.addresses.length)
         : (Address[]) new Object[_keys.length];
@@ -2122,6 +2224,16 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       Slot sl = (slots0 != null) ? (Slot) slots0[i] : null;
       if (newAddresses[i] != null) {
         if (sl != null) passthrough += slotBE(sl);             // clean buffered-passthrough subtree total
+        // Wrap a clean passthrough child that is still BARE, exactly as the baseline settle
+        // now does. `Branch.remove` writes an unchanged sibling into its successor as a bare
+        // ANode while keeping its still-valid address, so without this each disj ratchets
+        // more of the tree into permanently strong references and `:ref-type` stops
+        // bounding anything. Measured at bf 16 / 20000 elements / :ref-type :soft, before:
+        // after 400 disj and a store, {:ref 780, :bare-STRONG-with-address 119}.
+        if (newChildren != null && newChildren[i] instanceof ANode) {
+          if (newChildren == children0) newChildren = Arrays.copyOf(children0, children0.length);
+          newChildren[i] = _settings.makeReference(newChildren[i]);
+        }
         continue;
       }
       // addresses[i] == null: dirty this commit ⇒ child is resident; its slot is live (deposited).
@@ -2161,7 +2273,6 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // restore(anchor) + project(slot) — which is precisely why that writeback exists. A
     // FLUSHED child is written outright. Copy-on-write, so the published array is never the
     // snapshot's own.
-    Object[] newChildren = children0;
     int embedded = passthrough;
     for (int i : bufferable) {
       Slot sl = (Slot) slots0[i];

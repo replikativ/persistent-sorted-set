@@ -30,7 +30,52 @@ public class Settings {
   // through unchanged, so a transient preserves them. (The pre-diff-buf 5-arg edit ctor was
   // removed: it was unused and, lacking a diffBufSize arg, would have silently reset it to the
   // sysprop default.)
+  /**
+   * Forces diff-buffering OFF whenever a `leafProcessor` is configured. Called from EVERY
+   * constructor that can set both — the 5-arg one assigns its fields directly rather than
+   * delegating, so a guard in the canonical constructor alone does not run (measured: the
+   * repro still corrupted).
+   *
+   * NEUTRALIZE rather than throw, following `withBoundary`'s handling of MST + diff-buf.
+   * Throwing was tried and is wrong here: the `:test` alias sets `-Dpss.diffBufSize=256`, so
+   * every existing leafProcessor test inherits a budget it never asked for and 41 of them
+   * failed at construction. That also shows the broken combination has been silently ACTIVE
+   * across the suite all along — those tests pass only because none of them drives a
+   * store/restore cycle or an eviction.
+   *
+   * This is a STOPGAP, not the intended end state: buffering with a processor is planned.
+   * Closing it properly means `ILeafProcessor` reporting the edits it made, so the deposit
+   * can record them instead of recording only the caller's element.
+   */
+  // A leafProcessor is INCOMPATIBLE with diff-buffering, and the combination is refused
+  // here so it cannot be constructed silently — the same policy `withBoundary` applies to
+  // MST + leafProcessor.
+  //
+  // Every diff-buf deposit records exactly the one element the CALLER named (see
+  // Branch.add / .remove / .replace). A processor rewrites the WHOLE leaf, and when it
+  // does not expand past the branching factor the leaf comes back as a single node, so the
+  // parent classifies the change as content-only and buffers it. Every entry the processor
+  // added, dropped or rewrote is then absent from the slot's diff, while `Slot.count`
+  // (taken from childCount) still counts them — so the projected leaf and the cached count
+  // disagree, permanently.
+  //
+  // Measured, compacting processor at bf 4 with diff-buf 100, elements [k v]: a set of 8
+  // came back from a store/restore cycle with 9 elements, the processor-deleted [5 0]
+  // resurrected. With `:ref-type :weak` it is worse than a reload artifact — the same
+  // corruption appears IN PROCESS at the next GC, so a persistent value changes under the
+  // caller and `seq` and `count` disagree on one object.
+  //
+  // Closing it properly means having ILeafProcessor report its edits so the deposit can
+  // record them; until then the combination is rejected rather than silently wrong.
+  // Stratum, the only in-tree consumer of ILeafProcessor, does not set :diff-buf-size, so
+  // this refusal also protects it from the `pss.diffBufSize` system property switching
+  // buffering on underneath it.
+    private static int diffBufFor(ILeafProcessor leafProcessor, int diffBufSize) {
+    return (leafProcessor != null) ? 0 : diffBufSize;
+  }
+
   public Settings(int branchingFactor, RefType refType, AtomicReference<Thread> edit, IMeasure measure, ILeafProcessor leafProcessor, int diffBufSize, IBoundary boundary) {
+    diffBufSize = diffBufFor(leafProcessor, diffBufSize);
     _branchingFactor = branchingFactor;
     _refType = refType;
     _edit = edit;
@@ -73,7 +118,7 @@ public class Settings {
     _edit = null;
     _measure = measure;
     _leafProcessor = leafProcessor;
-    _diffBufSize = diffBufSize < 0 ? 0 : diffBufSize;
+    _diffBufSize = diffBufFor(leafProcessor, diffBufSize < 0 ? 0 : diffBufSize);
     _boundary = null; // count default; MST configured via withBoundary()
   }
 
@@ -128,11 +173,40 @@ public class Settings {
    *  restored node's own budget — nodes are self-describing, and a set running at 0 over
    *  nodes that carry slots drops their buffered elements on the next write.
    *
+   *  Note this adopts over an EXPLICIT 0 as well: the value cannot be distinguished from
+   *  an unset one, and must not be honoured anyway — running at 0 over nodes that carry
+   *  slots drops their buffered elements on the next write, which is the very thing this
+   *  adoption exists to prevent. See PersistentSortedSet.root().
+   *
    *  Refuses to enable buffering under a content-defined boundary (MST), for the same
    *  reason `withBoundary` forces it off: a buffered spine node is addressed by
    *  hash(anchor+diff) rather than its canonical content hash, which breaks the
    *  cross-peer dedup MST exists for. */
   public Settings withDiffBufSize(int diffBufSize) {
+    // REFUSE rather than neutralise when a leafProcessor would silently zero a budget the
+    // DATA is asking us to adopt. `PersistentSortedSet.root()` calls this to take on a
+    // restored node's own budget, and the whole point of that adoption is that running at 0
+    // over nodes carrying slots drops their buffered elements on the next write — measured
+    // at 81 elements for bf 16 / budget 512 / 6000 elements.
+    //
+    // The processor stopgap (diffBufFor, applied in every constructor) would send this
+    // straight back to 0 and the adoption would no-op in silence: measured,
+    // `withDiffBufSize(256)` returns 256 without a processor and 0 with one. That is the
+    // stopgap reintroducing the exact data loss it was added to avoid, one level up.
+    //
+    // Reachable whenever a store written WITHOUT a processor is later opened WITH one.
+    // Throwing is right here because there is no safe answer: honouring the budget runs the
+    // processor+diff-buf combination that corrupts, and ignoring it drops committed
+    // elements. The caller has to choose.
+    if (_leafProcessor != null && diffBufSize > 0
+        && !(_boundary != null && _boundary.contentDefined())) {
+      throw new IllegalStateException(
+        "cannot adopt diff-buf budget " + diffBufSize + " on a set configured with a "
+        + "leafProcessor: the two are incompatible (a diff records one element while a "
+        + "processor rewrites the whole leaf), but these nodes CARRY buffered elements, so "
+        + "running at 0 would drop them. Open this store without a leafProcessor, or "
+        + "rewrite it with diff-buf off.");
+    }
     int effective = (_boundary != null && _boundary.contentDefined()) ? 0 : diffBufSize;
     return new Settings(_branchingFactor, _refType, _edit, _measure, _leafProcessor, effective, _boundary);
   }

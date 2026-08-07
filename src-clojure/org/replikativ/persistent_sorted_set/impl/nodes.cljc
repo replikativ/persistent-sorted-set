@@ -95,11 +95,35 @@
 ;; ---------------------------------------------------------------------------
 
 (defn node->map
-  "Project a PSS node to its canonical CONTENT map — for content-addressing (hash this map) or
-   storing the map directly. Leaf → {:keys …}; Branch → {:level :keys :addresses :subtree-count
-   (:measure) (:slots)}. Comparator/storage/settings-free; element values stay raw. NOTE: this is
-   the CONTENT projection — the serialized blob additionally carries :branching-factor/:diff-buf-size
-   (see `node->blob`), which are NOT part of the content hash."
+  "Project a PSS node to the map that gets STORED. Leaf → {:keys … (:measure)}; Branch →
+   {:level :keys :addresses :subtree-count (:measure) (:slots)}. Comparator/storage/settings-free;
+   element values stay raw. `node->blob` appends :branching-factor/:diff-buf-size/:ref-type so a
+   read self-describes.
+
+   DO NOT HASH THIS MAP FOR A CONTENT ADDRESS — use `node->identity` instead.
+
+   An earlier version of this docstring said \"for content-addressing (hash this map)\", and that
+   is wrong: two of these keys are CACHES, not content, so the same logical node projects
+   differently depending on what happened to it earlier.
+
+     :measure        null until something forces it, and `forceComputeMeasure` ASSIGNS — so a
+                     read-only aggregate query changes what the node later serializes as. Two
+                     structurally identical leaves, one warm and one cold, produce
+                     {:keys [...] :measure ...} and {:keys [...]}.
+     :subtree-count  written raw from `Branch.subtreeCount()`, which is -1 (\"unknown\") whenever
+                     a child's count was unavailable. Measured: 2 of the branches on a second
+                     commit over 200 elements at bf 8 wrote -1. Read-back normalises it, so it
+                     is not corruption — but it is an address change.
+
+   Hashing this map therefore gives an address that is not a function of the node's content:
+   measured, the same set under the same operation produced 0 of 4 addresses in common between
+   two stores that differed only in which caches happened to be populated. Dedup and cross-peer
+   sharing are lost exactly where they are wanted.
+
+   Both real consumers already avoid this, independently, which is the strongest evidence the
+   old advice was the bug: datahike hashes `[addresses (canon slots)]` for a Branch and the
+   element vector for a Leaf; stratum hashes the address vector and the leaf's chunk keys.
+   `node->identity` is that subset, named."
   [node]
   #?(:clj
      ;; `vec` the keys/addresses: the raw trimmed Java List isn't hash-coercible (hasch) and differs
@@ -126,6 +150,27 @@
            slots                     (assoc :slots slots)))
        (cond-> {:keys (vec (.-keys node))}
          (some? (.-_measure node)) (assoc :measure (.-_measure node))))))
+
+(defn node->identity
+  "The CONTENT of a node, for a content address: hash THIS, not `node->map`.
+
+   Leaf → {:keys …}; Branch → {:level :keys :addresses (:slots)}.
+
+   Deliberately excludes `:measure` and `:subtree-count`: both are caches that can be present or
+   absent for the same logical node (see `node->map`), and both are recomputable — a leaf's
+   measure from its own keys, a branch's count from its children. Including them makes the
+   address depend on warmth rather than on content.
+
+   Deliberately INCLUDES `:slots`. Buffered diffs are content, not cache: a buffered child is
+   stored as `anchor + diff`, so two trees can share every child address and differ only in
+   their diffs. A hash that omits slots collides on logically different trees, and a tampered
+   diff would be invisible to a merkle audit. (datahike folds slots in for exactly this reason;
+   stratum does not, which is safe only while it leaves diff-buf off.)
+
+   Deliberately excludes :branching-factor/:diff-buf-size/:ref-type — configuration, not content
+   — which `node->blob` carries separately so a read self-describes."
+  [node]
+  (select-keys (node->map node) [:level :keys :addresses :slots]))
 
 (defn node->blob
   "What every format actually writes for a node: the content projection PLUS the node's own

@@ -224,6 +224,10 @@
             (when freed
               (let [reachable (atom #{})]
                 (ss/walk-addresses loaded (fn [a] (swap! reachable conj a)))
+                ;; `over` is meaningful only because this harness allocates a fresh address
+                ;; per write. Under a content-addressed storage a reachable node CAN appear in
+                ;; the freed stream — legitimately, since the address is derived from content.
+                ;; See IStorage.markFreed.
                 (let [over   (clojure.set/intersection @reachable @freed)
                       leaked (clojure.set/difference (set (keys @disk)) @reachable @freed)]
                   (when (seq over)

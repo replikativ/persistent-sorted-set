@@ -161,12 +161,22 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
 
   @Override
   public ANode[] remove(IStorage storage, Key key, ANode _left, ANode _right, Comparator<Key> cmp, Settings settings) {
+    return remove(storage, key, _left, _right, cmp, settings, null);
+  }
+
+  /** Reports the element actually removed into `removedOut[0]`. See ANode. */
+  @Override
+  public ANode[] remove(IStorage storage, Key key, ANode _left, ANode _right, Comparator<Key> cmp, Settings settings, Object[] removedOut) {
     Leaf left = (Leaf) _left;
     Leaf right = (Leaf) _right;
 
     int idx = search(key, cmp);
     if (idx < 0) // not in set
       return PersistentSortedSet.UNCHANGED;
+
+    // Report the element the leaf ACTUALLY holds, before any path below rewrites the
+    // array. Under a coarse operation comparator this is not the caller's `key`.
+    if (removedOut != null) removedOut[0] = _keys[idx];
 
     int newLen = _len - 1;
     IMeasure measureOps = _settings.measure();

@@ -148,6 +148,15 @@
           (recur (inc i) start acc))))))
 
 (defn- map->settings ^Settings [m]
+  ;; A `Settings` INSTANCE is not an opts map — every keyword lookup below returns nil for
+  ;; one, so it used to produce all-defaults SILENTLY. Measured: `(from-sorted-array cmp arr n
+  ;; (Settings. 4 STRONG nil nil 0))` came back at branching-factor 512, :ref-type :soft, with
+  ;; no error. Honour it instead of rebuilding from nils; the library's own 2-/3-arities pass
+  ;; a bare `(Settings.)`, for which this is exactly equivalent to the defaults it would have
+  ;; constructed. (Refusing was tried first and rejected those internal callers, because the
+  ;; no-arg ctor normalises to 512/SOFT and so does not look "unconfigured".)
+  (if (instance? Settings m)
+    m
   (let [boundary (:boundary m)
         s (Settings.
            (int (or (:branching-factor m) 0))
@@ -171,7 +180,7 @@
         s (if boundary (.withBoundary s ^IBoundary boundary) s)]
     ;; diff-buf: the comparator is NOT stored on Settings — it lives on the PersistentSortedSet
     ;; (_cmp) and is propagated to Branch nodes (Branch._projCmp) for leaf projection.
-    s))
+    s)))
 
 (defn- settings->map [^Settings s]
   {:branching-factor (.branchingFactor s)
@@ -266,8 +275,8 @@
          (loop [level 1
                 nodes (mapv ->Leaf (mst-split boundary settings keys len Object identity 1))]
            (case (count nodes)
-             0 (PersistentSortedSet. {} cmp storage settings)
-             1 (PersistentSortedSet. {} cmp nil storage (first nodes) len settings 0)
+             0 (PersistentSortedSet. (:meta opts) cmp storage settings)
+             1 (PersistentSortedSet. (:meta opts) cmp nil storage (first nodes) len settings 0)
              (recur (inc level)
                     (mapv #(->Branch level %)
                           (mst-split boundary settings nodes (count nodes) Object
@@ -275,8 +284,8 @@
        (loop [level 1
               nodes (mapv ->Leaf (split keys len Object avg-branching-factor max-branching-factor))]
          (case (count nodes)
-           0 (PersistentSortedSet. {} cmp storage settings)
-           1 (PersistentSortedSet. {} cmp nil storage (first nodes) len settings 0)
+           0 (PersistentSortedSet. (:meta opts) cmp storage settings)
+           1 (PersistentSortedSet. (:meta opts) cmp nil storage (first nodes) len settings 0)
            (recur (inc level) (mapv #(->Branch level %) (split nodes (count nodes) Object avg-branching-factor max-branching-factor)))))))))
 
 (defn- streaming-split

@@ -46,7 +46,13 @@
         written (set (keys @disk))
         leaked  (clojure.set/difference written r @freed)
         live    (clojure.set/intersection r @freed)]
-    (is (= 0 (count live)) "no live (reachable) node is ever markFreed (over-free)")
+    ;; Holds because THIS storage allocates a fresh address per write. It is NOT a general
+    ;; invariant: under a CONTENT-ADDRESSED store an address is a function of the node's
+    ;; content, so a node whose content returns to a previous value gets the address it had
+    ;; then — and `(-> s (conj x) (disj x))` puts a live address, sometimes the published
+    ;; root, into the freed stream. See IStorage.markFreed.
+    (is (= 0 (count live)) "no live (reachable) node is ever markFreed (over-free), for a
+                            storage that allocates fresh addresses")
     (is (= 0 (count leaked))
         (str "every superseded blob is markFreed (markFreed completeness); leaked="
              (count leaked) " of written=" (count written)))))

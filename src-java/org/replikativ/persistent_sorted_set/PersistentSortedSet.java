@@ -77,8 +77,21 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       // passed the budget. The caller cannot be expected to remember a number the data
       // already knows.
       //
-      // Only ever ADOPTS upward from 0 — an explicit budget wins, and `withDiffBufSize`
-      // refuses to enable buffering under a content-defined boundary.
+      // Adopts upward from 0 — including over an EXPLICIT 0, which the previous wording
+      // ("an explicit budget wins") got backwards. `Settings` cannot distinguish an
+      // explicit 0 from an unset one, but more importantly it must not: honouring a
+      // request for 0 over nodes that carry slots is exactly the state described above,
+      // where the next write drops their buffered elements. A caller asking for baseline
+      // over buffered data is asking to lose it, so the data wins.
+      //
+      // Consequence for tests, which is how this was found: pinning `:diff-buf-size 0`
+      // in the SET's opts does NOT give baseline once the storage hands back nodes that
+      // carry a budget — and the `:test` alias sets `-Dpss.diffBufSize=256`, so every
+      // node a default test storage reconstructs carries 256. A baseline test must give
+      // the STORAGE 0 as well; see test/diff_buf_restore_cycle.clj's node-settings.
+      //
+      // `withDiffBufSize` still refuses to enable buffering under a content-defined
+      // boundary.
       if (_settings.diffBufSize() <= 0 && root._settings.diffBufSize() > 0) {
         _settings = _settings.withDiffBufSize(root._settings.diffBufSize());
       }
