@@ -890,6 +890,22 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
+      // NOTE `key` here is the caller's SEARCH key, not the element the leaf removed.
+      // Under a coarse operation comparator those differ, and this is the same shape as
+      // the `replace` deposit defect fixed in this cycle: `projectLeaf` replays the diff
+      // under the SET's comparator, so `Absent(<search key>)` would cancel nothing and the
+      // removal would be lost on reload.
+      //
+      // NOT corrected, deliberately, because it could not be shown to be reachable. Six
+      // constructions were tried — conj-built and bulk-built, bf 4/8/64, cold-restored
+      // with the STORAGE's node settings carrying the same budget as the set — and `disj`
+      // produced no slot at all in any of them, so this line never ran and no reload ever
+      // resurrected an element. Threading a removed-element channel through `remove` the
+      // way `replace` now has one would be a signature change on a path with no test to
+      // hold it, which is the trade that put the last two defects here in the first place.
+      //
+      // If a construction is ever found that makes `disj` deposit, fix this first and
+      // treat the reproduction as the regression test.
       if (_settings.diffBufSize() > 0) depositInto(storage, idx, key, Slot.ABSENT, anchor0); // content-only: Absent(key) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
     }
@@ -1557,9 +1573,32 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // change must propagate so every separator up the spine stays canonical (mirrors the cljs
     // Branch.$replace value-based test). _keys[idx] is still the OLD separator here (overwritten
     // below). See doc/merkle-search-tree.md.
+    // Whether the change must PROPAGATE to this node's parent. `_keys[idx]` is written
+    // unconditionally below, so the immediate separator is always fresh; this decides
+    // whether the GRANDPARENT's separator (= this branch's max = _keys[_len-1]) is stale.
+    //
+    // The test is VALUE equality, not `cmp`. Asking the OPERATION comparator whether the
+    // max moved is wrong whenever that comparator is coarser than the one routing will
+    // use — datahike's value-changing upsert searches [e a _ _], so `cmp.compare` returns
+    // 0 for a datom whose v changed, propagation was suppressed, and every ancestor kept
+    // a separator naming the OLD element. A later descent comparing the new element
+    // against that stale separator routes past the child that holds it.
+    //
+    // Measured before this fix (elements [i 0], set cmp on (i,v), op cmp on i alone,
+    // replace [i 0] -> [i 5] for every i, inside a transient): 9 unfindable at n=40 bf=4,
+    // 24 at n=100 bf=4, 46 at n=3000 bf=16 — `contains?` false for an element that seq
+    // still lists, in a set that is sorted and counts correctly. Through datahike at
+    // branching-factor 8, 375 of 3000 datoms were invisible to `d/datoms db :eavt e a v`.
+    // Only trees of THREE levels or more are affected: with two levels the parent is the
+    // root and its separator is the one written unconditionally.
+    //
+    // `Util.equiv` rather than `Objects.equals` deliberately. Datom implements `equiv`
+    // (Clojure `=`) but not `Object.equals`, so `Objects.equals` is identity there and
+    // would propagate on EVERY upsert. `equiv` propagates exactly when the element really
+    // changed, which is the cheapest test that is still correct.
     boolean maxKeyChanged = settings.boundary().contentDefined()
       ? !java.util.Objects.equals(newMaxKey, _keys[idx])
-      : (idx == _len - 1) && (0 != cmp.compare(newMaxKey, _keys[idx]));
+      : (idx == _len - 1) && !clojure.lang.Util.equiv(newMaxKey, _keys[idx]);
     IMeasure measureOps = settings.measure();
 
     // Transient: can modify in place
@@ -2108,6 +2147,21 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // Staged on newAddresses/newSlots, local copies — nothing is visible to other threads yet.
     bufferable.sort((x, y) -> Integer.compare(csz[x], csz[y]));
     Object[] newSlots = (slots0 != null) ? Arrays.copyOf(slots0, slots0.length) : null;
+    // Children are WRAPPED here, exactly as the baseline settle wraps them. Publishing
+    // `children0` unchanged (what this did before) left every child that had been dirty in
+    // any commit a bare STRONG reference from its parent, and copy-on-write carried that
+    // into every successor — so with diff-buf on, `:ref-type :soft`/`:weak` silently stopped
+    // bounding anything and the resident set ratcheted toward the whole tree. Measured, bf 8
+    // and `:ref-type :soft`: diff-buf 0 gave {:ref 5} at the root, diff-buf 256 gave
+    // {:bare-strong 5}.
+    //
+    // Both settled kinds are safe to wrap because both end up with a durable address:
+    // a BUFFERED child is re-pointed to its anchor and its assembled diff is written back
+    // into the slot just below, so a cleared reference is re-derived as
+    // restore(anchor) + project(slot) — which is precisely why that writeback exists. A
+    // FLUSHED child is written outright. Copy-on-write, so the published array is never the
+    // snapshot's own.
+    Object[] newChildren = children0;
     int embedded = passthrough;
     for (int i : bufferable) {
       Slot sl = (Slot) slots0[i];
@@ -2115,6 +2169,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         newAddresses[i] = (Address) sl.anchor;                  // re-point to durable anchor (no write)
         newSlots[i] = new Slot(cnested[i], sl.count, sl.measure, sl.anchor, csz[i]); // write back assembled diff + its size
         embedded += csz[i];
+        if (newChildren != null && newChildren[i] instanceof ANode) {
+          if (newChildren == children0) newChildren = Arrays.copyOf(children0, children0.length);
+          newChildren[i] = _settings.makeReference(newChildren[i]);
+        }
       } else {
         writeList.add(i);                                       // doesn't fit ⇒ flush
       }
@@ -2127,6 +2185,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (sl != null && sl.anchor != null) storage.markFreed((Address) sl.anchor);
       newAddresses[i] = ((ANode<Key, Address>) child).store(storage);
       if (newSlots != null) newSlots[i] = null;
+      if (newChildren != null && newChildren[i] instanceof ANode) {
+        if (newChildren == children0) newChildren = Arrays.copyOf(children0, children0.length);
+        newChildren[i] = _settings.makeReference(newChildren[i]);
+      }
     }
     // Settle: this node now equals its durable object, whose remaining slots are exactly the
     // children we BUFFERED (passthrough + newly buffered) — the flushed ones were nulled. So
@@ -2135,9 +2197,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // ONE publish of the WHOLE per-child state replaces the old in-place address writes +
     // per-slot nulling + late total reset (the torn windows); it happens BEFORE
     // storage.store(this) so the serializer (slotsForStorage / addresses()) sees the
-    // settled state, exactly as the old in-place mutation did. children are unchanged by
-    // the diff-buf settle (no wrapping here — identical to the historical behavior).
-    _state = new NodeState<>(newAddresses, children0, new BufState(newSlots, embedded));
+    // settled state, exactly as the old in-place mutation did. children are WRAPPED per
+    // `:ref-type`, same as the baseline settle — see the staging comment above.
+    _state = new NodeState<>(newAddresses, newChildren, new BufState(newSlots, embedded));
     return storage.store(this);
   }
 

@@ -39,15 +39,38 @@
   (force-compute-measure [this storage measure-ops opts]
     ;; For leaves, try and force are the same - just compute from keys
     (node/try-compute-measure this storage measure-ops opts))
+  ;; merge / merge-split must CARRY the measure, not leave it nil.
+  ;;
+  ;; The old comment here said "Measure will be recomputed lazily if needed" — and
+  ;; nothing recomputes it. `try-compute-measure` computes on demand for the node it
+  ;; is called on; a BRANCH above a nil-measure child can only POSTPONE, so one merged
+  ;; leaf erases the aggregate for its whole spine. The JVM never had this: every
+  ;; merge/borrow arm of `Leaf.remove` does `join._measure = join.tryComputeMeasure(...)`
+  ;; whenever the source leaf had one.
+  ;;
+  ;; Measured with a per-level census (test.measure-population), 200 elements built
+  ;; eagerly with a measure and then removed from — the JVM held a measure on every
+  ;; node at every level, ClojureScript came back
+  ;;     bf  8, dropped  50: level 1: 2 of 5 without, level 0: 2 of 25 without
+  ;;     bf 16, dropped 137: level 1 (the ROOT): without
+  ;; A leaf computes from its own keys, so `storage` is not needed and this cannot
+  ;; postpone. Guarded on the source leaf's measure, exactly as the JVM guards.
   (merge [_ next]
-    (let [new-leaf (Leaf. (arrays/aconcat keys (.-keys next)) settings nil)]
-      ;; Measure will be recomputed lazily if needed
+    (let [new-leaf (Leaf. (arrays/aconcat keys (.-keys next)) settings nil)
+          measure-ops (:measure settings)]
+      (when (and measure-ops _measure)
+        (set! (.-_measure new-leaf)
+              (node/try-compute-measure new-leaf nil measure-ops {:sync? true})))
       new-leaf))
   (merge-split [_ next]
-    (let [ks (util/merge-n-split keys (.-keys next))]
-      ;; Measure will be recomputed lazily for new leaves
-      (util/return-array (Leaf. (arrays/aget ks 0) settings nil)
-                         (Leaf. (arrays/aget ks 1) settings nil))))
+    (let [ks (util/merge-n-split keys (.-keys next))
+          measure-ops (:measure settings)
+          l0 (Leaf. (arrays/aget ks 0) settings nil)
+          l1 (Leaf. (arrays/aget ks 1) settings nil)]
+      (when (and measure-ops _measure)
+        (set! (.-_measure l0) (node/try-compute-measure l0 nil measure-ops {:sync? true}))
+        (set! (.-_measure l1) (node/try-compute-measure l1 nil measure-ops {:sync? true})))
+      (util/return-array l0 l1)))
   (add [this storage key cmp {:keys [sync?] :or {sync? true}}]
     (let [branching-factor (:branching-factor settings)
           measure-ops (:measure settings)
@@ -117,19 +140,35 @@
                  (let [idx (garr/binarySearch keys key cmp)]
                    (when (<= 0 idx)
                      (arrays/aget keys idx))))))
-  ($remove [this storage key left right cmp {:keys [sync?] :or {sync? true}}]
+  ;; `removed-out`, when given, is a 1-element array this fills with the element
+  ;; ACTUALLY removed — the branch above needs it for the same reason this leaf does
+  ;; (see below), and cannot know it otherwise. Mirrors `$replace`'s channel.
+  ($remove [this storage key left right cmp {:keys [sync? removed-out] :or {sync? true}}]
     (let [root? (and (nil? left) (nil? right))
           measure-ops (:measure settings)
           idx   (garr/binarySearch keys key cmp)]
       (async+sync sync?
                   (async
                    (when (<= 0 idx)
-                     (let [new-keys (util/splice keys idx (inc idx) (arrays/array))
+                     (let [;; the element the leaf ACTUALLY holds, not the caller's `key`:
+                           ;; `cmp` may be coarser than the set's comparator, in which case
+                           ;; `key` is merely comparator-equal to it and `remove-measure`
+                           ;; would subtract the wrong contribution. Measured on the JVM twin
+                           ;; (200 longs, decade comparator): an EMPTY set with a cached sum
+                           ;; of 24.0 instead of 0. `node->map` serializes `:measure`, so it
+                           ;; is durable and changes the node's content address.
+                           ;;
+                           ;; ClojureScript is hit on EVERY remove, not just a transient one:
+                           ;; this is the only remove path here, and unlike the JVM's
+                           ;; persistent branch it does not recompute from the new keys.
+                           removed-element (arrays/aget keys idx)
+                           _ (when removed-out (aset removed-out 0 removed-element))
+                           new-keys (util/splice keys idx (inc idx) (arrays/array))
                            new-leaf (Leaf. new-keys settings nil)]
                        ;; Update measure only if already computed
                        (when (and measure-ops _measure)
                          (set! (.-_measure new-leaf)
-                               (measure/remove-measure measure-ops _measure key
+                               (measure/remove-measure measure-ops _measure removed-element
                                                        #(node/try-compute-measure new-leaf storage measure-ops {:sync? true}))))
                        (util/rotate new-leaf root? left right settings)))))))
   ;; `removed-out`, when given, is a 1-element array this fills with the element

@@ -181,10 +181,21 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
 
     // nothing to merge — transient, can edit in place (only if processor won't fire)
     if (editable() && !processorWillFire && (newLen >= _settings.minBranchingFactor() || (left == null && right == null))) {
+      // The element the leaf ACTUALLY holds, captured before the shift overwrites it.
+      // NOT the caller's `key`: `cmp` may be coarser than the set's comparator (the
+      // `[id value]`-compared-by-id pattern this class's `lookup` docstring advertises,
+      // and datahike's datom removal), in which case `key` is merely comparator-equal
+      // to the stored element and `IMeasure.remove` would subtract the wrong
+      // contribution. Measured, 200 longs 3,13,23,... removed via a decade comparator
+      // inside a transient: the set ended EMPTY with a cached sum of 24.0 (bf 8) and
+      // 48.0 (bf 16) instead of 0. `node->map` serializes `:measure`, so that lands on
+      // disk and changes the node's content address. The persistent path below never
+      // had this — it recomputes from the new leaf's keys.
+      Key removedElement = _keys[idx];
       ArrayUtil.copy(_keys, idx + 1, _len, _keys, idx);
       _len = newLen;
       if (measureOps != null && _measure != null) {
-        _measure = measureOps.remove(_measure, key, () -> thisLeaf.tryComputeMeasure(storage));
+        _measure = measureOps.remove(_measure, removedElement, () -> thisLeaf.tryComputeMeasure(storage));
       }
       if (idx == newLen) // removed last, need to signal new maxKey
         return new ANode[]{left, this, right};

@@ -65,6 +65,93 @@
   one the leaf overwrote — recording `Absent` for one while replacing another, reintroducing the
   very duplicate this fixes.
 
+### `replace` under a coarse comparator left a stale separator, and elements became unfindable
+
+  `maxKeyChanged` asked the OPERATION comparator whether a child's max had moved. Routing uses the
+  SET's comparator, which can see a change the coarse one calls equal — so propagation was
+  suppressed and ancestors kept separators naming the OLD element. A later descent comparing the
+  new element against a stale separator routes past the child that holds it.
+
+  The element is still there: `seq` lists it, the set is sorted, `count` is right, and a lookup
+  with the coarse comparator finds it. Only a lookup with the set's own comparator misses.
+
+      JVM, inside a transient     n=40 bf=4: 9   n=100 bf=4: 24   n=3000 bf=16: 46
+      ClojureScript, persistent   n=40 bf=4: 13  n=100 bf=4: 33   n=3000 bf=16: 250
+
+  Through datahike at the DEFAULT branching factor of 512, measured against `d/datoms db :eavt e a v`:
+
+      100 000 elements   root level 1   0 unfindable   (structurally impossible)
+      200 000            root level 2   3
+      400 000            root level 2   6
+
+  Three levels are required — with two the parent is the root, whose separator is written
+  unconditionally. So an index crosses into exposure somewhere between 100k and 200k datoms, and
+  above that roughly one datom per 66k, silently, for cardinality-one value upserts. `d/q` and
+  `d/pull` still found them; they scan by prefix.
+
+  The test is `Util.equiv`, not `Objects.equals`: a Datom implements `equiv` but not
+  `Object.equals`, so `Objects.equals` is identity there and would propagate on EVERY upsert.
+  Measured cost of the fix: within noise at bf 512, +5-10% at bf 32/64.
+
+  The two runtimes failed on different paths. The JVM writes `_keys[idx]` unconditionally and its
+  persistent path always returns the successor, so only its TRANSIENT path was wrong — the one
+  datahike transactions use. ClojureScript gated the keys rebuild on the same flag, so its default
+  persistent path was wrong, once per leaf, while its comment claimed it "Mirrors JVM
+  Branch.replace, which always writes `_keys[idx] = newMaxKey`".
+
+### The measure subtracted the search key, and ClojureScript lost it entirely
+
+  `IMeasure.remove` removes the contribution of the key being removed; the leaf passed the
+  CALLER's search key. Those differ under a coarse operation comparator — the `[id value]`
+  compared-by-id pattern `lookup`'s own docstring advertises. Measured, 200 longs removed via a
+  decade comparator inside a transient: the set ended EMPTY with a cached sum of 24.0 (bf 8) and
+  48.0 (bf 16). `node->map` serializes `:measure`, so that is durable and changes the node's
+  content address.
+
+  ClojureScript had it at TWO sites (the leaf, and again at the branch), and something worse
+  underneath: `Leaf/merge` and `merge-split` built successors with a nil measure under a comment
+  saying "Measure will be recomputed lazily if needed" — nothing recomputes it, and a branch above
+  a nil-measure child can only postpone, so one merged leaf erased the aggregate for its whole
+  spine. A per-level census made it plain:
+
+      JVM  after removes   level 2: 1 with     level 1: 6 with           level 0: 33 with
+      cljs after removes   (bf 8)  level 1: 2 WITHOUT / 3 with, level 0: 2 WITHOUT / 23 with
+                           (bf 16) level 1 (the ROOT): WITHOUT
+
+  With the leaves carrying their measures again, ClojureScript's branch now RECOMPUTES from its
+  children instead of subtracting, matching the JVM. That is not a refinement: a measure is a
+  MONOID, not a group, so a non-invertible one — min/max, which stratum uses — cannot be un-merged
+  at all. `remove-measure`'s recompute-fn exists so the implementation can decide; a branch never
+  needs it, since its children already hold their own measures.
+
+### `:ref-type` was silently defeated whenever diff-buf was on
+
+  The diff-buf settle published its children array with no `makeReference`, while the baseline
+  settle wraps. Every child that had been dirty in any commit stayed a bare STRONG reference from
+  its parent, and copy-on-write carried that into every successor — so the bound a user configured
+  stopped applying to the hot part of the index, in exactly the deployment diff-buf exists for.
+  Measured at bf 8 with `:ref-type :soft`: diff-buf 0 gave `{:ref 5}` at the root, diff-buf 256
+  gave `{:bare-strong 5}`.
+
+  Both settled kinds are safe to wrap because both end with a durable address: a BUFFERED child is
+  re-pointed to its anchor and its assembled diff written back into the slot, a FLUSHED child is
+  written outright.
+
+  Wrapping switches on the re-derive path — `restore(anchor) + project(slot)` — which had NEVER
+  executed in-process, precisely because a buffered child was never weakly held. `test/ref_type_diff_buf.clj`
+  exercises it deterministically by clearing the references itself rather than waiting for a GC,
+  and checks that an evicted tree still reads, still stores, and still restores.
+
+### `disj`'s deposit uses the search key — documented, not corrected
+
+  `Branch.remove` deposits `Absent(<the caller's search key>)`, the same shape as the `replace`
+  defect above. It could not be shown to be reachable: six constructions (conj-built and
+  bulk-built, bf 4/8/64, cold-restored with the storage's node settings carrying the same budget as
+  the set) produced no slot at all for `disj`, so the line never ran and no reload resurrected an
+  element. Threading a removed-element channel through `remove` would be a signature change on a
+  path with no test to hold it — the trade that produced the last two defects here. The hazard is
+  written at the deposit site instead, with what to do if a reproduction is ever found.
+
 ### `diff` reads its address/slot pair from one snapshot
 
   `diff`'s frontier decides, per child, whether that child's ADDRESS still stands for its

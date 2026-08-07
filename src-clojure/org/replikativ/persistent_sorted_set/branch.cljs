@@ -621,7 +621,19 @@
                          right-child (when (< idx (dec (arrays/alength keys)))
                                        (await (child this storage (inc idx) opts)))
                          child       (await (child this storage idx opts))
-                         disjoined   (await (node/$remove child storage key left-child right-child cmp opts))]
+                         ;; Ask the child to REPORT the element it removed. This branch
+                         ;; subtracts that element's contribution from its cached measure
+                         ;; below, and the caller's `key` is not it whenever `cmp` is
+                         ;; coarser than the set's comparator — the same search-key-is-not-
+                         ;; the-stored-element defect as the leaf's, one level up. The JVM
+                         ;; branch does not have it because it RECOMPUTES from children
+                         ;; (`tryComputeMeasure`) instead of subtracting.
+                         removed-out (when (:measure (.-settings this)) (arrays/make-array 1))
+                         disjoined   (await (node/$remove child storage key left-child right-child cmp
+                                                          (if removed-out
+                                                            (assoc opts :removed-out removed-out)
+                                                            opts)))
+                         removed-element (or (some-> removed-out (arrays/aget 0)) key)]
                      (when disjoined
                        (let [left-idx  (if left-child  (dec idx) idx)
                              right-idx (if right-child (+ idx 2) (inc idx))
@@ -665,11 +677,28 @@
                              new-sc (if (>= old-sc 0) (dec old-sc) -1)
                              ;; Update measure only if already computed
                              measure-ops (:measure (.-settings this))
+                             ;; RECOMPUTE from the (already rebuilt) children — never subtract.
+                             ;; This mirrors the JVM's `Branch.remove`, which assigns
+                             ;; `tryComputeMeasure(storage)` and offers no branch-level
+                             ;; subtraction at all.
+                             ;;
+                             ;; Subtracting was wrong twice over. It presumed INVERTIBILITY: a
+                             ;; measure is a monoid, not a group, so min/max — which stratum
+                             ;; uses — cannot be un-merged, and `remove-measure`'s recompute-fn
+                             ;; exists precisely because the implementation must decide. And it
+                             ;; is arithmetic on a total that a structural rebalance may already
+                             ;; have changed by more than the one removed element.
+                             ;;
+                             ;; This was tried once before and made every cljs measure nil. That
+                             ;; was a SYMPTOM of the leaf bug fixed alongside it: `Leaf/merge`
+                             ;; and `merge-split` built successors with a nil measure, and a
+                             ;; branch above a nil-measure child can only postpone. With the
+                             ;; leaves carrying their measures again, folding them is both
+                             ;; possible and exact.
                              new-measure (when (and measure-ops (.-_measure this))
-                                           (measure/remove-measure measure-ops (.-_measure this) key
-                                                                   #(node/try-compute-measure
-                                                                     (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this) nil 0 (.-_projCmp this))
-                                                                     storage measure-ops {:sync? true})))
+                                           (node/try-compute-measure
+                                            (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this) nil 0 (.-_projCmp this))
+                                            storage measure-ops {:sync? true}))
                              center (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-measure (.-settings this) nil 0 (.-_projCmp this))]
                          ;; diff-buf: install the center's slots BEFORE rotate (so a subsequent
                          ;; rotate merge/merge-split with this node's siblings carries them).
@@ -817,9 +846,29 @@
                              ;; and propagate up the spine. Count mode is routing-only (by cmp), so its
                              ;; original last-child?/cmp test is preserved byte-for-byte. Mirrors JVM
                              ;; Branch.replace, which always writes _keys[idx] = newMaxKey.
-                             max-key-changed (if (b/content-boundary settings)
-                                               (not= new-max-key (arrays/aget keys idx))
-                                               (and last-child? (not (== 0 (cmp new-max-key (arrays/aget keys idx))))))]
+                             ;; VALUE equality, and for EVERY child — not `cmp`, and not only
+                             ;; the last one.
+                             ;;
+                             ;; Asking the OPERATION comparator whether the max moved is wrong
+                             ;; whenever that comparator is coarser than the one routing uses:
+                             ;; datahike's value-changing upsert searches [e a _ _], so `cmp`
+                             ;; returns 0 for a datom whose v changed, this arm took the
+                             ;; "reuse keys array" branch, and `keys[idx]` kept naming the OLD
+                             ;; element while the child held the new one. A later descent
+                             ;; comparing the new element against that stale separator routes
+                             ;; past the child that holds it.
+                             ;;
+                             ;; The JVM writes `_keys[idx] = newMaxKey` UNCONDITIONALLY and its
+                             ;; persistent path always returns the successor, so only its
+                             ;; transient path was affected. ClojureScript gated the keys
+                             ;; rebuild on this flag too, which is why its default (persistent)
+                             ;; path was. Testing the value for every child makes the rebuild
+                             ;; and the propagation match the JVM persistent path exactly.
+                             ;;
+                             ;; `not=` (Clojure `=`, i.e. -equiv) rather than identity: a Datom
+                             ;; implements equiv but not reference equality, so this propagates
+                             ;; exactly when the element really changed.
+                             max-key-changed (not= new-max-key (arrays/aget keys idx))]
                          (if max-key-changed
                            ;; maxKey changed - update keys array
                            (if editable?
