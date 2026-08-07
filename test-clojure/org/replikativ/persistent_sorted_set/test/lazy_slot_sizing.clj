@@ -69,7 +69,7 @@
           budget   1
           ns1      (Settings. (int BF) RefType/STRONG nil nil (int budget))
           written  (atom [])
-          inner    (tstore/->Storage (atom {}) disk ns1)
+          ^IStorage inner (tstore/->Storage (atom {}) disk ns1)
           counting (reify IStorage
                      (store [_ node]
                        (let [a (.store inner node)]
@@ -102,7 +102,7 @@
         ;; asserts `editable()`). Constructing the state is also more honest about
         ;; what is being tested: a dirty child whose restored LAZY slot survived.
         (let [len      (.len root)
-              kid      (.child root counting (int idx))   ; resident, bare
+              kid      (.child root ^IStorage counting (int idx))   ; resident, bare
               addrs    (object-array (seq (aget ^objects (.addressesAndSlots root) 0)))
               children (object-array len)
               slots2   (object-array (seq slots))

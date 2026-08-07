@@ -46,7 +46,7 @@
    caching storage does, and what makes aliasing observable at all. The default
    test storage rebuilds a node per restore, which is why nothing caught this."
   [disk]
-  (let [inner (tstore/->Storage (atom {}) disk (node-settings))
+  (let [^IStorage inner (tstore/->Storage (atom {}) disk (node-settings))
         cache (atom {})]
     (reify IStorage
       (store [_ node] (.store inner node))
@@ -94,8 +94,8 @@
           "precondition: some slot carries a diff, so projectBranch actually runs.
            Without one `child()` returns the base unchanged and this is vacuous.")
       (let [base-addr (aget ^objects (addresses-of root) idx)
-            proj      (.child root st (int idx))
-            base      (.restore st base-addr)]
+            proj      (.child root ^IStorage st (int idx))
+            base      (.restore ^IStorage st base-addr)]
         (is (instance? Branch proj) "the projected child is a Branch")
         (is (not (identical? proj base))
             "precondition: a projection really happened — projectBranch returns a
@@ -119,7 +119,7 @@
           ^Branch root (.root ^PersistentSortedSet back)]
       (is (not (.editable root))
             "precondition: a restored root is shared, not editable")
-      (let [kid (.child root st (int 0))
+      (let [kid (.child root ^IStorage st (int 0))
             e   (try (.child root (int 0) ^ANode kid) nil
                      (catch AssertionError e e))]
         (is (some? e)
