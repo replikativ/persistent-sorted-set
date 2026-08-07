@@ -2018,15 +2018,19 @@
                          (mst-partition bd arr identity 1))]
         (loop [nodes leaves, lvl 1]
           (case (count nodes)
-            0 (BTSet. (Leaf. (arrays/array) settings nil) 0 cmp nil UNINITIALIZED_HASH storage nil settings)
-            1 (BTSet. (first nodes) (arrays/alength arr) cmp nil UNINITIALIZED_HASH storage nil settings)
+            0 (BTSet. (Leaf. (arrays/array) settings nil) 0 cmp (:meta opts) UNINITIALIZED_HASH storage nil settings)
+            1 (BTSet. (first nodes) (arrays/alength arr) cmp (:meta opts) UNINITIALIZED_HASH storage nil settings)
             (recur (mapv #(mst-build-branch lvl (array-seq %) settings cmp)
                          (mst-partition bd (arrays/into-array nodes) node/max-key (inc lvl)))
                    (inc lvl)))))
-      (from-sorted-array-count cmp arr _len settings storage measure-ops))))
+      (from-sorted-array-count cmp arr _len settings storage measure-ops (:meta opts)))))
 
 (defn- ^BTSet from-sorted-array-count
-  [cmp arr _len settings storage measure-ops]
+  ;; `meta-val` is threaded explicitly: this fn takes `settings` (a select-keys subset), not
+  ;; `opts`, so `:meta` is not reachable here otherwise. Dropping it was the cljs half of the
+  ;; defect fixed on the JVM — `from-sorted-array`/`from-sequential`/`sorted-set` all lost the
+  ;; metadata the wire codec resolves `:pss/storage-id` from.
+  [cmp arr _len settings storage measure-ops meta-val]
   (let [leaves   (->> arr
                       (arr-partition-approx settings)
                       (arr-map-inplace #(let [leaf (Leaf. % settings nil)]
@@ -2037,8 +2041,8 @@
     (loop [current-level leaves
            shift 0]
       (case (count current-level)
-        0 (BTSet. (Leaf. (arrays/array) settings nil) 0 cmp nil UNINITIALIZED_HASH storage nil settings)
-        1 (BTSet. (first current-level) (arrays/alength arr) cmp nil UNINITIALIZED_HASH storage nil settings)
+        0 (BTSet. (Leaf. (arrays/array) settings nil) 0 cmp meta-val UNINITIALIZED_HASH storage nil settings)
+        1 (BTSet. (first current-level) (arrays/alength arr) cmp meta-val UNINITIALIZED_HASH storage nil settings)
         (recur
          (->> current-level
               (arr-partition-approx settings)

@@ -227,3 +227,93 @@
                           (for [round (range 20) i (range 11)]
                             [(+ 100000 (* round 32) i) 0])))
                     "diff-buf-256-mixed")))
+
+;; ---- checkpointed live transient: the EARLY_EXIT arms ----------------------
+;;
+;; Every scenario above calls `.persistent` BEFORE storing, so the store always sees
+;; a settled tree. That is the whole reason this file's oracle — which is the right
+;; oracle — reported 0 leaked while three sites leaked: it never reached them.
+;;
+;; The EARLY_EXIT arms of Branch.{add,remove,replace} run only when a child mutates
+;; IN PLACE and returns no new node (an editable leaf with room, above min, or a
+;; same-shape replace). They then clear the child's stale address, because a durable
+;; address no longer describes the mutated child. Three of them cleared it WITHOUT
+;; markFreed — so the old blob became unreachable and was never reported freed. It is
+;; reachable from the public API by exactly this shape: store a live transient, mutate
+;; it further, store again — datahike's checkpointing import.
+;;
+;; Measured before the fix, bf 8 / dbs 0 / 40 checkpoint rounds:
+;;
+;;     disk blobs 242 · reachable 82 · freed-reported 99 · ORPHANS 61
+;;     orphan levels {2 -> 37, 1 -> 24} · content ok true
+;;
+;; Content was never wrong. This is unbounded storage growth for any consumer that
+;; treats the freed stream as its GC candidate list, which datahike does.
+;;
+;; Only at dbs 0, and the fix is gated to match: under diff-buf the old address is
+;; re-pointed as the buffered anchor at store, so freeing it would free a LIVE node.
+;; The dbs-256 case below pins that gate — it must stay green without the free.
+
+(defn run-checkpointed-transient
+  "One transient, stored MID-EDIT each round and mutated further — never persistent!
+   until the end. `mutate!` edits the transient in place."
+  [dbs mutate!]
+  (let [{:keys [stored freed storage mk-fresh]} (counting-storage dbs)
+        s0 (reduce (fn [s k] (pset/conj s [k 0] cmp-full))
+                   (pset/sorted-set* {:comparator cmp-full :storage storage
+                                      :branching-factor 32 :diff-buf-size dbs})
+                   (range 10000))
+        _  (pset/store s0 storage)
+        t  (.asTransient ^PersistentSortedSet s0)
+        _  (dotimes [round 20]
+             (mutate! t round)
+             (pset/store t storage))
+        root-addr (pset/store t storage)
+        s-final   (.persistent ^PersistentSortedSet t)]
+    {:s-final s-final :stored @stored :freed @freed
+     :reachable (reachable root-addr mk-fresh dbs)}))
+
+(deftest checkpointed-transient-conj-frees-complete
+  (let [r (run-checkpointed-transient
+           0 (fn [t round]
+               ;; [k 1] lands strictly between [k 0] and [k+1 0]: an INTERIOR insert
+               ;; into a leaf with room, which is what returns EARLY_EXIT.
+               (dotimes [i 32] (pset/conj t [(+ (* round 32) i) 1] cmp-full))))]
+    (assert-accounting r "checkpointed-transient-conj")
+    (assert-content r
+                    (vec (concat (mapcat (fn [k] [[k 0] [k 1]]) (range 640))
+                                 (for [k (range 640 10000)] [k 0])))
+                    "checkpointed-transient-conj")))
+
+(deftest checkpointed-transient-disj-frees-complete
+  (let [r (run-checkpointed-transient
+           0 (fn [t round]
+               (dotimes [i 32] (pset/disj t [(+ (* round 32) i) 0] cmp-full))))]
+    (assert-accounting r "checkpointed-transient-disj")
+    (assert-content r (vec (for [k (range 640 10000)] [k 0]))
+                    "checkpointed-transient-disj")))
+
+(deftest checkpointed-transient-replace-frees-complete
+  (let [r (run-checkpointed-transient
+           0 (fn [^PersistentSortedSet t round]
+               (dotimes [i 32]
+                 (let [k (+ (* round 32) i)]
+                   (.replace t [k 0] [k (inc round)] ^java.util.Comparator cmp-k)))))]
+    (assert-accounting r "checkpointed-transient-replace")
+    (assert-content r
+                    (vec (for [k (range 10000)]
+                           (if (< k 640) [k (inc (quot k 32))] [k 0])))
+                    "checkpointed-transient-replace")))
+
+(deftest checkpointed-transient-diff-buf-frees-complete
+  ;; The gate. Under diff-buf the EARLY_EXIT address must NOT be freed — store
+  ;; re-points it as the buffered anchor, so freeing it would free a live node.
+  ;; This asserts the same identity holds with the free suppressed.
+  (let [r (run-checkpointed-transient
+           256 (fn [t round]
+                 (dotimes [i 32] (pset/conj t [(+ (* round 32) i) 1] cmp-full))))]
+    (assert-accounting r "checkpointed-transient-diff-buf")
+    (assert-content r
+                    (vec (concat (mapcat (fn [k] [[k 0] [k 1]]) (range 640))
+                                 (for [k (range 640 10000)] [k 0])))
+                    "checkpointed-transient-diff-buf")))

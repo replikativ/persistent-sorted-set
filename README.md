@@ -142,30 +142,43 @@ The Clojure version can store a PersistentSortedSet on disk / in a DB / anywhere
 it lazily. Implement the `IStorage` interface:
 
 ```clojure
+(require '[org.replikativ.persistent-sorted-set.impl.nodes :as nodes])
+
+;; Use `nodes/node->blob` and `nodes/blob->leaf` / `nodes/blob->branch`.
+;;
+;; DO NOT hand-roll the field list. An earlier version of this README wrote only
+;; {:level :keys :addresses} for a Branch and the bare keys for a Leaf. That is
+;; INCOMPLETE and silently loses committed elements: it omits `slotsForStorage()`,
+;; the diff-buf buffered diffs. A buffered child is stored as its durable anchor
+;; PLUS the parent's slot, so persisting only the address drops every element
+;; buffered against that child. Measured: 40 elements at bf 8 with diff-buf 256,
+;; three added and committed — 43 in memory, 40 after restore, two gone. It also
+;; omitted `subtreeCount()` and the measure, which costs a full recount/recompute
+;; and changes the node's content address. See IStorage.store.
+;;
+;; `node->blob` also carries the node's own branching-factor / diff-buf-size /
+;; ref-type, so a restored node self-describes rather than silently adopting
+;; whatever the reading set happened to configure.
+
 (defrecord Storage [*storage]
   IStorage
   (store [_ node]
     (let [address (random-uuid)]
-      (swap! *storage assoc address
-        (pr-str
-          (if (instance? Branch node)
-            {:level     (.level ^Branch node)
-             :keys      (.keys ^Branch node)
-             :addresses (.addresses ^Branch node)}
-            (.keys ^Leaf node))))
+      (swap! *storage assoc address (pr-str (nodes/node->blob node)))
       address))
 
   (restore [_ address]
-    (let [value (-> (get @*storage address)
-                  (edn/read-string))]
-      (if (map? value)
-        (Branch. (int (:level value)) ^java.util.List (:keys value) ^java.util.List (:addresses value))
-        (Leaf. ^java.util.List value))))
+    (let [blob (edn/read-string (get @*storage address))]
+      (if (:level blob)
+        (nodes/blob->branch blob nil)
+        (nodes/blob->leaf blob nil))))
 
   (markFreed [_ address]
-    ;; Optional: track addresses that become obsolete during modifications.
-    ;; Called automatically when tree nodes are replaced during conj/disj.
-    ;; Enables garbage collection of unreachable nodes.
+    ;; A HINT that this address is superseded by the version being produced.
+    ;; NOT a reachability claim, and NOT safe to act on by deletion: under a
+    ;; content-addressed store an address reported here can be re-issued as live
+    ;; by the same commit, because a node whose content returns to a previous
+    ;; value gets the address it had then. Establish liveness yourself.
     nil)
 
   (accessed [_ address]

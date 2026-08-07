@@ -93,7 +93,26 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       // `withDiffBufSize` still refuses to enable buffering under a content-defined
       // boundary.
       if (_settings.diffBufSize() <= 0 && root._settings.diffBufSize() > 0) {
-        _settings = _settings.withDiffBufSize(root._settings.diffBufSize());
+        if (_settings.leafProcessor() != null) {
+          // A leafProcessor and diff-buf corrupt together (a deposit records one element, a
+          // processor rewrites the whole leaf), so adopting is unsafe — but refusing is only
+          // right when there is something to lose. Decide on what the subtree ACTUALLY
+          // carries, not on the budget it declares: `bufEntries()` is 0 when there is no
+          // buffer at all, and otherwise the subtree total, resolved from slots already in
+          // memory with no IO.
+          long buffered = (root instanceof Branch) ? ((Branch) root).bufEntries() : 0;
+          if (buffered > 0) {
+            throw new IllegalStateException(
+              "cannot open this store with a leafProcessor: its nodes declare a diff-buf budget of "
+              + root._settings.diffBufSize() + " and carry " + buffered + " buffered element(s), but a "
+              + "leafProcessor forces buffering OFF (the two corrupt together), so those elements "
+              + "would be dropped on the next write. Open it without a leafProcessor, or rewrite it "
+              + "with diff-buf off.");
+          }
+          // Nothing buffered ⇒ nothing to preserve ⇒ stay at 0 and carry on.
+        } else {
+          _settings = _settings.withDiffBufSize(root._settings.diffBufSize());
+        }
       }
     }
     // A DIRTY root (no address) must be held strongly — see markDirty. If it is gone

@@ -702,6 +702,23 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // The EARLY_EXIT arms were the only ones that did not, because they install no new
       // node. `anchor0` was captured above, so under diff-buf the child now classifies as
       // dirty and Pass 2 re-points the address to that anchor.
+      //
+      // Free the address we are about to clear. The two pre-existing clear sites do this
+      // (see the `_settings.diffBufSize() <= 0 && ...markFreed` blocks around child(idx,node)
+      // in the non-EARLY_EXIT arms); these three did not, so a checkpointed transient left
+      // blobs that were unreachable AND never reported freed. Measured over 40 checkpoint
+      // rounds at bf 8 / dbs 0: disk 242, reachable 82, freed-reported 99, ORPHANS 61
+      // (levels {2 -> 37, 1 -> 24}). Content was correct — this is unbounded storage growth
+      // for any consumer that treats the freed stream as its GC candidate list, which
+      // datahike does.
+      //
+      // GATED on diffBufSize <= 0, exactly as the other sites are: under diff-buf the old
+      // address is re-pointed as the buffered anchor at store, so freeing it here would free
+      // a LIVE node. That gate is also why the measurement only shows orphans at dbs 0.
+      if (_settings.diffBufSize() <= 0 && storage != null
+          && s0.addresses != null && s0.addresses[ins] != null) {
+        storage.markFreed(s0.addresses[ins]);
+      }
       child(ins, oldChild);  // clears addresses[ins] AND unwraps the child (a dirty child must be bare)
       if (_settings.diffBufSize() > 0) depositInto(storage, ins, key, key, anchor0); // content-only: Present(key) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
@@ -965,6 +982,23 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // The EARLY_EXIT arms were the only ones that did not, because they install no new
       // node. `anchor0` was captured above, so under diff-buf the child now classifies as
       // dirty and Pass 2 re-points the address to that anchor.
+      //
+      // Free the address we are about to clear. The two pre-existing clear sites do this
+      // (see the `_settings.diffBufSize() <= 0 && ...markFreed` blocks around child(idx,node)
+      // in the non-EARLY_EXIT arms); these three did not, so a checkpointed transient left
+      // blobs that were unreachable AND never reported freed. Measured over 40 checkpoint
+      // rounds at bf 8 / dbs 0: disk 242, reachable 82, freed-reported 99, ORPHANS 61
+      // (levels {2 -> 37, 1 -> 24}). Content was correct — this is unbounded storage growth
+      // for any consumer that treats the freed stream as its GC candidate list, which
+      // datahike does.
+      //
+      // GATED on diffBufSize <= 0, exactly as the other sites are: under diff-buf the old
+      // address is re-pointed as the buffered anchor at store, so freeing it here would free
+      // a LIVE node. That gate is also why the measurement only shows orphans at dbs 0.
+      if (_settings.diffBufSize() <= 0 && storage != null
+          && s0.addresses != null && s0.addresses[idx] != null) {
+        storage.markFreed(s0.addresses[idx]);
+      }
       child(idx, mutatedChild);  // clears addresses[idx] AND unwraps the child (a dirty child must be bare)
       if (_settings.diffBufSize() > 0) depositInto(storage, idx, removedKey, Slot.ABSENT, anchor0); // content-only: Absent(removedKey) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
@@ -1529,6 +1563,36 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   }
 
   /**
+   * Must the parent's separator be refreshed because this child's max moved?
+   *
+   * BOTH tests are needed, and each alone has been wrong in this file:
+   *
+   *   - the OPERATION comparator (`cmp`) is wrong because it is deliberately coarser than the
+   *     set's — datahike's upsert searches [e a _ _] — so it calls a value change "unchanged"
+   *     and suppresses a propagation routing needs.
+   *   - the element's `=` (`Util.equiv`) is wrong in the OPPOSITE direction: it fails when `=`
+   *     is COARSER than the set's comparator. datahike's `equiv-datom` compares e/a/v while
+   *     `cmp-datoms-eavt` orders by e/a/v/tx, so two datoms differing only in tx are `=` but
+   *     not comparator-equal. Measured with an element type whose `=` ignores a field the set
+   *     orders by, inside a transient: 9 unfindable at n=40 bf=4, 24 at n=100, 46 at n=3000 —
+   *     identical to the numbers from before the `cmp` version was replaced, i.e. the same
+   *     defect, reachable through a different door. 24 of them survived a store/restore,
+   *     because the stale separator is a branch key and is serialized.
+   *
+   * So: propagate if the element CHANGED BY VALUE (content addressing needs the separator to
+   * equal the child's max element) OR if it moved under the SET's comparator (routing needs
+   * the separator to be in the right position). `_projCmp` is the set's comparator, seeded
+   * unconditionally at `PersistentSortedSet.root()` and inherited by every successor; when it
+   * is somehow absent we propagate rather than guess, which costs a spine rebuild and never
+   * correctness.
+   */
+  private boolean separatorMoved(Key newMaxKey, Key oldSeparator) {
+    if (!clojure.lang.Util.equiv(newMaxKey, oldSeparator)) return true;
+    if (_projCmp == null) return true;
+    return 0 != _projCmp.compare(newMaxKey, oldSeparator);
+  }
+
+  /**
    * -ea only: the cross-leaf half of `replace`'s no-equal-sibling precondition.
    *
    * `Leaf.replace` checks the neighbours INSIDE the leaf; this checks the two that sit
@@ -1642,6 +1706,23 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // The EARLY_EXIT arms were the only ones that did not, because they install no new
       // node. `anchor0` was captured above, so under diff-buf the child now classifies as
       // dirty and Pass 2 re-points the address to that anchor.
+      //
+      // Free the address we are about to clear. The two pre-existing clear sites do this
+      // (see the `_settings.diffBufSize() <= 0 && ...markFreed` blocks around child(idx,node)
+      // in the non-EARLY_EXIT arms); these three did not, so a checkpointed transient left
+      // blobs that were unreachable AND never reported freed. Measured over 40 checkpoint
+      // rounds at bf 8 / dbs 0: disk 242, reachable 82, freed-reported 99, ORPHANS 61
+      // (levels {2 -> 37, 1 -> 24}). Content was correct — this is unbounded storage growth
+      // for any consumer that treats the freed stream as its GC candidate list, which
+      // datahike does.
+      //
+      // GATED on diffBufSize <= 0, exactly as the other sites are: under diff-buf the old
+      // address is re-pointed as the buffered anchor at store, so freeing it here would free
+      // a LIVE node. That gate is also why the measurement only shows orphans at dbs 0.
+      if (_settings.diffBufSize() <= 0 && storage != null
+          && s0.addresses != null && s0.addresses[idx] != null) {
+        storage.markFreed(s0.addresses[idx]);
+      }
       child(idx, mutatedChild);  // clears addresses[idx] AND unwraps the child (a dirty child must be bare)
       if (_settings.diffBufSize() > 0) depositReplace(storage, idx, removedKey, newKey, anchor0); // Absent(removedKey)+Present(newKey) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
@@ -1681,7 +1762,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // changed, which is the cheapest test that is still correct.
     boolean maxKeyChanged = settings.boundary().contentDefined()
       ? !java.util.Objects.equals(newMaxKey, _keys[idx])
-      : (idx == _len - 1) && !clojure.lang.Util.equiv(newMaxKey, _keys[idx]);
+      : (idx == _len - 1) && separatorMoved(newMaxKey, _keys[idx]);
     IMeasure measureOps = settings.measure();
 
     // Transient: can modify in place

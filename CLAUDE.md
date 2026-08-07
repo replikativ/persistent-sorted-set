@@ -33,13 +33,16 @@ clj -M:test
 # or
 ./script/test_clj.sh
 
-# ClojureScript tests
-yarn shadow-cljs release test
+# ClojureScript tests  (the build is :node-tests; there is no :test build)
+yarn shadow-cljs release node-tests && node target/pss/tests.min.js
 # or
 ./script/test_cljs.sh
 
+# The stress namespace lives in its own build and is NOT part of the above
+yarn shadow-cljs release node-stress && node target/pss/stress.min.js
+
 # Watch mode for ClojureScript tests
-yarn shadow-cljs watch test --config-merge '{:autorun true}'
+yarn shadow-cljs watch node-tests --config-merge '{:autorun true}'
 # or
 ./script/test_cljs_watch.sh
 ```

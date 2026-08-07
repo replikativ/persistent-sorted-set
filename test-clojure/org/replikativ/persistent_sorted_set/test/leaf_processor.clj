@@ -5,10 +5,11 @@
    [clojure.test.check.properties :as prop]
    [clojure.test.check.clojure-test :refer [defspec]]
    [org.replikativ.persistent-sorted-set :as set]
-   [org.replikativ.persistent-sorted-set.diagnostics :as diag])
+   [org.replikativ.persistent-sorted-set.diagnostics :as diag]
+   [org.replikativ.persistent-sorted-set.test.storage :as tstore])
   (:import
    [java.util Comparator List ArrayList Collections]
-   [org.replikativ.persistent_sorted_set ILeafProcessor Settings PersistentSortedSet]))
+   [org.replikativ.persistent_sorted_set ILeafProcessor Settings PersistentSortedSet Branch RefType]))
 
 (set! *warn-on-reflection* true)
 
@@ -831,3 +832,87 @@
                        (or (nil? result)
                            (empty? result)
                            (apply < result))))))
+
+;; =============================================================================
+;; Opening a diff-buf store WITH a leaf processor
+;; =============================================================================
+;;
+;; A leaf processor rewrites a leaf's entries wholesale at materialization. A
+;; diff-buf slot is a *replayable edit log* against an anchor blob. The two cannot
+;; both be authoritative: replaying a diff onto a leaf the processor has already
+;; rewritten reapplies edits the processor may have folded away or dropped.
+;; `Settings.diffBufFor` therefore forces a processor-configured set's own budget
+;; to 0 — such a set never buffers and never writes a slot.
+;;
+;; But `PersistentSortedSet.root()` ADOPTS the budget recorded in the restored
+;; root's settings, so a processor-configured set opened against a store whose
+;; nodes carry a budget would silently re-arm buffering. Refusing outright is
+;; wrong too: a store can carry a non-zero budget and have nothing buffered — the
+;; `:test` alias sets `-Dpss.diffBufSize=256`, so the bare `(Settings.)` that a
+;; storage reconstructs nodes with picks 256 up, and 41 tests opened stores in
+;; exactly that state. There was nothing to preserve in any of them.
+;;
+;; So the guard is keyed on what is actually BUFFERED, not on the declared budget:
+;; nothing buffered means nothing to lose, stay at 0 and carry on; something
+;; buffered means the two mechanisms genuinely conflict, and it must say so rather
+;; than quietly return wrong contents. `bufEntries()` resolves from in-memory
+;; slots and does no IO.
+
+(defn- explicit-storage
+  "A storage whose node Settings carry `dbs` explicitly, rather than inheriting the
+   sysprop. Without this the fixture depends on the alias that runs it."
+  [bf dbs]
+  (tstore/storage-with-settings
+   (Settings. (int bf) RefType/STRONG nil nil (int dbs))))
+
+(deftest opening-a-budgeted-store-with-a-processor-is-allowed-when-nothing-is-buffered
+  (testing "a non-zero budget on disk with no buffered entries is the common case
+            — it must open, stay unbuffered, and read back correctly"
+    (let [storage (explicit-storage 8 256)
+          opts    {:comparator compare :branching-factor 8 :ref-type :strong
+                   :leaf-processor (identity-processor)}
+          s0      (into (set/sorted-set* opts) (range 200))
+          _       (is (zero? (.diffBufSize (.-_settings ^PersistentSortedSet s0)))
+                      "diffBufFor forces a processor-configured set to 0")
+          addr    (set/store s0 storage)
+          back    (set/restore-by compare addr storage opts)]
+      (is (= (vec (range 200)) (vec (seq back)))
+          "contents survive the round trip")
+      (is (zero? (.diffBufSize (.-_settings ^PersistentSortedSet back)))
+          "and the budget was NOT adopted — buffering stays off with a processor"))))
+
+(deftest opening-a-store-with-buffered-entries-with-a-processor-is-refused
+  (testing "when the store really does carry buffered edits the two mechanisms
+            conflict, and silently dropping either one returns wrong contents"
+    (let [storage (explicit-storage 16 256)
+          plain   {:comparator compare :branching-factor 16 :ref-type :strong
+                   :diff-buf-size 256}
+          ;; build WITHOUT a processor, mutate a restored tree, store again — that
+          ;; second store is what deposits slots. The SHAPE decides whether anything
+          ;; is buffered at all: measured, `from-sorted-array` + 4 conjs gives
+          ;; bufEntries 0 at (40,bf 8) and (200,bf 8) and 4 at (300,bf 16) and
+          ;; (2000,bf 32). A fixture picked without measuring asserts nothing.
+          s0      (set/from-sorted-array compare (object-array (range 0 3000 10)) 300
+                                         (assoc plain :storage storage))
+          a0      (set/store s0 storage)
+          cold    (set/restore-by compare a0 storage plain)
+          s1      (reduce #(set/conj %1 %2 compare) cold [5 15 25 35])
+          a1      (set/store s1 storage)
+          buffered (set/restore-by compare a1 storage plain)]
+      (is (pos? (.bufEntries ^Branch (.root ^PersistentSortedSet buffered)))
+          "precondition: the store really does carry buffered entries. If this
+           ever stops holding the refusal below can never fire and the test is
+           vacuous.")
+      ;; `root()` is LAZY: restore-by only records the address, so the refusal
+      ;; surfaces at the first access rather than at open. Resolving the root is
+      ;; therefore part of the act being tested, not incidental setup — a try
+      ;; around restore-by alone catches nothing and the test passes vacuously.
+      (let [e (try (let [s (set/restore-by compare a1 storage
+                                          (assoc plain :leaf-processor (identity-processor)))]
+                     (.root ^PersistentSortedSet s)
+                     nil)
+                   (catch IllegalStateException e e))]
+        (is (some? e) "opening it with a processor must be refused, not silently mis-read")
+        (is (re-find #"leafProcessor" (str (.getMessage ^IllegalStateException e)))
+            (str "and the message must name the conflict, got: "
+                 (some-> ^IllegalStateException e .getMessage)))))))

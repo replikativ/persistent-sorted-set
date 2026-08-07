@@ -524,8 +524,19 @@
    (restore-by RT/DEFAULT_COMPARATOR address storage opts)))
 
 (defn walk-addresses
-  "Visit each address used by this set. Usable for cleaning up
-   garbage left in storage from previous versions of the set"
+  "Visit each address used by this set. Usable for cleaning up garbage left in
+   storage from previous versions of the set.
+
+   THE RETURN VALUE OF `consume-fn` IS A CONTINUE FLAG, and a falsey one stops the
+   walk. Measured on a 20000-element tree at bf 16: a fn returning `true` visits
+   1819 addresses; one returning `nil` or `false` visits 1. So a side-effecting
+   `#(delete! %)` whose `delete!` returns nil enumerates ONE address and reports
+   nothing wrong — which matters because the usual reason to call this is GC.
+   Return `true` unless you deliberately want to prune.
+
+   The two levels disagree on what falsey means: at the root it aborts the whole
+   walk (PersistentSortedSet.walkAddresses), inside a branch it prunes only that
+   subtree (Branch.walkAddresses)."
   [^PersistentSortedSet set consume-fn]
   (.walkAddresses set consume-fn))
 

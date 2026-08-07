@@ -183,30 +183,15 @@ public class Settings {
    *  hash(anchor+diff) rather than its canonical content hash, which breaks the
    *  cross-peer dedup MST exists for. */
   public Settings withDiffBufSize(int diffBufSize) {
-    // REFUSE rather than neutralise when a leafProcessor would silently zero a budget the
-    // DATA is asking us to adopt. `PersistentSortedSet.root()` calls this to take on a
-    // restored node's own budget, and the whole point of that adoption is that running at 0
-    // over nodes carrying slots drops their buffered elements on the next write — measured
-    // at 81 elements for bf 16 / budget 512 / 6000 elements.
-    //
-    // The processor stopgap (diffBufFor, applied in every constructor) would send this
-    // straight back to 0 and the adoption would no-op in silence: measured,
-    // `withDiffBufSize(256)` returns 256 without a processor and 0 with one. That is the
-    // stopgap reintroducing the exact data loss it was added to avoid, one level up.
-    //
-    // Reachable whenever a store written WITHOUT a processor is later opened WITH one.
-    // Throwing is right here because there is no safe answer: honouring the budget runs the
-    // processor+diff-buf combination that corrupts, and ignoring it drops committed
-    // elements. The caller has to choose.
-    if (_leafProcessor != null && diffBufSize > 0
-        && !(_boundary != null && _boundary.contentDefined())) {
-      throw new IllegalStateException(
-        "cannot adopt diff-buf budget " + diffBufSize + " on a set configured with a "
-        + "leafProcessor: the two are incompatible (a diff records one element while a "
-        + "processor rewrites the whole leaf), but these nodes CARRY buffered elements, so "
-        + "running at 0 would drop them. Open this store without a leafProcessor, or "
-        + "rewrite it with diff-buf off.");
-    }
+    // The leafProcessor conflict is NOT decided here — it needs the ROOT NODE, which this
+    // does not have. An earlier version threw whenever a processor was configured and the
+    // requested budget was non-zero, keying on the node's DECLARED budget. That budget says
+    // nothing about whether anything was ever buffered: under a processor `diffBufFor` has
+    // already forced the set to 0, so it never buffered and never wrote a `:slots` key —
+    // measured, 64 blobs with `any :slots on disk? = false` — and the throw still fired, on
+    // EVERY access, because root() runs on every access. It bricked a store that had
+    // previously opened fine. See PersistentSortedSet.root(), which now decides this from
+    // `bufEntries()`, i.e. from whether the subtree actually carries buffered elements.
     int effective = (_boundary != null && _boundary.contentDefined()) ? 0 : diffBufSize;
     return new Settings(_branchingFactor, _refType, _edit, _measure, _leafProcessor, effective, _boundary);
   }

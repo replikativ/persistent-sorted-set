@@ -170,7 +170,27 @@
    Deliberately excludes :branching-factor/:diff-buf-size/:ref-type — configuration, not content
    — which `node->blob` carries separately so a read self-describes."
   [node]
-  (select-keys (node->map node) [:level :keys :addresses :slots]))
+  (let [m (select-keys (node->map node) [:level :keys :addresses :slots])]
+    (cond-> m
+      (:slots m)
+      ;; STRIP the per-slot caches. `slotsForStorage` writes `:count` and `:measure` into
+      ;; every slot entry, and that `:measure` is `child.measure()` captured at deposit time
+      ;; — exactly the null-until-forced cache this projection excludes at the top level. An
+      ;; earlier version kept the slot map whole and so re-admitted them one level down:
+      ;; measured, two sets with identical content and identical operations, differing only
+      ;; in whether a READ-ONLY `set/measure` query ran first, gave
+      ;;     cold slot measures [[0 nil]]
+      ;;     warm slot measures [[0 NumericStats{count=13, sum=665.0, ...}]]
+      ;; and hashed to 1979634333 vs 1940705680.
+      ;;
+      ;; `:diff` and `:max-key` STAY — the buffered diff is content (a buffered child is
+      ;; stored as anchor + diff, so omitting it collides logically different trees) and the
+      ;; separator is what the diff is keyed against.
+      (update :slots
+              (fn [slots]
+                (reduce-kv (fn [acc k entry]
+                             (assoc acc k (select-keys entry [:diff :max-key])))
+                           (empty slots) slots))))))
 
 (defn node->blob
   "What every format actually writes for a node: the content projection PLUS the node's own
