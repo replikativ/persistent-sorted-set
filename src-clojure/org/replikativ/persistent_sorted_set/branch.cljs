@@ -783,7 +783,6 @@
               (async
                (let [keys (.-keys this)
                      settings (.-settings this)
-                     editable? (:edit settings)
                      measure-ops (:measure settings)
                      idx  (let [arr-l (arrays/alength keys)
                                 i     (util/binary-search-l cmp keys (dec arr-l) old-key)]
@@ -849,12 +848,11 @@
                              new-max-key   (node/max-key new-node)
                              children      (ensure-children this)
                              addrs         (.-addresses this)
-                             last-child?   (== idx (dec (arrays/alength keys)))
                              ;; split-seam (MST): the separator keys[idx] must equal the child's max for
                              ;; canonical content-addressing, so ANY value change (even at the same
                              ;; comparator position, and for a non-rightmost child) must rebuild keys[idx]
                              ;; and propagate up the spine. Count mode is routing-only (by cmp), so its
-                             ;; original last-child?/cmp test is preserved byte-for-byte. Mirrors JVM
+                             ;; original last-child/cmp test is preserved byte-for-byte. Mirrors JVM
                              ;; Branch.replace, which always writes _keys[idx] = newMaxKey.
                              ;; VALUE equality, and for EVERY child — not `cmp`, and not only
                              ;; the last one.
@@ -881,22 +879,10 @@
                              max-key-changed (not= new-max-key (arrays/aget keys idx))]
                          (if max-key-changed
                            ;; maxKey changed - update keys array
-                           (if editable?
-                             ;; Transient: mutate in place
-                             (do
-                               (aset keys idx new-max-key)
-                               (aset children idx new-node)
-                               (when addrs
-                                 ;; Mark old child address as freed before clearing (deferred under diff-buf)
-                                 (when (and (not diff-buf?) storage (aget addrs idx))
-                                   (storage/markFreed storage (aget addrs idx)))
-                                 (aset addrs idx nil))
-                               (when (and measure-ops (.-_measure this))
-                                 (set! (.-_measure this)
-                                       (replace-measure this storage measure-ops)))
-                               (when diff-buf? (await (deposit-replace this storage idx removed-key new-key anchor0 opts)))
-                               (arrays/array this))
-                             ;; Persistent: clone arrays
+                           ;; Clone arrays. There is no in-place arm: see
+                           ;; .internal/transient-support-cljs.md — cljs has no node
+                           ;; ownership, so mutating `this` would edit a node other
+                           ;; versions share.
                              (let [new-keys     (arrays/aclone keys)
                                    new-children (arrays/aclone children)
                                    new-addrs    (when addrs
@@ -916,26 +902,10 @@
                                (when diff-buf?
                                  (set! (.-_bufEntries new-branch) (buf-entries this)) ; carry running total (or -1) onto successor
                                  (await (carry-and-deposit-replace new-branch storage (.-_slots this) idx removed-key new-key anchor0 opts)))
-                               (arrays/array new-branch)))
+                               (arrays/array new-branch))
                            ;; maxKey unchanged - reuse keys array
-                           (if editable?
-                             ;; Transient: mutate in place
-                             (do
-                               (aset children idx new-node)
-                               (when addrs
-                                 ;; Mark old child address as freed before clearing (deferred under diff-buf)
-                                 (when (and (not diff-buf?) storage (aget addrs idx))
-                                   (storage/markFreed storage (aget addrs idx)))
-                                 (aset addrs idx nil))
-                               (when (and measure-ops (.-_measure this))
-                                 (set! (.-_measure this)
-                                       (replace-measure this storage measure-ops)))
-                               (when diff-buf? (await (deposit-replace this storage idx removed-key new-key anchor0 opts)))
-                               (if last-child?
-                                 (arrays/array this)  ; Last child, need to propagate
-                                 :early-exit))        ; Not last child, early exit
-                             ;; Persistent: clone ALL arrays — sharing would allow a
-                             ;; later transient editable path to corrupt the original
+                           ;; Clone ALL arrays — sharing any of them would let a future
+                           ;; in-place path corrupt the original.
                              (let [new-keys     (arrays/aclone keys)
                                    new-children (arrays/aclone children)
                                    new-addrs    (when addrs
@@ -954,7 +924,7 @@
                                (when diff-buf?
                                  (set! (.-_bufEntries new-branch) (buf-entries this)) ; carry running total (or -1) onto successor
                                  (await (carry-and-deposit-replace new-branch storage (.-_slots this) idx removed-key new-key anchor0 opts)))
-                               (arrays/array new-branch))))))))))))
+                               (arrays/array new-branch)))))))))))
 
 ;; ---- diff-buf store-side helpers (mirror JVM Branch) ----
 
