@@ -174,7 +174,12 @@
            ;; breaks the cross-peer dedup MST exists for) is enforced in ONE place — `.withBoundary`
            ;; below forces diff-buf OFF for a *content-defined* boundary (a non-content boundary is
            ;; left untouched). See .internal/SPLIT_SEAM_DESIGN.md two-hash note.
-           (int (or (:diff-buf-size m) (Settings/defaultDiffBufSize))))
+           ;; A processor with NO :diff-buf-size inherits 0, not the default — otherwise the
+           ;; `pss.diffBufSize` sysprop would supply a budget the caller never asked for and
+           ;; `diffBufFor` would refuse the pairing. An EXPLICIT :diff-buf-size is passed
+           ;; through unchanged so that refusal fires when it should.
+           (int (or (:diff-buf-size m)
+                    (if (:leaf-processor m) 0 (Settings/defaultDiffBufSize)))))
         ;; split-seam: opt into a content-defined boundary (e.g. MST) per store. nil ⇒ the
         ;; default count B-tree (byte-identical baseline). See .internal/SPLIT_SEAM_DESIGN.md.
         s (if boundary (.withBoundary s ^IBoundary boundary) s)]

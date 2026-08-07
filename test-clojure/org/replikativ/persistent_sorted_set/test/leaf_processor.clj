@@ -907,8 +907,16 @@
       ;; surfaces at the first access rather than at open. Resolving the root is
       ;; therefore part of the act being tested, not incidental setup — a try
       ;; around restore-by alone catches nothing and the test passes vacuously.
+      ;; Open with a processor and NO :diff-buf-size — stratum's shape, and the
+      ;; only shape that can reach this guard now. Naming a budget alongside a
+      ;; processor is refused at CONSTRUCTION (see
+      ;; an-explicit-budget-with-a-processor-is-refused), so the two refusals are
+      ;; complementary: that one catches an incoherent request, this one catches a
+      ;; coherent request meeting a store that turns out to carry buffered data.
       (let [e (try (let [s (set/restore-by compare a1 storage
-                                          (assoc plain :leaf-processor (identity-processor)))]
+                                          (-> plain
+                                              (dissoc :diff-buf-size)
+                                              (assoc :leaf-processor (identity-processor))))]
                      (.root ^PersistentSortedSet s)
                      nil)
                    (catch IllegalStateException e e))]
@@ -916,3 +924,82 @@
         (is (re-find #"leafProcessor" (str (.getMessage ^IllegalStateException e)))
             (str "and the message must name the conflict, got: "
                  (some-> ^IllegalStateException e .getMessage)))))))
+
+;; ---------------------------------------------------------------------------
+;; Naming a diff-buf budget together with a processor
+;;
+;; The pairing corrupts (see Settings.diffBufFor), so it must not be accepted.
+;; Silently zeroing it was also wrong: a caller who wrote `:diff-buf-size 256`
+;; got neither an error nor buffering.
+;;
+;; But refusal cannot key on the VALUE, because a budget arrives from three
+;; places and only one of them is a request. Measured under
+;; `-Dpss.diffBufSize=256`, before the split, `(or (:diff-buf-size m)
+;; (Settings/defaultDiffBufSize))` gave 256 for BOTH of these:
+;;
+;;     {:leaf-processor p}                      -> 256
+;;     {:leaf-processor p :diff-buf-size 256}   -> 256
+;;
+;; So a value-keyed throw rejects stratum — which passes `:leaf-processor` and
+;; never mentions diff-buf anywhere in its source — on any deployment that sets
+;; the property, and rejects this file's own `(Settings. (int bf) nil nil
+;; processor)` helpers, which is most of the tests above.
+;;
+;; The split: inheriting callers pass 0 before they reach the check (the 4-arg
+;; ctor and `map->settings`), so a positive budget here means someone named one.
+;; Both cases below are asserted with AND without the property, because a rule
+;; about explicitness that changes with an ambient default is not one.
+
+(defn- with-diff-buf-prop [v f]
+  (let [old (System/getProperty "pss.diffBufSize")]
+    (try (if v (System/setProperty "pss.diffBufSize" (str v))
+             (System/clearProperty "pss.diffBufSize"))
+         (f)
+         (finally (if old (System/setProperty "pss.diffBufSize" old)
+                      (System/clearProperty "pss.diffBufSize"))))))
+
+(deftest an-explicit-budget-with-a-processor-is-refused
+  (doseq [prop [nil 256]]
+    (with-diff-buf-prop prop
+      (fn []
+        (testing (str "pss.diffBufSize=" prop ": naming both must fail loudly")
+          (let [e (try (set/sorted-set* {:comparator compare :branching-factor 8
+                                         :leaf-processor (identity-processor)
+                                         :diff-buf-size 256})
+                       nil
+                       (catch IllegalArgumentException e e))]
+            (is (some? e) "an explicit :diff-buf-size with a processor must be refused")
+            (is (re-find #"leafProcessor" (str (some-> ^IllegalArgumentException e .getMessage)))
+                "and the message must name the conflict")))
+        (testing (str "pss.diffBufSize=" prop ": the same through the Java ctor")
+          (is (thrown? IllegalArgumentException
+                       (Settings. (int 8) nil nil (identity-processor) (int 256)))))))))
+
+(deftest an-inherited-budget-with-a-processor-is-neutralized
+  (doseq [prop [nil 256]]
+    (with-diff-buf-prop prop
+      (fn []
+        (testing (str "pss.diffBufSize=" prop ": a caller who never named a budget —"
+                      " stratum's shape — must keep working, unbuffered")
+          (let [s (set/sorted-set* {:comparator compare :branching-factor 8
+                                    :leaf-processor (identity-processor)})]
+            (is (zero? (.diffBufSize (.-_settings ^PersistentSortedSet s)))
+                "buffering off")
+            (is (= (vec (range 50)) (vec (seq (into s (range 50)))))
+                "and the set still works")))
+        (testing (str "pss.diffBufSize=" prop ": the 4-arg Java ctor is an"
+                      " inheriting caller too — most of this file uses it")
+          (is (zero? (.diffBufSize (Settings. (int 8) nil nil (identity-processor))))))
+        (testing (str "pss.diffBufSize=" prop ": an explicit 0 is not a request"
+                      " for buffering and must be accepted")
+          (is (zero? (.diffBufSize (Settings. (int 8) nil nil (identity-processor) (int 0))))))))))
+
+(deftest a-budget-without-a-processor-is-untouched
+  (doseq [prop [nil 256]]
+    (with-diff-buf-prop prop
+      (fn []
+        (testing (str "pss.diffBufSize=" prop ": the no-processor path must be"
+                      " unchanged in both directions")
+          (is (= 256 (.diffBufSize (Settings. (int 8) nil nil nil (int 256)))))
+          (is (= (or prop 0) (.diffBufSize (Settings. (int 8) nil nil nil)))
+              "and an unnamed budget still follows the system property"))))))

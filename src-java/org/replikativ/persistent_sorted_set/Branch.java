@@ -326,6 +326,13 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // node — clears the slot's address and installs the bare child, both in place within
   // the current snapshot (unshared by contract; see NodeState).
   public ANode<Key, Address> child(int idx, ANode<Key, Address> child) {
+    // The "unshared by contract" in the comment above is the whole safety argument for
+    // writing into the snapshot's arrays in place, and nothing checked it. Under -ea (the
+    // :test alias) this turns the contract into something the suite enforces. Measured
+    // before adding it: 0 violations over 38,813,363 calls across the diff-buf namespaces,
+    // so it costs nothing today and fails loudly the moment a non-owner path appears.
+    assert editable() : "child(int,ANode) writes in place — it may only be called on an "
+                      + "editable (owner-thread, unshared) node, not a shared one";
     NodeState<Address> s = _state;
     if (s.addresses != null) {
       s.addresses[idx] = null;
@@ -2192,10 +2199,23 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     }
     // The copy's slots REPLACE any slots base's own blob carried (parent's nested diff is
     // the complete superseding state — same semantics as the historical in-place install).
-    // ĝ.count / ĝ.measure — no child summing. The copy aliases base's addresses array
-    // (read-only by the shared-snapshot contract; the copy is sealed, never edited in
-    // place). installSlots on the unpublished copy is single-threaded by construction.
-    Branch<Key, Address> proj = new Branch<>(base._level, base._len, newKeys, baseAddresses,
+    // ĝ.count / ĝ.measure — no child summing. installSlots on the unpublished copy is
+    // single-threaded by construction.
+    //
+    // COPY the addresses array. This used to alias base's, justified as "read-only by the
+    // shared-snapshot contract; the copy is sealed, never edited in place" — an invariant
+    // that held only because a projected copy inherits `base._settings`, whose `_edit` is
+    // null, so it is never editable and `child(int,ANode)` (which writes
+    // `addresses[idx] = null` IN PLACE) never reaches it. That is a long chain of
+    // reasoning protecting a caching IStorage's shared node: datahike's CachedStorage
+    // returns the same object by address across tree versions, so one nulled entry there
+    // would make another version see a phantom dirty child. `newKeys` and `slots` are
+    // already allocated here, so this adds a third array copy of the same length to a
+    // function that allocates two — and removes the aliasing entirely rather than
+    // documenting why it is currently survivable.
+    Address[] projAddresses = (baseAddresses != null)
+        ? Arrays.copyOf(baseAddresses, baseAddresses.length) : null;
+    Branch<Key, Address> proj = new Branch<>(base._level, base._len, newKeys, projAddresses,
                                              null, sl.count, sl.measure, _projCmp, base._settings);
     proj.installSlots(slots, BUF_LAZY);
     return proj;
@@ -2328,7 +2348,24 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       } else if (sl.bufEntries == BUF_WRITE) {                  // subtree rebalanced (poison) ⇒ must write
         writeList.add(i);
       } else {                                                  // content-only ⇒ bufferable
-        csz[i] = (int) sl.bufEntries;
+        // RESOLVE, don't read raw — the passthrough arm above already calls slotBE(sl) for
+        // exactly this quantity. A slot reconstructed from storage carries Slot.LAZY (-2)
+        // (the 4-arg Slot ctor), and the gate above only rejects BUF_WRITE (-1), so a LAZY
+        // slot on a dirty child fell through to here and was sized as -2. That is not a
+        // small error, it is a NEGATIVE size: `bufferable` sorts it first, the budget test
+        // `embedded + csz[i] <= budget` always passes, and `embedded += csz[i]` moves the
+        // running total BACKWARDS — so the per-node budget stops bounding the blob, and the
+        // -2 is then written back into the slot as its settled size.
+        //
+        // Measured, budget 1, a level-2 root whose slot 0 carries a real restored diff, that
+        // child made dirty: raw read buffered it (addresses[idx] == anchor, no write, slot
+        // persisted with bufEntries -2) where the real diff must flush; with slotBE it
+        // flushes. Not reached by the current suite — 0 hits over 38.8M child(int,ANode)
+        // calls across the diff-buf namespaces — because every path that dirties a child
+        // also re-deposits its slot with a computed size. That makes this a latent
+        // inconsistency rather than a live defect, and the reason to close it is that the
+        // two arms must not disagree about how to read the same field.
+        csz[i] = slotBE(sl);
         cnested[i] = (sl.diff != null) ? sl.diff                // leaf-diff, or restored-nested branch-diff
                    : assembleNested(storage, (Branch)(ANode) _settings.readReference(children0[i])); // live branch marker
         bufferable.add(i);

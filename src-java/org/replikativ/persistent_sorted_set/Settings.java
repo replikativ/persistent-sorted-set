@@ -70,8 +70,36 @@ public class Settings {
   // Stratum, the only in-tree consumer of ILeafProcessor, does not set :diff-buf-size, so
   // this refusal also protects it from the `pss.diffBufSize` system property switching
   // buffering on underneath it.
-    private static int diffBufFor(ILeafProcessor leafProcessor, int diffBufSize) {
-    return (leafProcessor != null) ? 0 : diffBufSize;
+  //
+  // REFUSE an EXPLICIT pairing; NEUTRALIZE an inherited one. The distinction is the whole
+  // design here, and it exists because a budget can arrive from three places: the caller,
+  // the `pss.diffBufSize` system property, or a restored node's own settings. Only the
+  // first is a request.
+  //
+  // Silently zeroing an explicit `:diff-buf-size 256` meant a caller who asked for both got
+  // neither an error nor buffering — a config that reads as enabled and is not. But a throw
+  // keyed on the VALUE cannot tell the two apart: measured under `-Dpss.diffBufSize=256`,
+  // a processor with no `:diff-buf-size` and a processor with an explicit 256 both arrive
+  // here as 256. Throwing on that rejects stratum, which passes `:leaf-processor` and never
+  // mentions diff-buf anywhere in its source, on any deployment that sets the property —
+  // and rejects this suite's own `(Settings. (int bf) nil nil processor)` helpers.
+  //
+  // So the callers that INHERIT a budget pass 0 before they get here (the 4-arg ctor below,
+  // and `map->settings` in the Clojure API), and reaching this with a positive budget means
+  // someone named one. `PersistentSortedSet.root()` handles the third source separately: it
+  // decides from what the subtree actually BUFFERS, not from what it declares.
+  private static int diffBufFor(ILeafProcessor leafProcessor, int diffBufSize) {
+    if (leafProcessor != null && diffBufSize > 0) {
+      throw new IllegalArgumentException(
+        "diff-buf size " + diffBufSize + " was requested together with a leafProcessor, and the "
+        + "two are incompatible: a diff-buf slot records individual element edits against a "
+        + "durable anchor, while a processor rewrites a whole leaf at materialization, so "
+        + "replaying the diff reapplies edits the processor already folded away. Measured, a "
+        + "compacting processor at bf 4 with diff-buf 100: a set of 8 came back from a "
+        + "store/restore cycle with 9 elements, the processor-deleted one resurrected. Drop "
+        + "one of the two — omit :diff-buf-size to run this set unbuffered.");
+    }
+    return diffBufSize;
   }
 
   public Settings(int branchingFactor, RefType refType, AtomicReference<Thread> edit, IMeasure measure, ILeafProcessor leafProcessor, int diffBufSize, IBoundary boundary) {
@@ -102,7 +130,11 @@ public class Settings {
   }
 
   public Settings(int branchingFactor, RefType refType, IMeasure measure, ILeafProcessor leafProcessor) {
-    this(branchingFactor, refType, measure, leafProcessor, defaultDiffBufSize());
+    // No budget named ⇒ INHERIT, and a processor means the inherited one is 0. Taking
+    // `defaultDiffBufSize()` here would hand `diffBufFor` a positive budget nobody asked
+    // for and turn the system property into a hard failure for every processor user.
+    this(branchingFactor, refType, measure, leafProcessor,
+         (leafProcessor != null) ? 0 : defaultDiffBufSize());
   }
 
   // Normalizing constructor with explicit diffBufSize (used by the Clojure API).
