@@ -1576,6 +1576,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     for (int i = 0; i < n; i++) keys[i] = ((ANode<Key, Address>) newChildren[i]).maxKey();
     long count = tryComputeSubtreeCountFromChildren(newChildren, n, storage);
     Object measure = tryComputeMeasureFromChildren(newChildren, n, storage, measureOps);
+    wrapAddressedChildren(newChildren, newAddresses, n);      // AFTER the probes read them
     return new Branch(_level, n, keys, newAddresses, newChildren, count, measure, _projCmp, settings);
   }
 
@@ -1621,7 +1622,36 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     for (int i = 0; i < n; i++) keys[i] = ((ANode<Key, Address>) children[i]).maxKey();
     long count = tryComputeSubtreeCountFromChildren(children, n, storage);
     Object measure = tryComputeMeasureFromChildren(children, n, storage, measureOps);
+    wrapAddressedChildren(children, addrs, n);                // AFTER the probes read them
     return new Branch(_level, n, keys, addrs, children, count, measure, _projCmp, settings);
+  }
+
+  /**
+   * Wrap every rebuilt child that still has a durable address per `:ref-type`, exactly as the
+   * count-mode settle in store() does.
+   *
+   * The MST rebuild paths (removeContent, mstMergeWith) copy each unchanged sibling forward as
+   * `child(storage, i)` — a BARE ANode — while keeping its still-valid address, and nothing on
+   * those paths ever called makeReference. So in content-defined (MST) mode no Reference was
+   * created anywhere in the tree: `:ref-type :soft`/`:weak` silently bounded nothing, and every
+   * node the writer touched stayed pinned until the next store. Measured, bf 8, n=20000,
+   * `:ref-type :soft`, after 20 disj on a cold tree:
+   *
+   *   count mode   {:bare-strong 2267, :reference 2498}     85 nodes resident
+   *   MST          {:bare-strong 1296, :reference    4}    159 nodes resident, of 1377 blobs
+   *
+   * Only an addressed child may be wrapped: a cleared reference is recovered by restoring from
+   * the address, so a freshly built child (null address — the removal's successor, or a merge
+   * junction) must stay strong. Under `:ref-type :strong` makeReference returns the node itself,
+   * so this is a no-op there.
+   */
+  private void wrapAddressedChildren(Object[] children, Address[] addresses, int n) {
+    if (children == null || addresses == null) return;
+    for (int i = 0; i < n; ++i) {
+      if (addresses[i] != null && children[i] instanceof ANode) {
+        children[i] = _settings.makeReference(children[i]);
+      }
+    }
   }
 
   /**
