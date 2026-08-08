@@ -45,11 +45,18 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   public static final long BUF_WRITE = -1;   // must write (rebalanced subtree)
   public static final long BUF_LAZY  = Slot.LAZY;  // restored, derive from slots on first read
 
-  // All settle-visible per-child state as ONE immutable snapshot. SHARED nodes have a
-  // single writer (the commit thread's settle) and many readers (apply-thread copies,
-  // query traversals): one volatile reference makes every observable state internally
-  // consistent — a reader/copier can never see addresses and children from different
-  // generations. Replaces the plain (_addresses, _children) pair whose two-step settle
+  // All settle-visible per-child state as ONE immutable snapshot. A shared node is assumed
+  // to have a single writer (a settle) and many readers (apply-thread copies, query
+  // traversals): one volatile reference makes every observable state internally consistent —
+  // a reader/copier can never see addresses and children from different generations.
+  //
+  // "Single writer" is a CONTRACT ON THE CALLER, not a property this class provides. Nothing
+  // here serialises store(), and structural sharing means two versions can share dirty nodes:
+  // measured on a pipelining-writer shape at bf 8 / n 1000, 3 Branch objects were reachable
+  // from both roots and dirty in both, and two concurrent stores settle those same objects.
+  // The required exclusion is therefore per LINEAGE (in practice per storage), not per tree —
+  // see doc/CONCURRENCY.md, which also records what does and does not go wrong when it is
+  // violated. The snapshot below defends readers; it does not defend writers from each other. Replaces the plain (_addresses, _children) pair whose two-step settle
   // (write _addresses[i], THEN wrap _children[i] in a Reference) tore under a
   // pipelining writer: a concurrent copy could mix a pre-settle (null) address with a
   // post-settle wrapped child — the forbidden "dirty child behind a SoftReference"

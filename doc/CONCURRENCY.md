@@ -135,12 +135,39 @@ init, so the branch folds away when it is off.
 
 ## Single-writer settle
 
-`store()` may be called by **one thread at a time per tree** (datahike: the commit
-thread). Concurrent `store()` of overlapping trees from two threads is not
-supported: each settle's publish is internally consistent, but the second plain
-write would discard the first thread's re-pointing and children could be written
-twice. Readers and derivers (the pipelining apply thread) are unrestricted — that
-is the race `NodeState` exists for.
+`store()` may be called by **one thread at a time per LINEAGE** — in practice, per
+storage — not per tree. "Per tree" was the earlier wording and it is too weak:
+structural sharing means two trees are not disjoint. Measured on the pipelining-writer
+shape (derive v1 from a base, then v2 from v1, touching different subtrees), **3 Branch
+objects were reachable from both roots AND dirty in both** at bf 8 / n 1000. Storing
+either settles those same objects in place, so "one thread per tree" permits exactly
+the interference it means to forbid.
+
+Concurrent `store()` of two versions sharing dirty nodes is not supported. The
+consequences, in increasing order of severity:
+
+* Both settles publish with a **plain write** (`_state = new NodeState<>(...)`), not a
+  CAS, so the loser's state is discarded and children can be written twice. Measured
+  over 1600 rounds with barrier-synchronised threads: at bf 8 / diff-buf 0, 20 writes
+  where a sequential run does 15, in 196 of 200 rounds. Wasted work, not corruption.
+* The publish happens **before** `storage.store(this)`, so one thread can serialise a
+  blob built from the OTHER thread's address array. With a fresh-address storage both
+  arrays are equally valid, which is why the measured runs stayed content-correct; under
+  a content-addressed store, or when one thread buffered a child the other flushed, they
+  are not interchangeable.
+* `assembleNested` is **not snapshot-atomic across nodes** — it reads a child's slots,
+  then its keys, then recurses into grandchildren's slots as separate volatile reads. A
+  concurrent settle landing mid-walk mixes generations into a diff written against an
+  anchor it no longer describes. That is a wrong-data-on-reload path, and it is the
+  reason this is a hard constraint rather than a performance note.
+
+No content corruption was observed in 1600 rounds, and no `-ea` oracle tripped; the
+third point above is argued from the code, not measured. Nothing enforces or detects
+any of it. `test/concurrent_store.clj` and `concurrent_diff.clj` cover settle-vs-READER,
+never settle-vs-settle.
+
+Readers and derivers (the pipelining apply thread) are unrestricted — that is the race
+`NodeState` exists for.
 
 `markFreed` calls happen at the same program points as before the `NodeState`
 rework (method-entry snapshots feed the same decisions), so GC accounting

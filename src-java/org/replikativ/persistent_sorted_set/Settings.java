@@ -295,21 +295,30 @@ public class Settings {
    *  pattern to prevent the unsafe one. Enable it where you know no handoff occurs. */
   private static final boolean STRICT_TRANSIENTS = Boolean.getBoolean("pss.strictTransients");
 
-  /** Is this set editable in place BY THE CALLING THREAD?
+  /** Is this set editable in place?
    *
-   *  Throws rather than answering false for a foreign thread: answering false would send
-   *  it down the persistent path, which is a silent wrong answer, not a safe one. Measured
+   *  BY DEFAULT this answers "is some transient live", NOT "does the calling thread own it".
+   *  Ownership is only checked under `-Dpss.strictTransients=true` (see STRICT_TRANSIENTS
+   *  above for why that is opt-in). So in an ordinary build a FOREIGN thread gets `true` and
+   *  takes the in-place path; it neither throws nor answers false. An earlier version of this
+   *  sentence claimed the opposite, and callers should not read an ownership guarantee here.
+   *  Note this also weakens the `assert editable()` guards elsewhere in the tree: under the
+   *  default flag they enforce "a transient is live", not "the owner thread is calling".
+   *
+   *  UNDER THE STRICT FLAG it throws rather than answering false for a foreign thread:
+   *  answering false would send it down the persistent path, which is a silent wrong answer,
+   *  not a safe one. Measured
    *  before this check existed — 4 threads x 5000 `conj!` on one transient — 19 262 of
    *  20 000 elements present, `count` disagreeing with `seq` (13 942 vs 19 262), and
    *  `sorted?` FALSE: a sorted set whose keys are not in order, so every later
    *  binarySearch is arbitrary, and durable once stored. Clojure's transients have always
    *  thrown here; this one silently corrupted.
    *
-   *  KNOWN GAP: using a transient AFTER `persistent!` still degrades silently to the
-   *  persistent path rather than throwing, because `persistent()` returns `this` — the
-   *  stale handle and the persistent result are the same object, so they cannot be told
-   *  apart. Clojure can throw because its two are different objects. Fixing that means
-   *  changing what `persistent()` returns, which is a wider change than this. */
+   *  The former KNOWN GAP here — that using a transient AFTER `persistent!` degraded
+   *  silently because `persistent()` returned `this` — is CLOSED. `persistent()` now
+   *  returns a new set, so the stale handle is distinguishable and
+   *  `ensureLiveTransient` throws, in both boundary modes; pinned by
+   *  test/transient_ownership.clj. */
   public boolean editable() {
     if (_edit == null) return false;
     Thread owner = _edit.get();
