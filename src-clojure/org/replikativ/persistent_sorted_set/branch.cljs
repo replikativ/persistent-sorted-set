@@ -979,6 +979,53 @@
 ;; by the O(1) _bufEntries aggregate: a child's subtree size is (buf-entries child) and its
 ;; must-write status is the -1 poison that already climbed the deposit sum — see store/deposit-kv.)
 
+(defn- refresh-marker-slots!
+  "Mirrors JVM `Branch.refreshMarkerSlots`. A branch-MARKER slot (`:diff` nil, `:anchor`
+  non-nil) caches the child's whole-subtree buffered total as of DEPOSIT time, and carries no
+  diff of its own — the diff is derived from the LIVE child at store time by `assemble-nested`.
+
+  `store` settles that child IN PLACE (`set! (.-_bufEntries child) embedded`, and its slots are
+  rewritten), and nodes are SHARED between versions, so every other version's parent slot keeps
+  both the pre-settle total AND the pre-settle `:anchor`. Nothing is overwritten — blobs are
+  immutable and a re-store gets a fresh address — but the slot's two halves now straddle the
+  settle: the derived diff moved forward while the anchor did not, and the flush already
+  `markFreed` that anchor.
+
+  Correcting the NUMBER is the wrong fix and was measured wrong on the JVM: 25/35/37 content
+  mismatches per config at B in {1,4}. The inflated stale value is accidentally protective —
+  it forces `embedded + csz > budget`, so the child is FLUSHED; correcting it lets the child be
+  BUFFERED against the stale anchor and the restore loses everything the child flushed.
+
+  So detect the settle and poison the slot to -1 (must-write): Pass 1 then writes the child
+  wholesale and it gets a fresh, coherent anchor. On the JVM this changed write counts by zero
+  — the flush was already happening, for the wrong reason.
+
+  Only detects staleness for a RESIDENT child; a child settled and then evicted is invisible
+  here. Instrumented on the JVM across the diff-buf namespaces: 0 non-resident markers out of
+  4382 examined, so that hole is real but unobserved."
+  [^Branch node]
+  (let [slots (.-_slots node)]
+    (when (some? slots)
+      (let [children (.-children node)
+            len      (arrays/alength (.-keys node))]
+        (when (some? children)
+          (loop [i 0, poisoned? false]
+            (if (>= i len)
+              (when poisoned? (set! (.-_bufEntries node) -1))
+              (let [sl (aget slots i)]
+                (if (or (nil? sl) (some? (:diff sl)) (nil? (:anchor sl))
+                        (== -1 (:buf-entries sl)))
+                  (recur (inc i) poisoned?)                    ; not a live marker slot
+                  (let [c (aget children i)]
+                    (if-not (instance? Branch c)
+                      (recur (inc i) poisoned?)                ; absent or a leaf
+                      (do
+                        (refresh-marker-slots! c)              ; post-order
+                        (if (== (buf-entries c) (slot-be sl (dec (.-level node))))
+                          (recur (inc i) poisoned?)
+                          (do (aset slots i (assoc sl :buf-entries -1))
+                              (recur (inc i) true)))))))))))))))
+
 (defn- assemble-nested
   "Assemble c's serializable nested diff {idx -> {:count :measure :diff :max-key}}, recursing
   markers into the (resident) live subtree. Mirrors JVM assembleNested."
@@ -1063,7 +1110,8 @@
                  ;; share of the budget is written proportionally often and can't jam the buffer.
                  ;; Only dirty (resident) children are flushed (no read); clean passthrough consumes
                  ;; budget but is left untouched. Mirrors JVM Branch.store (see doc/diff-buffering.md).
-                 (let [addrs  (.-addresses this)
+                 (let [_      (refresh-marker-slots! this)   ; see the fn: detect a settled child
+                       addrs  (.-addresses this)
                        slots  (.-_slots this)
                        budget (or (:diff-buf-size (.-settings this)) 0)
                        len    (arrays/alength (.-keys this))
