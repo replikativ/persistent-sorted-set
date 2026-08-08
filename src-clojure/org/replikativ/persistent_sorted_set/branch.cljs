@@ -453,7 +453,7 @@
   "split-seam (MST): given the merged separators/children after absorbing a child split,
    cut at boundary keys (≤2-way for one incremental insert). Mirrors the JVM Branch.add seam
    path. MST forces diff-buf off, so no slots/addresses bookkeeping (anchorless re-store)."
-  [^Branch this bd new-keys new-children ins key]
+  [^Branch this bd new-keys new-children new-addrs ins key]
   (let [settings    (.-settings this)
         lvl         (.-level this)
         measure-ops (:measure settings)
@@ -465,12 +465,13 @@
             new-sc (if (>= old-sc 0) (inc old-sc) -1)
             m      (when (and measure-ops (.-_measure this))
                      (measure/merge-measure measure-ops (.-_measure this) (measure/extract measure-ops key)))]
-        (arrays/array (Branch. lvl new-keys new-children nil new-sc m settings nil 0 (.-_projCmp this))))
+        (arrays/array (Branch. lvl new-keys new-children new-addrs new-sc m settings nil 0 (.-_projCmp this))))
       (loop [out (transient []), pos 0, ls lens]
         (if (seq ls)
           (let [l    (first ls)
                 kseg (.slice new-keys pos (+ pos l))
                 cseg (.slice new-children pos (+ pos l))
+                aseg (when new-addrs (.slice new-addrs pos (+ pos l)))
                 m    (when (and measure-ops (.-_measure this))
                        (reduce (fn [acc child]
                                  (if (nil? acc)
@@ -479,7 +480,7 @@
                                      (if cs (measure/merge-measure measure-ops acc cs) (reduced nil)))))
                                (measure/identity-measure measure-ops) cseg))
                 sc   (try-compute-subtree-count-from-children cseg l)]
-            (recur (conj! out (Branch. lvl kseg cseg nil sc m settings nil 0 (.-_projCmp this)))
+            (recur (conj! out (Branch. lvl kseg cseg aseg sc m settings nil 0 (.-_projCmp this)))
                    (+ pos l) (next ls)))
           (arrays/into-array (persistent! out)))))))
 
@@ -505,7 +506,15 @@
                            new-children     (util/splice children idx (inc idx) nodes)
                            nodes-len        (arrays/alength nodes)]
                        (if bd
-                         (mst-branch-add this bd new-keys new-children idx key)
+                         ;; PROBE FIX: preserve unchanged siblings' durable addresses across the
+                         ;; MST rebuild, mirroring the JVM's allAddresses Stitch (copyAll +
+                         ;; copyOne(null) per new node). Also free the split child's old blob.
+                         (let [mst-addrs (when addrs
+                                           (util/splice addrs idx (inc idx)
+                                                        (arrays/make-array nodes-len)))]
+                           (when (and storage addrs (aget addrs idx))
+                             (storage/markFreed storage (aget addrs idx)))
+                           (mst-branch-add this bd new-keys new-children mst-addrs idx key))
                          (if (<= (arrays/alength new-children) branching-factor)
                            (let [new-addrs
                                  (when addrs
