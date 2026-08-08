@@ -271,7 +271,27 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     }
 
     // borrow from left
-    if (left != null && (left.editable() || right == null || left._len >= right._len)) {
+    //
+    // WHICH sibling we borrow from must not depend on whether a node happens to be
+    // editable. `left.editable()` is true only inside a transient, so this made the same
+    // logical delete produce a DIFFERENT TREE depending on whether the caller batched it —
+    // measured before this change, 3 of 8 shapes differed between a transient and a
+    // persistent remove of the same keys:
+    //
+    //     bf 16 n 40  drop 3    persistent [10 8 8]        transient [8 8 10]
+    //     bf 16 n 100 drop 3    persistent [10 11 11 10 9 15]  transient [10 11 11 10 16 8]
+    //     bf  8 n 100 drop 2    persistent [6 6 6 6 4 4 6 4 8] transient [6 6 6 6 4 4 6 4 4 4]
+    //
+    // A transient is meant to be a pure performance optimization over the persistent path,
+    // so a shape that depends on it is a defect on its own terms — and under
+    // content-addressed storage it means the same data gets a different merkle root
+    // depending on how it was written. datahike batches through `db-transient`, so both
+    // paths are live.
+    //
+    // `Branch.remove`'s corresponding arm (:1297) never had the clause, so this also makes
+    // the leaf and branch rules agree. `editable()` is still consulted BELOW to mutate in
+    // place — that is about HOW to rebalance, not WHICH sibling to rebalance with.
+    if (left != null && (right == null || left._len >= right._len)) {
       int totalLen     = left._len + centerLen,
           newLeftLen   = totalLen >>> 1,
           newCenterLen = totalLen - newLeftLen;

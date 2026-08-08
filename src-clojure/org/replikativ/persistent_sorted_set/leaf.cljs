@@ -102,13 +102,28 @@
                                      (arrays/into-array (persistent! out))))))
 
                              (== keys-l branching-factor)
-                             (let [middle (arrays/half (inc keys-l))
-                                   left-leaf (if (> idx middle)
-                                               (Leaf. (.slice keys 0 middle) settings nil)
-                                               (Leaf. (util/cut-n-splice keys 0 middle idx idx (arrays/array key)) settings nil))
-                                   right-leaf (if (> idx middle)
-                                                (Leaf. (util/cut-n-splice keys middle keys-l idx idx (arrays/array key)) settings nil)
-                                                (Leaf. (.slice keys middle keys-l) settings nil))]
+                             ;; Split POSITION-INDEPENDENTLY, exactly as the JVM does.
+                             ;; `CountBoundary.splitLengths` re-partitions the whole
+                             ;; overflowing run into even pieces and puts the remainder on
+                             ;; the LATER piece, whatever the insert position — its own
+                             ;; comment says "count: position-independent, ignores ins".
+                             ;;
+                             ;; This used to cut at `middle` and then splice the new key
+                             ;; into whichever half contained it, so the extra element went
+                             ;; left or right depending on WHERE you inserted. `middle` was
+                             ;; already the JVM's `baseLen`; only the placement differed —
+                             ;; one element, but it changes which leaf the next insert lands
+                             ;; in, so shapes diverged globally. Measured, conj-built at
+                             ;; bf 8: ascending agreed ([4 4 4 5]) because the extra always
+                             ;; lands last, while descending gave JVM [7 5 5] vs [5 4 4 4]
+                             ;; here — differing even in LEAF COUNT.
+                             ;;
+                             ;; Build the full run and cut it, the same shape the MST arm
+                             ;; above already uses.
+                             (let [all-keys (util/splice keys idx idx (arrays/array key))
+                                   middle   (arrays/half (inc keys-l))
+                                   left-leaf  (Leaf. (.slice all-keys 0 middle) settings nil)
+                                   right-leaf (Leaf. (.slice all-keys middle (inc keys-l)) settings nil)]
                                ;; Compute measure for split leaves only if already computed
                                (when (and measure-ops _measure)
                                  (node/try-compute-measure left-leaf nil measure-ops {:sync? true})
