@@ -1694,13 +1694,23 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
    *
    * The MST rebuild paths (removeContent, mstMergeWith) copy each unchanged sibling forward as
    * `child(storage, i)` — a BARE ANode — while keeping its still-valid address, and nothing on
-   * those paths ever called makeReference. So in content-defined (MST) mode no Reference was
-   * created anywhere in the tree: `:ref-type :soft`/`:weak` silently bounded nothing, and every
-   * node the writer touched stayed pinned until the next store. Measured, bf 8, n=20000,
-   * `:ref-type :soft`, after 20 disj on a cold tree:
+   * those paths ever called makeReference. `:ref-type :soft`/`:weak` therefore stopped bounding
+   * the tree, because a bare strong child pins its WHOLE subtree: an unwrapped node near the
+   * root makes everything beneath it unevictable regardless of how the rest is held.
    *
-   *   count mode   {:bare-strong 2267, :reference 2498}     85 nodes resident
-   *   MST          {:bare-strong 1296, :reference    4}    159 nodes resident, of 1377 blobs
+   * Measured, bf 8, n=20000, `:ref-type :soft`, 20 disj after a store and WITHOUT a second
+   * store (a checkpoint re-wraps everything and hides it), before -> after:
+   *
+   *   MST     cleared    0 references, 1375 of 1375 nodes resident (100% pinned)
+   *           after:   850 cleared,     525 of 1375 (38%)
+   *   count   cleared 2565 references, 4033 of 6598 resident (61%), unchanged both ways
+   *
+   * A correction to an earlier version of this comment, which claimed "no Reference was created
+   * anywhere in the tree" and cited `{:reference 4}`: that is false. A census on the unfixed
+   * build found `{:bare-strong-with-address 126, :bare-strong-no-address 32, :reference 1216}` —
+   * 1216 References did exist. What the MST paths unwrapped was 126 of them (~9%), and because
+   * an eviction walk stops at a bare strong child, those 126 were enough to drive the CLEARABLE
+   * count to zero. The pinning, not the reference count, is the defect.
    *
    * Only an addressed child may be wrapped: a cleared reference is recovered by restoring from
    * the address, so a freshly built child (null address — the removal's successor, or a merge

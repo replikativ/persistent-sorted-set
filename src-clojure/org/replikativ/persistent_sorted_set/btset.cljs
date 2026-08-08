@@ -1827,6 +1827,26 @@
 
 #!------------------------------------------------------------------------------
 
+(defn- empty-leaf
+  "The empty root leaf, carrying the measure IDENTITY when a measure is configured.
+
+   Every measure-maintenance site in leaf.cljs and branch.cljs is guarded on the SOURCE
+   node already having a measure — correct for maintenance, but it means nothing ever
+   BOOTSTRAPS one. The empty leaf was built with nil, so on the incremental path no node
+   ever acquired a measure at all, and the library's own `diagnostics/validate-measures-known`
+   failed on ClojureScript for every conj-built set (measured: 12 / 129 / 5 / 56 violations at
+   bf 8 n 40 / bf 8 n 400 / bf 16 n 40 / bf 16 n 400 — leaves as well as branches). It also
+   made cljs internally inconsistent, since the bulk builders compute eagerly, so bulk and
+   incremental builds of the SAME set produced different `:measure` in their blobs.
+
+   Seeding the identity here is enough: from a non-nil measure the existing incremental
+   maintenance carries it through every add, split, merge and borrow, so the whole tree
+   bootstraps from the empty set outward. The identity is what an empty leaf's measure IS,
+   so this is also the correct value rather than a convenient one."
+  [settings]
+  (let [measure-ops (:measure settings)]
+    (Leaf. (arrays/array) settings (when measure-ops (measure/identity-measure measure-ops)))))
+
 (deftype BTSet [^:mutable root cnt comparator meta ^:mutable _hash storage ^:mutable address ^:mutable settings]
   Object
   (toString [this] (pr-str* this))
@@ -1841,7 +1861,7 @@
   (-meta [_] meta)
 
   IEmptyableCollection
-  (-empty [_] (BTSet. (Leaf. (arrays/array) settings nil) 0 comparator meta UNINITIALIZED_HASH nil nil settings))
+  (-empty [_] (BTSet. (empty-leaf settings) 0 comparator meta UNINITIALIZED_HASH nil nil settings))
 
   IEquiv
   (-equiv [this other]
@@ -2060,7 +2080,7 @@
                          (mst-partition bd arr identity 1))]
         (loop [nodes leaves, lvl 1]
           (case (count nodes)
-            0 (BTSet. (Leaf. (arrays/array) settings nil) 0 cmp (:meta opts) UNINITIALIZED_HASH storage nil settings)
+            0 (BTSet. (empty-leaf settings) 0 cmp (:meta opts) UNINITIALIZED_HASH storage nil settings)
             1 (BTSet. (first nodes) (arrays/alength arr) cmp (:meta opts) UNINITIALIZED_HASH storage nil settings)
             (recur (mapv #(mst-build-branch lvl (array-seq %) settings cmp)
                          (mst-partition bd (arrays/into-array nodes) node/max-key (inc lvl)))
@@ -2340,7 +2360,7 @@
    - :meta     Metadata"
   [opts]
   (let [settings (node-settings opts)]
-    (BTSet. (Leaf. (arrays/array) settings nil) 0 (or (:comparator opts) (:cmp opts) compare)
+    (BTSet. (empty-leaf settings) 0 (or (:comparator opts) (:cmp opts) compare)
             (:meta opts) UNINITIALIZED_HASH (:storage opts) nil settings)))
 
 (defn ^BTSet sorted-set-by
