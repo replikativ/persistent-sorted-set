@@ -1609,7 +1609,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     for (int i = 0; i < n; i++) keys[i] = ((ANode<Key, Address>) newChildren[i]).maxKey();
     long count = tryComputeSubtreeCountFromChildren(newChildren, n, storage);
     Object measure = tryComputeMeasureFromChildren(newChildren, n, storage, measureOps);
-    wrapAddressedChildren(newChildren, newAddresses, n);      // AFTER the probes read them
+    wrapAddressedChildren(newChildren, newAddresses, n, settings);   // AFTER the probes read them
     return new Branch(_level, n, keys, newAddresses, newChildren, count, measure, _projCmp, settings);
   }
 
@@ -1655,7 +1655,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     for (int i = 0; i < n; i++) keys[i] = ((ANode<Key, Address>) children[i]).maxKey();
     long count = tryComputeSubtreeCountFromChildren(children, n, storage);
     Object measure = tryComputeMeasureFromChildren(children, n, storage, measureOps);
-    wrapAddressedChildren(children, addrs, n);                // AFTER the probes read them
+    wrapAddressedChildren(children, addrs, n, settings);             // AFTER the probes read them
     return new Branch(_level, n, keys, addrs, children, count, measure, _projCmp, settings);
   }
 
@@ -1678,11 +1678,19 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
    * junction) must stay strong. Under `:ref-type :strong` makeReference returns the node itself,
    * so this is a no-op there.
    */
-  private void wrapAddressedChildren(Object[] children, Address[] addresses, int n) {
+  private void wrapAddressedChildren(Object[] children, Address[] addresses, int n, Settings settings) {
     if (children == null || addresses == null) return;
     for (int i = 0; i < n; ++i) {
       if (addresses[i] != null && children[i] instanceof ANode) {
-        children[i] = _settings.makeReference(children[i]);
+        // The SET's settings, not this node's. A node reconstructed by an IStorage carries the
+        // STORAGE's Settings, and every in-tree storage builds them as `new Settings(bf, null, ..)`
+        // whose null refType normalizes to SOFT. Reading `_settings` here therefore made
+        // `:ref-type` on the set not govern this path in EITHER direction: measured MST, bf 8,
+        // n=4000, 30 deletes -- a `:strong` set over default storage nodes got 87 SoftReferences
+        // it never asked for (0 before), and a `:soft` set over strong-settings nodes got the wrap
+        // not at all (87 bare-strong-with-address, i.e. inert). The successor Branch two lines
+        // below is already built from `settings`; this now agrees with it.
+        children[i] = settings.makeReference(children[i]);
       }
     }
   }
