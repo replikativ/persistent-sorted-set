@@ -1134,8 +1134,18 @@
                                    (== (:buf-entries sl) -1)                   ; subtree rebalanced (poison) ⇒ must write
                                    (recur (inc i) pass buf (conj wl i))
                                    :else                                       ; content-only ⇒ bufferable, size O(1)
+                                   ;; RESOLVE with slot-be, don't read `:buf-entries` raw — the
+                                   ;; passthrough arm above already calls it for exactly this
+                                   ;; quantity. A slot reconstructed from storage carries no
+                                   ;; `:buf-entries` (the cljs analogue of JVM Slot.LAZY), and the
+                                   ;; gate above only rejects the -1 poison, so a restored slot on a
+                                   ;; dirty child fell through to here and was sized as nil — which
+                                   ;; `+` coerces to 0, so the budget test always passes, the running
+                                   ;; total never advances, and nil is then written back into the
+                                   ;; slot as its settled size. The JVM closed this in 31e41a6; the
+                                   ;; two arms must not disagree about how to read the same field.
                                    (let [nested (if (some? (:diff sl)) (:diff sl) (await (assemble-nested storage child opts)))]
-                                     (recur (inc i) pass (conj buf {:i i :sz (:buf-entries sl) :nested nested}) wl))))))))
+                                     (recur (inc i) pass (conj buf {:i i :sz (slot-be sl (dec level)) :nested nested}) wl))))))))
                        ;; Pass 2: buffer SMALLEST-first while running total ≤ budget; flush the rest.
                        [embedded flushed]
                        (reduce (fn [[emb wl] {:keys [i sz nested]}]
@@ -1146,7 +1156,45 @@
                                      [(+ emb sz) wl])
                                    [emb (conj wl i)]))
                                [(:pass classified) (:wl classified)]
-                               (sort-by :sz (:buf classified)))]
+                               (sort-by :sz (:buf classified)))
+                       ;; D3: the merge/borrow arms (`concat-slots`, `merge`, `merge-split`)
+                       ;; concatenate two nodes' slot arrays without re-checking the budget, so the
+                       ;; passthrough total alone can start above B — and Pass 2, which only ever
+                       ;; flushes DIRTY children, can never bring it back down. Measured over ~157k
+                       ;; written blobs before this: worst case ≈ 2B (B=1→2, 2→4, 4→8, 8→12,
+                       ;; 16→26) on ~0.1% of blobs. It does not compound, and content was always
+                       ;; correct — but it is a budget the code claims to enforce and did not.
+                       ;;
+                       ;; Flush already-settled children (clean passthrough and newly buffered
+                       ;; alike — both now carry an address AND a slot) biggest-first until the
+                       ;; total fits. Candidate test and write order both mirror the JVM arm: the
+                       ;; child is stored HERE, before Pass 3, so both runtimes issue the same
+                       ;; `store` call sequence and a backend that assigns addresses in call order
+                       ;; produces the same disk image.
+                       embedded
+                       (loop [emb   embedded
+                              cands (when (and slots (> embedded budget))
+                                      (->> (range len)
+                                           (filter (fn [i] (and (some? (aget addrs i))
+                                                                (some? (aget slots i)))))
+                                           (sort-by (fn [i] (- (slot-be (aget slots i) (dec level)))))
+                                           seq))]
+                         (if (or (<= emb budget) (nil? cands))
+                           emb
+                           (let [i  (first cands)
+                                 sl (aget slots i)
+                                 ;; resident if we still hold it, else restore+project — the
+                                 ;; settled child was re-pointed at its anchor, so this is
+                                 ;; restore(anchor) + project(slot), never a wrong node. Measured
+                                 ;; on the JVM: every flushed child was already resident under
+                                 ;; :ref-type strong, soft AND weak, so this is a fallback rather
+                                 ;; than a read in practice.
+                                 c  (or (when-some [cs (.-children this)] (aget cs i))
+                                        (await (child this storage i opts)))]
+                             (storage/markFreed storage (aget addrs i))
+                             (aset addrs i (await (node/store c storage opts)))
+                             (aset slots i nil)
+                             (recur (- emb (slot-be sl (dec level))) (next cands)))))]
                    ;; Pass 3: write flushed/structural children (all resident ⇒ no read).
                    (loop [ws (seq flushed)]
                      (when ws

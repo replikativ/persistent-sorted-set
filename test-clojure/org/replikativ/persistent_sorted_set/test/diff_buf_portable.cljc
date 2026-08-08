@@ -101,6 +101,85 @@
       (is (= 3 (blob-embedded (get @disk addr)))
           "root buffered the small diff and flushed the large one (biggest-first, not naive fill)"))))
 
+;; A deterministic Lehmer RNG, so both runtimes drive the IDENTICAL op stream.
+(defn- lcg [seed] (atom (+ 1 (mod seed 2147483646))))
+(defn- nxt [st n] (let [v (mod (* @st 48271) 2147483647)] (reset! st v) (mod v n)))
+
+(deftest budget-holds-across-merge-and-borrow
+  (testing "the SAME Σ≤B claim as above, but reached through DELETION.
+
+            The case above only ever `replace`s, which is content-only — it never rebalances,
+            so it never reaches the arms this exists for. `remove`'s join/borrow and `add`'s
+            stitch concatenate two nodes' slot arrays WITHOUT re-checking the budget. The
+            merged node is then must-write, so Pass 1 counts every surviving slot as clean
+            passthrough — and Pass 2 by design only ever flushes DIRTY children, so `embedded`
+            starts above B and nothing can bring it back down.
+
+            Measured over ~157k written blobs before the fix: worst ≈ 2B (B=1 -> 2, 2 -> 4,
+            4 -> 8, 8 -> 12, 16 -> 26) on ~0.1% of blobs. It did not compound and content was
+            always correct, so nothing user-visible failed — but `Branch.store` documents this
+            total as staying within B strictly, and it did not.
+
+            Small budgets only: the violation needs the concatenated total to exceed B, which at
+            the suite's usual B=256 never happens — so a fixture built at that budget proves
+            nothing here. Every (bf, B, seed) below was MEASURED to violate against the unfixed
+            code, with the round it first fires and the worst total it reached:
+
+              bf 8  B 1  seed 1  round  2  worst 2      bf 8  B 4  seed 1  round 3  worst 5
+              bf 8  B 2  seed 1  round  3  worst 4      bf 6  B 4  seed 3  round 6  worst 7
+              bf 8  B 3  seed 1  round  2  worst 5      bf 6  B 6  seed 3  round 6  worst 9
+
+            Eight rounds therefore suffice. Branching factor 4 is deliberately NOT here: it was
+            measured across all budgets and seeds and never violates, so including it would add
+            runtime and no coverage."
+    (doseq [[bf b seed] [[8 1 1] [8 2 1] [8 3 1] [8 4 1] [6 4 3] [6 6 3]]]
+      (let [n     300
+            o     {:branching-factor bf :diff-buf-size b :comparator cmp}
+            disk  (atom {})
+            st    (lcg seed)
+            s0    (reduce (fn [s i] (conj s [i 0])) (set/sorted-set* o) (range n))
+            a0    (set/store s0 (make-storage disk bf b))
+            ;; rounds of: cold restore, mixed conj/disj/replace, store. Only the blobs written
+            ;; by THIS round are checked, so a violation is attributed to the round that wrote
+            ;; it. Keys are drawn from 2n, so roughly half the deletes miss — which is what
+            ;; drives repeated merge/borrow rather than one steady shrink.
+            bad   (loop [round 0, addr a0, bad []]
+                    (if (= round 8)
+                      bad
+                      (let [base   (restore* addr (make-storage disk bf b) o)
+                            _      (dorun (seq base))
+                            before (set (keys @disk))
+                            v      (reduce (fn [s _]
+                                             (let [k (nxt st (* 2 n)) op (nxt st 3)]
+                                               (case op
+                                                 0 (conj s [k 0])
+                                                 1 (disj s [k 0])
+                                                 2 (if (contains? s [k 0])
+                                                     (set/replace s [k 0] [k (inc round)])
+                                                     (conj s [k 0])))))
+                                           base (range (quot n 3)))
+                            addr'  (set/store v (make-storage disk bf b))
+                            over   (->> (remove before (keys @disk))
+                                        (map #(get @disk %))
+                                        (filter #(re-find #":slots" %))
+                                        (map blob-embedded)
+                                        (filter #(> % b)))]
+                        ;; content stayed correct even while the budget was violated — that is
+                        ;; exactly why nothing user-visible ever failed, and why this needs its
+                        ;; own assertion rather than riding on a content check.
+                        (is (= (vec (seq v))
+                               (vec (seq (restore* addr' (make-storage disk bf b) o))))
+                            (str "bf=" bf " B=" b " seed=" seed " round=" round
+                                 ": content survives a cold restore"))
+                        (recur (inc round) addr'
+                               (if (seq over)
+                                 (conj bad {:round round :over (vec (sort > over))})
+                                 bad)))))]
+        (is (empty? bad)
+            (str "bf=" bf " B=" b " seed=" seed
+                 ": every written branch must satisfy Σ embedded <= B, got over-budget blobs "
+                 (pr-str bad)))))))
+
 ;; ---- C4: I0 — diff-buf-size 0 buffers nothing --------------------------------------------------
 (deftest i0-no-slots-at-zero
   (testing "at diff-buf-size 0 no node carries slots (byte-identical-to-baseline path)"

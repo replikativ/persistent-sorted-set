@@ -2439,6 +2439,42 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       }
     }
 
+    // D3: the merge/borrow arms (`remove`'s join/borrow, `add`'s stitchSlots) concatenate two
+    // nodes' slot arrays without re-checking the budget, so `passthrough` alone can start above
+    // B — and Pass 2, which only ever flushes DIRTY children, can never bring it down. Measured
+    // over ~157k written blobs before this: worst case ≈ 2B (B=1→2, 2→4, 4→8, 8→12, 16→26) on
+    // ~0.1% of blobs. It does not compound (200 adversarial shrink/refill rounds stayed at ~2B)
+    // and content was always correct — but the comment below claims the running total stays
+    // within B strictly, and it did not.
+    //
+    // Flush already-settled children (clean passthrough and newly buffered alike — both now
+    // carry an address AND a slot; Pass 1's must-write and Pass 2's flushed children have a null
+    // address and so are correctly excluded) biggest-first until the total fits. Measured:
+    // needed on 0.05% of written blobs, +0..3 writes out of 750-3500, and every flushed child
+    // was already resident under :ref-type strong, soft AND weak — so the restore below is a
+    // fallback, not a read in practice.
+    if (embedded > budget) {
+      java.util.ArrayList<Integer> pt = new java.util.ArrayList<>();
+      for (int i = 0; i < _len; ++i)
+        if (newAddresses[i] != null && newSlots != null && newSlots[i] != null) pt.add(i);
+      final Object[] fs = newSlots;
+      pt.sort((x, y) -> Integer.compare(slotBE((Slot) fs[y]), slotBE((Slot) fs[x])));
+      for (int i : pt) {
+        if (embedded <= budget) break;
+        Object ref = (children0 != null) ? children0[i] : null;
+        ANode c = (ref != null) ? (ANode) _settings.readReference(ref) : null;
+        if (c == null) c = child(storage, i);                   // not resident ⇒ restore+project
+        embedded -= slotBE((Slot) newSlots[i]);
+        storage.markFreed((Address) newAddresses[i]);
+        newAddresses[i] = ((ANode<Key, Address>) c).store(storage);
+        newSlots[i] = null;
+        if (newChildren != null && newChildren[i] instanceof ANode) {
+          if (newChildren == children0) newChildren = Arrays.copyOf(children0, children0.length);
+          newChildren[i] = _settings.makeReference(newChildren[i]);
+        }
+      }
+    }
+
     // Pass 3: write the flushed/structural children (all resident ⇒ no read).
     for (int i : writeList) {
       ANode child = (ANode) _settings.readReference(children0[i]);
