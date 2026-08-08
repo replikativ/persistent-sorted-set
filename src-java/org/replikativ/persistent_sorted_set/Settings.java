@@ -227,6 +227,12 @@ public class Settings {
   //    multiple entries per op would violate that invariant ⇒ reject.
   //  - diff-buffering: a buffered spine node is addressed by hash(anchor+diff), not its canonical
   //    content hash, which defeats the cross-peer dedup MST exists for ⇒ force off.
+  /** Adopt a restored node's branching factor. See `PersistentSortedSet.root()` for why. */
+  public Settings withBranchingFactor(int branchingFactor) {
+    return new Settings(checkBranchingFactor(branchingFactor), _refType, _edit, _measure,
+                        _leafProcessor, _diffBufSize, _boundary);
+  }
+
   public Settings withBoundary(IBoundary boundary) {
     if (boundary != null && boundary.contentDefined()) {
       if (_leafProcessor != null)

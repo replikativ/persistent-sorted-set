@@ -78,6 +78,34 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       // `makeReference` reads only `_refType`, which none of the adjustments below
       // change, so deferring it is behaviour-preserving for the reference kind.
 
+      // self-describing BRANCHING FACTOR, and it is not optional. The rebalance arms decide
+      // whether a merge FITS from the NODE's settings (`Leaf.java:250` `left._len + centerLen <=
+      // _settings.branchingFactor()`, and its three siblings, plus the Branch twins) while the
+      // resulting array is allocated from the SET's (`ANode.java:259` caps `newLen` at
+      // `settings.branchingFactor()` when editable). Nothing made the two agree, so a node bf
+      // LARGER than the set's overruns the array it was just given.
+      //
+      // Reachable through the shipped codec, which is what makes this urgent rather than
+      // theoretical: `impl.nodes/blob->leaf|blob->branch` rebuild every node with the
+      // `:branching-factor` recorded in its OWN blob, so simply reopening a store with a
+      // different `:branching-factor` than it was written with is enough. Measured, 2000
+      // elements written at bf 64 and reopened at bf 8, one transient `disj`:
+      //
+      //     AssertionError at ANode.<init>:23   (-ea)
+      //     ArrayIndexOutOfBoundsException: last destination index 31 out of bounds for
+      //     object array[8]  in Stitch.copyAll   (-da)
+      //
+      // The persistent path does not throw — it silently builds leaves of up to NODE-bf keys
+      // inside a set that believes it is bf 8, which is worse.
+      //
+      // Adopting is the same principle already applied to the boundary and the diff-buf budget
+      // just below: the data knows the number and the caller cannot be expected to. Unlike
+      // those two this adopts UNCONDITIONALLY rather than only upward from a default, because
+      // there is no safe way to run at a smaller bf over larger nodes.
+      if (root._settings.branchingFactor() != _settings.branchingFactor()) {
+        _settings = _settings.withBranchingFactor(root._settings.branchingFactor());
+      }
+
       // self-describing boundary: a restored node carries its split strategy; adopt it so this
       // set's own conj/disj use the right splitter even when restore opts didn't specify one.
       // Idempotent for the root-handler restore path (settings already carry the boundary).
