@@ -139,6 +139,40 @@
     (set! (.-addresses this) (make-array (alength (.-keys this)))))
   (.-addresses this))
 
+(defn install-slots!
+  "diff-buf restore: install reconstructed slots on a not-yet-published node. The single
+   entry point for a storage/codec handing buffered diffs back to a restored Branch —
+   the ClojureScript twin of JVM `Branch.installSlots`, including its refusal.
+
+   A node carrying buffered diffs whose SETTINGS say buffering is off is an incoherent
+   reconstruction: the storage persisted `:slots` and is now rebuilding the node declaring
+   there is no buffer. Every read of it is then subtly wrong rather than loudly broken —
+   `store` takes the baseline path at budget 0 and writes the node WITHOUT its slots, so
+   the buffered element-changes are silently dropped. Measured on cljs before this check,
+   a restored root with 7 buffered slots whose contents were exact beforehand: one conj,
+   then store and cold restore, lost 13 previously committed elements.
+
+   The JVM has refused this since `Branch.java`'s installSlots; ClojureScript accepted it
+   and lost the data, so the same storage-contract violation was loud on one runtime and
+   silent on the other.
+
+   Refused rather than accommodated, for the same reason as on the JVM: the settings are
+   the storage's to get right — they come from the blob the storage itself wrote — and a
+   library that silently returns the wrong set is worse than one that says which half of
+   the contract was broken."
+  [node slots]
+  (when (and (some? slots)
+             (not (pos? (or (:diff-buf-size (.-settings node)) 0))))
+    (throw (ex-info (str "diff-buf: a node reconstructed with diff-buf-size "
+                         (pr-str (:diff-buf-size (.-settings node)))
+                         " was handed buffered slots. The storage persisted this node's "
+                         "diff buffer and must reconstruct it with the same budget — see "
+                         "IStorage restore and :diff-buf-size.")
+                    {:diff-buf-size (:diff-buf-size (.-settings node))
+                     :slot-count    (count (remove nil? (array-seq slots)))})))
+  (set! (.-_slots node) slots)
+  node)
+
 (defn child
   [^Branch node storage idx {:keys [sync?] :or {sync? true} :as opts}]
   (assert (and (some? idx) (number? idx)))

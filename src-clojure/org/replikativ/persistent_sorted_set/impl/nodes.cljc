@@ -230,7 +230,10 @@
                               :count   (:count entry)
                               :measure (:measure entry)
                               :anchor  (nth av (int idx))}))
-       (set! (.-_slots node) arr))))
+       ;; via install-slots!, not a direct field write: it carries the incoherent-budget
+       ;; refusal (slots handed to a node whose settings say buffering is off), which the
+       ;; JVM has always had at Branch.installSlots and cljs silently accepted.
+       (branch/install-slots! node arr))))
 
 (defn reader-context
   "Bundle the read-side knobs once, so each format module builds it in one call and the
