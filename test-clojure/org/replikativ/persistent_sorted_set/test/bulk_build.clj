@@ -285,15 +285,24 @@
             `avg = (min + max) / 2` with `min = bf >>> 1`, so bf 1 and 2 both give
             avg 1. Before the check, bf=2 spun until OOM rather than failing —
             which is the worst way for a bulk build to be wrong, because it looks
-            like the slow-but-working case it is meant to replace."
+            like the slow-but-working case it is meant to replace.
+
+            bf 3 USED to be listed as workable here. It is not: `min = bf >>> 1`
+            is 1 at bf 3, so a branch of length 1 counts as full, its only child
+            has no sibling to rebalance with, and a removal leaves a length-0 leaf
+            whose `maxKey()` reads index -1. The supported floor is 4, the first
+            factor whose minimum fill is 2 — see test/branching_factor.cljc, which
+            states the rule for both runtimes. `Settings` now refuses 1-3 at
+            construction, so the refusal here arrives as IllegalArgumentException
+            before the bulk builder's own assertion is reached."
     (let [{:keys [storage]} (mk-storage)]
-      (doseq [bf [1 2]]
-        (is (thrown-with-msg? AssertionError #"branching-factor must be >= 3"
+      (doseq [bf [1 2 3]]
+        (is (thrown-with-msg? IllegalArgumentException #"branching-factor"
                               (count (set/from-sorted-seq compare (range 200)
                                                           {:storage storage :branching-factor bf})))
             (str "bf=" bf " must be refused")))
       (testing "and the smallest workable factor does work"
-        (doseq [bf [3 5 7]]
+        (doseq [bf [4 5 7]]
           (is (= 200 (count (set/from-sorted-seq compare (range 200)
                                                  {:storage storage :branching-factor bf})))
               (str "bf=" bf)))))))

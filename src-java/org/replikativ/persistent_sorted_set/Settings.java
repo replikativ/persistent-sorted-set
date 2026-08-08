@@ -104,7 +104,7 @@ public class Settings {
 
   public Settings(int branchingFactor, RefType refType, AtomicReference<Thread> edit, IMeasure measure, ILeafProcessor leafProcessor, int diffBufSize, IBoundary boundary) {
     diffBufSize = diffBufFor(leafProcessor, diffBufSize);
-    _branchingFactor = branchingFactor;
+    _branchingFactor = checkBranchingFactor(branchingFactor);
     _refType = refType;
     _edit = edit;
     _measure = measure;
@@ -137,11 +137,47 @@ public class Settings {
          (leafProcessor != null) ? 0 : defaultDiffBufSize());
   }
 
+  /** The smallest branching factor this implementation supports.
+   *
+   *  `minBranchingFactor()` is `bf >>> 1`, so bf 2 and bf 3 both give a MINIMUM FILL OF 1.
+   *  A non-root branch of length 1 is then "legally filled", its single child has no
+   *  siblings, and `Leaf.remove`'s no-rebalance arm (`left == null && right == null`)
+   *  returns a length-0 leaf. The parent immediately reads `maxKey()` on it, i.e.
+   *  `_keys[-1]`. Measured: bf 2 and bf 3 both throw
+   *  `ArrayIndexOutOfBoundsException: Index -1 out of bounds for length 0` on ordinary
+   *  add/remove sequences (bf 2 on 40/40 random seeds, bf 3 on 30/40), while bf 4 and every
+   *  larger factor tested — 5, 6, 7, 8, 15, 16, 17, 32, 33, 64 — pass 40/40. ClojureScript
+   *  does not throw there; it retains the empty leaf and starts yielding `nil` ELEMENTS from
+   *  a set whose constructor refuses nil, with `count` disagreeing with `seq`.
+   *
+   *  bf 4 is the first factor whose minimum fill is 2, which is what a B-tree needs for a
+   *  merge to be able to restore a valid node. So this is the real floor, not a chosen one.
+   *
+   *  A non-positive value means UNSET and takes {@link #DEFAULT_BRANCHING_FACTOR}; that is
+   *  long-standing behaviour (`Settings()` delegates with 0) and stays. Only an explicit
+   *  1, 2 or 3 is refused — a caller who names one is asking for a tree that cannot work. */
+  public static final int MIN_BRANCHING_FACTOR = 4;
+
+  public static final int DEFAULT_BRANCHING_FACTOR = 512;
+
+  private static int checkBranchingFactor(int branchingFactor) {
+    if (branchingFactor <= 0) return DEFAULT_BRANCHING_FACTOR;   // unset
+    if (branchingFactor < MIN_BRANCHING_FACTOR) {
+      throw new IllegalArgumentException(
+        "branching-factor " + branchingFactor + " is not supported: the minimum is "
+        + MIN_BRANCHING_FACTOR + ". Below it the minimum fill (bf >>> 1) is 1, so a branch of "
+        + "length 1 is considered full, its only child has no sibling to rebalance with, and a "
+        + "removal leaves a length-0 leaf whose maxKey() reads index -1. Measured: bf 2 and 3 "
+        + "throw ArrayIndexOutOfBoundsException on ordinary add/remove sequences on the JVM and "
+        + "silently yield nil elements in ClojureScript. Pass 0 (or omit it) for the default of "
+        + DEFAULT_BRANCHING_FACTOR + ".");
+    }
+    return branchingFactor;
+  }
+
   // Normalizing constructor with explicit diffBufSize (used by the Clojure API).
   public Settings(int branchingFactor, RefType refType, IMeasure measure, ILeafProcessor leafProcessor, int diffBufSize) {
-    if (branchingFactor <= 0) {
-      branchingFactor = 512;
-    }
+    branchingFactor = checkBranchingFactor(branchingFactor);
     if (null == refType) {
       refType = RefType.SOFT;
     }

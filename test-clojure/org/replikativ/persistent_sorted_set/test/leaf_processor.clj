@@ -921,6 +921,26 @@
                      nil)
                    (catch IllegalStateException e e))]
         (is (some? e) "opening it with a processor must be refused, not silently mis-read")
+        ;; EVERY call, not just the first. `root()` used to publish `_root` BEFORE
+        ;; running this check, and the `root == null` guard at the top means a second
+        ;; entry takes the early return — so the refusal fired once and then stopped,
+        ;; leaving the set at diffBufSize 0 over nodes carrying slots, which is exactly
+        ;; the state it exists to prevent. Measured before the fix: 1st root() THREW,
+        ;; 2nd root() NO-THROW. Every read and every write calls `root()`, so a single
+        ;; `count` was enough to arm it.
+        (let [again (try (let [s2 (set/restore-by compare a1 storage
+                                                  (-> plain
+                                                      (dissoc :diff-buf-size)
+                                                      (assoc :leaf-processor (identity-processor))))]
+                           (try (.root ^PersistentSortedSet s2) (catch IllegalStateException _ nil))
+                           ;; second call on the SAME set
+                           (.root ^PersistentSortedSet s2)
+                           nil)
+                         (catch IllegalStateException e2 e2))]
+          (is (some? again)
+              "the refusal must fire on the SECOND root() call too — a guard that
+               disarms itself after one throw is worse than no guard, because the
+               caller has already been told the store is unusable"))
         (is (re-find #"leafProcessor" (str (.getMessage ^IllegalStateException e)))
             (str "and the message must name the conflict, got: "
                  (some-> ^IllegalStateException e .getMessage)))))))

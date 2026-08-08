@@ -19,7 +19,14 @@
    :diff-buf-size default-diff-buf-size})
 
 (defn- with-defaults [opts]
-  (merge default-opts opts))
+  ;; nil-AWARE: a plain `merge` lets an explicit nil beat the default, which the JVM's
+  ;; `map->settings` never does — it uses `(or (:diff-buf-size m) (default))` and normalizes
+  ;; a non-positive branching factor to 512. Measured before this, `{:branching-factor nil}`
+  ;; gave a 3-element set on the JVM and exhausted the Node heap here (`arr-partition-approx`
+  ;; loops forever with a chunk length of 0), and `{:diff-buf-size nil}` gave the JVM default
+  ;; but 0 here.
+  (reduce-kv (fn [acc k v] (if (nil? v) acc (assoc acc k v)))
+             default-opts opts))
 
 (defn from-sorted-array
   "Fast path to create a set if you already have a sorted array of elements on your hands."

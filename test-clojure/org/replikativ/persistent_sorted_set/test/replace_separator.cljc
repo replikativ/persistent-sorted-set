@@ -108,3 +108,71 @@
                   "3000 elements at bf 16 must be at least three levels"))
        :cljs (is true "depth is asserted on the JVM; the cljs failure was
                        per-leaf and visible at every shape above"))))
+
+;; ---------------------------------------------------------------------------
+;; The half of C2 that value equality alone cannot see
+;;
+;; The cases above use elements whose `=` agrees with the set comparator, so
+;; `not= new-max-key keys[idx]` is a sufficient test and ClojureScript passed
+;; them. The defect needs a type whose `=` is COARSER than the comparator —
+;; datahike's Datom, where `equiv-datom` compares e/a/v while `cmp-datoms-eavt`
+;; orders by e/a/v/tx. Then `=` says "same element", the separator is left naming
+;; the OLD one, and a later descent routes past the child that holds the new one.
+;;
+;; The JVM got `separatorMoved` (value equality OR the projection comparator);
+;; ClojureScript kept the bare `not=` until this test was written. Measured,
+;; elements that `seq` lists but `lookup` cannot find:
+;;
+;;     bf  4 n   40    JVM 0    cljs 19
+;;     bf  8 n  400    JVM 0    cljs 99
+;;     bf 16 n 3000    JVM 0    cljs 374
+;;
+;; `count` and `seq` were both correct throughout — only lookup failed.
+
+(deftype CoarseE [a b]
+  Object
+  (toString [_] (str "CoarseE[" a " " b "]"))
+  #?@(:clj  [clojure.lang.IPersistentCollection
+             (equiv [_ o] (and (instance? CoarseE o) (= a (.-a ^CoarseE o))))]
+      :cljs [IEquiv
+             (-equiv [_ o] (and (instance? CoarseE o) (= a (.-a o))))]))
+
+(defn- coarse-set-cmp [^CoarseE x ^CoarseE y]
+  (let [c (compare (.-a x) (.-a y))]
+    (if (zero? c) (compare (.-b x) (.-b y)) c)))
+
+(defn- coarse-op-cmp [^CoarseE x ^CoarseE y] (compare (.-a x) (.-a y)))
+
+(deftest a-separator-must-move-when-the-comparator-says-so-even-if-equals-does-not
+  (testing "an element type whose `=` ignores a field the set orders by. Every
+            replaced element must still be findable; the CONTROL below uses plain
+            vectors, whose `=` is exact, and must be clean on both runtimes — if
+            it is not, the probe is wrong rather than the code."
+    (doseq [[bf n] [[4 40] [8 400] [16 3000]]]
+      (let [base  (reduce #(s/conj %1 %2 coarse-set-cmp)
+                          (s/sorted-set* {:comparator coarse-set-cmp
+                                          :branching-factor bf})
+                          (map #(CoarseE. % 0) (range n)))
+            after (reduce (fn [st i] (s/replace st (CoarseE. i 0) (CoarseE. i 5) coarse-op-cmp))
+                          base (range n))
+            missing (for [i (range n)
+                          :when (nil? (s/lookup after (CoarseE. i 5) coarse-set-cmp))]
+                      i)]
+        (is (= n (count after)) (str "bf=" bf " n=" n ": count"))
+        (is (= n (count (elems after))) (str "bf=" bf " n=" n ": seq length"))
+        (is (empty? missing)
+            (str "bf=" bf " n=" n ": " (count missing) " elements that `seq` lists"
+                 " but `lookup` cannot find, first " (vec (take 8 missing))))))))
+
+(deftest the-coarse-equality-probe-is-sound
+  (testing "the same experiment with plain vectors, whose `=` is exact — this must
+            be clean regardless, and was on both runtimes even before the fix"
+    (doseq [[bf n] [[4 40] [8 400]]]
+      (let [base  (reduce #(s/conj %1 %2 compare)
+                          (s/sorted-set* {:comparator compare :branching-factor bf})
+                          (map #(vector % 0) (range n)))
+            after (reduce (fn [st i] (s/replace st [i 0] [i 5]
+                                                (fn [x y] (compare (first x) (first y)))))
+                          base (range n))]
+        (is (empty? (for [i (range n) :when (nil? (s/lookup after [i 5] compare))] i))
+            (str "bf=" bf " n=" n ": control must be clean"))))))

@@ -59,7 +59,25 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     ANode root = (ANode<Key, Address>) _settings.readReference(_root);
     if (root == null && _address != null) {
       root = _storage.restore(_address);
-      _root = _settings.makeReference(root);
+      // NOTE the publish of `_root` is at the END of this block, not here. Everything
+      // below adjusts `_settings` from what the restored node turns out to carry, and one
+      // arm of it THROWS. Publishing first made both of those skippable, because the
+      // `root == null` guard above means a second entry never re-runs them:
+      //
+      //   * the leafProcessor refusal degraded into silent data loss. Measured, single
+      //     threaded: 1st root() -> THREW, 2nd root() -> NO-THROW with the set left at
+      //     diffBufSize 0 over nodes carrying slots — precisely the state the refusal
+      //     exists to prevent. Every read and every write calls root(), so one `count`
+      //     was enough to arm it.
+      //   * the diff-buf and boundary adoptions became racy: another thread observing the
+      //     published `_root` before the `_settings` write proceeds at budget 0 over
+      //     buffered nodes, and its next write drops their buffered elements.
+      //
+      // Publishing last makes the adopted settings visible before anything can use the
+      // root, and makes the refusal fire on every call rather than only the first.
+      // `makeReference` reads only `_refType`, which none of the adjustments below
+      // change, so deferring it is behaviour-preserving for the reference kind.
+
       // self-describing boundary: a restored node carries its split strategy; adopt it so this
       // set's own conj/disj use the right splitter even when restore opts didn't specify one.
       // Idempotent for the root-handler restore path (settings already carry the boundary).
@@ -114,6 +132,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
           _settings = _settings.withDiffBufSize(root._settings.diffBufSize());
         }
       }
+      _root = _settings.makeReference(root);   // PUBLISH LAST — see the note above
     }
     // A DIRTY root (no address) must be held strongly — see markDirty. If it is gone
     // there is no durable copy to fall back on, so say so rather than dereference null

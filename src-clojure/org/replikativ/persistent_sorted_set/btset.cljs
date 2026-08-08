@@ -2004,9 +2004,52 @@
           (recur (inc i) (inc i) (conj! out (.slice arr start (inc i))))
           (recur (inc i) start out))))))
 
+
+;; ---------------------------------------------------------------------------
+;; Supported branching factors — must agree with Settings.MIN_BRANCHING_FACTOR
+;; on the JVM (4) and with `Settings.checkBranchingFactor`'s treatment of an
+;; unset value.
+;;
+;; Below 4 the minimum fill (`bf >>> 1`) is 1, so a branch of length 1 counts as
+;; full, its only child has no sibling to rebalance with, and a removal leaves a
+;; length-0 leaf. The JVM then throws (`maxKey()` reads index -1); ClojureScript
+;; does not — it keeps the empty leaf and starts yielding `nil` ELEMENTS out of a
+;; set whose constructor refuses nil, with `count` disagreeing with `seq`.
+;; Measured, bf 2, one random seed: `count` 41 for 39 real elements, 5 leaves of
+;; length 0, and 11 structural violations reported by `diagnostics/validate`.
+;;
+;; A non-positive or absent value means UNSET and takes the default, matching the
+;; JVM where `Settings()` delegates with 0. Only an explicit 1, 2 or 3 is refused.
+(def ^:const MIN-BRANCHING-FACTOR 4)
+(def ^:const DEFAULT-BRANCHING-FACTOR 512)
+
+(defn check-branching-factor
+  "Normalize an unset branching factor to the default and refuse an unsupported one."
+  [bf]
+  (let [bf (if (or (nil? bf) (not (pos? bf))) DEFAULT-BRANCHING-FACTOR bf)]
+    (when (< bf MIN-BRANCHING-FACTOR)
+      (throw (ex-info (str "branching-factor " bf " is not supported: the minimum is "
+                           MIN-BRANCHING-FACTOR ". Below it the minimum fill (bf >>> 1) is 1, "
+                           "so a branch of length 1 is considered full, its only child has no "
+                           "sibling to rebalance with, and a removal leaves a length-0 leaf. "
+                           "Measured: this yields nil elements and a count that disagrees with "
+                           "seq in ClojureScript, and throws ArrayIndexOutOfBoundsException on "
+                           "the JVM. Omit :branching-factor for the default of "
+                           DEFAULT-BRANCHING-FACTOR ".")
+                      {:branching-factor bf :min MIN-BRANCHING-FACTOR})))
+    bf))
+
+(defn- node-settings
+  "The settings a node carries, normalized and validated exactly as the JVM's
+   `Settings` constructor does."
+  [opts]
+  (-> (select-keys opts [:branching-factor :measure :boundary :diff-buf-size])
+      (update :branching-factor check-branching-factor)
+      (update :diff-buf-size (fn [d] (if (or (nil? d) (neg? d)) 0 d)))))
+
 (defn ^BTSet from-sorted-array
   [cmp arr _len opts]
-  (let [settings (select-keys opts [:branching-factor :measure :boundary :diff-buf-size])
+  (let [settings (node-settings opts)
         measure-ops (:measure settings)
         storage  (:storage opts)
         bd       (b/content-boundary settings)]
@@ -2187,7 +2230,7 @@
    Input MUST be sorted and distinct under `cmp`; this is checked, because the
    alternative is a silently corrupt tree."
   [cmp xs {:keys [sync? storage flush-fn] :or {sync? true} :as opts}]
-  (let [settings    (select-keys opts [:branching-factor :measure :boundary :diff-buf-size])
+  (let [settings    (node-settings opts)
         measure-ops (:measure settings)
         max-bf      (max-len settings)
         avg-bf      (avg-len settings)
@@ -2206,7 +2249,7 @@
     ;; of k nodes produces k nodes again and the tree grows upward forever. The
     ;; JVM can afford `assert` here; ClojureScript cannot.
     (when (< avg-bf 2)
-      (throw (ex-info (str "branching-factor must be >= 3 for a streaming build (got avg fanout "
+      (throw (ex-info (str "branching-factor must be >= 4 for a streaming build (got avg fanout "
                            avg-bf "); a fanout of 1 never reduces the level count")
                       {:type :pss/branching-factor-too-small :avg avg-bf})))
     (async+sync
@@ -2297,7 +2340,7 @@
    - :measure  Measure implementation (IMeasure protocol)
    - :meta     Metadata"
   [opts]
-  (let [settings (select-keys opts [:branching-factor :measure :boundary :diff-buf-size])]
+  (let [settings (node-settings opts)]
     (BTSet. (Leaf. (arrays/array) settings nil) 0 (or (:comparator opts) (:cmp opts) compare)
             (:meta opts) UNINITIALIZED_HASH (:storage opts) nil settings)))
 

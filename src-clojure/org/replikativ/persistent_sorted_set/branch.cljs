@@ -876,7 +876,33 @@
                              ;; `not=` (Clojure `=`, i.e. -equiv) rather than identity: a Datom
                              ;; implements equiv but not reference equality, so this propagates
                              ;; exactly when the element really changed.
-                             max-key-changed (not= new-max-key (arrays/aget keys idx))]
+                             ;; Mirrors the JVM's `separatorMoved` (Branch.java:1596). VALUE
+                             ;; equality alone is not enough: it answers "is this the same
+                             ;; element?", and the question here is "does the separator still
+                             ;; sit where the SET's comparator puts it?". Those come apart for
+                             ;; any type whose `=` is COARSER than the set comparator —
+                             ;; datahike's Datom, whose `equiv-datom` compares e/a/v while
+                             ;; `cmp-datoms-eavt` orders by e/a/v/tx. `not=` then says
+                             ;; "unchanged", the separator is left naming the OLD element, and
+                             ;; a later descent comparing the new element against that stale
+                             ;; separator routes past the child that holds it.
+                             ;;
+                             ;; Measured with an element type whose `=` ignores a field the set
+                             ;; orders by, value-changing upsert over the whole set, elements
+                             ;; that `seq` still lists but `lookup` cannot find:
+                             ;;
+                             ;;     bf  4 n   40   JVM 0   cljs 19
+                             ;;     bf  8 n  400   JVM 0   cljs 99
+                             ;;     bf 16 n 3000   JVM 0   cljs 374
+                             ;;
+                             ;; A control with plain vectors (exact `=`) is 0 on both, so the
+                             ;; probe is sound. This was fixed on the JVM and not ported here.
+                             max-key-changed
+                             (let [old-sep (arrays/aget keys idx)
+                                   pcmp    (.-_projCmp this)]
+                               (or (not= new-max-key old-sep)
+                                   (nil? pcmp)
+                                   (not (zero? (pcmp new-max-key old-sep)))))]
                          (if max-key-changed
                            ;; maxKey changed - update keys array
                            ;; Clone arrays. There is no in-place arm: see

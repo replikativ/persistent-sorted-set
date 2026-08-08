@@ -239,7 +239,7 @@
          ;; Verified: bf=2 ran to OutOfMemoryError rather than failing. The
          ;; streaming builder got this guard first; the arithmetic is shared.
          _                    (assert (>= avg-branching-factor 2)
-                                      (str "branching-factor must be >= 3 (got avg fanout "
+                                      (str "branching-factor must be >= 4 (got avg fanout "
                                            avg-branching-factor "); a fanout of 1 never "
                                            "reduces the level count"))
          storage              (:storage opts)
@@ -313,7 +313,7 @@
   ;; upward forever. avg = (min+max)/2 with min = bf>>>1, so this means bf >= 3.
   ;; Checked rather than left to hang — bf=2 spun until OOM.
   (assert (>= avg 2)
-          (str "branching-factor must be >= 3 for a streaming build (got avg fanout "
+          (str "branching-factor must be >= 4 for a streaming build (got avg fanout "
                avg "); a fanout of 1 never reduces the level count"))
   (let [need (* 2 avg)
         fill (fn [buf s]
