@@ -728,6 +728,16 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   }
 
   public PersistentSortedSet disjoin(Object key, Comparator cmp) {
+    // BEFORE the mode split: a stale transient handle must be refused in BOTH modes. This used
+    // to sit below the content-defined arm, so `disj!` on a sealed handle took the MST path and
+    // silently degraded to a persistent remove — it returned a NEW set and left the handle the
+    // caller kept unchanged. Since discarding the return value is the whole point of a
+    // transient, the delete was lost with no signal. Measured, bf 8, 100 elements, a handle
+    // sealed by `persistent!`: count mode threw IllegalAccessError, MST returned a new set of
+    // count 99 while the stale handle still had 100 and still contained the key.
+    // `cons` and `replace` always guarded both modes; only this one did not.
+    ensureLiveTransient();
+
     // split-seam (MST/content mode): sibling-free removeContent recursion, then collapse a
     // single-child root (count path below is untouched / byte-identical).
     if (_settings.boundary().contentDefined()) {
@@ -750,7 +760,6 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       return new PersistentSortedSet(_meta, _cmp, null, _storage, newRoot, newCount, _settings, _version + 1);
     }
 
-    ensureLiveTransient();
     final ANode<Key, Address> r = root();
     ANode[] nodes = r.remove(_storage, (Key) key, null, null, cmp, _settings);
 

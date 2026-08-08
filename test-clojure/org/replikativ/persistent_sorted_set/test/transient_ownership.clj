@@ -24,7 +24,8 @@
    every later `binarySearch` on the set is arbitrary — and it is durable the
    moment the set is stored."
   (:require [clojure.test :refer [deftest testing is]]
-            [org.replikativ.persistent-sorted-set :as s]))
+            [org.replikativ.persistent-sorted-set :as s]
+            [org.replikativ.persistent-sorted-set.boundary :as b]))
 
 (defn- opts [] {:branching-factor 32 :comparator compare})
 
@@ -32,17 +33,32 @@
   (testing "using a transient after persistent! throws, as every Clojure transient
             does. It used to answer `editable() == false` and quietly take the
             PERSISTENT path — so `conj!` returned a new set and the caller's
-            mutation went somewhere they were not looking."
-    (let [t (transient (s/sorted-set* (opts)))
-          _ (conj! t 1)
-          p (persistent! t)]
-      (is (not (identical? p t))
-          "persistent! returns a NEW set — which is what makes the stale handle detectable")
-      (is (= [1] (vec (seq p))) "and the result is a usable persistent set")
-      (doseq [[label op] [["conj!" #(conj! t 2)] ["disj!" #(disj! t 1)]]]
-        (let [e (try (op) nil (catch Throwable e e))]
-          (is (instance? IllegalAccessError e) (str label ": expected IllegalAccessError"))
-          (is (= "Transient used after persistent! call" (ex-message e)) label))))))
+            mutation went somewhere they were not looking.
+
+            BOTH boundary modes, because they are separate code paths and only one
+            was covered. `disjoin` split on `boundary().contentDefined()` BEFORE
+            calling `ensureLiveTransient`, so under a content-defined (MST) boundary
+            a stale `disj!` silently degraded to a persistent remove: it returned a
+            NEW set and left the caller's handle untouched. Since discarding the
+            return value is the whole point of a transient, the delete was lost with
+            no signal. Measured at bf 8 / 100 elements: count mode threw, MST
+            returned a set of count 99 while the stale handle still held 100 and
+            still contained the key. `conj!` and `replace` always guarded both."
+    (doseq [[mode o] [[:count (opts)]
+                      [:mst (assoc (opts) :boundary (b/mst-boundary 4))]]]
+      (let [t (transient (s/sorted-set* o))
+            _ (conj! t 1)
+            p (persistent! t)]
+        (is (not (identical? p t))
+            (str mode ": persistent! returns a NEW set — which is what makes the stale
+                 handle detectable"))
+        (is (= [1] (vec (seq p))) (str mode ": and the result is a usable persistent set"))
+        (doseq [[label op] [["conj!" #(conj! t 2)] ["disj!" #(disj! t 1)]]]
+          (let [e (try (op) nil (catch Throwable e e))]
+            (is (instance? IllegalAccessError e)
+                (str mode " " label ": expected IllegalAccessError, got " (pr-str e)))
+            (is (= "Transient used after persistent! call" (ex-message e))
+                (str mode " " label))))))))
 
 (deftest a-set-that-was-never-transient-is-unaffected
   (testing "the stale-handle guard must not touch ordinary persistent use"
