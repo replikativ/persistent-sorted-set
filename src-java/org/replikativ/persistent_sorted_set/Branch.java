@@ -625,16 +625,39 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   }
 
   /**
-   * Helper to get subtree count from an ANode.
+   * Helper to get subtree count from an ANode, for the IN-MEMORY probe above ONLY.
+   *
+   * Returns -1 for a Branch whose count is unknown, rather than computing it. That is what
+   * tryComputeSubtreeCountFromChildren documents ("or has unknown count") and what the
+   * ClojureScript twin has always done; this side computed instead, and computeSubtreeCount
+   * descends through child(storage, i), which RESTORES every node below.
+   *
+   * The probe bails at the first non-resident child, scanning left to right, so it only ran
+   * to completion when a resident prefix reached the end — which `remove` arranges by
+   * materialising idx-1, idx and idx+1. At root fanout 2 that is every child, so one disj on
+   * a cold tree pulled in the whole thing. Measured, n=80000, a storage that does not persist
+   * counts:
+   *
+   *   bf  16  root fanout   2   11426 of 11426 blobs restored   (100%)
+   *   bf  64  root fanout   2    2580 of  2580 blobs restored   (100%)
+   *   bf  32  root fanout  19     547 restored for a LEFT-edge delete, 10 for a middle one
+   *   bf 512  root fanout 312       3-4 restored
+   *
+   * It is a one-time warmup, not an ongoing cost — the walk caches counts into the children it
+   * visits, so of 20 successive deletes only the first paid (11425, then 0 x19). What it costs
+   * is a latency spike on the first write after a restore and, worse, a resident set of the
+   * WHOLE tree, which is exactly the bound `:ref-type` exists to enforce.
+   *
+   * Returning -1 does not lose the count: the caller stores -1, and PersistentSortedSet already
+   * treats a negative root count as "unknown" and defers to count(), which computes and caches
+   * on demand. So the work moves to whoever actually asks for a count, instead of every delete.
    */
   private static long getSubtreeCount(ANode node, IStorage storage) {
     if (node instanceof ISubtreeCount) {
       long count = ((ISubtreeCount) node).subtreeCount();
       if (count >= 0) return count;
-      // Branch with unknown count - compute it
-      if (node instanceof Branch) {
-        return ((Branch) node).computeSubtreeCount(storage);
-      }
+      // Branch with unknown count: propagate unknown. Computing here would restore the subtree.
+      if (node instanceof Branch) return -1;
     }
     return node.count(storage);
   }
