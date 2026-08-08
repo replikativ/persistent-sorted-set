@@ -27,23 +27,50 @@
    2-8, and at n=800/lzpl=4 that was 46 of 46, the entire index. That second form is the
    dangerous one, because nothing fails; it just stops sharing.
 
-   The test asserts BOTH: the cold path works, and the write amplification stays bounded."
+   The test asserts BOTH: the cold path works, and the write amplification stays bounded.
+   Verified RED against the pre-fix `branch.cljs`, reproducing both forms exactly:
+
+     cold   Assert failed: (or (and (some? (.-children node)) ...))
+     warm   bf=32 n=200 lzpl=4: warm conj wrote 9 of 9 blobs
+            bf=32 n=800 lzpl=4: warm conj wrote 46 of 46 blobs
+
+   Two things had to be right for it to reach the defect at all, and getting either wrong
+   made it pass while testing nothing:
+
+     * the STORAGE must carry the boundary (see below), and
+     * elements must be [k v] pairs ordered on the first component. The MST boundary derives
+       a key's level from the key, so the element type decides where boundaries fall; plain
+       integers give a shape that does not trigger this."
   (:require [clojure.test :refer [deftest testing is]]
             [org.replikativ.persistent-sorted-set :as set]
             [org.replikativ.persistent-sorted-set.boundary :as b]
             #?(:clj  [org.replikativ.persistent-sorted-set.test.storage :as tstore])
             #?(:cljs [org.replikativ.persistent-sorted-set.test.storage.util :as util]))
-  #?(:clj (:import [org.replikativ.persistent_sorted_set Settings])))
+  #?(:clj (:import [org.replikativ.persistent_sorted_set Settings IBoundary])))
 
-(def ^:private cmp compare)
+;; Elements are [k v] pairs ordered on the FIRST component. The MST boundary derives a key's
+;; level from the key itself, so the element type decides where boundaries land and therefore
+;; which rebuild arms run at all — plain integers give a different, and here non-triggering,
+;; shape.
+(def ^:private cmp (fn [a b] (compare (first a) (first b))))
 
+;; THE STORAGE MUST CARRY THE BOUNDARY. `branch/add` reads `(content-boundary (.-settings this))`
+;; — the NODE's settings — and a restored node carries the STORAGE's. A storage built without
+;; the boundary hands back nodes that take the ordinary, non-MST arm, so `mst-branch-add` is
+;; never reached and this whole namespace passes while testing nothing. That is exactly how the
+;; first version of this test came out green against the unfixed code.
 #?(:clj
    (do
-     (defn- storage [disk bf] (tstore/->Storage (atom {}) disk (Settings. (int bf) nil nil nil (int 0))))
+     (defn- storage [disk bf lz]
+       (tstore/->Storage (atom {}) disk
+                         (.withBoundary (Settings. (int bf) nil nil nil (int 0))
+                                        ^IBoundary (b/mst-boundary lz))))
      (defn- restore* [addr st opts] (set/restore-by cmp addr st opts)))
    :cljs
    (do
-     (defn- storage [disk bf] (util/storage (atom {}) disk {:branching-factor bf :diff-buf-size 0 :comparator cmp}))
+     (defn- storage [disk bf lz]
+       (util/storage (atom {}) disk {:branching-factor bf :diff-buf-size 0 :comparator cmp
+                                     :boundary (b/mst-boundary lz)}))
      (defn- restore* [addr st opts] (set/restore addr st opts))))
 
 (defn- elems [s] (vec #?(:clj (seq s) :cljs (set/seq s))))
@@ -56,26 +83,26 @@
     (doseq [[bf n lzpl] cases]
       (let [opts  {:comparator cmp :branching-factor bf :boundary (b/mst-boundary lzpl)}
             disk  (atom {})
-            s0    (reduce #(set/conj %1 %2 cmp) (set/sorted-set* opts) (range n))
-            addr  (set/store s0 (storage disk bf))
+            s0    (reduce #(set/conj %1 [%2 0] cmp) (set/sorted-set* opts) (range n))
+            addr  (set/store s0 (storage disk bf lzpl))
             blobs (count @disk)
             lbl   (str "bf=" bf " n=" n " lzpl=" lzpl)
 
             ;; COLD: restore and conj without materializing anything first. This is where
             ;; the missing addresses surface as "neither child nor address".
-            cold  (restore* addr (storage disk bf) opts)
-            grown (set/conj cold n cmp)]
+            cold  (restore* addr (storage disk bf lzpl) opts)
+            grown (conj cold [n 0])]
         (is (= (inc n) (count (elems grown)))
             (str lbl ": a cold restore + one conj must yield n+1 elements"))
-        (is (= (vec (range (inc n))) (elems grown))
+        (is (= (mapv #(vector % 0) (range (inc n))) (elems grown))
             (str lbl ": and the contents must be exact"))
 
         ;; and it must still be storable — the state above is only detectable at store time
         ;; on some shapes, because a nil address is not read until something writes.
         (let [before (count (keys @disk))
-              a2     (set/store grown (storage disk bf))
+              a2     (set/store grown (storage disk bf lzpl))
               wrote  (- (count (keys @disk)) before)]
-          (is (= (vec (range (inc n))) (elems (restore* a2 (storage disk bf) opts)))
+          (is (= (mapv #(vector % 0) (range (inc n))) (elems (restore* a2 (storage disk bf lzpl) opts)))
               (str lbl ": round-trips after the conj"))
           ;; Write amplification: one conj touches its path, not the index. The broken
           ;; version rewrote up to 100% of the blobs; the JVM writes single digits. The
@@ -91,18 +118,18 @@
     (doseq [[bf n lzpl] cases]
       (let [opts  {:comparator cmp :branching-factor bf :boundary (b/mst-boundary lzpl)}
             disk  (atom {})
-            s0    (reduce #(set/conj %1 %2 cmp) (set/sorted-set* opts) (range n))
-            addr  (set/store s0 (storage disk bf))
+            s0    (reduce #(set/conj %1 [%2 0] cmp) (set/sorted-set* opts) (range n))
+            addr  (set/store s0 (storage disk bf lzpl))
             blobs (count @disk)
-            warm  (restore* addr (storage disk bf) opts)
+            warm  (restore* addr (storage disk bf lzpl) opts)
             _     (dorun (elems warm))                    ; materialize everything
-            grown (set/conj warm n cmp)
+            grown (conj warm [n 0])
             before (count (keys @disk))
-            a2    (set/store grown (storage disk bf))
+            a2    (set/store grown (storage disk bf lzpl))
             wrote (- (count (keys @disk)) before)
             lbl   (str "bf=" bf " n=" n " lzpl=" lzpl)]
-        (is (= (vec (range (inc n))) (elems grown)) (str lbl ": contents"))
-        (is (= (vec (range (inc n))) (elems (restore* a2 (storage disk bf) opts)))
+        (is (= (mapv #(vector % 0) (range (inc n))) (elems grown)) (str lbl ": contents"))
+        (is (= (mapv #(vector % 0) (range (inc n))) (elems (restore* a2 (storage disk bf lzpl) opts)))
             (str lbl ": round-trips"))
         (is (< wrote (max 8 (quot blobs 4)))
             (str lbl ": warm conj wrote " wrote " of " blobs " blobs"))))))
