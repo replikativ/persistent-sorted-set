@@ -476,12 +476,45 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     return true;
   }
 
-  // D2 option D: a branch-marker slot caches the child's whole-subtree buffered total as of
-  // DEPOSIT time. store() settles that child IN PLACE, so every OTHER version whose parent slot
-  // points at the same child object keeps the pre-settle total AND a stale anchor: the child's
-  // durable image no longer describes it, so assembleNested would build a diff against the
-  // child's POST-settle children rather than against `anchor`. Detect it (post-order, O(1) per
-  // slot) and poison the slot so Pass 1 writes the child wholesale.
+  // A branch-marker slot caches the child's whole-subtree buffered total as of DEPOSIT time.
+  // store() settles that child IN PLACE, so every OTHER version whose parent slot points at the
+  // same child object keeps the pre-settle total. Detect it post-order and poison the slot so
+  // Pass 1 writes the child wholesale.
+  //
+  // WHAT THIS DOES AND DOES NOT PROTECT — measured, so it is not re-litigated:
+  //
+  //   * It does NOT protect CONTENT. Of ~1175 stale slots observed with this repair DISABLED,
+  //     not one was ever actually buffered: the per-node budget test in Pass 2 flushed every
+  //     one. 0 content mismatches over 13164 trials (bf 4-16, B 1-256, four sharing orders
+  //     including forks and descendant-first). The budget test is what stands between a stale
+  //     slot and a wrong blob, not this walk.
+  //   * It does NOT protect the ANCHOR. The same settle calls markFreed on the anchor that the
+  //     other version's slot still names; with this repair ON or OFF the resulting dangling
+  //     anchors are byte-identical (25 read failures / 768 trials against a storage that
+  //     reclaims). See .internal/NEXT_SESSION.md — that is a separate, open defect, and it also
+  //     originates from LEAF-diff slots, which this walk never inspects.
+  //   * It DOES keep the delta-maintained bufEntries consistent with a fresh subtree walk, i.e.
+  //     it is what makes the -ea oracle assertBufEntries hold. Dropping the recursion below
+  //     costs 9 oracle failures / 1080 trials; dropping the repair entirely costs 21. Every one
+  //     is the oracle, never a content mismatch.
+  //
+  // WHY A STALE VALUE IS ALWAYS SAFE-HIGH (never stale-LOW, which WOULD be a correctness bug,
+  // since an under-count would let a blob exceed the budget B):
+  //
+  //   A published node's `entries` never increases. The only in-place writers are installSlots
+  //   (pre-publish, or on a node owned by the current transient), the BUF_LAZY->sum CAS
+  //   (resolution, not a change), this method (-> BUF_WRITE), and the settle. At a settle,
+  //   entries - embedded = the sum of csz[i] over bufferable children that were FLUSHED, and a
+  //   child is flushed with slotBE > 0 only when embedded + csz[i] > B (Pass 2 non-fit) or
+  //   embedded > B (the D3 overflow arm). So `entries` strictly decreases only if the
+  //   pre-settle value already exceeded B — which is exactly the value the other version's slot
+  //   cached. Hence stale implies over budget implies flushed. Measured: 0 stale-LOW and 0
+  //   over-budget blobs across 8100 trials with this repair disabled.
+  //
+  // Kept because the cost is inside the noise floor (-2.1% to +2.4% on a store-heavy workload,
+  // against a +-5-10% run-to-run spread), so there is nothing to buy by removing it. An earlier
+  // measurement of +4-12% was an artifact: that build incremented an AtomicLong per slot
+  // scanned, and the comparison arm skipped the counters along with the walk.
   private void refreshMarkerSlots(IStorage storage) {
     for (;;) {
       NodeState<Address> s = _state;
