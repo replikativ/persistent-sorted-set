@@ -106,5 +106,22 @@
             correctly — a fix that moved BOTH numbers would be doing something else"
     (let [{:keys [resident-before cleared resident-after expected actual]} (run 20000 false)]
       (is (pos? cleared) (str "count mode cleared " cleared))
-      (is (< resident-after resident-before) "count mode still evicts")
+      (is (< resident-after (* 0.8 resident-before))
+          (str "count mode pinned " resident-after " of " resident-before
+               " — a BOUND, not merely `<`, which one evicted node would satisfy"))
       (is (= expected actual) "contents"))))
+
+;; SCOPE OF THIS NAMESPACE, since it is easy to expect more of it than it gives.
+;;
+;; `count-mode-is-unchanged` is a CONTROL: it shows the MST wrapping did not move the count
+;; path. It is not, and cannot be, a guard on the count-mode wraps themselves — those run
+;; inside `store()`, and this namespace deliberately does no second store (see the ns
+;; docstring). Verified rather than assumed: disabling both count-mode passthrough wraps
+;; leaves every number here identical (bare-strong-with-address 24, resident 4033/6598,
+;; cleared 2565 — the same with them on).
+;;
+;; The wraps ARE guarded, by `ref_type_diff_buf/diff-buf-honours-ref-type`, which checks the
+;; post-settle state. Disabling the same two lines makes it fail with
+;; "diff-buf 0: root holds bare strong children: {:reference 3, :bare-strong 2}". A review
+;; reported that the suite stayed green when those wraps were removed; that is not what I
+;; measured — the coverage exists, in that namespace rather than this one.
