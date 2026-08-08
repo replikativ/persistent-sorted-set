@@ -476,6 +476,40 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     return true;
   }
 
+  // D2 option D: a branch-marker slot caches the child's whole-subtree buffered total as of
+  // DEPOSIT time. store() settles that child IN PLACE, so every OTHER version whose parent slot
+  // points at the same child object keeps the pre-settle total AND a stale anchor: the child's
+  // durable image no longer describes it, so assembleNested would build a diff against the
+  // child's POST-settle children rather than against `anchor`. Detect it (post-order, O(1) per
+  // slot) and poison the slot so Pass 1 writes the child wholesale.
+  private void refreshMarkerSlots(IStorage storage) {
+    for (;;) {
+      NodeState<Address> s = _state;
+      BufState b = s.buf;
+      Object[] slots = (b != null) ? b.slots : null;
+      if (slots == null || s.children == null) return;
+      Object[] ns = null;
+      boolean poisoned = false;
+      for (int i = 0; i < _len; i++) {
+        Slot sl = (Slot) slots[i];
+        if (sl == null || sl.diff != null || sl.anchor == null) continue;   // marker slots only
+        if (sl.bufEntries == BUF_WRITE) continue;                            // already poisoned
+        Object ref = s.children[i];
+        if (ref == null) continue;                                           // not resident
+        ANode c = (ANode) _settings.readReference(ref);
+        if (!(c instanceof Branch)) continue;
+        ((Branch) c).refreshMarkerSlots(storage);                            // post-order
+        if (((Branch) c).bufEntries() == slotBE(sl)) continue;
+        if (ns == null) ns = Arrays.copyOf(slots, slots.length);
+        poisoned = true;
+        ns[i] = new Slot(sl.diff, sl.count, sl.measure, sl.anchor, BUF_WRITE);
+      }
+      if (ns == null) return;
+      long entries = poisoned ? BUF_WRITE : bufEntriesOf(b);
+      if (STATE_UPDATER.compareAndSet(this, s, new NodeState<>(s.addresses, s.children, new BufState(ns, entries)))) return;
+    }
+  }
+
   private long bufEntriesSlow(IStorage storage) {
     Object[] slots = slots();                                   // one snapshot
     if (slots == null) return 0;
@@ -901,8 +935,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     Branch left = (Branch) _left;
     Branch right = (Branch) _right;
 
-    int idx = search(key, cmp);
-    if (idx < 0) idx = -idx - 1;
+    int idx = searchFirst(key, cmp);   // D1
 
     if (idx == _len) // not in set
       return PersistentSortedSet.UNCHANGED;
@@ -1457,8 +1490,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
   @Override
   public ANode removeContent(IStorage storage, Key key, Comparator<Key> cmp, Settings settings) {
-    int idx = search(key, cmp);
-    if (idx < 0) idx = -idx - 1;
+    int idx = searchFirst(key, cmp);   // D1
     if (idx == _len) return null; // key greater than everything → not present
 
     ANode oldChild = child(storage, idx);
@@ -1626,8 +1658,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     assert 0 == cmp.compare(oldKey, newKey) : "oldKey and newKey must compare as equal (cmp.compare must return 0)";
 
     // Find which child contains the key
-    int idx = search(oldKey, cmp);
-    if (idx < 0) idx = -idx - 1;
+    int idx = searchFirst(oldKey, cmp);   // D1
     if (idx == _len) idx = _len - 1; // key might be in last child
     assert 0 <= idx && idx < _len;
 
@@ -2291,6 +2322,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // but are left untouched (flushing them would require loading their anchor). The running
     // total stays <= B strictly. See doc/diff-buffering.md (Store / eviction policy).
     final int budget = _settings.diffBufSize();
+    refreshMarkerSlots(storage);   // D2
     assert assertBufEntries(storage);  // -ea oracle: delta-maintained total == fresh subtree walk
 
     // Single-snapshot / single-publish settle (see NodeState): all three passes read ONE

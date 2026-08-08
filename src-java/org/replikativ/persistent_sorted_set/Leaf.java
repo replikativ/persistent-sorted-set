@@ -170,7 +170,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
     Leaf left = (Leaf) _left;
     Leaf right = (Leaf) _right;
 
-    int idx = search(key, cmp);
+    int idx = searchFirstEq(key, cmp);   // D1
     if (idx < 0) // not in set
       return PersistentSortedSet.UNCHANGED;
 
@@ -398,7 +398,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
 
   @Override
   public ANode removeContent(IStorage storage, Key key, Comparator<Key> cmp, Settings settings) {
-    int idx = search(key, cmp);
+    int idx = searchFirstEq(key, cmp);   // D1
     if (idx < 0) return null; // not present
 
     int newLen = _len - 1;
@@ -477,7 +477,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
   public ANode[] replace(IStorage storage, Key oldKey, Key newKey, Comparator<Key> cmp, Settings settings, Object[] removedOut) {
     assert 0 == cmp.compare(oldKey, newKey) : "oldKey and newKey must compare as equal (cmp.compare must return 0)";
 
-    int idx = search(oldKey, cmp);
+    int idx = searchFirstEq(oldKey, cmp);   // D1
     if (idx < 0) // not in set
       return PersistentSortedSet.UNCHANGED;
 

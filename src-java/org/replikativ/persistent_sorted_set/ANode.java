@@ -104,6 +104,13 @@ public abstract class ANode<Key, Address> {
     // return -high - 1; // high
   }
 
+  /** D1: `search`'s contract (>=0 found / -(ins+1) absent) but LEFTMOST among cmp-equal. */
+  public int searchFirstEq(Key key, Comparator<Key> cmp) {
+    int idx = searchFirst(key, cmp);
+    if (idx < _len && 0 == cmp.compare(_keys[idx], key)) return idx;
+    return -idx - 1;
+  }
+
   public int searchFirst(Key key, Comparator<Key> cmp) {
     int low = 0, high = _len;
     while (low < high) {

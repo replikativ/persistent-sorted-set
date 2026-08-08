@@ -122,17 +122,20 @@
                  `conj`-built cljs set leaves `_measure` nil and this would test
                  nothing.
 
-                 NO measure equality is asserted, deliberately. After both fixes a
-                 cljs set still reports a root measure of 187350 where the
-                 survivors sum to 187200 (n=200 bf=8 drop=50) — a gap of exactly
-                 150 = 50 x 3, the difference between the search keys and the
-                 stored elements. Something else on the cljs measure path is still
-                 wrong and is not yet attributed; asserting it would leave a
-                 permanently red suite, and asserting nothing while calling the
-                 case covered would be worse. Tracked separately.
+                 Measure equality IS asserted now. When this was written the cljs
+                 root reported 187350 against a survivor sum of 187200 (n=200 bf=8
+                 drop=50) — a gap of exactly 150 = 50 x 3, the difference between
+                 the search keys and the stored elements — so the assertion was
+                 left out and the gap recorded as unattributed. Re-measured
+                 2026-08 on both runtimes at (200,8,50), (200,16,137), (200,8,200)
+                 and (60,4,20): the cached measure equals the real sum
+                 everywhere. Whichever later fix closed it, the gap is gone, and
+                 the equality below is live rather than commented about.
 
-                 The count and survivor assertions below DO hold and are what this
-                 case checks today."
+                 It is guarded by `(some? (cljs-cached v))` because a cljs set
+                 does not always carry a root measure, and by the
+                 `(pos? @with-measure)` precondition at the end so the guard
+                 cannot make the whole case vacuous."
          (let [with-measure (atom 0)]
            (doseq [[n bf drop-n] [[200 8 50] [200 16 137] [200 8 200]]]
              (let [xs (mapv #(+ 3 (* 10 %)) (range n))
