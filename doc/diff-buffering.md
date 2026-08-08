@@ -132,10 +132,30 @@ and `contains`/routing break.
   written ancestor is the **complete, accumulated** delta of the subtree and *supersedes*
   (is a superset of) any diff baked in the node's durable object. Projection therefore
   *installs* the parent's diff, overwriting the restored base's stored slots.
-- **Anchor safety.** A buffered child keeps its durable address as the anchor its diff is
-  against; its diff is replaced wholesale each commit and reset when the child is finally
-  written ⇒ apply-once, never a chain. `markFreed` is issued **only when a node is written**,
-  so a buffered child's anchor is never freed while still referenced.
+- **Anchor safety — holds WITHIN one lineage only.** A buffered child keeps its durable
+  address as the anchor its diff is against; its diff is replaced wholesale each commit and
+  reset when the child is finally written ⇒ apply-once, never a chain. `markFreed` is issued
+  only when a node is written.
+
+  That does **not** mean an anchor is never freed while still referenced, and an earlier
+  version of this bullet claimed it did. Two versions can name the same anchor with different
+  diffs, because a slot says "anchor A **plus** this diff" rather than "the blob at A".
+  Storing one of them may FLUSH that child — writing it out whole and freeing A — which is
+  correct for the version being stored and wrong for the other. Freeing on *supersession* is
+  safe; freeing on *re-representation* is not, and a flush is re-representation: the same
+  elements, written differently. Baseline has no such operation, which is why baseline is
+  unaffected.
+
+  So the guarantee is: **the freed stream is sound exactly when the history is LINEAR** —
+  every version stored before the next is derived from it. Measured against a backend that
+  deletes on `markFreed`: linear held publication closure in 432/432 cells at every budget;
+  storing an ancestor and then a descendant derived from it while unstored gave 25 read
+  failures / 768 trials at B ≤ 4 (clean at B ≥ 8); `diffBufSize 0` was clean in 864/864.
+
+  Retaining "the last N images" does not rescue it — the freed blob is not reachable from the
+  immediately preceding image, and the required retention depth grows without bound. Nor does
+  restricting the number of branches, since the shape lives inside a single lineage. See
+  `IStorage.markFreed` for the consumer-facing statement of this.
 - **Disabled is identical (I0).** `diffBufSize = 0` ⇒ every path is exactly baseline PSS,
   byte-identical on disk. All behavior forks on the gate.
 - **Forward-compatible format.** A node with no slots deserializes as empty diffs; the new

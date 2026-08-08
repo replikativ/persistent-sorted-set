@@ -77,13 +77,55 @@ public interface IStorage<Key, Address> {
      * candidate list.
      *
      * A store that allocates a FRESH address per write (a sequential or random UUID) is not
-     * affected: a re-created node gets a new address and a freed one is dead forever. Both
-     * regimes exist in practice — datahike's `gen-address` is a content hash under
-     * `:crypto-hash?` and a `squuid` otherwise.
+     * affected BY THAT PARTICULAR HAZARD — a re-created node gets a new address, so the
+     * content-hash collision above cannot happen. It is NOT thereby safe: see the diff-buf
+     * paragraph below, which was measured entirely on random UUIDs. An earlier version of
+     * this sentence said such a store "is not affected" and that "a freed one is dead
+     * forever"; both are false. Both regimes exist in practice — datahike's `gen-address`
+     * is a content hash under `:crypto-hash?` and a `squuid` otherwise.
+     *
+     * ── DIFF-BUF: the stream is only sound for a LINEAR history ──────────────────────────
+     *
+     * With `Settings.diffBufSize() > 0` a parent does not say "child i IS the blob at A". It
+     * says "child i is the blob at anchor A, PLUS this diff" — so TWO versions can name the
+     * same A with different diffs, and neither owns it. Storing one of them may FLUSH that
+     * child: write it out whole to a new address and free A, which is correct for the version
+     * doing the storing and wrong for the other one.
+     *
+     * The distinction to hold on to is that freeing on SUPERSESSION is safe, while freeing on
+     * RE-REPRESENTATION is not. A flush changes how a child is written down, not what it
+     * contains; baseline has no such operation, which is why baseline is unaffected.
+     *
+     * Consequently the stream is sound exactly when the history is LINEAR — every version
+     * stored before the next is derived from it. It is NOT sound when a version derived from
+     * an UNSTORED ancestor is later stored. Measured against a backend that deletes on this
+     * callback, bf 4-16:
+     *
+     *   linear                    publication closure held in 432/432 cells, every budget
+     *   ancestor-then-descendant  25 read failures / 768 trials at B <= 4; clean at B >= 8
+     *   diffBufSize 0             864/864 clean, no premature free in any shape
+     *
+     * Two consequences worth stating plainly, because they defeat the obvious mitigations:
+     * the freed blob is NOT reachable from the immediately preceding image, so retaining "the
+     * last N versions" does not help for any N (the required depth was measured growing
+     * without bound); and roughly 42% of the affected anchors belong to LEAF diffs, so a fix
+     * aimed at branch markers cannot cover it.
+     *
+     * A consumer that acts on this stream destructively — deleting, or recycling an address
+     * onto a freelist, which is deletion-equivalent — must therefore either keep the history
+     * linear, run diff-buf at 0, or do its own reachability check. This is a real
+     * combination: a GC that trusts the stream plus a non-zero diff-buf budget is unsafe,
+     * and it is not made safe by restricting the number of branches, since the hazardous
+     * shape lives inside a single lineage.
      *
      * Note the two in-tree GC tests (test/gc_leak.cljs, test/stress_diff_buf.clj) assert that
-     * no reachable node is ever reported here. That holds for THEIR storages, which allocate
-     * fresh addresses — it is not a general invariant, and those tests say so.
+     * no reachable node is ever reported here. That is not a general invariant, and those
+     * tests say so. It holds for them for TWO reasons, and the second is the one that
+     * matters: their storages allocate fresh addresses, AND their workloads are linear —
+     * each version is stored before the next is derived. `test/freed_tracking.clj` is in the
+     * same position: its `assert-safety` predicates are correct, but every scenario it runs
+     * stores before deriving, so none of them reaches the shape above. Adding one
+     * shared-ancestor fixture would cover it.
      *
      * This is a HINT, not a reachability claim. An earlier version of this doc said
      * "node no longer reachable", which is not what the call site knows: only STORED
