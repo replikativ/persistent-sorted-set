@@ -1194,7 +1194,28 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
         _len = newLen;
         // Compute exact subtree count from children (accounts for processor changes)
-        _subtreeCount = tryComputeSubtreeCountFromChildren(children, newLen, storage);
+        // DELTA, not a recompute. `remove` deletes exactly one element, and in this arm no
+        // child leaves this node (any merge/borrow was between ITS OWN children), so the
+        // subtree total is exactly one less. The probe would instead bail to -1 the moment a
+        // single child is non-resident — discarding a number we already know — and that -1 is
+        // then SERIALIZED (`impl.nodes/node->map` writes `subtreeCount()` raw), so every later
+        // reader of the blob pays a subtree walk to recover it.
+        //
+        // 04499a0 stopped the probe restoring subtrees just to count them, which was right, but
+        // it made -1 the answer far more often and so degraded the on-disk counts. This closes
+        // that without reintroducing any IO. It also converges the runtimes: ClojureScript has
+        // always used the delta here (`branch.cljs`, `new-sc (if (>= old-sc 0) (dec old-sc) -1)`),
+        // and a census over 2259 nodes found 93 disagreeing on `:subtree-count`, 93 of 93 being
+        // "JVM -1, cljs exact" — never two different real values. cljs was right.
+        // ONLY without a leafProcessor. A processor may compact or expand a leaf, so removing
+        // one KEY need not reduce the element count by one — `PersistentSortedSet.disjoin`
+        // makes the same distinction ("count may differ from +1"). With a processor, fall back
+        // to the probe. Caught by leaf_processor/test-mixed-processor, which reported
+        // :subtree-count-mismatch {:branch-count 139, :children-sum 137} when this was
+        // unconditional.
+        _subtreeCount = (_settings.leafProcessor() == null && _subtreeCount >= 0)
+                        ? _subtreeCount - 1
+                        : tryComputeSubtreeCountFromChildren(children, newLen, storage);
         // Update measure: recompute from children
         if (measureOps != null && _measure != null) {
           _measure = tryComputeMeasure(storage);
@@ -1242,7 +1263,15 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       cs.copyAll(myChildren, idx + 2, _len);
 
       // Compute exact subtree count from children (accounts for processor changes)
-      newCenter._subtreeCount = tryComputeSubtreeCountFromChildren(centerChildren, newLen, storage);
+      // DELTA, not a recompute — same reasoning as the in-place arm above. `newCenter` covers
+      // exactly this node's key range minus the one removed element: any merge/borrow here was
+      // between THIS node's own children (newLen may shrink, but no element left the subtree).
+      // The probe would bail to -1 at the first non-resident child and discard a number we
+      // already know, and that -1 is serialized.
+      // ONLY without a leafProcessor — see the in-place arm above.
+      newCenter._subtreeCount = (_settings.leafProcessor() == null && _subtreeCount >= 0)
+                                ? _subtreeCount - 1
+                                : tryComputeSubtreeCountFromChildren(centerChildren, newLen, storage);
       newCenter._measure = tryComputeMeasureFromChildren(centerChildren, newLen, storage, measureOps);
       if (settings.diffBufSize() > 0) {
         if (!leftChanged && !rightChanged && newLen == _len) {

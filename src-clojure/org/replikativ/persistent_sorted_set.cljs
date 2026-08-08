@@ -152,6 +152,26 @@
   "Replace an existing key with a new key at the same logical position.
    The comparator must return 0 for both old-key and new-key.
    This is a single-traversal update - faster than disj + conj.
+
+   PRECONDITION, and it is the caller's to uphold: under the comparator passed to
+   THIS call, no element other than old-key itself may compare equal to old-key.
+   The single-traversal update rewrites in place at the position it finds, so if a
+   comparator-EQUAL sibling exists, the rewrite can order the two wrongly and leave
+   the node unsorted. The sibling then still appears in iteration but is no longer
+   reachable by binary search, and the disorder becomes durable the moment the set
+   is stored — after which every later search on that node is arbitrary.
+
+   This matters specifically when the comparator is COARSER than the set's own —
+   the `[id value]`-compared-by-id pattern these docstrings advertise. A set built
+   under a full comparator may legitimately hold two elements that a coarser one
+   cannot tell apart; `replace` under that coarser comparator is then outside
+   contract.
+
+   It is checked by assertions only, so it is NOT checked in ordinary production
+   builds. That is deliberate — the check costs a scan on a hot write path — but it
+   means violating this silently corrupts the structure rather than throwing. If you
+   cannot guarantee uniqueness under the comparator, use disj + conj.
+
    returns BTSet by default
    returns continuation yielding BTSet when {:sync? false}"
   ([^BTSet set old-key new-key]          (btset/$replace set old-key new-key))

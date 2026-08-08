@@ -89,6 +89,25 @@
   The comparator must return 0 for both old-key and new-key.
   This is a single-traversal update - much faster than disj + conj.
 
+  PRECONDITION, and it is the caller's to uphold: under the comparator passed to
+  THIS call, no element other than old-key itself may compare equal to old-key.
+  The single-traversal update rewrites in place at the position it finds, so if a
+  comparator-EQUAL sibling exists, the rewrite can order the two wrongly and leave
+  the node unsorted. The sibling then still appears in iteration but is no longer
+  reachable by binary search, and the disorder becomes durable the moment the set
+  is stored — after which every later search on that node is arbitrary.
+
+  This matters specifically when `cmp` is COARSER than the set's own comparator —
+  the `[id value]`-compared-by-id pattern these docstrings advertise. A set built
+  under a full comparator may legitimately hold two elements that a coarser `cmp`
+  cannot tell apart; `replace` under that coarser `cmp` is then outside contract.
+
+  It is checked by assertions, so it fails loudly under -ea (the :test alias) and
+  is NOT checked in ordinary production runs. That is deliberate — the check costs
+  a scan on a hot write path — but it means violating this silently corrupts the
+  structure rather than throwing. If you cannot guarantee uniqueness under `cmp`,
+  use disj + conj.
+
   O(log n) traversal with minimal allocations.
 
   Returns the updated set, or the original set if old-key not found."
