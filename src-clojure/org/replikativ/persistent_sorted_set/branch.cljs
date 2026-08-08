@@ -1147,6 +1147,34 @@
                                    [emb (conj wl i)]))
                                [(:pass classified) (:wl classified)]
                                (sort-by :sz (:buf classified)))]
+                   ;; D3: the merge/borrow arms (`concat-slots`, `merge`, `merge-split`)
+                   ;; concatenate two nodes' slot arrays without re-checking the budget, so
+                   ;; `passthrough` alone can start above B and Pass 2 — which only ever flushes
+                   ;; DIRTY children — can never bring it down. Measured worst case before this,
+                   ;; over ~157k written blobs: B=1 -> 2, B=2 -> 4, B=4 -> 8, B=8 -> 12, B=16 ->
+                   ;; 26, i.e. roughly 2B, on ~0.1% of blobs. It does not compound (200
+                   ;; adversarial shrink/refill rounds stayed at ~2B) but it is a budget the code
+                   ;; claims to enforce and did not.
+                   ;;
+                   ;; Flush passthrough children biggest-first until the total fits. Mirrors the
+                   ;; JVM arm added in the same change. Measured there: needed on 0.05% of blobs,
+                   ;; +0..3 writes out of 750-3500, and every flushed child was already resident
+                   ;; under :ref-type strong, soft AND weak — so no read in practice, though the
+                   ;; fallback restores rather than being wrong if one is not.
+                   [embedded flushed]
+                   (loop [emb embedded, wl flushed]
+                     (if (<= emb budget)
+                       [emb wl]
+                       (let [cand (->> (range len)
+                                       (filter (fn [i] (and (aget addrs i)
+                                                            slots (aget slots i)
+                                                            (not (some #{i} wl)))))
+                                       (sort-by (fn [i] (- (slot-be (aget slots i) (dec level)))))
+                                       first)]
+                         (if (nil? cand)
+                           [emb wl]
+                           (recur (- emb (slot-be (aget slots cand) (dec level)))
+                                  (conj wl cand))))))
                    ;; Pass 3: write flushed/structural children (all resident ⇒ no read).
                    (loop [ws (seq flushed)]
                      (when ws

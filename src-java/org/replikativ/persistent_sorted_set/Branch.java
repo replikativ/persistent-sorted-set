@@ -2439,6 +2439,33 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       }
     }
 
+    // D3: the merge/borrow arms concatenate two nodes' slot arrays without re-checking the
+    // budget, so `passthrough` alone can start above B and Pass 2 (which only ever flushes
+    // DIRTY children) can never bring it down. Flush passthrough children, biggest first,
+    // until the total fits. Measured: needed on 0.05% of written blobs, and every one of them
+    // was already resident (no read) across :ref-type strong/soft/weak.
+    if (embedded > budget) {
+      java.util.ArrayList<Integer> pt = new java.util.ArrayList<>();
+      for (int i = 0; i < _len; ++i)
+        if (newAddresses[i] != null && newSlots != null && newSlots[i] != null) pt.add(i);
+      final Object[] fs = newSlots;
+      pt.sort((x, y) -> Integer.compare(slotBE((Slot) fs[y]), slotBE((Slot) fs[x])));
+      for (int i : pt) {
+        if (embedded <= budget) break;
+        Object ref = (children0 != null) ? children0[i] : null;
+        ANode c = (ref != null) ? (ANode) _settings.readReference(ref) : null;
+        if (c == null) c = child(storage, i);                   // not resident ⇒ restore+project
+        embedded -= slotBE((Slot) newSlots[i]);
+        storage.markFreed((Address) newAddresses[i]);
+        newAddresses[i] = ((ANode<Key, Address>) c).store(storage);
+        newSlots[i] = null;
+        if (newChildren != null && newChildren[i] instanceof ANode) {
+          if (newChildren == children0) newChildren = Arrays.copyOf(children0, children0.length);
+          newChildren[i] = _settings.makeReference(newChildren[i]);
+        }
+      }
+    }
+
     // Pass 3: write the flushed/structural children (all resident ⇒ no read).
     for (int i : writeList) {
       ANode child = (ANode) _settings.readReference(children0[i]);
