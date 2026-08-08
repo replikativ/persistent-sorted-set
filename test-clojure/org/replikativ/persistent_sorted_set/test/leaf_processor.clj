@@ -914,9 +914,9 @@
       ;; complementary: that one catches an incoherent request, this one catches a
       ;; coherent request meeting a store that turns out to carry buffered data.
       (let [e (try (let [s (set/restore-by compare a1 storage
-                                          (-> plain
-                                              (dissoc :diff-buf-size)
-                                              (assoc :leaf-processor (identity-processor))))]
+                                           (-> plain
+                                               (dissoc :diff-buf-size)
+                                               (assoc :leaf-processor (identity-processor))))]
                      (.root ^PersistentSortedSet s)
                      nil)
                    (catch IllegalStateException e e))]

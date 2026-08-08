@@ -2004,7 +2004,6 @@
           (recur (inc i) (inc i) (conj! out (.slice arr start (inc i))))
           (recur (inc i) start out))))))
 
-
 ;; ---------------------------------------------------------------------------
 ;; Supported branching factors — must agree with Settings.MIN_BRANCHING_FACTOR
 ;; on the JVM (4) and with `Settings.checkBranchingFactor`'s treatment of an

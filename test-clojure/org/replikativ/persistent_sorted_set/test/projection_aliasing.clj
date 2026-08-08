@@ -118,7 +118,7 @@
                                :ref-type :strong :diff-buf-size DBS})
           ^Branch root (.root ^PersistentSortedSet back)]
       (is (not (.editable root))
-            "precondition: a restored root is shared, not editable")
+          "precondition: a restored root is shared, not editable")
       (let [kid (.child root ^IStorage st (int 0))
             e   (try (.child root (int 0) ^ANode kid) nil
                      (catch AssertionError e e))]

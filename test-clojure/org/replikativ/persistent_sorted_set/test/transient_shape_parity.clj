@@ -74,8 +74,8 @@
                          (s/sorted-set* {:comparator compare :branching-factor bf}) xs)
             tran (let [t (reduce (fn [^PersistentSortedSet t k] (.cons t k))
                                  (.asTransient ^PersistentSortedSet
-                                               (s/sorted-set* {:comparator compare
-                                                               :branching-factor bf}))
+                                  (s/sorted-set* {:comparator compare
+                                                  :branching-factor bf}))
                                  xs)]
                    (.persistent ^PersistentSortedSet t))
             lbl  (str "bf=" bf " n=" n)]
@@ -96,8 +96,8 @@
             tran (let [t (reduce (fn [^PersistentSortedSet t [op k]]
                                    (if (= op :add) (.cons t k) (.disjoin t k compare)))
                                  (.asTransient ^PersistentSortedSet
-                                               (s/sorted-set* {:comparator compare
-                                                               :branching-factor bf}))
+                                  (s/sorted-set* {:comparator compare
+                                                  :branching-factor bf}))
                                  ops)]
                    (.persistent ^PersistentSortedSet t))]
         (is (= (vec (seq pers)) (vec (seq tran))) (str "bf=" bf ": contents"))

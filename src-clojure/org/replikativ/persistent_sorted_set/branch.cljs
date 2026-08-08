@@ -909,48 +909,48 @@
                            ;; .internal/transient-support-cljs.md — cljs has no node
                            ;; ownership, so mutating `this` would edit a node other
                            ;; versions share.
-                             (let [new-keys     (arrays/aclone keys)
-                                   new-children (arrays/aclone children)
-                                   new-addrs    (when addrs
-                                                  (let [na (arrays/aclone addrs)]
+                           (let [new-keys     (arrays/aclone keys)
+                                 new-children (arrays/aclone children)
+                                 new-addrs    (when addrs
+                                                (let [na (arrays/aclone addrs)]
                                                     ;; Mark old child address as freed before clearing (deferred under diff-buf)
-                                                    (when (and (not diff-buf?) storage (aget addrs idx))
-                                                      (storage/markFreed storage (aget addrs idx)))
-                                                    (aset na idx nil)
-                                                    na))
-                                   _            (aset new-keys idx new-max-key)
-                                   _            (aset new-children idx new-node)
-                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil 0 (.-_projCmp this))
-                                   new-measure    (when (and measure-ops (.-_measure this))
-                                                    (replace-measure new-branch storage measure-ops))]
-                               (set! (.-_measure new-branch) new-measure)
+                                                  (when (and (not diff-buf?) storage (aget addrs idx))
+                                                    (storage/markFreed storage (aget addrs idx)))
+                                                  (aset na idx nil)
+                                                  na))
+                                 _            (aset new-keys idx new-max-key)
+                                 _            (aset new-children idx new-node)
+                                 new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil 0 (.-_projCmp this))
+                                 new-measure    (when (and measure-ops (.-_measure this))
+                                                  (replace-measure new-branch storage measure-ops))]
+                             (set! (.-_measure new-branch) new-measure)
                                ;; diff-buf: content-only replace ⇒ carry source slots + deposit Present(new-key).
-                               (when diff-buf?
-                                 (set! (.-_bufEntries new-branch) (buf-entries this)) ; carry running total (or -1) onto successor
-                                 (await (carry-and-deposit-replace new-branch storage (.-_slots this) idx removed-key new-key anchor0 opts)))
-                               (arrays/array new-branch))
+                             (when diff-buf?
+                               (set! (.-_bufEntries new-branch) (buf-entries this)) ; carry running total (or -1) onto successor
+                               (await (carry-and-deposit-replace new-branch storage (.-_slots this) idx removed-key new-key anchor0 opts)))
+                             (arrays/array new-branch))
                            ;; maxKey unchanged - reuse keys array
                            ;; Clone ALL arrays — sharing any of them would let a future
                            ;; in-place path corrupt the original.
-                             (let [new-keys     (arrays/aclone keys)
-                                   new-children (arrays/aclone children)
-                                   new-addrs    (when addrs
-                                                  (let [na (arrays/aclone addrs)]
+                           (let [new-keys     (arrays/aclone keys)
+                                 new-children (arrays/aclone children)
+                                 new-addrs    (when addrs
+                                                (let [na (arrays/aclone addrs)]
                                                     ;; Mark old child address as freed before clearing (deferred under diff-buf)
-                                                    (when (and (not diff-buf?) storage (aget addrs idx))
-                                                      (storage/markFreed storage (aget addrs idx)))
-                                                    (aset na idx nil)
-                                                    na))
-                                   _            (aset new-children idx new-node)
-                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil 0 (.-_projCmp this))
-                                   new-measure    (when (and measure-ops (.-_measure this))
-                                                    (replace-measure new-branch storage measure-ops))]
-                               (set! (.-_measure new-branch) new-measure)
+                                                  (when (and (not diff-buf?) storage (aget addrs idx))
+                                                    (storage/markFreed storage (aget addrs idx)))
+                                                  (aset na idx nil)
+                                                  na))
+                                 _            (aset new-children idx new-node)
+                                 new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil 0 (.-_projCmp this))
+                                 new-measure    (when (and measure-ops (.-_measure this))
+                                                  (replace-measure new-branch storage measure-ops))]
+                             (set! (.-_measure new-branch) new-measure)
                                ;; diff-buf: content-only replace ⇒ carry source slots + deposit Present(new-key).
-                               (when diff-buf?
-                                 (set! (.-_bufEntries new-branch) (buf-entries this)) ; carry running total (or -1) onto successor
-                                 (await (carry-and-deposit-replace new-branch storage (.-_slots this) idx removed-key new-key anchor0 opts)))
-                               (arrays/array new-branch)))))))))))
+                             (when diff-buf?
+                               (set! (.-_bufEntries new-branch) (buf-entries this)) ; carry running total (or -1) onto successor
+                               (await (carry-and-deposit-replace new-branch storage (.-_slots this) idx removed-key new-key anchor0 opts)))
+                             (arrays/array new-branch)))))))))))
 
 ;; ---- diff-buf store-side helpers (mirror JVM Branch) ----
 

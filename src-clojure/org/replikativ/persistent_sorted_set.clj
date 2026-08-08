@@ -157,16 +157,16 @@
   ;; no-arg ctor normalises to 512/SOFT and so does not look "unconfigured".)
   (if (instance? Settings m)
     m
-  (let [boundary (:boundary m)
-        s (Settings.
-           (int (or (:branching-factor m) 0))
-           (case (:ref-type m)
-             :strong RefType/STRONG
-             :soft   RefType/SOFT
-             :weak   RefType/WEAK
-             nil)
-           ^IMeasure (:measure m)
-           (:leaf-processor m)
+    (let [boundary (:boundary m)
+          s (Settings.
+             (int (or (:branching-factor m) 0))
+             (case (:ref-type m)
+               :strong RefType/STRONG
+               :soft   RefType/SOFT
+               :weak   RefType/WEAK
+               nil)
+             ^IMeasure (:measure m)
+             (:leaf-processor m)
            ;; diff-buf: fall back to the shared Settings default (Settings/defaultDiffBufSize,
            ;; 0/off unless the pss.diffBufSize sysprop is set) when the caller doesn't specify.
            ;; 0 = baseline (I0). See doc/diff-buffering.md. The MST incompatibility (a buffered
@@ -178,14 +178,14 @@
            ;; `pss.diffBufSize` sysprop would supply a budget the caller never asked for and
            ;; `diffBufFor` would refuse the pairing. An EXPLICIT :diff-buf-size is passed
            ;; through unchanged so that refusal fires when it should.
-           (int (or (:diff-buf-size m)
-                    (if (:leaf-processor m) 0 (Settings/defaultDiffBufSize)))))
+             (int (or (:diff-buf-size m)
+                      (if (:leaf-processor m) 0 (Settings/defaultDiffBufSize)))))
         ;; split-seam: opt into a content-defined boundary (e.g. MST) per store. nil ⇒ the
         ;; default count B-tree (byte-identical baseline). See .internal/SPLIT_SEAM_DESIGN.md.
-        s (if boundary (.withBoundary s ^IBoundary boundary) s)]
+          s (if boundary (.withBoundary s ^IBoundary boundary) s)]
     ;; diff-buf: the comparator is NOT stored on Settings — it lives on the PersistentSortedSet
     ;; (_cmp) and is propagated to Branch nodes (Branch._projCmp) for leaf projection.
-    s)))
+      s)))
 
 (defn- settings->map [^Settings s]
   {:branching-factor (.branchingFactor s)

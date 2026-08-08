@@ -38,7 +38,7 @@
   [opts]
   #?(:clj  (.branchingFactor
             (.-_settings ^org.replikativ.persistent_sorted_set.PersistentSortedSet
-                         (s/sorted-set* (assoc opts :comparator compare))))
+             (s/sorted-set* (assoc opts :comparator compare))))
      :cljs (:branching-factor (.-settings (s/sorted-set* (assoc opts :comparator compare))))))
 
 (defn- refused? [opts]
