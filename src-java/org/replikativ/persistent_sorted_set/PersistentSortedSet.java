@@ -489,7 +489,28 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
 
     IMeasure measureOps = _settings.measure();
     if (measureOps == null) {
-      throw new IllegalStateException("getNth requires measure to be configured");
+      // UNWEIGHTED: the nth ELEMENT by position, navigating the subtree counts the tree
+      // already maintains for countSlice. No measure needed, and none should be invented:
+      // requiring one here is what tempted `IMeasure.weight`'s old default to claim every
+      // entry weighed 1 — which is not a monoid homomorphism and made getNth answer null for
+      // every index above 0.
+      //
+      // Every element weighs exactly one, so the offset within the element is always 0.
+      long n = count();
+      if (rank < 0 || rank >= n) return null;
+      while (node instanceof Branch) {
+        Branch<Key, Address> branch = (Branch<Key, Address>) node;
+        boolean found = false;
+        for (int i = 0; i < branch._len; i++) {
+          ANode<Key, Address> child = branch.child(_storage, i);
+          long childCount = child.count(_storage);
+          if (rank < childCount) { node = child; found = true; break; }
+          rank -= childCount;
+        }
+        if (!found) return null;
+      }
+      if (outOffset != null) outOffset[0] = 0;
+      return ((Leaf<Key, Address>) node)._keys[(int) rank];
     }
 
     // Check bounds using root measure
