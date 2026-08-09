@@ -2392,8 +2392,58 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     return proj;
   }
 
+  // -ea ONLY: detect two threads settling the SAME node concurrently.
+  //
+  // `store()` publishes the settled per-child state with a PLAIN write, not a CAS, and it
+  // publishes BEFORE `storage.store(this)`. Both are correct under the documented contract —
+  // one settle at a time per LINEAGE (doc/CONCURRENCY.md) — and neither is safe if two threads
+  // settle versions that share dirty nodes. Structural sharing makes that easy to do by
+  // accident: measured on a pipelining-writer shape at bf 8 / n 1000, 3 Branch objects were
+  // reachable from BOTH roots and dirty in both, so storing either settles the same objects.
+  //
+  // The contract is not enforced and cannot cheaply be: serialising store() would cost every
+  // single-threaded caller. So this DETECTS instead. Both methods run only inside `assert`, so
+  // with -da the map is never touched and there is no field, no allocation and no lookup —
+  // exactly the trade the rest of this class makes (an assertion that costs nothing in
+  // production but fails loudly in a user's tests).
+  //
+  // Keyed by node identity: ANode/Branch/Leaf override neither equals nor hashCode, so the
+  // ConcurrentHashMap compares by identity and cannot conflate two distinct nodes.
+  //
+  // What it CANNOT catch: two threads settling DISJOINT trees over one storage (legal), and a
+  // race whose windows never overlap in a given run. It is a detector, not a proof.
+  private static final java.util.concurrent.ConcurrentHashMap<Object, Thread> SETTLING =
+      new java.util.concurrent.ConcurrentHashMap<>();
+
+  private boolean beginSettle() {
+    Thread me = Thread.currentThread();
+    Thread other = SETTLING.putIfAbsent(this, me);
+    if (other != null && other != me) {
+      throw new AssertionError(
+          "concurrent settle of the same node by " + me + " and " + other
+          + ". store() may run on one thread at a time per LINEAGE (in practice per storage), "
+          + "not per tree: two versions can share dirty nodes, and both settles publish with a "
+          + "plain write before serializing. See doc/CONCURRENCY.md.");
+    }
+    return true;
+  }
+
+  private boolean endSettle() {
+    SETTLING.remove(this);
+    return true;
+  }
+
   @Override
   public Address store(IStorage<Key, Address> storage) {
+    assert beginSettle();
+    try {
+      return storeImpl(storage);
+    } finally {
+      assert endSettle();
+    }
+  }
+
+  private Address storeImpl(IStorage<Key, Address> storage) {
     if (_settings.diffBufSize() <= 0) {                           // baseline ⇒ byte-identical (I0)
       // SETTLE, baseline: stage the whole {addresses, children} pair on LOCAL copies of
       // ONE snapshot and publish ONCE. This replaces the historical per-slot two-step
