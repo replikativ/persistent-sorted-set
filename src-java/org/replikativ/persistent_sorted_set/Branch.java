@@ -1249,6 +1249,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           }
         }
 
+        if (newLen < _len) {                                                       // TAILCLEAR
+          Arrays.fill(_keys, newLen, _len, null);
+          if (s0.addresses != null) Arrays.fill(s0.addresses, newLen, _len, null);
+          Arrays.fill(children, newLen, _len, null);
+          if (stitched != null) Arrays.fill(stitched, newLen, _len, null);
+        }
         _len = newLen;
         // Compute exact subtree count from children (accounts for processor changes)
         // DELTA, not a recompute. `remove` deletes exactly one element, and in this arm no

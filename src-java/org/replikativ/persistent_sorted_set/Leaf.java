@@ -203,6 +203,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       // had this — it recomputes from the new leaf's keys.
       Key removedElement = _keys[idx];
       ArrayUtil.copy(_keys, idx + 1, _len, _keys, idx);
+      Arrays.fill(_keys, newLen, _len, null);   // TAILCLEAR
       _len = newLen;
       if (measureOps != null && _measure != null) {
         _measure = measureOps.remove(_measure, removedElement, () -> thisLeaf.tryComputeMeasure(storage));
@@ -304,6 +305,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         newCenter = this;
         ArrayUtil.copy(centerKeys,  0, centerLen, _keys, leftTail);
         ArrayUtil.copy(left._keys, newLeftLen, left._len, _keys, 0);
+        if (newCenterLen < _len) Arrays.fill(_keys, newCenterLen, _len, null);   // TAILCLEAR
         _len = newCenterLen;
         if (measureOps != null && _measure != null) {
           newCenter._measure = newCenter.tryComputeMeasure(storage);
@@ -321,6 +323,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       // shrink left
       if (left.editable()) {
         newLeft  = left;
+        if (newLeftLen < left._len) Arrays.fill(left._keys, newLeftLen, left._len, null);   // TAILCLEAR
         left._len = newLeftLen;
         // Guarded on the measure of the node being MODIFIED, not on `this`.
         // `left` is shrunk IN PLACE here, so its cached measure describes keys it
@@ -359,6 +362,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         newCenter = this;
         ArrayUtil.copy(centerKeys,  0, centerLen, _keys, 0);
         ArrayUtil.copy(right._keys, 0, rightHead, _keys, centerLen);
+        if (newCenterLen < _len) Arrays.fill(_keys, newCenterLen, _len, null);   // TAILCLEAR
         _len = newCenterLen;
         if (measureOps != null && _measure != null) {
           newCenter._measure = newCenter.tryComputeMeasure(storage);
@@ -377,6 +381,7 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       if (right.editable()) {
         newRight = right;
         ArrayUtil.copy(right._keys, rightHead, right._len, right._keys, 0);
+        if (newRightLen < right._len) Arrays.fill(right._keys, newRightLen, right._len, null);   // TAILCLEAR
         right._len = newRightLen;
         // Same wrong-guard as the left branch above: `right` is mutated in place,
         // so the test must be on ITS cached measure, not on this leaf's.
