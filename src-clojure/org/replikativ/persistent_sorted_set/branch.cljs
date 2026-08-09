@@ -497,7 +497,7 @@
     (if (nil? lens)
       (let [old-sc (.-subtree-count this)
             new-sc (if (>= old-sc 0) (inc old-sc) -1)
-            m      (when (and measure-ops (.-_measure this))
+            m      (when (and measure-ops (some? (.-_measure this)))
                      (measure/merge-measure measure-ops (.-_measure this) (measure/extract measure-ops key)))]
         (arrays/array (Branch. lvl new-keys new-children new-addrs new-sc m settings nil 0 (.-_projCmp this))))
       (loop [out (transient []), pos 0, ls lens]
@@ -506,7 +506,7 @@
                 kseg (.slice new-keys pos (+ pos l))
                 cseg (.slice new-children pos (+ pos l))
                 aseg (when new-addrs (.slice new-addrs pos (+ pos l)))
-                m    (when (and measure-ops (.-_measure this))
+                m    (when (and measure-ops (some? (.-_measure this)))
                        (reduce (fn [acc child]
                                  (if (nil? acc)
                                    (reduced nil)
@@ -571,7 +571,7 @@
                                  new-sc (if (>= old-sc 0) (inc old-sc) -1)
                                ;; Update measure incrementally only if already computed
                                  measure-ops (:measure (.-settings this))
-                                 new-measure (when (and measure-ops (.-_measure this))
+                                 new-measure (when (and measure-ops (some? (.-_measure this)))
                                                (measure/merge-measure measure-ops (.-_measure this) (measure/extract measure-ops key)))
                                  nb (Branch. (.-level this) new-keys new-children new-addrs new-sc new-measure (.-settings this) nil 0 (.-_projCmp this))]
                            ;; diff-buf: nodes-len==1 ⇒ content-only ⇒ carry the source slots and
@@ -599,7 +599,7 @@
                                  measure-ops (:measure (.-settings this))
                                ;; Compute measure for split branches from their children only if already computed
                                ;; Return nil if any child measure is nil (don't silently undercount)
-                                 left-measure (when (and measure-ops (.-_measure this))
+                                 left-measure (when (and measure-ops (some? (.-_measure this)))
                                                 (reduce (fn [acc child]
                                                           (if (nil? acc)
                                                             (reduced nil)
@@ -609,7 +609,7 @@
                                                                 (reduced nil)))))
                                                         (measure/identity-measure measure-ops)
                                                         left-children))
-                                 right-measure (when (and measure-ops (.-_measure this))
+                                 right-measure (when (and measure-ops (some? (.-_measure this)))
                                                  (reduce (fn [acc child]
                                                            (if (nil? acc)
                                                              (reduced nil)
@@ -748,7 +748,7 @@
                              ;; branch above a nil-measure child can only postpone. With the
                              ;; leaves carrying their measures again, folding them is both
                              ;; possible and exact.
-                             new-measure (when (and measure-ops (.-_measure this))
+                             new-measure (when (and measure-ops (some? (.-_measure this)))
                                            (node/try-compute-measure
                                             (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this) nil 0 (.-_projCmp this))
                                             storage measure-ops {:sync? true}))
@@ -964,7 +964,7 @@
                                  _            (aset new-keys idx new-max-key)
                                  _            (aset new-children idx new-node)
                                  new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil 0 (.-_projCmp this))
-                                 new-measure    (when (and measure-ops (.-_measure this))
+                                 new-measure    (when (and measure-ops (some? (.-_measure this)))
                                                   (replace-measure new-branch storage measure-ops))]
                              (set! (.-_measure new-branch) new-measure)
                                ;; diff-buf: content-only replace ⇒ carry source slots + deposit Present(new-key).
@@ -986,7 +986,7 @@
                                                   na))
                                  _            (aset new-children idx new-node)
                                  new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil 0 (.-_projCmp this))
-                                 new-measure    (when (and measure-ops (.-_measure this))
+                                 new-measure    (when (and measure-ops (some? (.-_measure this)))
                                                   (replace-measure new-branch storage measure-ops))]
                              (set! (.-_measure new-branch) new-measure)
                                ;; diff-buf: content-only replace ⇒ carry source slots + deposit Present(new-key).
@@ -1312,7 +1312,7 @@
                              (if (nil? child)
                                nil ;; child not in memory, postpone
                                (let [child-measure (node/measure child)]
-                                 (if child-measure
+                                 (if (some? child-measure)
                                    (recur (inc i)
                                           (measure/merge-measure measure-ops acc child-measure))
                                    nil)))) ;; child measure unavailable, postpone
@@ -1330,7 +1330,7 @@
                               (if (nil? child)
                                 nil
                                 (let [child-measure (node/measure child)]
-                                  (if child-measure
+                                  (if (some? child-measure)
                                     (recur (inc i)
                                            (measure/merge-measure measure-ops acc child-measure))
                                     nil))))
@@ -1350,7 +1350,7 @@
                                           child-measure (or (node/measure child)
                                                             (await (node/force-compute-measure child storage measure-ops opts)))]
                                       (recur (inc i)
-                                             (if child-measure
+                                             (if (some? child-measure)
                                                (measure/merge-measure measure-ops acc child-measure)
                                                acc)))
                                     acc))]

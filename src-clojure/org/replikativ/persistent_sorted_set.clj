@@ -276,7 +276,7 @@
                                       measure       (when measure-ops
                                                       (reduce (fn [acc ^ANode child]
                                                                 (let [child-measure (.-_measure child)]
-                                                                  (if child-measure
+                                                                  (if (some? child-measure)
                                                                     (.merge measure-ops acc child-measure)
                                                                     acc)))
                                                               (.identity measure-ops)

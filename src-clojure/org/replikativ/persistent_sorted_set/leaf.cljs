@@ -58,7 +58,7 @@
   (merge [_ next]
     (let [new-leaf (Leaf. (arrays/aconcat keys (.-keys next)) settings nil)
           measure-ops (:measure settings)]
-      (when (and measure-ops _measure)
+      (when (and measure-ops (some? _measure))
         (set! (.-_measure new-leaf)
               (node/try-compute-measure new-leaf nil measure-ops {:sync? true})))
       new-leaf))
@@ -67,7 +67,7 @@
           measure-ops (:measure settings)
           l0 (Leaf. (arrays/aget ks 0) settings nil)
           l1 (Leaf. (arrays/aget ks 1) settings nil)]
-      (when (and measure-ops _measure)
+      (when (and measure-ops (some? _measure))
         (set! (.-_measure l0) (node/try-compute-measure l0 nil measure-ops {:sync? true}))
         (set! (.-_measure l1) (node/try-compute-measure l1 nil measure-ops {:sync? true})))
       (util/return-array l0 l1)))
@@ -89,14 +89,14 @@
                                    lens     (b/-split-on-insert bd all-keys total idx 0)]  ; idx = insert pos
                                (if (nil? lens)
                                  (let [lf (Leaf. all-keys settings nil)]
-                                   (when (and measure-ops _measure)
+                                   (when (and measure-ops (some? _measure))
                                      (node/try-compute-measure lf nil measure-ops {:sync? true}))
                                    (arrays/array lf))
                                  (loop [out (transient []), pos 0, ls lens]
                                    (if (seq ls)
                                      (let [l  (first ls)
                                            lf (Leaf. (.slice all-keys pos (+ pos l)) settings nil)]
-                                       (when (and measure-ops _measure)
+                                       (when (and measure-ops (some? _measure))
                                          (node/try-compute-measure lf nil measure-ops {:sync? true}))
                                        (recur (conj! out lf) (+ pos l) (next ls)))
                                      (arrays/into-array (persistent! out))))))
@@ -125,7 +125,7 @@
                                    left-leaf  (Leaf. (.slice all-keys 0 middle) settings nil)
                                    right-leaf (Leaf. (.slice all-keys middle (inc keys-l)) settings nil)]
                                ;; Compute measure for split leaves only if already computed
-                               (when (and measure-ops _measure)
+                               (when (and measure-ops (some? _measure))
                                  (node/try-compute-measure left-leaf nil measure-ops {:sync? true})
                                  (node/try-compute-measure right-leaf nil measure-ops {:sync? true}))
                                (arrays/array left-leaf right-leaf))
@@ -135,7 +135,7 @@
                                    new-leaf (Leaf. new-keys settings nil)]
                                ;; Update measure incrementally only if we already have measure.
                                ;; If _measure is nil (e.g. from merge/merge-split), leave nil for lazy recomputation.
-                               (when (and measure-ops _measure)
+                               (when (and measure-ops (some? _measure))
                                  (set! (.-_measure new-leaf)
                                        (measure/merge-measure measure-ops _measure (measure/extract measure-ops key))))
                                (arrays/array new-leaf)))]
@@ -181,7 +181,7 @@
                            new-keys (util/splice keys idx (inc idx) (arrays/array))
                            new-leaf (Leaf. new-keys settings nil)]
                        ;; Update measure only if already computed
-                       (when (and measure-ops _measure)
+                       (when (and measure-ops (some? _measure))
                          (set! (.-_measure new-leaf)
                                (measure/remove-measure measure-ops _measure removed-element
                                                        #(node/try-compute-measure new-leaf storage measure-ops {:sync? true}))))
@@ -220,7 +220,7 @@
                            new-leaf (Leaf. new-keys settings nil)
                            measure-ops (:measure settings)]
                        ;; Eagerly maintain measure: compute from new leaf (which has replacement done)
-                       (when (and measure-ops _measure)
+                       (when (and measure-ops (some? _measure))
                          (set! (.-_measure new-leaf)
                                ;; Compute from new-leaf which has new-key instead of old-key
                                (node/try-compute-measure new-leaf storage measure-ops {:sync? true})))
