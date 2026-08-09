@@ -574,7 +574,13 @@
   ([address storage]
    (restore-by RT/DEFAULT_COMPARATOR address storage {}))
   ([address ^IStorage storage opts]
-   (restore-by (or (:comparator opts) RT/DEFAULT_COMPARATOR) address storage opts)))
+   ;; `:cmp` as well as `:comparator`: `btset/restore` reads `(or (:comparator opts)
+   ;; (:cmp opts) compare)` and this file's own `sorted-set*` accepts `:cmp`, so a caller who
+   ;; wrote `(restore addr st {:cmp cmp})` still hit the whole defect on the JVM alone after
+   ;; the `:comparator` half was fixed. Measured on the fixed build before this line:
+   ;;     {:cmp desc}   JVM (contains? r 5) => FALSE      cljs => true
+   ;;     {:comparator} JVM (contains? r 5) => true       cljs => true
+   (restore-by (or (:comparator opts) (:cmp opts) RT/DEFAULT_COMPARATOR) address storage opts)))
 
 (defn walk-addresses
   "Visit each address used by this set. Usable for cleaning up garbage left in

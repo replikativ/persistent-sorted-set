@@ -1249,6 +1249,19 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           }
         }
 
+        // Hygiene only — this clear frees NOTHING measurable, and the commit that added it
+        // (854c32e) claimed otherwise. Isolated afterwards: with the five Leaf clears kept
+        // and this one removed, the retention test passes with 0 failures and the measured
+        // numbers are bit-identical to having it. The reason is structural: the arm is
+        // guarded `editable() && idx < _len-2`, so `copyAll(children, idx+2, _len)` always
+        // shifts the tail LEFT, which makes every slot in [newLen, _len) a duplicate of one
+        // still live in [0, newLen). An instrumented run over the whole suite saw 4123
+        // executions and 4123 stale child slots, none of which held a node that was not
+        // still referenced below newLen.
+        //
+        // Kept because it costs four fills on a path that already copies arrays, and because
+        // "no shape was found where it matters" is weaker than a proof. But do NOT cite it
+        // as the source of any retention number: those all come from Leaf.
         if (newLen < _len) {                                                       // TAILCLEAR
           Arrays.fill(_keys, newLen, _len, null);
           if (s0.addresses != null) Arrays.fill(s0.addresses, newLen, _len, null);

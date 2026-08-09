@@ -58,11 +58,27 @@
     (doseq [bf [8 16]]
       (let [{:keys [addr disk n]} (stored bf 20)
             r (set/restore addr (storage disk bf) {:comparator desc :branching-factor bf})]
-        (is (= n (count (set/conj r 5 desc)))
+        ;; clojure.core/conj and disj DELIBERATELY, i.e. the set's own comparator. An earlier
+        ;; version passed `desc` as the OPERATION comparator, which overrides the set's wrong
+        ;; `_cmp` and repairs the very thing under test — so it passed against the unfixed
+        ;; build while the commit message's numbers (21 and 20) came from these 2-arity forms.
+        ;; Caught by an adversarial review.
+        (is (= n (count (clojure.core/conj r 5)))
             (str "bf=" bf ": conjing an element that is already present must be a no-op, "
                  "not a second copy"))
-        (is (= (dec n) (count (set/disj r 5 desc)))
+        (is (= (dec n) (count (clojure.core/disj r 5)))
             (str "bf=" bf ": and disj must actually remove it"))))))
+
+(deftest restore-honours-cmp-as-well-as-comparator
+  (testing "`btset/restore` reads (or (:comparator opts) (:cmp opts) compare) and this
+            namespace's own `sorted-set*` accepts `:cmp`, so fixing only `:comparator` left
+            the identical defect live on the JVM for anyone who spelled it `:cmp`"
+    (doseq [bf [8 16]]
+      (let [{:keys [addr disk n]} (stored bf 20)
+            r (set/restore addr (storage disk bf) {:cmp desc :branching-factor bf})]
+        (is (= (reverse (range n)) (vec r)) (str "bf=" bf ": contents"))
+        (doseq [k [0 5 13 19]]
+          (is (contains? r k) (str "bf=" bf ": " k " must be findable under :cmp too")))))))
 
 (deftest restore-by-and-restore-agree
   (testing "the two spellings must give the same set — restore-by is the JVM-only one that
