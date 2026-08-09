@@ -998,17 +998,28 @@
   (-seek [this key]
     (-seek this key (.-comparator set)))
 
+  ;; Two things were wrong here, and they pulled in opposite directions.
+  ;;
+  ;; The `(nat-int? (cmp current key)) => this` arm made a BACKWARD seek a no-op: positioned
+  ;; at 5000, `(seek it 2500)` returned the iterator unchanged, so the answer began at 5000
+  ;; rather than 2500. That arm is only sound under forward-only semantics; the docstring
+  ;; states the postcondition unconditionally, and `-seek-path` re-descends from the root, so
+  ;; the general answer costs the same O(log n) a forward seek already paid.
+  ;;
+  ;; And the `:else` arm built the new Iter with NO check that `left'` is still before
+  ;; `right`, so seeking past a slice's upper bound emitted elements outside the slice:
+  ;;
+  ;;     (seek (slice s 2500 7500) 9000)   cljs => [9000]   JVM => nil
+  ;;
+  ;; `right` is this Iter's retained end and every other method here guards on it
+  ;; (`-next`, `-chunked-next`, `-reduce` all test `path-lt`); only `-seek` did not.
+  ;; `ReverseIter` already had the mirror guard.
   (-seek [this key cmp]
-    (cond
-      (nil? key)
+    (if (nil? key)
       (throw (js/Error. "seek can't be called with a nil key!"))
-
-      (nat-int? (cmp (arrays/aget keys idx) key))
-      this
-
-      :else
       (when-some [left' (-seek-path set key cmp {:sync? true})]
-        (Iter. set left' right (-keys-for set left' {:sync? true}) (path-get set left' 0)))))
+        (when (path-lt left' right)
+          (Iter. set left' right (-keys-for set left' {:sync? true}) (path-get set left' 0))))))
 
   Object
   (toString [this] (pr-str* this))
@@ -1118,19 +1129,20 @@
   (-seek [this key]
     (-seek this key (.-comparator set)))
 
+  ;; Mirror of `Iter -seek` above, for the same two reasons.
+  ;;
+  ;; The `this` arm made a seek back UP a descending iterator a no-op. And `(path-lt right'
+  ;; right)` was not a bound check but a "never move above where you started" restriction:
+  ;; for a ReverseIter, `left` is the retained end (the `to` of `rslice`) and `right` is
+  ;; merely the current position. Keeping `path-lte left right'` preserves the bound; dropping
+  ;; the other restores the same absolute-reposition semantics the ascending side and the JVM
+  ;; now have, so `(-> (rslice s 9999 nil) (seek 5000) (seek 7500))` answers from 7500.
   (-seek [this key cmp]
-    (cond
-      (nil? key)
+    (if (nil? key)
       (throw (js/Error. "seek can't be called with a nil key!"))
-
-      (nat-int? (cmp key (arrays/aget keys idx)))
-      this
-
-      :else
       (let [right' (-prev-path set (-rseek set key cmp {:sync? true}) {:sync? true})]
         (when (and right' (>= right' (js* "0n"))
-                   (path-lte left right')
-                   (path-lt  right' right))
+                   (path-lte left right'))
           (ReverseIter. set left right' (-keys-for set right' {:sync? true}) (path-get set right' 0))))))
 
   Object
@@ -2067,8 +2079,28 @@
       (update :diff-buf-size (fn [d] (if (or (nil? d) (neg? d)) 0 d)))))
 
 (defn ^BTSet from-sorted-array
-  [cmp arr _len opts]
-  (let [settings (node-settings opts)
+  "Build from the first `len` elements of `arr`.
+
+   `len` used to be ignored outright — the parameter was spelled `_len` and both branches
+   below partitioned the WHOLE array and took the count from `(arrays/alength arr)`. A caller
+   passing a reusable buffer with only its first `len` slots valid got the buffer's stale tail
+   as set members, silently:
+
+       (from-sorted-array compare #js [1 2 3 4 5] 3)
+       JVM  => [1 2 3]      count 3
+       cljs => [1 2 3 4 5]  count 5
+
+   Truncating here rather than threading `len` through both builders keeps the two branches
+   (MST and count) honest by construction — neither can forget it again — and costs one array
+   slice only when the caller actually passed a shorter length."
+  [cmp arr len opts]
+  (let [full     (arrays/alength arr)
+        len      (if (nil? len) full len)
+        _        (when (or (neg? len) (> len full))
+                   (throw (ex-info "from-sorted-array: len out of range"
+                                   {:len len :array-length full})))
+        arr      (if (< len full) (.slice arr 0 len) arr)
+        settings (node-settings opts)
         measure-ops (:measure settings)
         storage  (:storage opts)
         bd       (b/content-boundary settings)]
@@ -2085,14 +2117,17 @@
             (recur (mapv #(mst-build-branch lvl (array-seq %) settings cmp)
                          (mst-partition bd (arrays/into-array nodes) node/max-key (inc lvl)))
                    (inc lvl)))))
-      (from-sorted-array-count cmp arr _len settings storage measure-ops (:meta opts)))))
+      (from-sorted-array-count cmp arr len settings storage measure-ops (:meta opts)))))
 
 (defn- ^BTSet from-sorted-array-count
   ;; `meta-val` is threaded explicitly: this fn takes `settings` (a select-keys subset), not
   ;; `opts`, so `:meta` is not reachable here otherwise. Dropping it was the cljs half of the
   ;; defect fixed on the JVM — `from-sorted-array`/`from-sequential`/`sorted-set` all lost the
   ;; metadata the wire codec resolves `:pss/storage-id` from.
-  [cmp arr _len settings storage measure-ops meta-val]
+  ;; `arr` arrives already truncated to `len` by `from-sorted-array`, so the count taken from
+  ;; `(arrays/alength arr)` below is the caller's length. `len` is kept in the signature only
+  ;; to keep the two call sites symmetric.
+  [cmp arr len settings storage measure-ops meta-val]
   (let [leaves   (->> arr
                       (arr-partition-approx settings)
                       (arr-map-inplace #(let [leaf (Leaf. % settings nil)]

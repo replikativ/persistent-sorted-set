@@ -29,13 +29,17 @@
              default-opts opts))
 
 (defn from-sorted-array
-  "Fast path to create a set if you already have a sorted array of elements on your hands."
+  "Fast path to create a set if you already have a sorted array of elements on your hands.
+
+   Only the first `len` elements are used; the rest of `arr` is ignored. (`len` was formerly
+   accepted and then discarded here, so a caller passing a reusable buffer got its stale tail
+   as set members — see `btset/from-sorted-array`.)"
   ([cmp arr]
    (from-sorted-array cmp arr (arrays/alength arr)))
-  ([cmp arr _len]
-   (from-sorted-array cmp arr _len {}))
-  ([cmp arr _len opts]
-   (btset/from-sorted-array cmp arr _len (with-defaults opts))))
+  ([cmp arr len]
+   (from-sorted-array cmp arr len {}))
+  ([cmp arr len opts]
+   (btset/from-sorted-array cmp arr len (with-defaults opts))))
 
 (defn from-sequential
   "Create a set with custom comparator and a collection of keys. Useful when you't want to call [[clojure.core/apply]] on [[sorted-set-by]]."
@@ -367,10 +371,19 @@
    fill ratios. Preserves comparator, settings, and metadata.
    Returns a new set with the same elements in a freshly built tree.
 
-   Note: currently materializes all elements in memory."
+   Note: currently materializes all elements in memory.
+
+   `(.-settings set)` is the NODE settings — `[:branching-factor :measure :boundary
+   :diff-buf-size]` only — so passing it alone dropped both the storage and the metadata that
+   the docstring promises and that the wire codec resolves `:pss/storage-id` from. Measured
+   before the fix: `(meta (compact s))` nil for `(meta s)` `{:x 1}`, `(.-storage (compact s))`
+   nil, and `(store (compact s))` throwing \"BTSet/store requires IStorage in second
+   argument\". This is the ClojureScript half of the defect fixed on the JVM."
   [^BTSet set]
   (let [arr (into-array (btset/$seq set))
         len (alength arr)
-        opts (.-settings set)]
+        opts (assoc (.-settings set)
+                    :storage (.-storage set)
+                    :meta (meta set))]
     (btset/from-sorted-array (.-comparator set) arr len opts)))
 
