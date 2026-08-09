@@ -184,14 +184,31 @@ public class Seq extends ASeq implements IReduce, Reversible, IChunkedSeq, ISeek
 
     if (_asc) {
 
-      while (node != null && cmp.compare(node.maxKey(), to) < 0){
-        if (seq == null) {
-          return null;
-        } else {
-          node = seq._node;
-          seq = seq._parent;
-        }
+      // Climb while `to` lies outside this subtree — on EITHER side.
+      //
+      // This used to test only `maxKey(node) < to`, i.e. only the forward direction. A `to`
+      // BELOW the current position therefore never climbed, and `searchFirst` below re-ran on
+      // the current LEAF, which answered with that leaf's first element. The result was wrong
+      // in two directions at once — measured on `(apply sorted-set (range 10000))`, seeking to
+      // 5000 and then back to 2500:
+      //
+      //     5008 elements, first 4992      (documented: 7500 elements, first 2500)
+      //
+      // so 2500..4991 were silently missing AND 4992..4999 were re-emitted below the position
+      // already consumed. The rewind distance is the leaf boundary, hence shape-dependent,
+      // which is why the (all-forward) seek tests never saw it.
+      //
+      // Forward seeks are unaffected: `to` is then above the current position, so it is never
+      // below the current node's minKey and the added disjunct is false. `||` short-circuits,
+      // so a forward climb evaluates the second comparison exactly once, at the level where it
+      // stops.
+      while (node != null && seq != null
+             && (cmp.compare(node.maxKey(), to) < 0 || cmp.compare(to, node.minKey()) < 0)) {
+        node = seq._node;
+        seq = seq._parent;
       }
+      // Past the end of the whole tree: nothing is at or after `to`.
+      if (node == null || cmp.compare(node.maxKey(), to) < 0) return null;
 
       while (true) {
         int idx = node.searchFirst(to, cmp);
@@ -210,8 +227,17 @@ public class Seq extends ASeq implements IReduce, Reversible, IChunkedSeq, ISeek
 
     } else {
 
-      // NOTE: We can't shortcircuit here as we don't know the minKey. Might go up one level too high.
-      while (cmp.compare(to, node.minKey()) < 0 && seq != null){
+      // Mirror of the ascending climb above: leave the subtree when `to` is outside it on
+      // EITHER side. Testing only `to < minKey(node)` covered only the descending direction of
+      // travel, so seeking BACK UP a descending iterator clamped inside the current subtree.
+      // Measured on `(rslice (apply sorted-set (range 10000)) 9999 nil)`, seek 5000 then 7500:
+      //
+      //     first 5375, 5376 elements      (documented: first 7500, 7501 elements)
+      //
+      // A `to` above everything is still handled by the `clamp to last` line below, and a `to`
+      // below everything by the leaf arm's `advance()`, which returns null when it cannot.
+      while (node != null && seq != null
+             && (cmp.compare(to, node.minKey()) < 0 || cmp.compare(node.maxKey(), to) < 0)) {
         node = seq._node;
         seq = seq._parent;
       }
