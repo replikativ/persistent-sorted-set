@@ -151,6 +151,49 @@
        (cond-> {:keys (vec (.-keys node))}
          (some? (.-_measure node)) (assoc :measure (.-_measure node))))))
 
+(defn- nested-slot-map?
+  "Is this `:diff` a NESTED slot map (index -> entry) rather than a leaf diff?
+
+   `Branch.assembleNested` writes `{idx {:count _ :measure _ :diff _ :max-key _}}` for a
+   branch child, where the inner `:diff` is either another such map or — at level 1 — a
+   leaf diff in the comparator-agnostic storage form `{:absent [...] :present [...]}`.
+   The two are told apart by their VALUES: a nested entry is a map carrying `:max-key`,
+   which a leaf diff's `[el ...]` vectors never are."
+  [d]
+  (and (map? d)
+       (seq d)
+       (every? (fn [[_ v]] (and (map? v) (contains? v :max-key))) d)))
+
+(defn- strip-slot-caches
+  "Drop the null-until-forced caches from a slot entry AT EVERY DEPTH.
+
+   Stripping only the top level re-admitted them one level down: for a branch at level >= 2,
+   `assembleNested` writes `:count` and `:measure` per GRANDCHILD inside `slot.diff`, and
+   `:diff` is deliberately kept because a buffered diff is content. So `slot.measure` —
+   `child.measure()`, precisely the cache this projection exists to exclude — sat inside the
+   identity from depth 2 down.
+
+   Measured on two cold restores off the SAME disk, differing only in whether a READ-ONLY
+   `set/measure` ran before an otherwise identical `conj` and `store`:
+
+       n=200  root level 2   keys equal, addresses equal, slots DIFFER
+                             nested :measure  cold [false]       warm [true]
+                             identity equal? false   hash equal? false
+       n=600  root level 3   nested :measure  cold [false false]  warm [true true]
+       n=40   root level 1   identity equal? true    (the case the old test pinned)
+
+   So a node's content address depended on warmth, which is the same defect already fixed
+   once at the top level. `test/node_identity.cljc` asserted \"At level 2 the slot is a
+   branch marker with no measure and nothing here can vary\" — that claim was false, and its
+   companion test only inspected top-level entry KEYS, so neither could see it."
+  [entry]
+  (let [e (select-keys entry [:diff :max-key])
+        d (:diff e)]
+    (if (nested-slot-map? d)
+      (assoc e :diff (reduce-kv (fn [acc k v] (assoc acc k (strip-slot-caches v)))
+                                (empty d) d))
+      e)))
+
 (defn node->identity
   "The CONTENT of a node, for a content address: hash THIS, not `node->map`.
 
@@ -189,7 +232,7 @@
       (update :slots
               (fn [slots]
                 (reduce-kv (fn [acc k entry]
-                             (assoc acc k (select-keys entry [:diff :max-key])))
+                             (assoc acc k (strip-slot-caches entry)))
                            (empty slots) slots))))))
 
 (defn node->blob

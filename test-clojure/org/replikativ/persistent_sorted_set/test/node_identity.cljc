@@ -90,8 +90,16 @@
                m-cold (nodes/node->map r-cold)
                m-warm (nodes/node->map r-warm)]
            (is (= 1 (.level ^ANode r-cold))
-               "precondition: a LEVEL-1 root. At level 2 the slot is a branch
-                marker with no measure and nothing here can vary.")
+               "precondition: a LEVEL-1 root, which is where THIS scenario puts the
+                measure — directly in the top-level slot entry.
+                The reason once given here, that 'at level 2 the slot is a branch
+                marker with no measure and nothing here can vary', was FALSE:
+                `assembleNested` writes :count and :measure per grandchild inside
+                slot.diff, and :diff is deliberately kept, so from level 2 down the
+                cache sat inside the identity. Measured, two cold restores differing
+                only in a read-only `measure` query: nested :measure cold [false]
+                vs warm [true], identity and hash unequal. Fixed by stripping the
+                caches recursively; `deeper-levels-strip-too` below pins it.")
            (is (seq (:slots m-cold))
                "precondition: the root actually carries diff-buf slots")
            (is (not= (slot-measures m-cold) (slot-measures m-warm))
@@ -128,4 +136,111 @@
            (doseq [[i e] (:slots id)]
              (is (= #{} (cset/intersection (set (keys e)) #{:measure :count}))
                  (str "slot " i " must carry no cached aggregate, got "
-                      (pr-str (keys e))))))))))
+                      (pr-str (keys e))))))))
+
+     ;; ---------------------------------------------------------------------
+     ;; The same thing one level down, which is where it actually survived.
+
+     (defn- cache-keys-at-any-depth
+       "Paths to every :count/:measure found ANYWHERE inside the slot structure.
+        The test above only inspects top-level entry keys, so it cannot see a
+        cache nested inside `:diff` — which is exactly where one was."
+       [m]
+       (let [found (atom [])]
+         (letfn [(walk [x path]
+                   (when (map? x)
+                     (doseq [k [:count :measure]]
+                       (when (contains? x k) (swap! found conj (conj path k))))
+                     (doseq [[k v] x] (walk v (conj path k)))))]
+           (walk (:slots m) [:slots]))
+         @found))
+
+     ;; Its own shape, and every part of it is load-bearing:
+     ;;   * bf 8 so 200 elements reach level 2 — at level 1 there is no nesting to strip;
+     ;;   * a large diff-buf so the parent BUFFERS its branch child rather than flushing it;
+     ;;   * and the identity must be taken AFTER a store, because `assembleNested` — the
+     ;;     thing that writes per-grandchild :count/:measure into slot.diff — runs during
+     ;;     store(). Taken before, the slot is a branch MARKER with `:diff nil`, there is
+     ;;     nothing nested at all, and the test passes against the unfixed code while
+     ;;     proving nothing. That is how the first version of this test came out green in
+     ;;     its own red check.
+     (def ^:private DEEP-BF 8)
+     (def ^:private DEEP-DBS 4096)
+
+     (defn- deep-settings ^Settings []
+       (Settings. (int DEEP-BF) RefType/STRONG ^IMeasure ops nil (int DEEP-DBS)))
+
+     (def ^:private deep-opts
+       {:branching-factor DEEP-BF :ref-type :strong :diff-buf-size DEEP-DBS
+        :measure ops :comparator compare})
+
+     (defn- deep-fixture []
+       (let [st (ts/storage-with-settings (deep-settings))
+             s0 (s/from-sorted-array compare (object-array (range 0 2000 10)) 200
+                                     (assoc deep-opts :storage st))]
+         {:addr (s/store s0 st) :disk (:*disk st)}))
+
+     (defn- deep-build [{:keys [addr disk]}]
+       (s/restore-by compare addr
+                     (ts/->Storage (atom {}) disk (deep-settings))
+                     deep-opts))
+
+     (deftest deeper-levels-strip-too
+       (testing "`assembleNested` writes :count and :measure per GRANDCHILD inside
+                 slot.diff, and :diff is deliberately kept as content — so from
+                 level 2 down the cache was back inside the identity. Measured
+                 before the recursive strip, two cold restores differing only in a
+                 read-only measure query: nested :measure cold [false] warm [true],
+                 identity and hash unequal, at root levels 2 and 3 alike."
+         (let [fx   (deep-fixture)
+               cold (deep-build fx)
+               warm (deep-build fx)
+               _    (s/measure warm)             ; force BEFORE the deposit
+               s-c  (conj cold 35)               ; one content-only insert, middle leaf
+               s-w  (conj warm 35)
+               _    (s/store s-c)                ; assembleNested runs HERE
+               _    (s/store s-w)
+               rc   (.root ^PersistentSortedSet s-c)
+               rw   (.root ^PersistentSortedSet s-w)
+               map-c (nodes/node->map rc)]
+           (is (>= (.level ^ANode rc) 2)
+               "precondition: a level-2+ root, or assembleNested never nests and
+                this test is vacuous")
+           ;; NESTED specifically. A top-level [:slots i :measure] is present in every
+           ;; node->map and was already stripped before this change, so asserting merely
+           ;; "some cache exists" would be satisfied by the case that already worked.
+           (is (seq (filter #(> (count %) 3) (cache-keys-at-any-depth map-c)))
+               (str "precondition: node->map must carry caches INSIDE :diff, or there is
+                     nothing for the recursive strip to remove and a green result would
+                     mean nothing. Paths found: "
+                    (pr-str (cache-keys-at-any-depth map-c))))
+           (is (= [] (cache-keys-at-any-depth (nodes/node->identity rc)))
+               "the identity projection must strip them at EVERY depth")
+           (is (= (nodes/node->identity rc) (nodes/node->identity rw))
+               "THE assertion: warmth must not change a level-2+ node's identity")
+           (is (= (hash (nodes/node->identity rc)) (hash (nodes/node->identity rw)))
+               "and therefore not its content address"))))
+
+     (deftest deep-identity-still-distinguishes-different-content
+       (testing "the recursive strip must not flatten away real nested content.
+
+                 The trees are STORED before comparing, and that is not incidental.
+                 On an unstored level-2 root the changed child has no address yet
+                 (`:addresses [nil ...]`) and its slot is a branch MARKER with
+                 `:diff nil` — the buffered element lives in the child, not here —
+                 so both roots project to the identical map. That is correct rather
+                 than a collision: identities are computed bottom-up at store time,
+                 when a child's address is what carries its content upward. A first
+                 version of this test compared unstored roots and failed for exactly
+                 that reason, which is worth recording since the level-1 test above
+                 does NOT need the store (at level 1 the slot holds the diff itself)."
+         (let [fx (deep-fixture)
+               store! (fn [k]
+                        (let [s (conj (deep-build fx) k)]
+                          (s/store s)
+                          (.root ^PersistentSortedSet s)))
+               ra (store! 35)
+               rb (store! 45)]
+           (is (>= (.level ^ANode ra) 2) "precondition: still a level-2+ root")
+           (is (not= (nodes/node->identity ra) (nodes/node->identity rb))
+               "different buffered elements must still give different identities"))))))
