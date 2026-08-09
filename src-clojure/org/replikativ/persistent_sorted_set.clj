@@ -541,11 +541,27 @@
 (defn restore
   "Constructs lazily-loaded set from storage and root address.
    Supports all operations that normal in-memory impl would,
-   will fetch missing nodes by calling IStorage::restore when needed"
+   will fetch missing nodes by calling IStorage::restore when needed.
+
+   Honours `:comparator` in `opts`, defaulting to the natural one. It used to
+   hard-code `RT/DEFAULT_COMPARATOR` and DISCARD an explicit `:comparator`, which
+   matters because `restore-by` is JVM-only: portable `.cljc` code restoring a
+   custom-comparator set has no other spelling, and ClojureScript honours the key.
+   So the same source gave a working set on one runtime and a broken one on the
+   other. Measured on a descending-comparator set of 0..19 stored and restored:
+
+       (vec r)          => [19 18 ... 1 0]   correct
+       (count r)        => 20                correct
+       (contains? r 5)  => FALSE             (restore-by desc => true)
+       (disj r 5)       => a no-op
+       (conj r 5)       => 21 elements, a DUPLICATE 5, durable once stored
+
+   Every cheap oracle — seq, count, printing — looks right, because the TREE is
+   fine; only the comparator the set navigates it with was wrong."
   ([address storage]
    (restore-by RT/DEFAULT_COMPARATOR address storage {}))
   ([address ^IStorage storage opts]
-   (restore-by RT/DEFAULT_COMPARATOR address storage opts)))
+   (restore-by (or (:comparator opts) RT/DEFAULT_COMPARATOR) address storage opts)))
 
 (defn walk-addresses
   "Visit each address used by this set. Usable for cleaning up garbage left in
