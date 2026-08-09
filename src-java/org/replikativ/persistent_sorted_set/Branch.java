@@ -275,7 +275,15 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // diff-buf: propagate the set's projection comparator down to each restored branch, so a
     // leaf-parent projects its buffered leaves with its own _projCmp — independent of whatever
     // operation (lookup with a prefix cmp, slice, count, …) drove this descent.
-    if (base instanceof Branch) ((Branch) base)._projCmp = _projCmp;
+    // Seed it when the restored node has none; COPY when it already carries a different one,
+    // because `base` is the object the IStorage returned and a caching storage shares it by
+    // address across sets. Overwriting it there is what let one set's comparator decide
+    // another set's leaf order — see withProjCmp for the measurement.
+    if (base instanceof Branch) {
+      Branch bb = (Branch) base;
+      if (bb._projCmp == null) bb._projCmp = _projCmp;
+      else if (bb._projCmp != _projCmp) base = bb.withProjCmp(_projCmp);
+    }
     // slots from the SAME snapshot as the address we restored from — the pair can't mix
     // a pre-settle address with post-settle slots (or vice versa).
     Object[] slots = (s.buf != null) ? s.buf.slots : null;
@@ -2417,6 +2425,47 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
                                              null, sl.count, sl.measure, _projCmp, base._settings);
     proj.installSlots(slots, BUF_LAZY);
     return proj;
+  }
+
+  /**
+   * A copy of this branch that projects under `projCmp` instead of `_projCmp`.
+   *
+   * Needed because `_projCmp` is a FIELD on a node that a caching IStorage shares by address.
+   * Two sets over one storage whose comparators order ties differently — `restore-by cmpA` and
+   * `restore-by cmpB` on the same root, or `restore` (which hard-codes DEFAULT_COMPARATOR)
+   * where `restore-by` was meant — both stamped the same object, and whichever ran last won.
+   * `projectLeaf` then rebuilt a buffered leaf's key array in the OTHER set's order.
+   *
+   * Measured before this copy, two sets over one storage at bf 8 / diff-buf 64 / n 60, reading
+   * interleaved so B re-stamps the shared root between two steps of A's lazy seq:
+   *
+   *     count 129 (correct)   seq sorted under cmp1: FALSE   first disorder at idx 18
+   *     contains? false for [8 1] [9 0] [14 1] [14 2] [15 0] — all present in seq
+   *
+   * and it does not stay in memory: one `conj` into the mis-sorted cached leaf, one `store`,
+   * and a cold reload through a fresh cache has one element PERMANENTLY unfindable — in `seq`,
+   * `contains?` false — because the branch separator no longer bounds it.
+   *
+   * The children array is deliberately NOT shared. Sharing it would defeat the whole copy:
+   * the cache holds children already projected under the other set's comparator, so the next
+   * level down would hand back the same mis-ordered leaves. Addresses and keys are copied for
+   * the reason `projectBranch` records — a shared node must not be reachable through an array
+   * another version can write. `buf` IS shared: slots are immutable snapshots, and this copy
+   * gets its own `_state`, so its CASes never touch the base's.
+   *
+   * Cost: nothing on the single-comparator path, which is every normal use — the callers copy
+   * only when a node already carries a DIFFERENT comparator, and they publish the copy, so it
+   * happens once per node rather than once per read.
+   */
+  Branch<Key, Address> withProjCmp(Comparator projCmp) {
+    NodeState<Address> s = _state;
+    Address[] addrCopy = (s.addresses != null)
+        ? Arrays.copyOf(s.addresses, s.addresses.length) : null;
+    Key[] keysCopy = Arrays.copyOf(_keys, _keys.length);
+    Branch<Key, Address> copy = new Branch<>(_level, _len, keysCopy, addrCopy, null,
+                                             _subtreeCount, _measure, projCmp, _settings);
+    copy._state = new NodeState<>(addrCopy, null, s.buf);
+    return copy;
   }
 
   // -ea ONLY: detect two threads settling the SAME node concurrently.

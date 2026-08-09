@@ -173,7 +173,21 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     // diff-buf: seed the projection comparator at the root; Branch.child propagates it down
     // as nodes materialize, so a leaf-parent can project buffered leaves with the set's
     // comparator. (Idempotent; no-op for a Leaf root, which has no buffered children.)
-    if (root instanceof Branch) ((Branch) root)._projCmp = _cmp;
+    // Seed it when the root carries none; COPY when it already carries a DIFFERENT one. The
+    // object in `_root` is whatever the IStorage returned, and a caching storage hands the
+    // same object to every set opened at that address — so an unconditional write here let
+    // the last set to call root() decide how every other set's buffered leaves are ordered.
+    // The copy is published into `_root`, so a conflicting pair costs one copy per set, not
+    // one per read; the single-comparator path is the same plain write it always was.
+    if (root instanceof Branch) {
+      Branch rb = (Branch) root;
+      if (rb._projCmp == null) {
+        rb._projCmp = _cmp;
+      } else if (rb._projCmp != _cmp) {
+        root = rb.withProjCmp(_cmp);
+        _root = _settings.makeReference(root);
+      }
+    }
     return root;
   }
 
