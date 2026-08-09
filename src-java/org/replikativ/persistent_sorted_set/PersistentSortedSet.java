@@ -19,7 +19,24 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   public static final PersistentSortedSet EMPTY = new PersistentSortedSet();
 
   public Address _address;
-  public Object _root; // Object == ANode | SoftReference<ANode> | WeakReference<ANode>
+  /** VOLATILE, and it is the publication point for `_settings` as well as for itself.
+   *
+   *  `root()` lazily restores, then ADJUSTS `_settings` (branching factor, boundary,
+   *  diff-buf budget) from what the restored node turns out to carry, then writes
+   *  `_root` last. Those settings writes reach another thread only if the write that
+   *  follows them is a release and the read that precedes reading them is an acquire.
+   *  Hence volatile here — and hence the local `rootRef` in `root()`/`store()`.
+   *
+   *  Reading it through `_settings.readReference(_root)` is NOT enough, and was the
+   *  actual defect: Java evaluates the RECEIVER first, so that expression reads
+   *  `_settings` BEFORE `_root`. The read order is then the exact inverse of the write
+   *  order, and a thread can pair the newly published root with the pre-adoption
+   *  settings. That needs no store reordering to happen, so it is reachable on x86 TSO
+   *  and not only on a weak model — a set then runs at the wrong branching factor over
+   *  the restored node, which is the overrun documented at `root()` below.
+   *
+   *  Object == ANode | SoftReference<ANode> | WeakReference<ANode> */
+  public volatile Object _root;
   public int _count;
   public int _version;
   // Not final: a lazily-restored root self-describes its split strategy (the boundary); root()
@@ -55,8 +72,12 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   }
 
   public ANode<Key, Address> root() {
-    assert _address != null || _root != null;
-    ANode root = (ANode<Key, Address>) _settings.readReference(_root);
+    // ACQUIRE FIRST. `_settings.readReference(_root)` would read `_settings` first — Java
+    // evaluates the receiver before the argument — and so could pair a published root with
+    // the settings from before this method adopted them. See the field's javadoc.
+    final Object rootRef = _root;
+    assert _address != null || rootRef != null;
+    ANode root = (ANode<Key, Address>) _settings.readReference(rootRef);
     if (root == null && _address != null) {
       root = _storage.restore(_address);
       // NOTE the publish of `_root` is at the END of this block, not here. Everything
@@ -565,7 +586,8 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     assert _storage != null;
 
     if (_address == null) {
-      ANode<Key, Address> root = (ANode) _settings.readReference(_root);
+      final Object rootRef = _root;   // acquire first — see the field's javadoc
+      ANode<Key, Address> root = (ANode) _settings.readReference(rootRef);
       if (root == null) {
         throw new IllegalStateException(
             "PersistentSortedSet cannot be stored: it has no address and its root reference "
