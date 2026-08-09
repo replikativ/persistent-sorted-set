@@ -58,8 +58,17 @@
                ;; diff-buf: seed the projection comparator at the root; branch/child propagates it
                ;; down as nodes materialize, so a leaf-parent can project buffered leaves with the
                ;; set's stable comparator. Idempotent; a Leaf root has no buffered children.
+               ;; Seed it when the root carries none; COPY when it already carries a
+               ;; DIFFERENT one. The object in `root` is whatever the storage returned, and a
+               ;; caching storage hands the same object to every set opened at that address,
+               ;; so an unconditional write let the last set to call `-root` decide how every
+               ;; other set's buffered leaves are ordered. The copy is published back into
+               ;; `root`, so a conflicting pair costs one copy per node rather than one per
+               ;; read. This is the ClojureScript half of the JVM fix; it was missing here,
+               ;; leaving the durable data loss live on this runtime alone.
                (when (instance? Branch (.-root set))
-                 (set! (.-_projCmp ^Branch (.-root set)) (.-comparator set)))
+                 (set! (.-root set)
+                       (branch/stamp-proj-cmp (.-root set) (.-comparator set))))
                (.-root set))))
 
 (defn $count

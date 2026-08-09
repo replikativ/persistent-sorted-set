@@ -109,10 +109,75 @@
         (when (some? mk)
           (arrays/aset new-keys i mk))))
     ;; _bufEntries -2 = LAZY, derived from the slots on first read (mirrors from-map).
-    (Branch. (.-level base) new-keys nil base-addr
+    ;; COPY the addresses array rather than aliasing base's. The JVM twin took this trade for
+    ;; the reason recorded at `Branch.projectBranch`: a caching IStorage returns the same
+    ;; object per address across versions, so any in-place write through this array would be
+    ;; seen by every other version. On this runtime the write-through is reachable — not
+    ;; under a consistent budget (a projected copy's `pass` equals the nested diff the parent
+    ;; buffered, and the parent only buffered it because it fit), but under a BUDGET
+    ;; MISMATCH: `install-slots!` refuses only a non-positive budget and `-root` adopts a
+    ;; node's budget only upward from 0, so a store written at `:diff-buf-size 512` whose
+    ;; storage rebuilds nodes at 8 gives a copy `pass` > `budget`, and the D3 over-budget
+    ;; flush writes `(aset addrs i ...)` in place. This function already allocates two arrays
+    ;; of this length; a third removes the reasoning chain entirely.
+    (Branch. (.-level base) new-keys nil (arrays/aclone base-addr)
              (long (:count sl))                      ; ĝ.count — no child summing
              (:measure sl)                           ; ĝ.measure
              (.-settings base) slots -2 proj-cmp)))
+
+(defn with-proj-cmp
+  "A copy of `base` that projects under `proj-cmp` instead of its own `_projCmp`.
+
+   The ClojureScript half of the JVM's `Branch.withProjCmp`. `_projCmp` is a FIELD on a node
+   that a caching storage shares by address, so two sets over one storage whose comparators
+   order ties differently were overwriting each other's stamp, and whichever read last won.
+   `project-leaf` then rebuilt a buffered leaf's key array in the OTHER set's order.
+
+   Measured on the JVM before the equivalent fix, and the same shape applies here: count
+   correct, `seq` NOT sorted under the first set's comparator, `contains?` false for elements
+   present in `seq`, and — after one `conj` into the mis-sorted cached leaf plus a `store` —
+   an element permanently unfindable on a cold reload, because the branch separator no longer
+   bounds it.
+
+   The children array is NOT shared: it holds children already projected under the other
+   comparator, which is the whole thing being escaped. Children with NO durable address are
+   the exception and must be carried over — such a child is reachable only through this
+   array, and dropping it loses the subtree. Keys and addresses are copied; `_slots` and
+   `_bufEntries` are shared, since slots are immutable snapshots.
+
+   Copy rather than refuse: two semantically identical comparators are routinely distinct
+   objects (any caller building `(fn [a b] ...)` per restore) and they order the leaf
+   identically, so throwing there would break correct code."
+  [^Branch base proj-cmp]
+  (let [ks    (.-keys base)
+        n     (arrays/alength ks)
+        addrs (.-addresses base)
+        kids  (.-children base)
+        addr-copy (when (some? addrs) (arrays/aclone addrs))
+        kid-copy  (when (some? kids)
+                    (let [out (make-array (arrays/alength kids))]
+                      (dotimes [i n]
+                        (when (and (or (nil? addr-copy) (nil? (arrays/aget addr-copy i)))
+                                   (some? (arrays/aget kids i)))
+                          (aset out i (arrays/aget kids i))))
+                      out))]
+    (Branch. (.-level base) (arrays/aclone ks) kid-copy addr-copy
+             (.-subtree-count base) (.-_measure base) (.-settings base)
+             (.-_slots base) (.-_bufEntries base) proj-cmp)))
+
+(defn stamp-proj-cmp
+  "Seed `node`'s projection comparator, or return a COPY when it already carries a different
+   one. Returns the node to use. Both stamp sites — `btset/-root` and `branch/child`'s
+   restore arm — used to `set!` unconditionally onto the object the storage handed back."
+  [node proj-cmp]
+  (if-not (instance? Branch node)
+    node
+    (let [^Branch b node
+          cur (.-_projCmp b)]
+      (cond
+        (nil? cur) (do (set! (.-_projCmp b) proj-cmp) b)
+        (identical? cur proj-cmp) b
+        :else (with-proj-cmp b proj-cmp)))))
 
 (defn- project-child
   "Project a freshly-restored child against this parent's buffered slot (if any). Returns
@@ -189,13 +254,17 @@
                    (let [addr (aget (.-addresses node) idx)
                          _    (assert (some? addr) "expected address to restore child")
                          _    (assert (some? storage) "expected storage")
-                         base (await (storage/restore storage addr opts))
+                         base0 (await (storage/restore storage addr opts))
                          ;; diff-buf: propagate the set's projection comparator down to the
                          ;; restored branch (the storage layer has no comparator), so a
                          ;; leaf-parent projects its buffered leaves with the set's own
                          ;; comparator — independent of the op that drove this descent.
-                         _    (when (instance? Branch base)
-                                (set! (.-_projCmp base) (.-_projCmp node)))
+                         ;; SEED it when the node carries none; COPY when it carries a
+                         ;; different one, because `base0` is the object the storage returned
+                         ;; and a caching storage shares it by address across sets. Writing
+                         ;; unconditionally is what let one set's comparator decide another
+                         ;; set's leaf order — see `with-proj-cmp`.
+                         base (stamp-proj-cmp base0 (.-_projCmp node))
                          ;; diff-buf: project this parent's buffered diff onto the freshly
                          ;; loaded child (leaf: rebuild keys; branch: install nested _slots).
                          c    (project-child node storage idx base)]
