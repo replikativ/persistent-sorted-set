@@ -755,7 +755,20 @@
                                                           (if removed-out
                                                             (assoc opts :removed-out removed-out)
                                                             opts)))
-                         removed-element (or (some-> removed-out (arrays/aget 0)) key)]
+                         ;; `if-some`, not `or`: `false` is a legal ELEMENT, and `or` fell
+                         ;; through to the caller's comparator-equivalent probe whenever the
+                         ;; stored element was `false`. The in-memory result was right and the
+                         ;; DIFF recorded the wrong key, so a cold restore applied an absence
+                         ;; for something that was never there and `false` came back from the
+                         ;; dead. Measured at bf 4 / budget 128: removing `false` through an
+                         ;; equivalent probe gave count 5 in memory and count 6 after restore;
+                         ;; a shape sweep over bf [4 6 8 10 16] failed 1489 of 1721 cells.
+                         ;; Correct at budget 0 (no diff is recorded) and on the JVM, which
+                         ;; tests the array slot for null. Same class as the `false`-measure
+                         ;; defect fixed in 071038c — that pass converted the measure sites
+                         ;; and missed these two element sites.
+                         removed-element (if-some [r (some-> removed-out (arrays/aget 0))]
+                                           r key)]
                      (when disjoined
                        (let [left-idx  (if left-child  (dec idx) idx)
                              right-idx (if right-child (+ idx 2) (inc idx))
@@ -941,7 +954,12 @@
                                                       (if removed-out
                                                         (assoc opts :removed-out removed-out)
                                                         opts)))
-                         removed-key (or (some-> removed-out (arrays/aget 0)) old-key)]
+                         ;; `if-some`, not `or` — see the remove path above. Replacing a
+                         ;; stored `false` recorded the probe instead, so a cold restore kept
+                         ;; BOTH: count 16 in memory, 17 after restore, with `false` and the
+                         ;; replacement both present.
+                         removed-key (if-some [r (some-> removed-out (arrays/aget 0))]
+                                       r old-key)]
                      (cond
                        ;; Not found in child
                        (nil? nodes)
