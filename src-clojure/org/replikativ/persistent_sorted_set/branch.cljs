@@ -288,14 +288,31 @@
    address))
 
 (defn- $count
+  "Element count of this subtree.
+
+   A branch already KNOWS this most of the time: `subtree-count` is maintained by the
+   write paths and round-trips through the blob (`impl.nodes/branch->blob` writes it,
+   `blob->branch` reads it back), so a restored root can answer in O(1) without touching
+   storage. This used to recurse unconditionally, which made `count` on a stored set load
+   the ENTIRE tree — where the JVM (`Branch.count`, which returns `_subtreeCount` when it
+   is >= 0) loads one node. `-1` means genuinely unknown and is the only case that walks.
+
+   Deliberately NOT caching the walked result back into `subtree-count`, unlike the JVM.
+   The JVM can, because its in-place transient arms maintain the field; the ClojureScript
+   Branch has no in-place arms at all, so nothing here would keep a cached value honest
+   through a later mutation, and `btset/$count` already memoizes at the SET level (`.-cnt`)
+   which is where the repeated-call win actually comes from."
   [^Branch node storage {:keys [sync?] :or {sync? true} :as opts}]
   (async+sync sync?
               (async
-               (let [*cnt (atom 0)]
-                 (dotimes [i (alength (.-keys node))]
-                   (let [c (await (child node storage i opts))]
-                     (swap! *cnt + (await (node/$count c storage opts)))))
-                 @*cnt))))
+               (let [known (.-subtree-count node)]
+                 (if (>= known 0)
+                   known
+                   (let [*cnt (atom 0)]
+                     (dotimes [i (alength (.-keys node))]
+                       (let [c (await (child node storage i opts))]
+                         (swap! *cnt + (await (node/$count c storage opts)))))
+                     @*cnt))))))
 
 (defn- $contains?
   [^Branch node storage key cmp {:keys [sync?] :or {sync? true} :as opts}]
