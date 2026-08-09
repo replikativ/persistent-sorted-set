@@ -16,6 +16,19 @@
 
 (def ^:const UNINITIALIZED_HASH nil)
 
+(declare -root)
+
+(defn root-node
+  "Materialize and return the root node, restoring it from storage if this set is cold.
+
+   Exists for `diagnostics`, which must not read `(.-root set)` directly: that field is nil
+   until `-root` restores it, so every check in that namespace silently saw an EMPTY tree and
+   reported a cold set as healthy — `validate-full` true, `tree-stats` `:element-count 0`,
+   and `verification-coverage` claiming nothing was even skipped. The JVM half calls the
+   `root()` METHOD, which materializes, so this was a pure cross-runtime accident."
+  [^BTSet set]
+  (-root set {:sync? true}))
+
 (defn- -root
   [^BTSet set {:keys [sync?] :or {sync? true} :as opts}]
   (assert (or (some? (.-address set)) (some? (.-root set))))

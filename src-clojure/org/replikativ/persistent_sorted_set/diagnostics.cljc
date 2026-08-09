@@ -14,7 +14,9 @@
    [org.replikativ.persistent-sorted-set :as set]
    #?(:cljs [org.replikativ.persistent-sorted-set.branch :refer [Branch]])
    #?(:cljs [org.replikativ.persistent-sorted-set.leaf :refer [Leaf]])
-   #?(:cljs [org.replikativ.persistent-sorted-set.impl.measure :as measure]))
+   #?(:cljs [org.replikativ.persistent-sorted-set.impl.measure :as measure])
+   #?(:cljs [org.replikativ.persistent-sorted-set.btset :as btset])
+   #?(:cljs [org.replikativ.persistent-sorted-set.impl.boundary :as b]))
   #?(:clj
      (:import
       [java.util Comparator]
@@ -25,9 +27,25 @@
 ;; Platform-specific node access
 ;; =============================================================================
 
-(defn- get-root [set]
+(defn- get-root
+  "The root node, MATERIALIZED. On ClojureScript this must go through `btset/root-node`, not
+   `(.-root set)`: that field is nil until `-root` restores it, so every entry point here saw
+   an empty tree on a cold set and reported it healthy. Measured on a 5000-element cold
+   restore, identical for plain and MST trees:
+
+       validate / validate-full / validate-navigation / validate-counts-known
+       / validate-measures-known / validate-content   ALL true
+       validate-content called the user's content-fn ZERO times
+       tree-stats {:element-count 0 :leaf-count 0 :branch-count 0 :counts-known? true}
+       verification-coverage {:branches 0 :counts-verified 0 :counts-skipped 0}
+
+   The coverage line is the worst: that function exists so a caller can tell a real pass from
+   a vacuous one, and it reported NOTHING SKIPPED for a tree where nothing was looked at. One
+   `contains?` flipped the same set to {:branches 6 :counts-skipped 5}. The JVM half always
+   called the root() METHOD, which materializes, so this was a pure cross-runtime accident."
+  [set]
   #?(:clj  (.root ^PersistentSortedSet set)
-     :cljs (.-root set)))
+     :cljs (btset/root-node set)))
 
 (defn- get-cmp
   "Returns a callable comparator (IFn) for the set."
@@ -95,9 +113,26 @@
   #?(:clj  (.-_measure ^ANode node)
      :cljs (.-_measure node)))
 
-(defn- leaf-keys-array [node]
-  #?(:clj  (.-_keys ^ANode node)
-     :cljs (.-keys node)))
+(defn- leaf-keys-array
+  "The leaf's LIVE keys, truncated to `[0, _len)`.
+
+   It used to return `_keys` raw. `ANode` documents that array as valid only in `[0, _len-1]`
+   and `ANode.keys()` truncates; this was the one accessor that did not, and it feeds
+   `validate-content`, whose whole job is handing each leaf's keys to a user callback
+   (\"for Datahike: verify each datom exists in the expected index\").
+
+   After transient churn the surplus is about half the array. Measured, 20000 elements with
+   10000 random `disj!`: bf 8 gave 14903 slots for 10000 live elements (49% surplus), bf 64
+   and bf 512 gave 51%. Before tail-clearing landed those slots held the REMOVED elements, so
+   a \"does every datom still exist?\" callback was handed deleted datoms as live members;
+   since tail-clearing they are nil, so the same callback NPEs instead. Both are this
+   accessor's fault, not the caller's.
+
+   Persistent-only workloads never see it (no in-place shrink, no surplus), and neither does
+   ClojureScript, whose leaf arrays are exact — hence a churn-heavy transient probe to find it."
+  [node]
+  #?(:clj  (java.util.Arrays/copyOf ^objects (.-_keys ^ANode node) (nlen node))
+     :cljs (.slice (.-keys node) 0 (nlen node))))
 
 ;; =============================================================================
 ;; Invariant 1: Balanced tree (all leaves at same depth)
@@ -118,17 +153,47 @@
 ;; Invariant 2: Node sizes within [B/2, B] (except root)
 ;; =============================================================================
 
-(defn- check-sizes [node bf root?]
+(defn- content-defined?
+  "Does this node's own settings carry a content-defined (MST) boundary?"
+  [node]
+  #?(:clj  (.contentDefined (.boundary ^Settings (.-_settings ^ANode node)))
+     :cljs (boolean (b/content-boundary (.-settings node)))))
+
+(defn- check-sizes
+  "`[bf/2, bf]` for a B-tree; `len >= 1` for an MST tree, where `bf` is inert.
+
+   Under a content-defined boundary a node's size is decided by the hash level of its keys,
+   not by the branching factor, so the B-tree bound is the wrong invariant. It rejected
+   essentially every healthy MST tree — measured over n = 1..299, identical on both runtimes:
+   level-probability 2 and 3 threw for 297 of 299 sizes (from n=3), lzpl 4 for 248 of 299.
+   Per node at bf 32: 1582 of 1607 rejected at lzpl 2, 258 of 333 at lzpl 4 (44 of them as
+   :node-too-large). Since `validate-content` calls `validate-full` first, the Datahike-facing
+   entry point threw on MST too, so the only whole-tree oracle could not be aimed at MST at
+   all — the same blindness that hid a durable count corruption on the restore path earlier.
+
+   That `bf` is inert here is measured, not assumed: node lengths are IDENTICAL at bf 8, 32
+   and 512 for the same lzpl and n, with min 1, mean exactly 2^lzpl, and a max that grows with
+   n (123 at lzpl 4, n 50000). No fixed upper bound holds.
+
+   Dropping the bound loses little: an emptied leaf, a moved separator, a drifted count and a
+   shrunk leaf were all still caught by `check-separators` and `check-subtree-counts` in a
+   four-way injection test. `len >= 1` keeps the one case those two skip, since both bail on a
+   zero-length child."
+  [node bf root? mst?]
   (let [n (nlen node)
         min-bf (quot bf 2)
         errors (cond
+                 (and (not root?) mst? (< n 1))
+                 [{:error :node-too-small :level (nlevel node) :len n :min 1}]
+
+                 mst? []                       ; no upper bound exists under an MST boundary
                  root? []
                  (< n min-bf) [{:error :node-too-small :level (nlevel node) :len n :min min-bf}]
                  (> n bf) [{:error :node-too-large :level (nlevel node) :len n :max bf}]
                  :else [])]
     (if (branch? node)
       (reduce into errors
-              (map #(when % (check-sizes % bf false)) (children-seq node)))
+              (map #(when % (check-sizes % bf false mst?)) (children-seq node)))
       errors)))
 
 ;; =============================================================================
@@ -500,7 +565,7 @@
       true
       (let [errors (concat
                     (check-balance root)
-                    (check-sizes root bf true)
+                    (check-sizes root bf true (content-defined? root))
                     (check-ordering root cmp)
                     (check-separators root cmp)
                     (check-root-shape root)
