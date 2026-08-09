@@ -181,10 +181,9 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     // one per read; the single-comparator path is the same plain write it always was.
     if (root instanceof Branch) {
       Branch rb = (Branch) root;
-      if (rb._projCmp == null) {
-        rb._projCmp = _cmp;
-      } else if (rb._projCmp != _cmp) {
-        root = rb.withProjCmp(_cmp);
+      ANode stamped = rb.stampOrCopy(_cmp);
+      if (stamped != rb) {
+        root = stamped;
         // A DIRTY root (no address) must be held STRONGLY — there is no durable copy to fall
         // back on, and the guard above throws IllegalStateException if its reference is ever
         // cleared. Wrapping unconditionally demoted it: measured, `:soft` and `:weak` both

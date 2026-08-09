@@ -112,7 +112,26 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // PersistentSortedSet.root()). A leaf-parent projects its buffered leaves with its own _projCmp,
   // so projection never depends on the comparator of whatever operation drove the descent. null
   // when diffBufSize==0 / projection never runs.
-  public Comparator _projCmp;
+  // VOLATILE, and stamped by CAS through PROJCMP_UPDATER rather than by a plain write. Two
+  // sets with different comparators can concurrently first-touch the SAME node a caching
+  // IStorage handed both of them; with a plain read-then-write both observe null, both stamp,
+  // and both proceed on the uncopied node — reinstating the very defect copy-on-conflict
+  // exists to prevent, since that arm only sees a conflict that is already visible.
+  //
+  // Two concurrent READERS over one storage is legal (the contract is one WRITER per lineage),
+  // so this is inside the supported region. Measured over 300 000 two-thread rounds: 9 rounds
+  // where both threads reached the same freshly-restored child, and 6 where set A's elements
+  // came back in set B's descending tie order — A expected [[0 0] [0 1] [0 2]] and got
+  // [[0 2] [0 1] [0 0]].
+  //
+  // Cost: a volatile READ on x86 is a plain load, and this field is read once per child()
+  // descent and written at most once per node.
+  public volatile Comparator _projCmp;
+
+  @SuppressWarnings("rawtypes")
+  private static final java.util.concurrent.atomic.AtomicReferenceFieldUpdater<Branch, Comparator>
+      PROJCMP_UPDATER = java.util.concurrent.atomic.AtomicReferenceFieldUpdater.newUpdater(
+          Branch.class, Comparator.class, "_projCmp");
 
   public Branch(int level, int len, Key[] keys, Address[] addresses, Object[] children, Settings settings) {
     this(level, len, keys, addresses, children, -1, settings);
@@ -279,11 +298,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // because `base` is the object the IStorage returned and a caching storage shares it by
     // address across sets. Overwriting it there is what let one set's comparator decide
     // another set's leaf order — see withProjCmp for the measurement.
-    if (base instanceof Branch) {
-      Branch bb = (Branch) base;
-      if (bb._projCmp == null) bb._projCmp = _projCmp;
-      else if (bb._projCmp != _projCmp) base = bb.withProjCmp(_projCmp);
-    }
+    if (base instanceof Branch) base = ((Branch) base).stampOrCopy(_projCmp);
     // slots from the SAME snapshot as the address we restored from — the pair can't mix
     // a pre-settle address with post-settle slots (or vice versa).
     Object[] slots = (s.buf != null) ? s.buf.slots : null;
@@ -2457,6 +2472,22 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
    * only when a node already carries a DIFFERENT comparator, and they publish the copy, so it
    * happens once per node rather than once per read.
    */
+  /**
+   * This node if it can carry `projCmp`, otherwise a copy that does.
+   *
+   * The seed is a CAS, not a plain write, so two threads first-touching the same shared node
+   * with different comparators cannot both conclude "it was null, it is mine now". The loser
+   * re-reads and takes the copy — see the `_projCmp` field comment for the measurement.
+   */
+  Branch<Key, Address> stampOrCopy(Comparator projCmp) {
+    Comparator cur = _projCmp;
+    if (cur == projCmp) return this;
+    if (cur == null && PROJCMP_UPDATER.compareAndSet(this, null, projCmp)) return this;
+    // Either it already carried a different comparator, or we lost the seed race. Re-read:
+    // the winner may have stamped OUR comparator, in which case there is nothing to escape.
+    return (_projCmp == projCmp) ? this : withProjCmp(projCmp);
+  }
+
   Branch<Key, Address> withProjCmp(Comparator projCmp) {
     NodeState<Address> s = _state;
     Address[] addrCopy = (s.addresses != null)

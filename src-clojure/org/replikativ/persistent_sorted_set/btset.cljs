@@ -1882,7 +1882,13 @@
   (-meta [_] meta)
 
   IEmptyableCollection
-  (-empty [_] (BTSet. (empty-leaf settings) 0 comparator meta UNINITIALIZED_HASH nil nil settings))
+  ;; KEEP the storage. This passed `nil` for it, so `(store (empty s))` threw "BTSet/store
+  ;; requires IStorage in second argument" while the JVM twin (which carries `_storage`
+  ;; through) returns an address — the same class of defect already fixed for `compact`, and
+  ;; the same failure shape: a crash on the next write, well away from the `empty` that
+  ;; caused it. The ADDRESS is still dropped, correctly: an empty set shares no nodes with
+  ;; the one it came from, so it has nothing durable to point at until it is stored.
+  (-empty [_] (BTSet. (empty-leaf settings) 0 comparator meta UNINITIALIZED_HASH storage nil settings))
 
   IEquiv
   (-equiv [this other]
