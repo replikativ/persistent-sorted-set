@@ -113,7 +113,9 @@ public interface IStorage<Key, Address> {
      *
      * A consumer that acts on this stream destructively — deleting, or recycling an address
      * onto a freelist, which is deletion-equivalent — must therefore either keep the history
-     * linear, run diff-buf at 0, or do its own reachability check. This is a real
+     * linear, run diff-buf at 0, or do its own reachability check. datahike takes the second
+     * route and refuses the combination outright; the reasoning and the measurements are in
+     * https://github.com/replikativ/datahike/issues/951 . This is a real
      * combination: a GC that trusts the stream plus a non-zero diff-buf budget is unsafe,
      * and it is not made safe by restricting the number of branches, since the hazardous
      * shape lives inside a single lineage.
