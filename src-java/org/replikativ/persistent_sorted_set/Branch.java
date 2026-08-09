@@ -778,8 +778,26 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     }
 
     if (PersistentSortedSet.EARLY_EXIT == nodes) { // child signalling nothing to update
-      // Editable in-place path: processor didn't fire, exactly one element added
-      if (_subtreeCount >= 0) _subtreeCount += 1;
+      // Editable in-place path: exactly one element added — but ONLY without a leafProcessor.
+      // A processor may compact or expand the leaf it is handed, so adding one KEY need not
+      // raise the element count by one, and EARLY_EXIT does not mean "the processor did not
+      // fire" — a level-1 Branch handles the processor correctly and STILL returns EARLY_EXIT
+      // to its parent, which then applied +1 blindly. Same distinction the remove arms at
+      // :1223/:1279 make. Reachable only at level >= 2 with a transient, which is why the
+      // suite was green; measured before this guard, bf 8 / n 200 / conj:
+      //     set count 221   seq count 220   drift level 3 221/220, level 2 85/84
+      // and it is DURABLE — node->identity excludes :subtree-count, so the address does not
+      // change and the wrong count travels in the blob, invisible to a merkle audit.
+      //
+      // Shaped as if/else rather than the ternary the remove arms use, so that the
+      // processor-free path is EXACTLY what it was: delta when the count is known, and
+      // nothing at all when it is unknown. Folding "unknown" into the probe would make
+      // every such add walk the children — the very cost 04499a0 removed.
+      if (_settings.leafProcessor() == null) {
+        if (_subtreeCount >= 0) _subtreeCount += 1;
+      } else {
+        _subtreeCount = tryComputeSubtreeCountFromChildren(s0.children, _len, storage);
+      }
       // Update measure: recompute from children (child's stats were updated in place)
       IMeasure measureOps = _settings.measure();
       if (measureOps != null && _measure != null) {
@@ -1033,8 +1051,17 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     Object anchor0 = (_settings.diffBufSize() > 0 && s0.addresses != null) ? s0.addresses[idx] : null;
 
     if (PersistentSortedSet.EARLY_EXIT == nodes) { // child signalling nothing to update
-      // Editable in-place path: processor didn't fire, exactly one element removed
-      if (_subtreeCount >= 0) _subtreeCount -= 1;
+      // Editable in-place path: exactly one element removed — but ONLY without a
+      // leafProcessor, for the reason spelled out in the `add` EARLY_EXIT arm above.
+      // Measured before this guard, bf 8 / n 200 / disj:
+      //     set count 179   seq count 178   drift level 3 179/178, level 2 75/74
+      // if/else, not a ternary — see the `add` arm: the processor-free path must stay a
+      // pure delta-or-nothing and must not fall into the children walk when unknown.
+      if (_settings.leafProcessor() == null) {
+        if (_subtreeCount >= 0) _subtreeCount -= 1;
+      } else {
+        _subtreeCount = tryComputeSubtreeCountFromChildren(s0.children, _len, storage);
+      }
       // Update measure: recompute from children (child's stats were updated in place)
       IMeasure measureOps = _settings.measure();
       if (measureOps != null && _measure != null) {

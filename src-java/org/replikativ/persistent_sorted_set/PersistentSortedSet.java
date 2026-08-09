@@ -776,7 +776,16 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       // `r` was modified IN PLACE, so it is the new root and must be published
       // strongly — see markDirty.
       markDirty(r);
-      _count = alterCount(-1);
+      // When a processor is configured, count may differ from -1 — the same distinction
+      // `cons` makes above and the rebuild arms below. This arm returned early and so
+      // skipped the guard entirely; measured before the fix, count outran the elements by
+      // one per op (bf 8 / n 200: count 179, seq 178).
+      if (_settings.leafProcessor() != null) {
+        long rootCount = getSubtreeCount(root());
+        _count = (rootCount >= 0) ? (int) rootCount : -1;
+      } else {
+        _count = alterCount(-1);
+      }
       _version += 1;
       return this;
     }
