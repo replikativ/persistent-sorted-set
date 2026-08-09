@@ -102,9 +102,18 @@
     (is (thrown? #?(:clj AssertionError :cljs js/Error)
                  (set/from-sorted-array compare (arr-of [1 2 2 3]) 4))
         "duplicates")
-    (is (thrown? #?(:clj AssertionError :cljs js/Error)
+    ;; A nil element is now refused by a dedicated, UNCONDITIONAL check that runs before the
+    ;; ordering assert, so it reports as a nil violation rather than as unsorted input. That
+    ;; matters: the ordering assert is elidable and could only ever catch a nil that happened
+    ;; to sit out of order, whereas `from-sorted-array` was one of the two entry points
+    ;; through which nil could enter a set the library says cannot hold one.
+    (is (thrown? #?(:clj IllegalArgumentException :cljs cljs.core/ExceptionInfo)
                  (set/from-sorted-array compare (arr-of [1 nil 3]) 3))
-        "a nil element, which the ascending check also catches")))
+        "a nil element anywhere")
+    (is (thrown? #?(:clj IllegalArgumentException :cljs cljs.core/ExceptionInfo)
+                 (set/from-sorted-array compare (arr-of [nil 1]) 2))
+        "including a LEADING nil, which under `compare` is legitimately ascending and so is
+         invisible to the ordering check — the case that needed no exotic comparator at all")))
 
 ;; ---------------------------------------------------------------------------
 ;; 2. compact preserves what it says it preserves
@@ -199,3 +208,13 @@
                 b [0 37 499 500 501 1000 1500 1999]]
           (is (= (set/slice s b nil) (-> (sq s) (set/seek a) (set/seek b)))
               (str "bf=" bf " seek " a " then " b)))))))
+
+(deftest replace-refuses-a-nil-new-key
+  (testing "the other entry point through which nil could enter. Every other mutation path
+            refuses nil, so a set that documents itself as unable to store one could still be
+            made to hold one: `(replace (sorted-set-by cmp 1) 1 nil)` gave count 1, [nil]."
+    (let [s (set/from-sorted-array compare (arr-of [1 2 3]) 3)]
+      (is (thrown? #?(:clj IllegalArgumentException :cljs cljs.core/ExceptionInfo)
+                   (set/replace s 2 nil))
+          "a nil replacement must be refused")
+      (is (= [1 2 3] (elems s)) "and the set is untouched"))))

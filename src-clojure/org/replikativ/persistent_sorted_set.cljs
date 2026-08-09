@@ -28,6 +28,14 @@
   (reduce-kv (fn [acc k v] (if (nil? v) acc (assoc acc k v)))
              default-opts opts))
 
+(defn- reject-nil!
+  "`replace` was one of the two ways nil got into a set that documents itself as unable to
+   store one — every other mutation path refuses it. O(1), so unconditional, the same
+   treatment `conj` gives."
+  [k]
+  (when (nil? k)
+    (throw (ex-info "PersistentSortedSet cannot store nil" {}))))
+
 (defn- assert-sorted!
   "Under `*assert*` only: verify strictly ascending order, as the JVM half does.
 
@@ -71,7 +79,15 @@
   ([cmp arr len]
    (from-sorted-array cmp arr len {}))
   ([cmp arr len opts]
-   (assert-sorted! cmp arr (min len (arrays/alength arr)))
+   ;; NIL REJECTION, unconditional — see the JVM twin. `conj` and `from-sequential` both
+   ;; refuse nil here too, so this was the one hole through which a set that "can't store
+   ;; nil" could be given one, under the default comparator and with no exotic setup.
+   (let [n (min len (arrays/alength arr))]
+     (dotimes [i n]
+       (when (nil? (arrays/aget arr i))
+         (throw (ex-info (str "PersistentSortedSet cannot store nil (index " i ")")
+                         {:index i}))))
+     (assert-sorted! cmp arr n))
    (btset/from-sorted-array cmp arr len (with-defaults opts))))
 
 (defn from-sequential
@@ -211,9 +227,15 @@
 
    returns BTSet by default
    returns continuation yielding BTSet when {:sync? false}"
-  ([^BTSet set old-key new-key]          (btset/$replace set old-key new-key))
-  ([^BTSet set old-key new-key arg]      (btset/$replace set old-key new-key arg))
-  ([^BTSet set old-key new-key cmp opts] (btset/$replace set old-key new-key cmp opts)))
+  ([^BTSet set old-key new-key]
+   (reject-nil! new-key)
+   (btset/$replace set old-key new-key))
+  ([^BTSet set old-key new-key arg]
+   (reject-nil! new-key)
+   (btset/$replace set old-key new-key arg))
+  ([^BTSet set old-key new-key cmp opts]
+   (reject-nil! new-key)
+   (btset/$replace set old-key new-key cmp opts)))
 
 (defn slice
   "An iterator for part of the set with provided boundaries.

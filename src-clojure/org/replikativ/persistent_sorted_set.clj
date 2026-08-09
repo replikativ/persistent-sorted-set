@@ -112,8 +112,16 @@
 
   Returns the updated set, or the original set if old-key not found."
   ([^PersistentSortedSet set old-key new-key]
+   (when (nil? new-key)
+     (throw (IllegalArgumentException. "PersistentSortedSet cannot store nil")))
    (.replace set old-key new-key))
   ([^PersistentSortedSet set old-key new-key ^Comparator cmp]
+   ;; `replace` was the other way nil got in. Every other mutation path refuses it, so a set
+   ;; that "can't store nil" could be made to hold one:
+   ;;     (replace (sorted-set-by cmp 1) 1 nil)  =>  count 1, [nil]
+   ;; O(1), so unconditional — the same treatment `conj` gives.
+   (when (nil? new-key)
+     (throw (IllegalArgumentException. "PersistentSortedSet cannot store nil")))
    (.replace set old-key new-key cmp)))
 
 (defn- array-from-indexed [coll type from to]
@@ -262,6 +270,27 @@
      (when (or (neg? len) (> len alen))
        (throw (ex-info "from-sorted-array: len out of range"
                        {:len len :array-length alen}))))
+   ;; NIL REJECTION, and NOT behind `assert`, unlike the ordering check below.
+   ;;
+   ;; The namespace docstring's one stated difference from `clojure.core/sorted-set` is that
+   ;; this set "can't store nil", and `conj`, `from-sequential`, `sorted-set` and
+   ;; `from-sorted-seq` all enforce it by throwing. `from-sorted-array` did not, so the
+   ;; plainest possible call put a nil into a set that claims it cannot hold one:
+   ;;
+   ;;     (from-sorted-array compare (object-array [nil 1]) 2)  =>  count 2, [nil 1]
+   ;;
+   ;; and it survives a store/restore. No exotic comparator is needed — under `compare`, nil
+   ;; sorts below everything, so a LEADING nil is legitimately ascending and the ordering
+   ;; assert cannot see it. Under a comparator that maps nil onto a real value it can sit
+   ;; anywhere and still be ascending, so the scan has to cover every element.
+   ;;
+   ;; O(n) pointer comparisons on a path that already makes O(n) comparator CALLS and
+   ;; allocates O(n) nodes — a constant-factor addition, not a complexity change — which is
+   ;; why this one is unconditional where the comparison-heavy ordering check is not.
+   (dotimes [i len]
+     (when (nil? (arrays/aget keys i))
+       (throw (IllegalArgumentException.
+               (str "PersistentSortedSet cannot store nil (index " i ")")))))
    (assert-sorted! cmp keys len)
    (let [settings             (map->settings opts)
          max-branching-factor (.branchingFactor settings)
