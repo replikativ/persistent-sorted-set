@@ -75,6 +75,37 @@
     (is (= [1 2 3] (elems (set/from-sorted-array compare (arr-of [1 2 3]) 3))))
     (is (= [] (elems (set/from-sorted-array compare (arr-of []) 0))))))
 
+(deftest an-out-of-range-len-is-refused-identically-on-both-runtimes
+  (testing "`len` must name a real prefix. The empty-array case is the one that mattered:
+            `(from-sorted-array cmp [] 1)` built from a 1-element array whose only slot was
+            null and returned a set CONTAINING NIL, count 1 — the same defect fixed for
+            `from-sequential`, hidden by the same trap, since `assert-sorted!` passes
+            VACUOUSLY at len 1. The other two directions used to surface as
+            ArrayIndexOutOfBoundsException and IllegalArgumentException on the JVM, neither
+            catchable alongside the ClojureScript half, hence one `ex-info` on both."
+    (doseq [[label arr len] [["empty array, len 1" [] 1]
+                             ["len past the end"   [1 2 3] 5]
+                             ["negative len"       [1 2 3] -1]]]
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+                   (set/from-sorted-array compare (arr-of arr) len))
+          (str label ": must be refused, not silently accepted")))))
+
+(deftest unsorted-input-is-refused-on-both-runtimes
+  (testing "the JVM has always asserted strictly-ascending, distinct input; ClojureScript had
+            NO check, so the same call was refused on one runtime and silently accepted on
+            the other. Measured on cljs before the fix: 1000 shuffled elements gave count
+            1000 with only 3 of them findable by `contains?`, and `#js [1 nil 3]` made nil a
+            durable member of a set whose docstring says it cannot store nil."
+    (is (thrown? #?(:clj AssertionError :cljs js/Error)
+                 (set/from-sorted-array compare (arr-of [3 1 2]) 3))
+        "descending input")
+    (is (thrown? #?(:clj AssertionError :cljs js/Error)
+                 (set/from-sorted-array compare (arr-of [1 2 2 3]) 4))
+        "duplicates")
+    (is (thrown? #?(:clj AssertionError :cljs js/Error)
+                 (set/from-sorted-array compare (arr-of [1 nil 3]) 3))
+        "a nil element, which the ascending check also catches")))
+
 ;; ---------------------------------------------------------------------------
 ;; 2. compact preserves what it says it preserves
 

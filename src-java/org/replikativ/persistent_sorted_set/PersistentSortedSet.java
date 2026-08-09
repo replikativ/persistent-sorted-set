@@ -185,7 +185,12 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
         rb._projCmp = _cmp;
       } else if (rb._projCmp != _cmp) {
         root = rb.withProjCmp(_cmp);
-        _root = _settings.makeReference(root);
+        // A DIRTY root (no address) must be held STRONGLY — there is no durable copy to fall
+        // back on, and the guard above throws IllegalStateException if its reference is ever
+        // cleared. Wrapping unconditionally demoted it: measured, `:soft` and `:weak` both
+        // turned the Branch into a Soft/WeakReference whose clear() then made the very next
+        // root() throw "a dirty root's reference was cleared". Same rule markDirty follows.
+        _root = (_address == null) ? root : _settings.makeReference(root);
       }
     }
     return root;

@@ -213,21 +213,37 @@
     ;; descending into whichever children are resident.
     (let [sc (subtree-count* node)
           cs (children-seq node)
+          all-resident? (every? some? cs)
           child-counts (mapv #(if % (subtree-count* %) -1) cs)
-          verifiable? (and (every? some? cs) (every? #(>= % 0) child-counts))]
+          all-known? (every? #(>= % 0) child-counts)]
       (into
        (cond
          ;; Known count, every child resident AND self-describing: verify the sum. This is
-         ;; the only arm that can prove anything, and it is the one that catches a drifted
-         ;; count.
-         (and (>= sc 0) verifiable?)
+         ;; the only arm that can prove anything, and it is the one that catches a drift.
+         (and (>= sc 0) all-resident? all-known?)
          (let [expected (reduce + 0 child-counts)]
            (if (not= sc expected)
              [{:error :subtree-count-mismatch
                :level (nlevel node) :branch-count sc :children-sum expected}]
              []))
 
-         ;; Not verifiable at this node — no claim either way.
+         ;; Every child RESIDENT but one of them has no count, while this node claims one.
+         ;; Still a violation, and keeping it matters: an adversarial review showed that
+         ;; folding this into the skip above let `validate-full` return true on a warm,
+         ;; fully-resident tree whose root count was wrong by 7, merely because one resident
+         ;; child had been set to -1. The same review then looked for the state this arm
+         ;; supposedly needed to tolerate — a resident branch with count -1 under a
+         ;; known-count parent — across bulk, conj, transient-conj and disj-churn builds at
+         ;; bf 8 / n 3000, and found ZERO occurrences in all four. So relaxing it bought
+         ;; nothing and cost the detection.
+         (and (>= sc 0) all-resident? (not all-known?))
+         [{:error :count-known-child-unknown
+           :level (nlevel node) :branch-count sc :child-counts child-counts}]
+
+         ;; A child is NOT RESIDENT: its count lives in its own blob and cannot be seen from
+         ;; here. Unverifiable, not violated — this is the ordinary state of every lazily
+         ;; restored tree, and treating it as a violation is what made this check unusable
+         ;; against the restore path.
          :else [])
        (reduce into [] (map #(when % (check-subtree-counts %)) cs))))))
 

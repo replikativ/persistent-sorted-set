@@ -90,10 +90,14 @@
             sl (set/slice s 2500 7500)]
         (is (nil? (set/seek sl 9000))
             (str "bf=" bf ": seeking past the upper bound yields nothing"))
-        (is (= 7500 (last (set/seek sl 5000)))
-            (str "bf=" bf ": a forward seek stays bounded above"))
-        (is (= 7500 (last (set/seek (set/seek sl 5000) 3000)))
-            (str "bf=" bf ": and so does a backward one"))))))
+        ;; Assert the WHOLE range, not just `last`. An earlier version of this deftest
+        ;; checked only the last element, which is the retained bound and was therefore
+        ;; correct in BOTH builds — the defect moved the START, which `last` never sees. It
+        ;; passed its own red check as a result. An adversarial review caught it.
+        (is (= (range 5000 7501) (set/seek sl 5000))
+            (str "bf=" bf ": a forward seek moves the start and keeps the bound"))
+        (is (= (range 3000 7501) (set/seek (set/seek sl 5000) 3000))
+            (str "bf=" bf ": and a backward one moves the start back, still bounded above"))))))
 
 (deftest seek-agrees-with-a-fresh-slice-over-a-grid
   (testing "the general property, rather than a handful of points: for any pair of seek

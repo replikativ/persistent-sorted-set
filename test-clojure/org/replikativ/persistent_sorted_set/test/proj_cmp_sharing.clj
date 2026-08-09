@@ -74,6 +74,12 @@
         _    (first sA)                        ; A materialises its first leaf under cmp1
         rootA (.root ^PersistentSortedSet A)
         rootB (.root ^PersistentSortedSet B)   ; B's root() must not re-stamp A's node
+        ;; Read the stamp HERE, immediately after B's read. Every later `A` operation calls
+        ;; A.root() again, which re-seeds the field to cmp1 and REPAIRS the damage — so
+        ;; capturing it in the returned map (evaluated after the `store` below) observed the
+        ;; repaired value and passed against the unfixed build. An adversarial review caught
+        ;; that; the binding order is the assertion here.
+        proj-after-B (.-_projCmp ^Branch rootA)
         got  (vec sA)                          ; A finishes its walk
         ;; durability: mutate A and store, then read back through a FRESH cache
         dk   (or (ffirst (keep (fn [[x y]] (when (pos? (cmp1 x y)) [x y]))
@@ -84,7 +90,7 @@
         back (ss/restore-by cmp1 addr2 st2 (assoc opts :comparator cmp1 :storage st2))
         bseq (vec (seq back))]
     {:root-shared    (identical? rootA rootB)
-     :proj-cmp-of-A  (.-_projCmp ^Branch rootA)
+     :proj-cmp-of-A  proj-after-B
      :seq            got
      :truth          truth
      :count-A        (count A)

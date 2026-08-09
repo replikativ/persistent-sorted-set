@@ -249,6 +249,19 @@
   ([^Comparator cmp keys len]
    (from-sorted-array cmp keys len (Settings.)))
   ([^Comparator cmp keys len opts]
+   ;; `len` must name a real prefix of `keys`. Unchecked, `(from-sorted-array cmp (to-array
+   ;; []) 1)` built from a 1-element array whose only slot is null and returned a set
+   ;; CONTAINING NIL, count 1 — the same defect 987e8e5 fixed for `from-sequential`, hidden
+   ;; by the same trap: `assert-sorted!` passes VACUOUSLY at len 1, so the builder's own
+   ;; precondition could not see it. Out-of-range in the other direction used to surface as
+   ;; ArrayIndexOutOfBoundsException (len > alength) or IllegalArgumentException (negative),
+   ;; neither of which a `.cljc` caller could catch alongside the ClojureScript half — hence
+   ;; one `ex-info` on both runtimes. Unlike `assert-sorted!` this is NOT behind `assert`:
+   ;; it is O(1), and the failure it prevents is a durable nil member.
+   (let [alen (arrays/alength keys)]
+     (when (or (neg? len) (> len alen))
+       (throw (ex-info "from-sorted-array: len out of range"
+                       {:len len :array-length alen}))))
    (assert-sorted! cmp keys len)
    (let [settings             (map->settings opts)
          max-branching-factor (.branchingFactor settings)

@@ -28,17 +28,50 @@
   (reduce-kv (fn [acc k v] (if (nil? v) acc (assoc acc k v)))
              default-opts opts))
 
+(defn- assert-sorted!
+  "Under `*assert*` only: verify strictly ascending order, as the JVM half does.
+
+   Unsorted input does not fail on its own — it produces a tree whose invariants are quietly
+   false, so lookups miss and slices return the wrong range while `count` and `seq` both look
+   perfect. This runtime had NO check at all, while the JVM has had one since the beginning,
+   so the same call was refused on one runtime and silently accepted on the other. Measured on
+   ClojureScript before this:
+
+       (from-sorted-array compare #js [3 1 2] 3)
+       seq => [3 1 2]   count => 3   but contains? 1 => false, contains? 3 => false
+       1000 shuffled elements => count 1000, only 3 of them findable by contains?
+
+   Duplicates were accepted too (`#js [1 2 2 3]` => count 4), and `#js [1 nil 3]` made nil a
+   durable member of a set whose own namespace docstring says it \"can't store nil\" — the one
+   hole, since `conj` and `from-sequential` both refuse nil here. An ascending check closes
+   that case as well, because nil compares below any number.
+
+   Behind `assert` for the same reason as the JVM: O(n) comparisons on a documented fast
+   path, so it is live in dev and test and elided by `:elide-asserts` in a production build.
+   `from-sorted-seq` checks unconditionally instead — it is streaming, so the check is a fold
+   it performs anyway."
+  [cmp arr len]
+  (assert (loop [i 1]
+            (cond
+              (>= i len) true
+              (>= 0 (cmp (arrays/aget arr i) (arrays/aget arr (dec i)))) false
+              :else (recur (inc i))))
+          "from-sorted-array requires strictly ascending, distinct input"))
+
 (defn from-sorted-array
   "Fast path to create a set if you already have a sorted array of elements on your hands.
 
    Only the first `len` elements are used; the rest of `arr` is ignored. (`len` was formerly
    accepted and then discarded here, so a caller passing a reusable buffer got its stale tail
-   as set members — see `btset/from-sorted-array`.)"
+   as set members — see `btset/from-sorted-array`.)
+
+   Input MUST be strictly ascending and distinct under `cmp`; checked under `*assert*`."
   ([cmp arr]
    (from-sorted-array cmp arr (arrays/alength arr)))
   ([cmp arr len]
    (from-sorted-array cmp arr len {}))
   ([cmp arr len opts]
+   (assert-sorted! cmp arr (min len (arrays/alength arr)))
    (btset/from-sorted-array cmp arr len (with-defaults opts))))
 
 (defn from-sequential

@@ -84,28 +84,43 @@
             (str "bf=" bf " n=" n ": a healthy cold-restored tree must validate"))
         (is (= n (count cold)) (str "bf=" bf " n=" n ": and hold what was stored"))))))
 
-(deftest the-restored-tree-check-is-skipped-not-silently-passed
-  (testing "a cold tree's branches are unverifiable, and the coverage report must SAY so
-            rather than let a caller mistake it for a clean bill of health"
-    (let [bf 8 n 5000
-          disk (atom {})
-          addr (set/store (build bf n) (storage disk bf))
-          cold (set/restore-by compare addr (storage disk bf) {:branching-factor bf})
-          cov  (diag/verification-coverage cold)]
-      (is (pos? (:counts-skipped cov))
-          (str "a cold root has non-resident children, so its count is unverifiable: " cov)))))
+;; NOTE: the assertions that call `diagnostics/verification-coverage` live in
+;; `oracle_coverage.clj`, deliberately. That var does not exist before ea67a58, so a namespace
+;; referring to it fails to COMPILE against the pre-fix build — which silently takes every
+;; other assertion in the same namespace down with it. This file's red check reported "no such
+;; var" rather than the failures it was supposed to demonstrate, so the power assertions here
+;; were never actually red-checked until they were separated out. Caught by an adversarial
+;; review of this namespace.
 
-(deftest a-warm-tree-is-actually-verified
-  (testing "the other half — once resident, coverage must be non-zero, or the fix to the
-            false positive would just be an oracle that never looks at anything"
-    (doseq [[bf n] [[8 200] [8 5000] [64 5000]]]
-      (let [s   (build bf n)
-            _   (count (seq s))
-            cov (diag/verification-coverage s)]
-        (is (pos? (:counts-verified cov))
-            (str "bf=" bf " n=" n ": an in-memory tree must be genuinely count-checked: " cov))
-        (is (zero? (:counts-skipped cov))
-            (str "bf=" bf " n=" n ": and nothing should be skipped: " cov))))))
+(deftest a-resident-child-with-no-count-is-still-a-violation
+  (testing "the regression an adversarial review found in the false-positive fix.
+
+            Skipping a NON-RESIDENT child is right. Skipping a RESIDENT child whose cached
+            count is -1 is not: measured on a warm, fully-resident tree with no storage
+            involved, setting one resident child's count to -1 made validate-full return true
+            on a tree whose ROOT count was simultaneously wrong by 7. The old code caught
+            that. The same review then searched for the state the relaxation was supposed to
+            tolerate — a resident branch with count -1 under a known-count parent — across
+            bulk, conj, transient-conj and disj-churn builds at bf 8 / n 3000, and found ZERO
+            occurrences, so it cost detection and bought nothing."
+    (doseq [[bf n] [[8 200] [64 5000]]]
+      (let [s ^PersistentSortedSet (build bf n)
+            _ (count (seq s))
+            ^Branch root (.root s)
+            ^Branch c0 (.child root nil (int 0))
+            orig-root (.-_subtreeCount root)
+            orig-c0 (.-_subtreeCount c0)]
+        (is (instance? Branch c0)
+            (str "bf=" bf ": precondition — child 0 must itself be a branch"))
+        (set! (.-_subtreeCount root) (long (+ orig-root 7)))
+        (set! (.-_subtreeCount c0) (long -1))
+        (is (thrown? AssertionError (diag/validate-full s))
+            (str "bf=" bf " n=" n ": a resident child with an unknown count, under a parent "
+                 "that claims one, must not silence the parent's own drift"))
+        (set! (.-_subtreeCount root) (long orig-root))
+        (set! (.-_subtreeCount c0) (long orig-c0))
+        (is (true? (diag/validate-full s))
+            (str "bf=" bf " n=" n ": and the tree must validate again once restored"))))))
 
 ;; ---------------------------------------------------------------------------
 ;; 2. the oracle still CATCHES a corrupted count

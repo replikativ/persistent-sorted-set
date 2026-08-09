@@ -2462,9 +2462,29 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     Address[] addrCopy = (s.addresses != null)
         ? Arrays.copyOf(s.addresses, s.addresses.length) : null;
     Key[] keysCopy = Arrays.copyOf(_keys, _keys.length);
-    Branch<Key, Address> copy = new Branch<>(_level, _len, keysCopy, addrCopy, null,
+    // Carry over every child that has NO durable address. Dropping the children array
+    // wholesale is right for a child that can be restored from its address and wrong for one
+    // that cannot: a slot with `addresses[i] == null` and `children[i]` a bare dirty ANode is
+    // the ONLY reference to that subtree, and nulling it produced the state the invariant
+    // forbids — address null AND child null. Measured before this, root _len 7 with a null
+    // address at index 6, at diffBufSize 0 and 64 alike:
+    //     (seq copy)   -> AssertionError at Branch.child's precondition
+    //     (store copy) -> AssertionError "dirty child must be a bare resident ANode ..."
+    // and under -da an NPE or a silently truncated subtree. A dirty child is this version's
+    // own, not the storage cache's, so carrying the reference shares nothing that the
+    // fresh-children-array rule exists to keep separate.
+    Object[] childCopy = null;
+    if (s.children != null) {
+      for (int i = 0; i < _len; ++i) {
+        if ((addrCopy == null || addrCopy[i] == null) && s.children[i] != null) {
+          if (childCopy == null) childCopy = new Object[s.children.length];
+          childCopy[i] = s.children[i];
+        }
+      }
+    }
+    Branch<Key, Address> copy = new Branch<>(_level, _len, keysCopy, addrCopy, childCopy,
                                              _subtreeCount, _measure, projCmp, _settings);
-    copy._state = new NodeState<>(addrCopy, null, s.buf);
+    copy._state = new NodeState<>(addrCopy, childCopy, s.buf);
     return copy;
   }
 
