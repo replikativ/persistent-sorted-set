@@ -294,16 +294,6 @@ that is wrong ON DISK, and upgrading alone does not repair a database that alrea
   exercises it deterministically by clearing the references itself rather than waiting for a GC,
   and checks that an evicted tree still reads, still stores, and still restores.
 
-### `disj`'s deposit uses the search key — documented, not corrected
-
-  `Branch.remove` deposits `Absent(<the caller's search key>)`, the same shape as the `replace`
-  defect above. It could not be shown to be reachable: six constructions (conj-built and
-  bulk-built, bf 4/8/64, cold-restored with the storage's node settings carrying the same budget as
-  the set) produced no slot at all for `disj`, so the line never ran and no reload resurrected an
-  element. Threading a removed-element channel through `remove` would be a signature change on a
-  path with no test to hold it — the trade that produced the last two defects here. The hazard is
-  written at the deposit site instead, with what to do if a reproduction is ever found.
-
 ### `diff` reads its address/slot pair from one snapshot
 
   `diff`'s frontier decides, per child, whether that child's ADDRESS still stands for its
