@@ -2,7 +2,8 @@
 
 **Affects** persistent-sorted-set **0.3.114 – 0.4.139**, and therefore datahike
 **0.7.1615 – 0.8.1775**.
-**Fixed in** persistent-sorted-set *(pending release)*.
+**Fixed in** persistent-sorted-set **0.5.x** *(pending release; the patch component is the
+commit count, so the exact number is fixed at release time)*.
 **Data is recoverable.** Nothing was lost; re-importing repairs an affected database completely.
 
 ---

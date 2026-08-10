@@ -1,4 +1,8 @@
-# 0.4.x
+# 0.5.x
+
+A correctness release, and the version is 0.5 for that reason rather than for the feature list.
+`diff` is new, but the reason not to treat this as a patch on 0.4 is that behaviour existing
+callers depend on has moved — see **Compatibility** immediately below.
 
 **Read the data-integrity items before upgrading.** Three of the fixes below can leave a set
 that is wrong ON DISK, and upgrading alone does not repair a database that already has one:
@@ -77,6 +81,32 @@ that is wrong ON DISK, and upgrading alone does not repair a database that alrea
   equal under the operation comparator, so a second one could name a different element than the
   one the leaf overwrote — recording `Absent` for one while replacing another, reintroducing the
   very duplicate this fixes.
+
+### Compatibility — what a 0.4 caller should check before upgrading
+
+  Nothing here breaks a stored set: trees written by 0.4 still read. These are the places where
+  the same code does something different than it did.
+
+  * **Tree SHAPE changed, so content addresses changed.** ClojureScript `conj`/`disj` now cut
+    where the JVM cuts, and the JVM's transient remove now picks its sibling the way the
+    persistent path does. Stored trees are unaffected, but the same data REBUILT now produces
+    different node addresses — so nodes written by 0.4 and by 0.5 no longer dedup against each
+    other, and a merkle root computed over rebuilt data will differ. Both changes are fixes:
+    before them, the two runtimes and the two mutation paths disagreed with each other.
+  * **`node->identity` strips warmth caches**, so a consumer that followed `node->map`'s old
+    "hash this map for content-addressing" advice gets different addresses — and correct ones:
+    the old advice made the address depend on which caches happened to be populated.
+  * **Two configurations now throw that were accepted before.** A `leafProcessor` together with
+    diff-buf, and a node reconstructed with `diffBufSize <= 0` while carrying buffered slots.
+    Both silently corrupted; code that appeared to work will now fail loudly.
+  * **`validate-full` no longer checks measures by default.** Pass `{:check-measures? true}` for
+    the old behaviour.
+  * **`restore` now honours `:comparator`**, which it previously ignored on the JVM. A call that
+    passed one and silently got the default will now get what it asked for.
+  * **`from-sorted-seq` with no `:meta` returns `nil` rather than `{}`** on the JVM, matching
+    `sorted-set*` and ClojureScript.
+  * **A stale transient handle throws** instead of silently taking the persistent path, and
+    `replace`'s precondition is asserted under `-ea`.
 
 ### store() never wrote a child that was mutated in place — INHERITED FROM UPSTREAM
 
@@ -482,6 +512,8 @@ that is wrong ON DISK, and upgrading alone does not repair a database that alrea
   `:diff-buf-size` into both the set's opts and the storage's `Settings`, so the two can never
   disagree. Both gaps now have tests: `test/diff_buf_restore_cycle.clj` and
   `test/concurrent_restore.clj` (JVM), `test/diff_buf_replace_cycle.cljs` (ClojureScript).
+
+# 0.4.x
 
 - **Complete freed-address (`markFreed`) tracking on the JVM at `diff-buf-size 0`** — a parent
   replacing a durable child pointer now frees the old address at EVERY level of the root→leaf
