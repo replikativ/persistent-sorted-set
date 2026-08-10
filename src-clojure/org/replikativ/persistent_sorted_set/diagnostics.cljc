@@ -247,6 +247,30 @@
 ;; Invariant 5: Subtree counts consistent
 ;; =============================================================================
 
+(defn- deep-count
+  "Element count of `node`'s subtree computed from RESIDENT nodes only, or -1 when any part
+   of the subtree is not in memory. Never does IO: `child-node` returns nil for an absent
+   child rather than loading it.
+
+   Prefers a node's OWN cached count and descends only where it has none. That is induction
+   rather than laziness: every branch's cached count is itself verified at that branch by
+   `check-subtree-counts` recursing into it, so trusting it here does not create a hole, and
+   it keeps this from degenerating into a full tree walk at every level.
+
+   A Leaf always knows its count — `subtree-count*` answers its length — so the recursion
+   terminates and -1 can only ever mean a genuinely absent child."
+  [node]
+  (if (nil? node)
+    -1
+    (let [sc (subtree-count* node)]
+      (if (>= sc 0)
+        sc
+        (reduce (fn [acc c]
+                  (let [x (deep-count c)]
+                    (if (neg? x) (reduced -1) (+ acc x))))
+                0
+                (children-seq node))))))
+
 (defn- check-subtree-counts [node]
   (if (leaf? node)
     (let [sc (subtree-count* node)
@@ -292,18 +316,39 @@
                :level (nlevel node) :branch-count sc :children-sum expected}]
              []))
 
-         ;; Every child RESIDENT but one of them has no count, while this node claims one.
-         ;; Still a violation, and keeping it matters: an adversarial review showed that
-         ;; folding this into the skip above let `validate-full` return true on a warm,
-         ;; fully-resident tree whose root count was wrong by 7, merely because one resident
-         ;; child had been set to -1. The same review then looked for the state this arm
-         ;; supposedly needed to tolerate — a resident branch with count -1 under a
-         ;; known-count parent — across bulk, conj, transient-conj and disj-churn builds at
-         ;; bf 8 / n 3000, and found ZERO occurrences in all four. So relaxing it bought
-         ;; nothing and cost the detection.
+         ;; Every child RESIDENT, but at least one has no cached count of its own. This
+         ;; USED to be reported as `:count-known-child-unknown`, and that was wrong.
+         ;;
+         ;; The justification for reporting it searched only IN-MEMORY builds — bulk, conj,
+         ;; transient-conj, disj-churn — found the state never arose, and concluded it was
+         ;; not a legal state. It never looked at the RESTORE path, where it is completely
+         ;; ordinary: under diff-buf, `Branch.child` PROJECTS some children (projectBranch
+         ;; takes their count from the slot, so it is known) while their siblings restore
+         ;; plainly from a blob that carries no `:subtree-count` (so it is -1). A parent
+         ;; then legitimately has every child resident and only some of them
+         ;; self-describing. Measured: bf 4, diff-buf 128, n 200, transient conj + store +
+         ;; cold restore — 5 of 6 rounds reported 4-5 "violations" on a tree whose `count`,
+         ;; `seq` and contents were all exactly right.
+         ;;
+         ;; But the detection that arm was reinstated FOR is real: without it, a warm tree
+         ;; whose root count is wrong goes unnoticed when one resident child sits at -1.
+         ;; So rather than choose between a false positive and a blind spot, RESOLVE the
+         ;; unknown: a child with no cached count still has children of its own, and a leaf
+         ;; always knows its length. `deep-count` descends through resident nodes and
+         ;; answers -1 only when something genuinely is not in memory. That is strictly
+         ;; stronger than the old arm — it catches the drift the old arm caught, AND it
+         ;; catches drift the old arm could only shrug at — and it is silent on the lazy
+         ;; tree, which is not corrupt for being lazy.
          (and (>= sc 0) all-resident? (not all-known?))
-         [{:error :count-known-child-unknown
-           :level (nlevel node) :branch-count sc :child-counts child-counts}]
+         (let [resolved (mapv deep-count cs)]
+           (if (every? #(>= % 0) resolved)
+             (let [expected (reduce + 0 resolved)]
+               (if (not= sc expected)
+                 [{:error :subtree-count-mismatch
+                   :level (nlevel node) :branch-count sc :children-sum expected
+                   :resolved-by :deep-count}]
+                 []))
+             []))
 
          ;; A child is NOT RESIDENT: its count lives in its own blob and cannot be seen from
          ;; here. Unverifiable, not violated — this is the ordinary state of every lazily
@@ -680,10 +725,17 @@
           acc
           (let [branch? (branch? node)
                 cs      (when branch? (children-seq node))
+                ;; Mirrors `check-subtree-counts` EXACTLY, including its `deep-count`
+                ;; fallback — a child with no cached count of its own is still verifiable
+                ;; when its own subtree is resident. Before that fallback existed the two
+                ;; disagreed: a cold-restored diff-buf tree had nodes this function called
+                ;; `:counts-skipped` while the checker called them violations, so the pair
+                ;; could not both be right. They must move together or this stops describing
+                ;; the thing it claims to measure.
                 count-ok? (and branch?
                                (>= (subtree-count* node) 0)
                                (every? some? cs)
-                               (every? #(>= (subtree-count* %) 0) cs))
+                               (every? #(>= (deep-count %) 0) cs))
                 measure-ok? (and ops
                                  (some? (node-measure node))
                                  (not= ::unverifiable (expected-measure node ops)))
