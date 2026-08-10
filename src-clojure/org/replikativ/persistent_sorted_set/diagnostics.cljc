@@ -603,34 +603,56 @@
             (vec (reverse acc))))))))
 
 (defn validate-full
-  "Full integrity check including subtree counts, measures, and element-wise
-   navigation. Every key in the tree is re-looked up from the root to verify
-   search paths are correct. Catches separator key corruption, comparator bugs,
-   and any issue where elements are structurally present but unreachable.
-   Returns true if valid, throws with structured error data."
-  [set]
-  (validate set)
-  (let [root (get-root set)]
-    (when (and root (pos? (nlen root)))
-      (let [errors (check-subtree-counts root)]
-        (throw-errors errors "B-tree count/measure invariant violations"))
-      ;; Measures, which this docstring has always claimed and which nothing checked until
-      ;; now. Only runs when the set actually carries measure ops.
-      (when-let [ops (measure-ops set)]
-        (throw-errors (check-measure-agreement root ops)
-                      "B-tree measure invariant violations"))
-      ;; Element-wise navigation check: every key must be findable via lookup
-      (let [all-keys (collect-all-keys root)
-            errors (reduce
-                    (fn [errs key]
-                      (let [found (set/lookup set key)]
-                        (if (nil? found)
-                          (clojure.core/conj errs {:error :key-not-found-via-lookup :key key})
-                          errs)))
-                    []
-                    all-keys)]
-        (throw-errors errors "Root-descend navigation verification failed")))
-    true))
+  "Full integrity check including subtree counts and element-wise navigation. Every key in
+   the tree is re-looked up from the root to verify search paths are correct. Catches
+   separator key corruption, comparator bugs, and any issue where elements are structurally
+   present but unreachable. Returns true if valid, throws with structured error data.
+
+   MEASURES ARE NOT CHECKED unless you pass `{:check-measures? true}`, and the reason is
+   that the obvious check is only valid for SOME measures.
+
+   `check-measure-agreement` re-folds a leaf's keys from `identity` and compares the result
+   to the cached measure with `=`. But `IMeasure/remove` exists precisely so a measure can
+   be updated INCREMENTALLY — the shipped NumericStats subtracts from `sum` and `sumSq` and
+   only recomputes when min/max is invalidated — and floating-point addition is neither
+   associative nor exactly invertible. So for an inexact measure the cached value and the
+   re-folded value legitimately differ in the last bits, and an equality oracle calls that
+   corruption.
+
+   Measured, 72 shapes (bf 8/16/32/64/128/512 x n 100/200/500/1000 x 3 seeds), one transient
+   disj of interior elements: 55 of 72 reported a false `:leaf-measure-mismatch`, e.g.
+   cached sum 1593.6 vs expected 1593.5999999999995. Broken down by key type: `long` 0 of
+   24, `double` 15-17 of 24. Exact measures are fine; inexact ones are not, and this library
+   has no way to know which it was handed.
+
+   So the check is opt-in and its contract is on you: enable it only when your measure is
+   EXACT — integral counts, sums of integers, min/max of a totally ordered type — where
+   `merge` is associative and `remove` is exactly invertible. It has real teeth there (it
+   catches a wrong leaf measure and a wrong branch measure), which is why it is kept rather
+   than deleted. `validate-content` takes the same option and passes it through."
+  ([set] (validate-full set nil))
+  ([set {:keys [check-measures?] :or {check-measures? false}}]
+   (validate set)
+   (let [root (get-root set)]
+     (when (and root (pos? (nlen root)))
+       (let [errors (check-subtree-counts root)]
+         (throw-errors errors "B-tree count/measure invariant violations"))
+       (when check-measures?
+         (when-let [ops (measure-ops set)]
+           (throw-errors (check-measure-agreement root ops)
+                         "B-tree measure invariant violations")))
+       ;; Element-wise navigation check: every key must be findable via lookup
+       (let [all-keys (collect-all-keys root)
+             errors (reduce
+                     (fn [errs key]
+                       (let [found (set/lookup set key)]
+                         (if (nil? found)
+                           (clojure.core/conj errs {:error :key-not-found-via-lookup :key key})
+                           errs)))
+                     []
+                     all-keys)]
+         (throw-errors errors "Root-descend navigation verification failed")))
+     true)))
 
 (defn verification-coverage
   "How much of `validate-full`'s count and measure checking actually ran.
@@ -704,22 +726,27 @@
    or a map describing the error. For Datahike: verify each datom exists
    in the expected table/index.
 
-   Runs validate-full first, then walks all leaves."
-  [set content-fn]
-  (validate-full set)
-  (let [root (get-root set)]
-    (when (and root (pos? (nlen root)))
-      (letfn [(walk-leaves [node]
-                (if (leaf? node)
-                  (let [ks (leaf-keys-array node)
-                        error (content-fn ks)]
-                    (when error
-                      [error]))
-                  (reduce into []
-                          (map #(when % (walk-leaves %)) (children-seq node)))))]
-        (let [errors (walk-leaves root)]
-          (throw-errors errors "Content validation failed"))))
-    true))
+   Runs validate-full first, then walks all leaves.
+
+   Takes the same option map as `validate-full` and passes it through, so
+   `{:check-measures? true}` opts into measure checking here too — read that docstring
+   first, because the check is only valid for EXACT measures."
+  ([set content-fn] (validate-content set content-fn nil))
+  ([set content-fn opts]
+   (validate-full set opts)
+   (let [root (get-root set)]
+     (when (and root (pos? (nlen root)))
+       (letfn [(walk-leaves [node]
+                 (if (leaf? node)
+                   (let [ks (leaf-keys-array node)
+                         error (content-fn ks)]
+                     (when error
+                       [error]))
+                   (reduce into []
+                           (map #(when % (walk-leaves %)) (children-seq node)))))]
+         (let [errors (walk-leaves root)]
+           (throw-errors errors "Content validation failed"))))
+     true)))
 
 ;; =============================================================================
 ;; Root-descend verification

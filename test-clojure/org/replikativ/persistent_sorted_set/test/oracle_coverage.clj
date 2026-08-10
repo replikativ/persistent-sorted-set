@@ -23,7 +23,7 @@
             [org.replikativ.persistent-sorted-set :as set]
             [org.replikativ.persistent-sorted-set.diagnostics :as diag]
             [clojure.edn :as edn])
-  (:import [org.replikativ.persistent_sorted_set Settings IStorage ANode Branch Leaf]))
+  (:import [org.replikativ.persistent_sorted_set Settings IStorage ANode Branch Leaf IMeasure]))
 
 (set! *warn-on-reflection* true)
 
@@ -69,6 +69,34 @@
             (str "bf=" bf ": precondition — a healthy cold tree validates"))
         (is (pos? (:counts-skipped cov))
             (str "bf=" bf ": and the coverage report must show the skip: " cov))))))
+
+;; An EXACT measure — integer addition, and a `remove` that recomputes rather than
+;; subtracting. That matters: measure checking is opt-in (`{:check-measures? true}`) because
+;; an inexact measure legitimately drifts in the last bits and an equality oracle would call
+;; that corruption. See `validate-full`'s docstring.
+(def ^:private sum-measure
+  (reify IMeasure
+    (identity [_] 0)
+    (extract [_ k] k)
+    (merge [_ a b] (+ (long a) (long b)))
+    (remove [_ _current _key recompute] (.get recompute))))
+
+(deftest a-measured-tree-actually-verifies-its-measures
+  (testing "moved here from `oracle_power.clj`, where it made that whole namespace
+            impossible to red-check: `verification-coverage` does not exist before ea67a58,
+            so a namespace referring to it fails to COMPILE against the pre-fix build and
+            takes every sibling deftest down with it rather than failing on its own terms.
+
+            What it pins: the measure arm must actually LOOK at measures. Without this, the
+            opt-in flag could be wired to nothing at all and every measure test would still
+            pass by simply never checking."
+    (doseq [[bf n] [[8 200] [64 1000]]]
+      (let [s   (set/from-sorted-array compare (to-array (range n)) n
+                                       {:branching-factor bf :measure sum-measure})
+            _   (set/measure s)
+            cov (diag/verification-coverage s)]
+        (is (pos? (:measures-verified cov))
+            (str "bf=" bf " n=" n ": measures must actually be verified, not skipped: " cov))))))
 
 (deftest a-warm-tree-is-actually-verified
   (testing "the other half. Without this, the fix to the false positive could have been an

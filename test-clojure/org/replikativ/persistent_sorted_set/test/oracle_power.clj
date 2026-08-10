@@ -157,15 +157,26 @@
   (set/from-sorted-array compare (to-array (range n)) n
                          {:branching-factor bf :measure sum-measure}))
 
-(deftest a-correct-measure-passes-and-is-actually-examined
-  (testing "the control, plus proof the measure arm is not skipping"
+;; `sum-measure` above is EXACT — integer addition, and its `remove` recomputes rather than
+;; subtracting — which is what makes it legal to check at all. Measure checking is opt-in
+;; (`{:check-measures? true}`) precisely because an INEXACT measure drifts in the last bits
+;; and an equality oracle would call that corruption; see `validate-full`'s docstring.
+
+(deftest a-correct-measure-passes
+  (testing "the control for the two defect tests below"
     (doseq [[bf n] [[8 200] [64 1000]]]
       (let [s (measured bf n)]
-        (is (true? (diag/validate-full s)) (str "bf=" bf " n=" n))
+        (is (true? (diag/validate-full s {:check-measures? true})) (str "bf=" bf " n=" n))
         (is (= (reduce + (range n)) (set/measure s))
-            (str "bf=" bf " n=" n ": precondition — the measure is the sum"))
-        (is (pos? (:measures-verified (diag/verification-coverage s)))
-            (str "bf=" bf " n=" n ": measures must actually be verified, not skipped"))))))
+            (str "bf=" bf " n=" n ": precondition — the measure is the sum"))))))
+;; The other half of this — proof the measure arm is not merely SKIPPING everything — was a
+;; `verification-coverage` assertion that used to live right here, and it made this whole
+;; namespace impossible to red-check: that var does not exist before ea67a58, so reverting
+;; `diagnostics.cljc` gave "No such var: diag/verification-coverage" and took all five
+;; deftests down with a compile error instead of the failures they were meant to show. The
+;; NOTE above already said such assertions belong in `oracle_coverage.clj`; this one had been
+;; left behind, so the NOTE described an intent rather than the state of the file. Moved to
+;; `oracle_coverage.clj`'s `a-measured-tree-actually-verifies-its-measures`.
 
 (deftest a-wrong-measure-is-caught
   (testing "the defect class this arm exists for: a cached measure that is a WRONG NUMBER
@@ -177,11 +188,11 @@
             ^Branch root (.root s)
             original (.-_measure root)]
         (set! (.-_measure root) (long 999999))
-        (is (thrown? AssertionError (diag/validate-full s))
+        (is (thrown? AssertionError (diag/validate-full s {:check-measures? true}))
             (str "bf=" bf " n=" n ": a branch measure that disagrees with its children "
                  "must be caught"))
         (set! (.-_measure root) original)
-        (is (true? (diag/validate-full s))
+        (is (true? (diag/validate-full s {:check-measures? true}))
             (str "bf=" bf " n=" n ": and the tree must validate again once restored"))))))
 
 (deftest a-wrong-leaf-measure-is-caught
@@ -196,7 +207,7 @@
           original (.-_measure leaf)]
       (is (some? original) "precondition: the leaf carries a measure")
       (set! (.-_measure leaf) (long 424242))
-      (is (thrown? AssertionError (diag/validate-full s))
+      (is (thrown? AssertionError (diag/validate-full s {:check-measures? true}))
           "a leaf measure that disagrees with its own keys must be caught")
       (set! (.-_measure leaf) original)
-      (is (true? (diag/validate-full s)) "and validate again once restored"))))
+      (is (true? (diag/validate-full s {:check-measures? true})) "and validate again once restored"))))
