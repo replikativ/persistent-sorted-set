@@ -1408,8 +1408,23 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (nodes[2] != null) cs.copyOne(nodes[2]);
       cs.copyAll(s0.children, idx + 2, _len);
 
-      // Compute exact subtree count from children (accounts for processor changes)
-      join._subtreeCount = tryComputeSubtreeCountFromChildren(joinChildren, left._len + newLen, storage);
+      // DELTA, not a children walk. `join` is exactly `left` carried over untouched
+      // (ks/cs copyAll of all left._len children above) plus this node's content with the
+      // one element `remove` deleted. Both totals are already in hand, so the sum is exact
+      // and needs no child to be resident — which is the whole point: after a cold restore
+      // every node sits at minimum occupancy, so removing a single element cascades a JOIN
+      // up the entire spine, and the children walk answers -1 at every level because only
+      // idx-1/idx/idx+1 were ever materialized. That -1 is then SERIALIZED
+      // (`impl.nodes/node->map` writes subtreeCount raw), so the unknown becomes durable
+      // and every later reader pays to rebuild it. Measured at bf 16, one disj on a cold
+      // 10000-element tree: spine counts -1/-1/-1 under a root that knew 9999.
+      //
+      // Same leafProcessor caveat as the sibling delta above: a processor may compact or
+      // expand a leaf, so removing one KEY need not change the element count by one.
+      join._subtreeCount =
+          (settings.leafProcessor() == null && left._subtreeCount >= 0 && _subtreeCount >= 0)
+          ? left._subtreeCount + _subtreeCount - 1
+          : tryComputeSubtreeCountFromChildren(joinChildren, left._len + newLen, storage);
       join._measure = tryComputeMeasureFromChildren(joinChildren, left._len + newLen, storage, measureOps);
       if (settings.diffBufSize() > 0) {
         // merged with left: structural → written (BUF_WRITE), still buffers surviving
@@ -1463,8 +1478,13 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       cs.copyAll(s0.children,  idx + 2, _len);
       cs.copyAll(rs.children, 0, right._len);
 
-      // Compute exact subtree count from children (accounts for processor changes)
-      join._subtreeCount = tryComputeSubtreeCountFromChildren(joinChildren, newLen + right._len, storage);
+      // DELTA — the mirror of the left-join above: `join` is this node's content minus the
+      // one deleted element, plus `right` carried over untouched. See that comment for why
+      // the children walk cannot answer here and why the -1 it returns becomes durable.
+      join._subtreeCount =
+          (settings.leafProcessor() == null && right._subtreeCount >= 0 && _subtreeCount >= 0)
+          ? _subtreeCount - 1 + right._subtreeCount
+          : tryComputeSubtreeCountFromChildren(joinChildren, newLen + right._len, storage);
       join._measure = tryComputeMeasureFromChildren(joinChildren, newLen + right._len, storage, measureOps);
       if (settings.diffBufSize() > 0) {
         // merged with right: structural → written (BUF_WRITE), still buffers surviving
