@@ -1,7 +1,15 @@
 # Concurrency & Memory Model (JVM)
 
 This document is the contract for every mutable field in the JVM implementation
-(`src-java`). The ClojureScript implementation is single-threaded and out of scope.
+(`src-java`).
+
+The ClojureScript implementation is single-threaded, which is **not** the same as
+concurrency-free, and the difference has a contract of its own — see
+[ClojureScript: one writer per set](#clojurescript-one-writer-per-set) at the end. In
+short: every `await` inside `async+sync` is a yield point, and `store` mutates node state
+across those yields, so two overlapping async stores on one set interleave. The
+single-writer-store rule that follows from that is a caller obligation, not something the
+runtime prevents.
 
 ## Value semantics
 
@@ -208,8 +216,18 @@ read by many threads.
 | `_root` | `root()` restore fill (idempotent); `store()` re-wrap; editable ops | everything | contract (a) for the lazy fill; editable/commit writes are single-writer |
 | `_count` | `count()` cache fill; editable ops | `count()` | contract (a): idempotent fill |
 | `_version` | editable ops | seq invalidation | plain + owner (transients only) |
-| `_settings` | `root()` boundary adoption (one-time, idempotent) | everything | contract (a) |
+| `_settings` | `root()` self-describing adoption: branching factor, boundary, diff-buf budget — staged on a local, ONE publish | everything | contract (a), *because of the staging* |
 | `_storage` | `store(IStorage)` | traversals | set by the owner before sharing / by the commit thread |
+
+The `_settings` row earns contract (a) only because the three adoptions are staged on a
+local `Settings` and published with a single write. They used to be three chained
+read-modify-writes, and this table called that "one-time, idempotent" — which described
+each adoption in isolation, not the sequence. Two threads taking the restore path on one
+set could both read the pre-adoption value, and the second write would drop the first
+adoption. Never a wrong value (both compute the same targets), but a MISSING one, and the
+comments at the site record what each omission costs: leaves wider than the set believes
+its branching factor to be, or "81 elements silently gone". If a fourth adoption is ever
+added, add it to the staged local — not as another write to the field.
 
 ### `Settings`
 
@@ -246,3 +264,39 @@ it to false (the transient seal). `editable()` is a volatile read.
   `ANode` within one snapshot.
 - `test/baseline_store_softref.clj` — the forbidden state, injected artificially,
   is rejected loudly under `-ea` (and unwrapped without, #17's production behavior).
+
+## ClojureScript: one writer per set
+
+The ClojureScript runtime has one thread, so none of the JMM machinery above applies:
+there are no torn reads, no publication problem, no need for `volatile`. What it does
+have is **interleaving**, and the contract that follows from it was previously left
+unstated — the opening of this document said only "single-threaded and out of scope",
+which reads as "nothing to worry about" and is wrong.
+
+`async+sync` compiles to a CPS chain, so **every `await` is a yield point**: control
+returns to the event loop and any other pending continuation may run before the next
+line does. Two places make that observable.
+
+1. **`Branch.store` mutates node state across its yields.** The baseline arm loops over
+   the children, `await`s each child's `store`, and writes the returned address into
+   `this.addresses[i]` *in place* (`branch.cljs`, `(address this i child-address)`).
+   The diff-buf arm likewise re-points addresses and rewrites `_slots` across `await`s.
+   This is the same two-step settle that `NodeState` was introduced to eliminate on the
+   JVM — it is safe here only because nothing else runs concurrently, which is precisely
+   what a second in-flight store breaks.
+
+2. **A set does not become "already stored" until its store finishes.** `btset.cljs`
+   assigns `(set! (.-address set) …)` only *after* `await`ing the root store, so a second
+   `store` entered while the first is still in flight does not see an address and runs in
+   full — both walking and mutating the same nodes.
+
+**The rule.** At most one `store` may be in flight per set at a time. Await the first
+before starting another. This is a caller obligation: the library does not detect the
+overlap, and nothing in the single-threaded runtime prevents it.
+
+Reads (`seq`, `count`, `slice`, `lookup`) may interleave freely with each other. What
+they may not interleave with is a `store` on the same set, for the reason in (1) — a
+reader crossing a yield mid-settle can observe a node whose addresses are half-updated.
+
+This is the ClojureScript half of the JVM's single-writer rule, and the JVM's ownership
+argument (see `Branch._state`) is the same argument: exclusivity, not atomicity.

@@ -123,16 +123,31 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       // just below: the data knows the number and the caller cannot be expected to. Unlike
       // those two this adopts UNCONDITIONALLY rather than only upward from a default, because
       // there is no safe way to run at a smaller bf over larger nodes.
-      if (root._settings.branchingFactor() != _settings.branchingFactor()) {
-        _settings = _settings.withBranchingFactor(root._settings.branchingFactor());
+      // STAGE ALL THREE ADOPTIONS ON A LOCAL, PUBLISH ONCE. They used to be three chained
+      // read-modify-writes on `_settings` (bf, then boundary, then diff-buf), each reading
+      // what the previous one wrote. CONCURRENCY.md classified that as contract (a), "a
+      // benign idempotent single-word cache fill" — which it is not: two threads taking
+      // this path on the same set can both read the pre-adoption settings and the second
+      // write then LOSES the first adoption. Both threads compute the same targets, so the
+      // result is never a wrong value, but it can be a MISSING one, and the cost of each
+      // missing adoption is spelled out in the comments below — leaves larger than the set
+      // believes its branching factor to be, or "81 elements silently gone".
+      //
+      // Staging costs nothing (Settings.with* already allocates a new Settings per step;
+      // this just stops publishing the intermediates) and turns the whole block into one
+      // publish of a fully-formed value, which IS contract (a).
+      Settings adopted = _settings;
+
+      if (root._settings.branchingFactor() != adopted.branchingFactor()) {
+        adopted = adopted.withBranchingFactor(root._settings.branchingFactor());
       }
 
       // self-describing boundary: a restored node carries its split strategy; adopt it so this
       // set's own conj/disj use the right splitter even when restore opts didn't specify one.
       // Idempotent for the root-handler restore path (settings already carry the boundary).
       IBoundary nodeBoundary = root._settings.boundary();
-      if (nodeBoundary.contentDefined() && !_settings.boundary().contentDefined()) {
-        _settings = _settings.withBoundary(nodeBoundary);
+      if (nodeBoundary.contentDefined() && !adopted.boundary().contentDefined()) {
+        adopted = adopted.withBoundary(nodeBoundary);
       }
       // diff-buf: self-describing in exactly the same way, and adopted for a stronger
       // reason. A node carries its own budget in its blob, so a set restored WITHOUT
@@ -159,8 +174,8 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       //
       // `withDiffBufSize` still refuses to enable buffering under a content-defined
       // boundary.
-      if (_settings.diffBufSize() <= 0 && root._settings.diffBufSize() > 0) {
-        if (_settings.leafProcessor() != null) {
+      if (adopted.diffBufSize() <= 0 && root._settings.diffBufSize() > 0) {
+        if (adopted.leafProcessor() != null) {
           // A leafProcessor and diff-buf corrupt together (a deposit records one element, a
           // processor rewrites the whole leaf), so adopting is unsafe — but refusing is only
           // right when there is something to lose. Decide on what the subtree ACTUALLY
@@ -178,9 +193,10 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
           }
           // Nothing buffered ⇒ nothing to preserve ⇒ stay at 0 and carry on.
         } else {
-          _settings = _settings.withDiffBufSize(root._settings.diffBufSize());
+          adopted = adopted.withDiffBufSize(root._settings.diffBufSize());
         }
       }
+      _settings = adopted;                     // ONE publish of the fully-adopted settings
       _root = _settings.makeReference(root);   // PUBLISH LAST — see the note above
     }
     // A DIRTY root (no address) must be held strongly — see markDirty. If it is gone

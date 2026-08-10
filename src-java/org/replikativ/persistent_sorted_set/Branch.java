@@ -94,7 +94,17 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   }
 
   // The ONE mutable reference to this node's per-child state. Never null (every ctor
-  // installs a snapshot). Readers take ONE snapshot per method and use only its fields.
+  // installs a snapshot).
+  //
+  // Readers take ONE snapshot per method and use only its fields — WHERE THAT MATTERS,
+  // which is not everywhere, and the exceptions are safe for a different reason worth
+  // naming rather than leaving to be rediscovered. `depositKV` re-reads `_state` after its
+  // first snapshot, and `add`/`replace` call `child()` (which may itself publish a fill)
+  // after theirs. Neither is a torn-read bug, because both run on a node the calling thread
+  // OWNS: an editable transient, or an unpublished successor it is still building. The
+  // single-snapshot discipline is what protects a node that is already SHARED; owner-thread
+  // code is protected by ownership instead. Do not "fix" those sites by adding a re-read —
+  // the property they rely on is exclusivity, not atomicity.
   public volatile NodeState<Address> _state;
 
   // CAS access to _state for the publishers that can race the store()-time settle on a
@@ -405,10 +415,18 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
   // diff-buf restore: install reconstructed slots (fressian read side / storage impls)
   // as ONE atomically-published snapshot carrying the node's current {addresses,
-  // children} (restore-time: the node is not yet published, so the plain
-  // read-modify-write publish is single-threaded by contract). entries is usually
-  // BUF_LAZY (derived from the slots on first read), unless the caller knows the
-  // settled total.
+  // children}. entries is usually BUF_LAZY (derived from the slots on first read),
+  // unless the caller knows the settled total.
+  //
+  // The read-modify-write publish below is not atomic, and TWO DIFFERENT arguments make
+  // that safe depending on who is calling — the comment here used to give only the first,
+  // which is false of the second:
+  //   * STORAGE / codec callers, at restore time: the node is not yet published, so
+  //     nothing else can see it.
+  //   * `depositKV`, where the node IS published but is an editable TRANSIENT: the safety
+  //     comes from the single-writer ownership rule, not from non-publication.
+  // Either way there is exactly one thread, so a plain read-modify-write is sufficient;
+  // what must not be assumed is that "not yet published" covers every caller.
   public void installSlots(Object[] slots, long entries) {
     // A node carrying buffered diffs whose SETTINGS say buffering is off is an
     // incoherent reconstruction: the storage persisted `:slots` and is now

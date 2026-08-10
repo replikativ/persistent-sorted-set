@@ -86,7 +86,14 @@
   [node i]
   #?(:clj
      (let [^Branch b node
-           children (.childrenArray b)]  ; one snapshot; read-only
+           ;; One snapshot PER CALL, read-only — not one per traversal. `children-seq`
+           ;; calls this once per index, so a walk over a branch takes N snapshots and can
+           ;; straddle a concurrent settle. That is acceptable HERE and only here: these
+           ;; are diagnostics, they never write, and a settle only ever replaces a null
+           ;; child with a restored one or a bare child with a Reference to it. Do not copy
+           ;; this pattern into the library proper, where the one-snapshot-per-method rule
+           ;; is what keeps a derived tree from baking in a torn pair.
+           children (.childrenArray b)]
        (when children
          (let [ref (aget ^objects children i)]
            (when ref
