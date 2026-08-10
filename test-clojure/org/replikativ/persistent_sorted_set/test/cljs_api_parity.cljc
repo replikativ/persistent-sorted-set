@@ -184,9 +184,14 @@
             sl (set/slice s 2500 7500)]
         (is (nil? (set/seek sl 9000))
             (str "bf=" bf ": seeking past the upper bound yields nothing"))
-        (is (= 7500 (last (set/seek sl 5000)))
+        ;; The WHOLE RANGE, not `last`. Asserting only `last` reads the RETAINED bound,
+        ;; which the backward-seek defect never moved — so both of these lines stayed green
+        ;; against the broken build while their neighbours failed, certifying nothing.
+        ;; 52351a3 removed exactly this pattern from `seek_backward.clj` and left its twin
+        ;; here; caught by a test-vacuity audit.
+        (is (= (range 5000 7501) (set/seek sl 5000))
             (str "bf=" bf ": a forward seek stays bounded above"))
-        (is (= 7500 (last (set/seek (set/seek sl 5000) 3000)))
+        (is (= (range 3000 7501) (set/seek (set/seek sl 5000) 3000))
             (str "bf=" bf ": and so does a backward one"))
         ;; A seq retains only ONE bound: for an ascending seq that is the upper one. Seeking
         ;; below a slice's lower bound therefore yields elements under it — 1000..7500 here,
