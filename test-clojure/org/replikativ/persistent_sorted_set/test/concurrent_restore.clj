@@ -58,8 +58,9 @@
 (def ^:private ^:const n-init  8000)
 ;; TWO levels, not three. A deeper tree trips a SEPARATE, pre-existing defect in
 ;; the NESTED diff-buf path — `assembleNested` casting a Leaf to a Branch — which
-;; is not what this namespace is about and which fires single-threaded too. See
-;; `nested_diff_buf_repro.clj`, which reproduces it minimally and deterministically.
+;; is not what this namespace is about and which fires single-threaded too. (An earlier
+;; version of this note pointed at `nested_diff_buf_repro.clj`; no such file exists. The
+;; nearest live coverage of the nested-diff restore path is `diff_buf_restore_cycle.clj`.)
 ;; At this branching factor the tree is root -> leaves, so the slots, the
 ;; projection, the cache-fill CAS and the LAZY resolve all still run; only the
 ;; nested-diff assembly is out of the picture.
@@ -96,7 +97,14 @@
             clobbered state, and every reader must see the whole set"
     (let [disk (atom {})
           mem  (atom {})
-          st   (ts/storage mem disk)
+          ;; EXPLICIT Settings, never the bare `(ts/storage ...)` arities: those build a bare
+          ;; `(Settings.)`, whose diff-buf budget comes from the `pss.diffBufSize` system
+          ;; property -- 256 under the `:test` alias, 0 otherwise. This namespace declares
+          ;; `dbs` for the SET, so the bare arity silently ran set-128-over-nodes-256, a mixed
+          ;; configuration it never intended and never stated. Measured with the property at 0,
+          ;; the bare arity threw `diff-buf: a node reconstructed with diffBufSize=0 was handed
+          ;; buffered slots` and failed two assertions. See marker_slot_staleness.clj's note.
+          st   (ts/->Storage mem disk (Settings. (int bf) nil nil nil (int dbs)))
           opts {:comparator full-cmp :branching-factor bf
                 :diff-buf-size dbs :ref-type :strong}
           s0   (into (ss/sorted-set* (assoc opts :storage st))
@@ -178,7 +186,7 @@
             passed. This is D-F1's shape, pinned here for the concurrent
             harness specifically."
     (let [disk (atom {})
-          st   (ts/storage (atom {}) disk)
+          st   (ts/->Storage (atom {}) disk (Settings. (int bf) nil nil nil (int dbs)))  ; explicit budget -- see above
           opts {:comparator full-cmp :branching-factor bf
                 :diff-buf-size dbs :ref-type :strong}
           s0   (into (ss/sorted-set* (assoc opts :storage st))

@@ -74,13 +74,17 @@
     st))
 
 (deftest diff-of-a-set-with-itself-is-empty
-  (testing "the SHORT-CIRCUIT: identical root addresses answer without touching
-            storage at all"
+  (testing "identical root addresses answer empty.
+
+            This does NOT test the short-circuit, and it used to claim it did. `a` is built
+            in memory through the WRITING handle, so it is fully resident: a complete
+            traversal of it costs zero reads, which means `(is (zero? (reads)))` could not
+            fail whether the short-circuit existed or not. The real test is
+            `diff-of-identical-roots-reads-nothing` below, which restores the same address
+            twice through a COLD handle and so can actually observe a read."
     (let [storage (u/storage)
           a (build storage (range 1000))]
-      (reset-reads!)
-      (is (= {:added [] :removed []} (s/diff a a storage)))
-      (is (zero? (reads)) "same root address must cost zero reads")))
+      (is (= {:added [] :removed []} (s/diff a a storage)))))
 
   (testing "and the WALK, which the case above never reaches. `(diff a a)` returns
             on the identical-address early-out before the algorithm starts, so on

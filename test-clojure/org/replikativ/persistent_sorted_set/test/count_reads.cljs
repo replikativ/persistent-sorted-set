@@ -86,8 +86,19 @@
 
 (deftest an-unknown-count-still-walks-and-is-still-right
   (testing "-1 is the honest answer for a branch whose children are not all known, and the
-            walk must remain reachable and correct for it"
-    (let [set* (cold (written 2000 8))]
+            walk must remain reachable and correct for it.
+
+            The unknown state has to be FORCED, and that is the whole point. An ordinary cold
+            restore comes back with the root's count already KNOWN -- the deftest above
+            asserts exactly that -- and `branch/$count` returns a known count without walking
+            at all. So the earlier version of this test, which used a plain `(cold (written
+            2000 8))`, never reached the walk arm it is named for: it exercised the fast path
+            twice and duplicated the first deftest in this file."
+    (let [set* (cold (written 2000 8))
+          root (btset/root-node set*)]
+      (set! (.-subtree-count root) -1)
+      (is (neg? (node/subtree-count root))
+          "precondition: the arm under test is the UNKNOWN one, not the fast path")
       ;; A full traversal is the independent oracle: it never consults subtree-count.
-      (is (= (range 2000) (vec (s/seq set*))))
-      (is (= 2000 (count set*)) "and agrees with count"))))
+      (is (= 2000 (count set*)) "the walk must still produce the right count")
+      (is (= (range 2000) (vec (s/seq set*))) "and the elements are untouched"))))
