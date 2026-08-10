@@ -1,5 +1,18 @@
 # 0.4.x
 
+**Read the data-integrity items before upgrading.** Three of the fixes below can leave a set
+that is wrong ON DISK, and upgrading alone does not repair a database that already has one:
+
+- **`replace` under a coarse comparator left a stale separator** — an element stays in the set,
+  correctly ordered, but a lookup specifying every component of the key routes past it. Through
+  datahike this reached both `d/datoms db :eavt e a v` and `d/datoms db :avet a v`, while `d/q`,
+  `d/pull` and prefix `d/datoms` were unaffected. Requires a tree of three or more levels.
+  [doc/advisory-stale-separator.md](doc/advisory-stale-separator.md) has the affected-version
+  matrix, a check to run against your own data, and the repair.
+- **`store()` never wrote a child that was mutated in place** — inherited from upstream, at the
+  default settings, at every level.
+- **`disj` recorded the caller's search key** — deleted elements come back on reload.
+
 - **Fix (measure): a leaf shrunk by a sibling rebalance kept its pre-shrink measure.**
   `Leaf.remove`'s borrow-from-sibling paths shrink the SIBLING in place (`left._len = …`,
   `right._len = …`) but guarded the measure recomputation on `this._measure` — the measure of
@@ -216,9 +229,17 @@
       400 000            root level 2   6
 
   Three levels are required — with two the parent is the root, whose separator is written
-  unconditionally. So an index crosses into exposure somewhere between 100k and 200k datoms, and
-  above that roughly one datom per 66k, silently, for cardinality-one value upserts. `d/q` and
-  `d/pull` still found them; they scan by prefix.
+  unconditionally. So an index crosses into exposure somewhere between 100k and 200k datoms.
+  Do NOT read a rate off that table: how many datoms are affected depends on how many
+  cardinality-one upserts land on a node's maximum, and a later probe over a different upsert
+  pattern found fewer at the same size. Size tells you whether you are exposed, not how much.
+  `d/q` and `d/pull` still found them; they scan by prefix.
+
+  [doc/advisory-stale-separator.md](doc/advisory-stale-separator.md) carries the affected-version
+  matrix (pss 0.3.114 through 0.4.139, datahike 0.7.1615 through 0.8.1775), the access paths
+  verified affected and unaffected, a self-audit to run against your own database, and the
+  repair — export and re-import recovers everything, because the exporter scans rather than
+  looks up.
 
   The test is `Util.equiv`, not `Objects.equals`: a Datom implements `equiv` but not
   `Object.equals`, so `Objects.equals` is identity there and would propagate on EVERY upsert.
@@ -311,6 +332,87 @@
   the JVM against `{:x 1}` everywhere else. With no `:meta` the JVM now returns `nil` rather than
   `{}`, matching `sorted-set*` and ClojureScript. datahike never hit this — it applies `with-meta`
   after the build on both runtimes.
+
+### `disj`/`replace` and `lookup` disagreed on which comparator-equal element they act on
+
+  `lookup` takes the LEFTMOST element equal under the operation comparator; the mutating
+  operations took whatever `Arrays.binarySearch` returned, which explicitly disclaims which of
+  several equal elements it finds. For the `[id value]`-compared-by-id pattern the docs
+  advertise, `disj` could therefore remove a different element than `lookup` had just reported.
+  ClojureScript's binary search converges leftmost, so the same `disj` produced a different set
+  — and a different merkle root — on the two runtimes.
+
+### A backward `seek` returned a silently wrong range
+
+  Both climb loops tested only the direction of travel, so a target on the other side of the
+  current position never climbed the parent chain. Measured on `(apply sorted-set (range 10000))`:
+  `seek 5000` then `seek 2500` yielded 5008 elements starting at 4992, where 7500 starting at
+  2500 is what the documented contract says — elements missing AND already-consumed elements
+  re-emitted. Both runtimes.
+
+### `root()` published the root before the settings it had just adopted from it
+
+  A restored node carries the branching factor, boundary and diff-buf budget it was written
+  with, and `root()` adopts them. It published `_root` first, so another thread could pair the
+  new root with pre-adoption settings and run over it at the wrong branching factor. `_root` is
+  now volatile and read acquire-first.
+
+  The three adoptions were also chained read-modify-writes on `_settings`, so two threads could
+  each drop the other's. They are now staged on one local and published once.
+
+### Counts: a cold reader no longer pays to recover them
+
+  `remove` discarded a count it already had rather than taking the delta, and a join cascade
+  erased counts it had just written — so a reader that trusted the persisted count had to
+  restore nodes to recompute it. After 25 generations of churn, a cold `count` went from 256
+  node restores to 15. `disj` also no longer restores a subtree merely to count it.
+
+### `validate-full` no longer checks measures by default
+
+  The check compared a cached measure against a fresh fold with `=`, which is only valid for an
+  EXACT measure. An incremental floating-point measure legitimately differs in the last bits, and
+  55 of 72 healthy shapes were reported corrupt — a validator that cries wolf on correct trees
+  trains its users to ignore it. Pass `{:check-measures? true}` to opt in.
+
+### Smaller correctness fixes
+
+  * `from-sequential` on an empty collection returned `#{nil}` on the JVM.
+  * `false` is a legal element; a buffered diff recorded the search probe instead of it.
+  * Two entry points allowed `nil` into a set.
+  * `JavaIter.next` ignored `_over`, so it returned the last element forever and never threw
+    `NoSuchElementException`.
+  * `restore` now honours `:comparator`, as ClojureScript always did.
+  * A stale transient handle throws instead of silently taking the persistent path.
+  * A node shrinking in place left stale references past its new length, retaining removed
+    elements — and, at a branch, entire superseded subtrees.
+  * Two sets sharing one caching storage overwrote each other's projection comparator, which
+    could reorder a buffered leaf under the wrong comparator and leave an element permanently
+    unfindable after a store.
+  * `get-nth` treats weight as a real contract, and no longer requires a measure to be
+    configured in order to answer.
+
+### Added
+
+  * `from-sorted-seq`: streaming bulk build in O(depth) memory, on both runtimes. It previously
+    retained its whole input, making it O(n).
+  * `diff`: what changed between two versions of a set, pruning shared subtrees by address.
+
+### Performance, measured
+
+  diff-buf had never been measured. On a churn workload it stores ~3x fewer objects and ~2.4x
+  fewer bytes, against ~45% more CPU on transient `disj` and ~25% on persistent `conj`/`disj`.
+  Reads are unaffected. Note that the benchmark suite cannot show the benefit — `store-50K`
+  stores a fresh tree, where nothing is bufferable by construction.
+
+### Documentation
+
+  * `doc/CONCURRENCY.md` gained the ClojureScript contract: single-threaded is not
+    concurrency-free, every `await` is a yield point, and at most one `store` may be in flight
+    per set.
+  * `IStorage.markFreed` documents that the stream is a CANDIDATE list, that a content-addressed
+    store may re-issue a freed address as live in the same commit, and that under diff-buf it is
+    only sound for a linear history.
+  * Four comments that claimed concurrency properties the code does not provide were corrected.
 
 ### CI was testing materially less than the local suite
 
