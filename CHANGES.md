@@ -383,9 +383,26 @@ that is wrong ON DISK, and upgrading alone does not repair a database that alrea
 
 ### Added
 
-  * `from-sorted-seq`: streaming bulk build in O(depth) memory, on both runtimes. It previously
-    retained its whole input, making it O(n).
-  * `diff`: what changed between two versions of a set, pruning shared subtrees by address.
+  * `diff`: what changed between two versions of a set, pruning shared subtrees by address —
+    a subtree whose address both sides hold is skipped without being read. Both runtimes.
+  * `from-sorted-seq` on ClojureScript. The JVM has had it since 0.4.139; the streaming builder
+    is now on both runtimes.
+
+### `from-sorted-seq` was not actually O(depth) — it retained its whole input
+
+  Shipped in 0.4.139 under the title "streaming bulk build in O(depth) memory", which is what it
+  exists to be and what it was not. `streaming-split` fed the remainder forward as
+  `(subvec buf avg)`; a SubVector shares its base, and `conj` on one does `base.assocN(end, o)`,
+  so the base grew without bound and every element ever consumed stayed reachable.
+
+  Measured: 4M elements OOM'd at `-Xmx128m` before the fix and complete after it; live heap
+  sampled mid-stream grew 2.7x between 250k and 2M elements before, 0.99x after. The fix is a
+  forced copy, `(into [] (subvec …))`.
+
+  The test that was meant to catch this sampled the heap AFTER `from-sorted-seq` returned, when
+  every intermediate was already garbage — it measured the residue, an address and a count, and
+  reported a flat 1.4 MB at 4M while the same build died under a smaller heap. It now samples
+  mid-stream.
 
 ### Performance, measured
 
