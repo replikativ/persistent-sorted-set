@@ -38,6 +38,27 @@
                  (when (and (nil? (.-root set)) (some? (.-address set)))
                    (assert (implements? storage/IStorage (.-storage set)))
                    (set! (.-root set) (await (storage/restore (.-storage set) (.-address set) opts)))
+                   ;; self-describing BRANCHING FACTOR, mirroring the JVM's root(). A node
+                   ;; knows the width it was written at and the caller cannot be expected to
+                   ;; remember it, so reopening a store with a different (or defaulted)
+                   ;; :branching-factor otherwise leaves the SET believing one width while its
+                   ;; nodes have another. On the JVM that is loud — an -ea AssertionError, or
+                   ;; ArrayIndexOutOfBounds in Stitch.copyAll without -ea. Here it is silent,
+                   ;; because cljs arrays are exact-sized and split/rebalance read the width
+                   ;; from the NODE's settings: nothing overflows, but a root grown by conjoin
+                   ;; is built from the SET's settings, so a post-restore tree can carry a root
+                   ;; at one width over children at another and diverge in SHAPE from the JVM
+                   ;; for the same operations.
+                   ;;
+                   ;; Adopted UNCONDITIONALLY rather than only upward from a default, exactly
+                   ;; as the JVM does: there is no safe way to run at a width the data
+                   ;; contradicts. The boundary and diff-buf adoptions below are the same
+                   ;; principle; this one was simply never ported (f3e977a is JVM-only).
+                   (let [node-bf (:branching-factor (.-settings (.-root set)))]
+                     (when (and (number? node-bf)
+                                (not= node-bf (:branching-factor (.-settings set))))
+                       (set! (.-settings set)
+                             (assoc (.-settings set) :branching-factor node-bf))))
                    ;; self-describing boundary: a restored node carries its split strategy; adopt
                    ;; it so conj/disj use the right splitter even when restore opts omitted it.
                    (let [nb (b/content-boundary (.-settings (.-root set)))]
