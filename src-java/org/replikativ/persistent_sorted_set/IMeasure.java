@@ -53,6 +53,24 @@ public interface IMeasure<Key, M> {
      * @return the number of data elements represented by this measure
      */
     default long weight(M measure) {
-        return 1; // default: each entry has weight 1 (= subtreeCount behavior)
+        throw new UnsupportedOperationException(
+            "This IMeasure does not implement weight(), which getNth requires.\n"
+          + "\n"
+          + "weight must be a MONOID HOMOMORPHISM from your measure monoid to (long, +):\n"
+          + "    weight(identity())     == 0\n"
+          + "    weight(merge(a, b))    == weight(a) + weight(b)\n"
+          + "\n"
+          + "It answers 'how many logical items does this subtree hold', which is what lets\n"
+          + "getNth descend by accumulated position. For a set whose elements are RUNS or\n"
+          + "CHUNKS, that is the item count inside them, and getNth returns the containing\n"
+          + "element plus an offset within it.\n"
+          + "\n"
+          + "If you only want the nth ELEMENT by position, do not write a measure at all:\n"
+          + "getNth works without one, navigating by the subtree counts the tree already\n"
+          + "maintains.\n"
+          + "\n"
+          + "This default used to return 1, which satisfies NEITHER law — weight(identity)\n"
+          + "must be 0, and a merged measure must sum rather than stay 1. The result was that\n"
+          + "getNth believed every tree weighed one and returned null for every index above 0.");
     }
 }

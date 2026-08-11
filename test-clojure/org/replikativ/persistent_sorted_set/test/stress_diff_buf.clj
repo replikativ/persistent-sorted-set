@@ -59,10 +59,31 @@
 
 (defn- writes [] (:writes @tstore/*stats))
 
+(defn- subtree-elements [^ANode n storage]
+  (if (instance? Leaf n)
+    (vec (.keys n))
+    (vec (mapcat #(subtree-elements (.child ^Branch n storage %) storage)
+                 (range (.len ^Branch n))))))
+
+(defn- stale-measure-nodes
+  "Every node under `n` whose cached `_measure` disagrees with a recomputation
+   from its own subtree content. A null cache is fine — it means not computed."
+  [^ANode n storage path]
+  (let [cached (.-_measure n)
+        truth  (reduce + 0 (map (comp long first) (subtree-elements n storage)))
+        here   (if (and (some? cached) (not= truth (long cached)))
+                 [{:path path :level (if (instance? Leaf n) 0 (.level ^Branch n))
+                   :cached (long cached) :truth truth}]
+                 [])]
+    (into here
+          (when (instance? Branch n)
+            (mapcat #(stale-measure-nodes (.child ^Branch n storage %) storage (conj path %))
+                    (range (.len ^Branch n)))))))
+
 (defn run-trial
   "Run one deterministic trial. Returns {:ok? bool :seed :params :cov {...} (:detail on failure)}.
    Never throws — wraps failures so the sweep collects every failing seed."
-  [seed {:keys [bf b keyrange init cycles ops restore-prob transient-prob measure? gc?] :as params}]
+  [seed {:keys [bf b node-b keyrange init cycles ops restore-prob transient-prob measure? gc?] :as params}]
   (try
     (let [rng   (Random. seed)
           rint  (fn [n] (.nextInt rng (int n)))
@@ -70,7 +91,22 @@
           disk  (atom {})
           meas  (when measure? sum-measure)
           freed (when gc? (atom #{}))
-          mk    (fn [] (let [s (mkst disk bf b meas)] (if freed (recording s freed) s)))
+          ;; ONE node cache for the whole trial, not a fresh one per storage.
+          ;; `mk` used to build `(atom {})` on every call, so no restored node was
+          ;; ever SHARED between two versions of the tree — which is precisely the
+          ;; condition D-F2 needed (a caching IStorage handing one node object to
+          ;; consecutive versions, the datahike `CachedStorage` shape). The JVM's
+          ;; own #19 had the same blind spot. Sharing it here is what makes the
+          ;; cross-version projection path reachable from this sweep at all.
+          mem   (atom {})
+          ;; The budget the STORAGE stamps on reconstructed nodes, which need not
+          ;; equal the set's. It used to be `b` on both sides by construction, so
+          ;; the two could never disagree — the blind spot that hid D-F1, where a
+          ;; set at 0 over nodes at N dropped buffered elements on the next write.
+          ;; Defaults to `b` (the old behaviour) unless a grid arm says otherwise.
+          nb    (if (some? node-b) node-b b)
+          mk    (fn [] (let [s (tstore/->Storage mem disk (opbuf-settings bf nb meas))]
+                         (if freed (recording s freed) s)))
           ropts (cond-> {:branching-factor bf :diff-buf-size b :comparator cmp}
                   meas (assoc :measure meas))
           cov   (atom {:stores 0 :buffered 0 :flushed 0 :max-depth 0 :restores 0
@@ -117,6 +153,23 @@
                        (when (and (some? cached) (not= true-m (long cached)))
                          (throw (ex-info (str "cached measure mismatch @ " tag)
                                          {:tag tag :true true-m :cached cached})))
+                       ;; PER-NODE invariant, not just the root's total: every
+                       ;; node's CACHED measure must equal a recomputation from
+                       ;; that node's own content.
+                       ;;
+                       ;; The root-level check above cannot localise a fault and
+                       ;; can miss one entirely — `forceComputeMeasure` only
+                       ;; recurses into a child whose measure is null, so a stale
+                       ;; non-null child value is trusted and propagated. That is
+                       ;; how an in-place sibling shrink kept a pre-shrink total
+                       ;; (a leaf holding [413 414] carrying 413+414+415+417) and
+                       ;; the root's forced value came back 832 too high. This
+                       ;; check names the node instead of the symptom.
+                       (let [stale (stale-measure-nodes root (mk) [])]
+                         (when (seq stale)
+                           (throw (ex-info (str "stale cached measure @ " tag)
+                                           {:tag tag :nodes (vec (take 3 stale))
+                                            :count (count stale)}))))
                        (let [forced (.forceComputeMeasure root (mk))]
                          (when (and (some? forced) (not= true-m (long forced)))
                            (throw (ex-info (str "forced measure mismatch @ " tag)
@@ -171,6 +224,10 @@
             (when freed
               (let [reachable (atom #{})]
                 (ss/walk-addresses loaded (fn [a] (swap! reachable conj a)))
+                ;; `over` is meaningful only because this harness allocates a fresh address
+                ;; per write. Under a content-addressed storage a reachable node CAN appear in
+                ;; the freed stream — legitimately, since the address is derived from content.
+                ;; See IStorage.markFreed.
                 (let [over   (clojure.set/intersection @reachable @freed)
                       leaked (clojure.set/difference (set (keys @disk)) @reachable @freed)]
                   (when (seq over)
@@ -220,9 +277,23 @@
 
 ;; broad-grid exercises ALL oracles per trial (content/count/lookup + measure + GC over-free/leak).
 (def broad-grid
-  (for [bf [4 16 64 512] b [0 4 32 256 4096] keyrange [50 500 5000]]
-    {:bf bf :b b :keyrange keyrange :init (min keyrange 2000)
-     :cycles 20 :ops 40 :restore-prob 0.5 :transient-prob 0.3 :measure? true :gc? true}))
+  (concat
+   (for [bf [4 16 64 512] b [0 4 32 256 4096] keyrange [50 500 5000]]
+     {:bf bf :b b :keyrange keyrange :init (min keyrange 2000)
+      :cycles 20 :ops 40 :restore-prob 0.5 :transient-prob 0.3 :measure? true :gc? true})
+   ;; MISMATCHED arms: the set's budget and the one the storage stamps on
+   ;; reconstructed nodes differ, in both directions. This is the configuration
+   ;; D-F1 lived in and the one that produced the ClassCastException out of
+   ;; `assembleNested` before that was fixed.
+   ;; Only directions a coherent storage can produce: nodes carrying a budget the
+   ;; SET did not declare (D-F1 — a blob knows its budget, a caller restoring
+   ;; without opts does not, and `root()` adopts upward). The reverse, a set that
+   ;; buffers over a storage rebuilding nodes at 0, is REFUSED at `installSlots`
+   ;; rather than survived, so it is not a clean-trial arm; the refusal is
+   ;; asserted in test.diff-buf-restore-cycle.
+   (for [bf [4 64] [b nb] [[0 256] [32 4096]] keyrange [500 5000]]
+     {:bf bf :b b :node-b nb :keyrange keyrange :init (min keyrange 2000)
+      :cycles 20 :ops 40 :restore-prob 0.5 :transient-prob 0.3 :measure? true :gc? true})))
 
 (def large-grid
   (for [bf [64 512] b [0 256] keyrange [100000]]
@@ -234,9 +305,24 @@
 
 ;; Bounded slice for the regular suite (fast): a few seeds, modest sizes, B on and off.
 (deftest stress-bounded
-  (let [grid (for [bf [4 32] b [0 64] kr [80 2000]]
-               {:bf bf :b b :keyrange kr :init (min kr 1000)
-                :cycles 8 :ops 30 :restore-prob 0.5 :transient-prob 0.3 :measure? true :gc? true})
+  (let [grid (concat
+              (for [bf [4 32] b [0 64] kr [80 2000]]
+                {:bf bf :b b :keyrange kr :init (min kr 1000)
+                 :cycles 8 :ops 30 :restore-prob 0.5 :transient-prob 0.3 :measure? true :gc? true})
+              ;; The set declares NO budget while its nodes carry one — D-F1's
+              ;; direction, and the realizable one: a node's blob knows its budget,
+              ;; a caller restoring without opts does not, and `root()` adopts.
+              ;;
+              ;; The REVERSE (set buffers, storage rebuilds nodes at 0) is not swept
+              ;; here because it is now REFUSED at `installSlots`, not survived — a
+              ;; sweep arm expecting clean trials is the wrong shape for it. Before
+              ;; that refusal it returned wrong CONTENT with a matching count:
+              ;;   "content mismatch @ restore-cycle-1 {:expected-count 787 :got-count 787}"
+              ;; on 5 of 5 seeds at bf 8 / b 64 / node-b 0. The refusal itself is
+              ;; asserted in test.diff-buf-restore-cycle.
+              (for [[b nb] [[0 64]]]
+                {:bf 8 :b b :node-b nb :keyrange 2000 :init 1000
+                 :cycles 8 :ops 30 :restore-prob 0.5 :transient-prob 0.3 :measure? true :gc? true}))
         {:keys [failures cov]} (sweep {:grid grid :seeds 5 :label "stress-bounded(suite)"})]
     (is (empty? failures) (str (count failures) " stress trial(s) failed"))
     ;; sanity: the bounded grid must actually exercise each path it claims to test

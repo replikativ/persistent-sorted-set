@@ -95,11 +95,35 @@
 ;; ---------------------------------------------------------------------------
 
 (defn node->map
-  "Project a PSS node to its canonical CONTENT map — for content-addressing (hash this map) or
-   storing the map directly. Leaf → {:keys …}; Branch → {:level :keys :addresses :subtree-count
-   (:measure) (:slots)}. Comparator/storage/settings-free; element values stay raw. NOTE: this is
-   the CONTENT projection — the serialized blob additionally carries :branching-factor/:diff-buf-size
-   (see `node->blob`), which are NOT part of the content hash."
+  "Project a PSS node to the map that gets STORED. Leaf → {:keys … (:measure)}; Branch →
+   {:level :keys :addresses :subtree-count (:measure) (:slots)}. Comparator/storage/settings-free;
+   element values stay raw. `node->blob` appends :branching-factor/:diff-buf-size/:ref-type so a
+   read self-describes.
+
+   DO NOT HASH THIS MAP FOR A CONTENT ADDRESS — use `node->identity` instead.
+
+   An earlier version of this docstring said \"for content-addressing (hash this map)\", and that
+   is wrong: two of these keys are CACHES, not content, so the same logical node projects
+   differently depending on what happened to it earlier.
+
+     :measure        null until something forces it, and `forceComputeMeasure` ASSIGNS — so a
+                     read-only aggregate query changes what the node later serializes as. Two
+                     structurally identical leaves, one warm and one cold, produce
+                     {:keys [...] :measure ...} and {:keys [...]}.
+     :subtree-count  written raw from `Branch.subtreeCount()`, which is -1 (\"unknown\") whenever
+                     a child's count was unavailable. Measured: 2 of the branches on a second
+                     commit over 200 elements at bf 8 wrote -1. Read-back normalises it, so it
+                     is not corruption — but it is an address change.
+
+   Hashing this map therefore gives an address that is not a function of the node's content:
+   measured, the same set under the same operation produced 0 of 4 addresses in common between
+   two stores that differed only in which caches happened to be populated. Dedup and cross-peer
+   sharing are lost exactly where they are wanted.
+
+   Both real consumers already avoid this, independently, which is the strongest evidence the
+   old advice was the bug: datahike hashes `[addresses (canon slots)]` for a Branch and the
+   element vector for a Leaf; stratum hashes the address vector and the leaf's chunk keys.
+   `node->identity` is that subset, named."
   [node]
   #?(:clj
      ;; `vec` the keys/addresses: the raw trimmed Java List isn't hash-coercible (hasch) and differs
@@ -126,6 +150,90 @@
            slots                     (assoc :slots slots)))
        (cond-> {:keys (vec (.-keys node))}
          (some? (.-_measure node)) (assoc :measure (.-_measure node))))))
+
+(defn- nested-slot-map?
+  "Is this `:diff` a NESTED slot map (index -> entry) rather than a leaf diff?
+
+   `Branch.assembleNested` writes `{idx {:count _ :measure _ :diff _ :max-key _}}` for a
+   branch child, where the inner `:diff` is either another such map or — at level 1 — a
+   leaf diff in the comparator-agnostic storage form `{:absent [...] :present [...]}`.
+   The two are told apart by their VALUES: a nested entry is a map carrying `:max-key`,
+   which a leaf diff's `[el ...]` vectors never are."
+  [d]
+  (and (map? d)
+       (seq d)
+       (every? (fn [[_ v]] (and (map? v) (contains? v :max-key))) d)))
+
+(defn- strip-slot-caches
+  "Drop the null-until-forced caches from a slot entry AT EVERY DEPTH.
+
+   Stripping only the top level re-admitted them one level down: for a branch at level >= 2,
+   `assembleNested` writes `:count` and `:measure` per GRANDCHILD inside `slot.diff`, and
+   `:diff` is deliberately kept because a buffered diff is content. So `slot.measure` —
+   `child.measure()`, precisely the cache this projection exists to exclude — sat inside the
+   identity from depth 2 down.
+
+   Measured on two cold restores off the SAME disk, differing only in whether a READ-ONLY
+   `set/measure` ran before an otherwise identical `conj` and `store`:
+
+       n=200  root level 2   keys equal, addresses equal, slots DIFFER
+                             nested :measure  cold [false]       warm [true]
+                             identity equal? false   hash equal? false
+       n=600  root level 3   nested :measure  cold [false false]  warm [true true]
+       n=40   root level 1   identity equal? true    (the case the old test pinned)
+
+   So a node's content address depended on warmth, which is the same defect already fixed
+   once at the top level. `test/node_identity.cljc` asserted \"At level 2 the slot is a
+   branch marker with no measure and nothing here can vary\" — that claim was false, and its
+   companion test only inspected top-level entry KEYS, so neither could see it."
+  [entry]
+  (let [e (select-keys entry [:diff :max-key])
+        d (:diff e)]
+    (if (nested-slot-map? d)
+      (assoc e :diff (reduce-kv (fn [acc k v] (assoc acc k (strip-slot-caches v)))
+                                (empty d) d))
+      e)))
+
+(defn node->identity
+  "The CONTENT of a node, for a content address: hash THIS, not `node->map`.
+
+   Leaf → {:keys …}; Branch → {:level :keys :addresses (:slots)}.
+
+   Deliberately excludes `:measure` and `:subtree-count`: both are caches that can be present or
+   absent for the same logical node (see `node->map`), and both are recomputable — a leaf's
+   measure from its own keys, a branch's count from its children. Including them makes the
+   address depend on warmth rather than on content.
+
+   Deliberately INCLUDES `:slots`. Buffered diffs are content, not cache: a buffered child is
+   stored as `anchor + diff`, so two trees can share every child address and differ only in
+   their diffs. A hash that omits slots collides on logically different trees, and a tampered
+   diff would be invisible to a merkle audit. (datahike folds slots in for exactly this reason;
+   stratum does not, which is safe only while it leaves diff-buf off.)
+
+   Deliberately excludes :branching-factor/:diff-buf-size/:ref-type — configuration, not content
+   — which `node->blob` carries separately so a read self-describes."
+  [node]
+  (let [m (select-keys (node->map node) [:level :keys :addresses :slots])]
+    (cond-> m
+      (:slots m)
+      ;; STRIP the per-slot caches. `slotsForStorage` writes `:count` and `:measure` into
+      ;; every slot entry, and that `:measure` is `child.measure()` captured at deposit time
+      ;; — exactly the null-until-forced cache this projection excludes at the top level. An
+      ;; earlier version kept the slot map whole and so re-admitted them one level down:
+      ;; measured, two sets with identical content and identical operations, differing only
+      ;; in whether a READ-ONLY `set/measure` query ran first, gave
+      ;;     cold slot measures [[0 nil]]
+      ;;     warm slot measures [[0 NumericStats{count=13, sum=665.0, ...}]]
+      ;; and hashed to 1979634333 vs 1940705680.
+      ;;
+      ;; `:diff` and `:max-key` STAY — the buffered diff is content (a buffered child is
+      ;; stored as anchor + diff, so omitting it collides logically different trees) and the
+      ;; separator is what the diff is keyed against.
+      (update :slots
+              (fn [slots]
+                (reduce-kv (fn [acc k entry]
+                             (assoc acc k (strip-slot-caches entry)))
+                           (empty slots) slots))))))
 
 (defn node->blob
   "What every format actually writes for a node: the content projection PLUS the node's own
@@ -165,7 +273,10 @@
                               :count   (:count entry)
                               :measure (:measure entry)
                               :anchor  (nth av (int idx))}))
-       (set! (.-_slots node) arr))))
+       ;; via install-slots!, not a direct field write: it carries the incoherent-budget
+       ;; refusal (slots handed to a node whose settings say buffering is off), which the
+       ;; JVM has always had at Branch.installSlots and cljs silently accepted.
+       (branch/install-slots! node arr))))
 
 (defn reader-context
   "Bundle the read-side knobs once, so each format module builds it in one call and the

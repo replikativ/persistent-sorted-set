@@ -1,7 +1,15 @@
 # Concurrency & Memory Model (JVM)
 
 This document is the contract for every mutable field in the JVM implementation
-(`src-java`). The ClojureScript implementation is single-threaded and out of scope.
+(`src-java`).
+
+The ClojureScript implementation is single-threaded, which is **not** the same as
+concurrency-free, and the difference has a contract of its own — see
+[ClojureScript: one writer per set](#clojurescript-one-writer-per-set) at the end. In
+short: every `await` inside `async+sync` is a yield point, and `store` mutates node state
+across those yields, so two overlapping async stores on one set interleave. The
+single-writer-store rule that follows from that is a caller obligation, not something the
+runtime prevents.
 
 ## Value semantics
 
@@ -99,18 +107,75 @@ plain working arrays with a seal point:
   transient paths, and the shared-node rules above are unaffected because
   editability is per-node (`ANode.editable()` reads the node's own settings): a
   committed node is never editable, an editable node is never shared.
-- The seal point is `persistent!` (`Settings.persistent()` flips the shared
-  `AtomicBoolean`), after which every node that carried those settings answers
-  `editable() == false` and falls under the shared-node rules.
+- The seal point is `persistent!` (`Settings.persistent()` nulls the shared
+  `AtomicReference<Thread>`), after which every node that carried those settings
+  answers `editable() == false` and falls under the shared-node rules.
+- `persistent!` returns a NEW `PersistentSortedSet` — as every Clojure transient
+  does — and the stale handle then throws `IllegalAccessError("Transient used
+  after persistent! call")` on any mutation. While the two were the same object
+  the stale handle could only degrade silently: `conj!` took the persistent path
+  and returned a new set, so the caller's mutation landed somewhere they were not
+  looking.
+
+### Transient ownership
+
+A transient may be mutated by **one thread at a time**. A HANDOFF is fine — one
+thread finishes, publishes across a happens-before edge, another continues, which
+is what `fold` does and what a parking core.async block does. CONCURRENT mutation
+is undefined.
+
+This is a contract, **not enforced by default**, following Clojure: an owner
+comparison sees thread IDENTITY and so cannot tell handoff from concurrency, and
+enforcing it would forbid the safe pattern to prevent the unsafe one. Clojure's
+`PersistentVector.persistent()` carries exactly this check commented out.
+
+Breaking the rule is not a near-miss. Measured, 4 threads x 5000 `conj!` on one
+transient: `sorted?` **false** — the keys come out of order, so every later
+`binarySearch` is arbitrary — with `seq` and `count` disagreeing (19 318 vs
+14 793), and one trial throwing `ArrayIndexOutOfBoundsException` from
+`Seq/first`. Unlike Clojure's, this corruption becomes **durable** the moment the
+set is stored.
+
+Set `-Dpss.strictTransients=true` to have a foreign thread refused with
+`IllegalAccessError("Transient used by non-owner thread")`. Intended for test
+suites that know no handoff occurs; the flag is a `static final` read at class
+init, so the branch folds away when it is off.
 
 ## Single-writer settle
 
-`store()` may be called by **one thread at a time per tree** (datahike: the commit
-thread). Concurrent `store()` of overlapping trees from two threads is not
-supported: each settle's publish is internally consistent, but the second plain
-write would discard the first thread's re-pointing and children could be written
-twice. Readers and derivers (the pipelining apply thread) are unrestricted — that
-is the race `NodeState` exists for.
+`store()` may be called by **one thread at a time per LINEAGE** — in practice, per
+storage — not per tree. "Per tree" was the earlier wording and it is too weak:
+structural sharing means two trees are not disjoint. Measured on the pipelining-writer
+shape (derive v1 from a base, then v2 from v1, touching different subtrees), **3 Branch
+objects were reachable from both roots AND dirty in both** at bf 8 / n 1000. Storing
+either settles those same objects in place, so "one thread per tree" permits exactly
+the interference it means to forbid.
+
+Concurrent `store()` of two versions sharing dirty nodes is not supported. The
+consequences, in increasing order of severity:
+
+* Both settles publish with a **plain write** (`_state = new NodeState<>(...)`), not a
+  CAS, so the loser's state is discarded and children can be written twice. Measured
+  over 1600 rounds with barrier-synchronised threads: at bf 8 / diff-buf 0, 20 writes
+  where a sequential run does 15, in 196 of 200 rounds. Wasted work, not corruption.
+* The publish happens **before** `storage.store(this)`, so one thread can serialise a
+  blob built from the OTHER thread's address array. With a fresh-address storage both
+  arrays are equally valid, which is why the measured runs stayed content-correct; under
+  a content-addressed store, or when one thread buffered a child the other flushed, they
+  are not interchangeable.
+* `assembleNested` is **not snapshot-atomic across nodes** — it reads a child's slots,
+  then its keys, then recurses into grandchildren's slots as separate volatile reads. A
+  concurrent settle landing mid-walk mixes generations into a diff written against an
+  anchor it no longer describes. That is a wrong-data-on-reload path, and it is the
+  reason this is a hard constraint rather than a performance note.
+
+No content corruption was observed in 1600 rounds, and no `-ea` oracle tripped; the
+third point above is argued from the code, not measured. Nothing enforces or detects
+any of it. `test/concurrent_store.clj` and `concurrent_diff.clj` cover settle-vs-READER,
+never settle-vs-settle.
+
+Readers and derivers (the pipelining apply thread) are unrestricted — that is the race
+`NodeState` exists for.
 
 `markFreed` calls happen at the same program points as before the `NodeState`
 rework (method-entry snapshots feed the same decisions), so GC accounting
@@ -151,8 +216,18 @@ read by many threads.
 | `_root` | `root()` restore fill (idempotent); `store()` re-wrap; editable ops | everything | contract (a) for the lazy fill; editable/commit writes are single-writer |
 | `_count` | `count()` cache fill; editable ops | `count()` | contract (a): idempotent fill |
 | `_version` | editable ops | seq invalidation | plain + owner (transients only) |
-| `_settings` | `root()` boundary adoption (one-time, idempotent) | everything | contract (a) |
+| `_settings` | `root()` self-describing adoption: branching factor, boundary, diff-buf budget — staged on a local, ONE publish | everything | contract (a), *because of the staging* |
 | `_storage` | `store(IStorage)` | traversals | set by the owner before sharing / by the commit thread |
+
+The `_settings` row earns contract (a) only because the three adoptions are staged on a
+local `Settings` and published with a single write. They used to be three chained
+read-modify-writes, and this table called that "one-time, idempotent" — which described
+each adoption in isolation, not the sequence. Two threads taking the restore path on one
+set could both read the pre-adoption value, and the second write would drop the first
+adoption. Never a wrong value (both compute the same targets), but a MISSING one, and the
+comments at the site record what each omission costs: leaves wider than the set believes
+its branching factor to be, or "81 elements silently gone". If a fourth adoption is ever
+added, add it to the staged local — not as another write to the field.
 
 ### `Settings`
 
@@ -189,3 +264,39 @@ it to false (the transient seal). `editable()` is a volatile read.
   `ANode` within one snapshot.
 - `test/baseline_store_softref.clj` — the forbidden state, injected artificially,
   is rejected loudly under `-ea` (and unwrapped without, #17's production behavior).
+
+## ClojureScript: one writer per set
+
+The ClojureScript runtime has one thread, so none of the JMM machinery above applies:
+there are no torn reads, no publication problem, no need for `volatile`. What it does
+have is **interleaving**, and the contract that follows from it was previously left
+unstated — the opening of this document said only "single-threaded and out of scope",
+which reads as "nothing to worry about" and is wrong.
+
+`async+sync` compiles to a CPS chain, so **every `await` is a yield point**: control
+returns to the event loop and any other pending continuation may run before the next
+line does. Two places make that observable.
+
+1. **`Branch.store` mutates node state across its yields.** The baseline arm loops over
+   the children, `await`s each child's `store`, and writes the returned address into
+   `this.addresses[i]` *in place* (`branch.cljs`, `(address this i child-address)`).
+   The diff-buf arm likewise re-points addresses and rewrites `_slots` across `await`s.
+   This is the same two-step settle that `NodeState` was introduced to eliminate on the
+   JVM — it is safe here only because nothing else runs concurrently, which is precisely
+   what a second in-flight store breaks.
+
+2. **A set does not become "already stored" until its store finishes.** `btset.cljs`
+   assigns `(set! (.-address set) …)` only *after* `await`ing the root store, so a second
+   `store` entered while the first is still in flight does not see an address and runs in
+   full — both walking and mutating the same nodes.
+
+**The rule.** At most one `store` may be in flight per set at a time. Await the first
+before starting another. This is a caller obligation: the library does not detect the
+overlap, and nothing in the single-threaded runtime prevents it.
+
+Reads (`seq`, `count`, `slice`, `lookup`) may interleave freely with each other. What
+they may not interleave with is a `store` on the same set, for the reason in (1) — a
+reader crossing a yield mid-settle can observe a node whose addresses are half-updated.
+
+This is the ClojureScript half of the JVM's single-writer rule, and the JVM's ownership
+argument (see `Branch._state`) is the same argument: exclusivity, not atomicity.

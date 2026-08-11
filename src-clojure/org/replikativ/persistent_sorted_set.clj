@@ -89,12 +89,39 @@
   The comparator must return 0 for both old-key and new-key.
   This is a single-traversal update - much faster than disj + conj.
 
+  PRECONDITION, and it is the caller's to uphold: under the comparator passed to
+  THIS call, no element other than old-key itself may compare equal to old-key.
+  The single-traversal update rewrites in place at the position it finds, so if a
+  comparator-EQUAL sibling exists, the rewrite can order the two wrongly and leave
+  the node unsorted. The sibling then still appears in iteration but is no longer
+  reachable by binary search, and the disorder becomes durable the moment the set
+  is stored — after which every later search on that node is arbitrary.
+
+  This matters specifically when `cmp` is COARSER than the set's own comparator —
+  the `[id value]`-compared-by-id pattern these docstrings advertise. A set built
+  under a full comparator may legitimately hold two elements that a coarser `cmp`
+  cannot tell apart; `replace` under that coarser `cmp` is then outside contract.
+
+  It is checked by assertions, so it fails loudly under -ea (the :test alias) and
+  is NOT checked in ordinary production runs. That is deliberate — the check costs
+  a scan on a hot write path — but it means violating this silently corrupts the
+  structure rather than throwing. If you cannot guarantee uniqueness under `cmp`,
+  use disj + conj.
+
   O(log n) traversal with minimal allocations.
 
   Returns the updated set, or the original set if old-key not found."
   ([^PersistentSortedSet set old-key new-key]
+   (when (nil? new-key)
+     (throw (IllegalArgumentException. "PersistentSortedSet cannot store nil")))
    (.replace set old-key new-key))
   ([^PersistentSortedSet set old-key new-key ^Comparator cmp]
+   ;; `replace` was the other way nil got in. Every other mutation path refuses it, so a set
+   ;; that "can't store nil" could be made to hold one:
+   ;;     (replace (sorted-set-by cmp 1) 1 nil)  =>  count 1, [nil]
+   ;; O(1), so unconditional — the same treatment `conj` gives.
+   (when (nil? new-key)
+     (throw (IllegalArgumentException. "PersistentSortedSet cannot store nil")))
    (.replace set old-key new-key cmp)))
 
 (defn- array-from-indexed [coll type from to]
@@ -148,16 +175,25 @@
           (recur (inc i) start acc))))))
 
 (defn- map->settings ^Settings [m]
-  (let [boundary (:boundary m)
-        s (Settings.
-           (int (or (:branching-factor m) 0))
-           (case (:ref-type m)
-             :strong RefType/STRONG
-             :soft   RefType/SOFT
-             :weak   RefType/WEAK
-             nil)
-           ^IMeasure (:measure m)
-           (:leaf-processor m)
+  ;; A `Settings` INSTANCE is not an opts map — every keyword lookup below returns nil for
+  ;; one, so it used to produce all-defaults SILENTLY. Measured: `(from-sorted-array cmp arr n
+  ;; (Settings. 4 STRONG nil nil 0))` came back at branching-factor 512, :ref-type :soft, with
+  ;; no error. Honour it instead of rebuilding from nils; the library's own 2-/3-arities pass
+  ;; a bare `(Settings.)`, for which this is exactly equivalent to the defaults it would have
+  ;; constructed. (Refusing was tried first and rejected those internal callers, because the
+  ;; no-arg ctor normalises to 512/SOFT and so does not look "unconfigured".)
+  (if (instance? Settings m)
+    m
+    (let [boundary (:boundary m)
+          s (Settings.
+             (int (or (:branching-factor m) 0))
+             (case (:ref-type m)
+               :strong RefType/STRONG
+               :soft   RefType/SOFT
+               :weak   RefType/WEAK
+               nil)
+             ^IMeasure (:measure m)
+             (:leaf-processor m)
            ;; diff-buf: fall back to the shared Settings default (Settings/defaultDiffBufSize,
            ;; 0/off unless the pss.diffBufSize sysprop is set) when the caller doesn't specify.
            ;; 0 = baseline (I0). See doc/diff-buffering.md. The MST incompatibility (a buffered
@@ -165,13 +201,18 @@
            ;; breaks the cross-peer dedup MST exists for) is enforced in ONE place — `.withBoundary`
            ;; below forces diff-buf OFF for a *content-defined* boundary (a non-content boundary is
            ;; left untouched). See .internal/SPLIT_SEAM_DESIGN.md two-hash note.
-           (int (or (:diff-buf-size m) (Settings/defaultDiffBufSize))))
+           ;; A processor with NO :diff-buf-size inherits 0, not the default — otherwise the
+           ;; `pss.diffBufSize` sysprop would supply a budget the caller never asked for and
+           ;; `diffBufFor` would refuse the pairing. An EXPLICIT :diff-buf-size is passed
+           ;; through unchanged so that refusal fires when it should.
+             (int (or (:diff-buf-size m)
+                      (if (:leaf-processor m) 0 (Settings/defaultDiffBufSize)))))
         ;; split-seam: opt into a content-defined boundary (e.g. MST) per store. nil ⇒ the
         ;; default count B-tree (byte-identical baseline). See .internal/SPLIT_SEAM_DESIGN.md.
-        s (if boundary (.withBoundary s ^IBoundary boundary) s)]
+          s (if boundary (.withBoundary s ^IBoundary boundary) s)]
     ;; diff-buf: the comparator is NOT stored on Settings — it lives on the PersistentSortedSet
     ;; (_cmp) and is propagated to Branch nodes (Branch._projCmp) for leaf projection.
-    s))
+      s)))
 
 (defn- settings->map [^Settings s]
   {:branching-factor (.branchingFactor s)
@@ -181,7 +222,12 @@
                        RefType/WEAK   :weak)
    :measure          ^IMeasure (.measure s)
    :leaf-processor   (.leafProcessor s)
-   :diff-buf-size      (.diffBufSize s)})
+   :diff-buf-size      (.diffBufSize s)
+   ;; The boundary was dropped here, so anything round-tripping settings through this
+   ;; map silently became a count B-tree — `compact` turned an MST set into one. Note
+   ;; `map->settings` re-applies it through `withBoundary`, which forces diff-buf off
+   ;; for a content-defined boundary; that is the correct pairing, not a loss.
+   :boundary         (.boundary s)})
 
 (defn- assert-sorted!
   "Under `*assert*` only: verify strictly ascending order.
@@ -211,6 +257,40 @@
   ([^Comparator cmp keys len]
    (from-sorted-array cmp keys len (Settings.)))
   ([^Comparator cmp keys len opts]
+   ;; `len` must name a real prefix of `keys`. Unchecked, `(from-sorted-array cmp (to-array
+   ;; []) 1)` built from a 1-element array whose only slot is null and returned a set
+   ;; CONTAINING NIL, count 1 — the same defect 987e8e5 fixed for `from-sequential`, hidden
+   ;; by the same trap: `assert-sorted!` passes VACUOUSLY at len 1, so the builder's own
+   ;; precondition could not see it. Out-of-range in the other direction used to surface as
+   ;; ArrayIndexOutOfBoundsException (len > alength) or IllegalArgumentException (negative),
+   ;; neither of which a `.cljc` caller could catch alongside the ClojureScript half — hence
+   ;; one `ex-info` on both runtimes. Unlike `assert-sorted!` this is NOT behind `assert`:
+   ;; it is O(1), and the failure it prevents is a durable nil member.
+   (let [alen (arrays/alength keys)]
+     (when (or (neg? len) (> len alen))
+       (throw (ex-info "from-sorted-array: len out of range"
+                       {:len len :array-length alen}))))
+   ;; NIL REJECTION, and NOT behind `assert`, unlike the ordering check below.
+   ;;
+   ;; The namespace docstring's one stated difference from `clojure.core/sorted-set` is that
+   ;; this set "can't store nil", and `conj`, `from-sequential`, `sorted-set` and
+   ;; `from-sorted-seq` all enforce it by throwing. `from-sorted-array` did not, so the
+   ;; plainest possible call put a nil into a set that claims it cannot hold one:
+   ;;
+   ;;     (from-sorted-array compare (object-array [nil 1]) 2)  =>  count 2, [nil 1]
+   ;;
+   ;; and it survives a store/restore. No exotic comparator is needed — under `compare`, nil
+   ;; sorts below everything, so a LEADING nil is legitimately ascending and the ordering
+   ;; assert cannot see it. Under a comparator that maps nil onto a real value it can sit
+   ;; anywhere and still be ascending, so the scan has to cover every element.
+   ;;
+   ;; O(n) pointer comparisons on a path that already makes O(n) comparator CALLS and
+   ;; allocates O(n) nodes — a constant-factor addition, not a complexity change — which is
+   ;; why this one is unconditional where the comparison-heavy ordering check is not.
+   (dotimes [i len]
+     (when (nil? (arrays/aget keys i))
+       (throw (IllegalArgumentException.
+               (str "PersistentSortedSet cannot store nil (index " i ")")))))
    (assert-sorted! cmp keys len)
    (let [settings             (map->settings opts)
          max-branching-factor (.branchingFactor settings)
@@ -220,7 +300,7 @@
          ;; Verified: bf=2 ran to OutOfMemoryError rather than failing. The
          ;; streaming builder got this guard first; the arithmetic is shared.
          _                    (assert (>= avg-branching-factor 2)
-                                      (str "branching-factor must be >= 3 (got avg fanout "
+                                      (str "branching-factor must be >= 4 (got avg fanout "
                                            avg-branching-factor "); a fanout of 1 never "
                                            "reduces the level count"))
          storage              (:storage opts)
@@ -238,7 +318,7 @@
                                       measure       (when measure-ops
                                                       (reduce (fn [acc ^ANode child]
                                                                 (let [child-measure (.-_measure child)]
-                                                                  (if child-measure
+                                                                  (if (some? child-measure)
                                                                     (.merge measure-ops acc child-measure)
                                                                     acc)))
                                                               (.identity measure-ops)
@@ -261,8 +341,8 @@
          (loop [level 1
                 nodes (mapv ->Leaf (mst-split boundary settings keys len Object identity 1))]
            (case (count nodes)
-             0 (PersistentSortedSet. {} cmp storage settings)
-             1 (PersistentSortedSet. {} cmp nil storage (first nodes) len settings 0)
+             0 (PersistentSortedSet. (:meta opts) cmp storage settings)
+             1 (PersistentSortedSet. (:meta opts) cmp nil storage (first nodes) len settings 0)
              (recur (inc level)
                     (mapv #(->Branch level %)
                           (mst-split boundary settings nodes (count nodes) Object
@@ -270,8 +350,8 @@
        (loop [level 1
               nodes (mapv ->Leaf (split keys len Object avg-branching-factor max-branching-factor))]
          (case (count nodes)
-           0 (PersistentSortedSet. {} cmp storage settings)
-           1 (PersistentSortedSet. {} cmp nil storage (first nodes) len settings 0)
+           0 (PersistentSortedSet. (:meta opts) cmp storage settings)
+           1 (PersistentSortedSet. (:meta opts) cmp nil storage (first nodes) len settings 0)
            (recur (inc level) (mapv #(->Branch level %) (split nodes (count nodes) Object avg-branching-factor max-branching-factor)))))))))
 
 (defn- streaming-split
@@ -294,7 +374,7 @@
   ;; upward forever. avg = (min+max)/2 with min = bf>>>1, so this means bf >= 3.
   ;; Checked rather than left to hang — bf=2 spun until OOM.
   (assert (>= avg 2)
-          (str "branching-factor must be >= 3 for a streaming build (got avg fanout "
+          (str "branching-factor must be >= 4 for a streaming build (got avg fanout "
                avg "); a fanout of 1 never reduces the level count"))
   (let [need (* 2 avg)
         fill (fn [buf s]
@@ -365,6 +445,7 @@
          max-bf   (.branchingFactor settings)
          avg-bf   (-> (.minBranchingFactor settings) (+ max-bf) (quot 2))
          storage  (:storage opts)
+         flush-fn (:flush-fn opts)
          ^IMeasure measure-ops (.measure settings)
          _ (when (nil? storage)
              (throw (IllegalArgumentException.
@@ -388,6 +469,20 @@
          ;; ---- level 0: leaves ----
          store-node! (fn [^ANode node]
                        (let [addr (.store node ^IStorage storage)]
+                         ;; Called after each node is stored, so a caller that
+                         ;; buffers writes can drain instead of accumulating the
+                         ;; whole tree — otherwise this function's memory bound
+                         ;; is real for the TREE and nominal for the caller.
+                         ;; Same seam as the ClojureScript builder, which awaits
+                         ;; it; here it is an ordinary call.
+                         (when flush-fn
+                           ;; AWAIT a deref-able result. Discarding it meant a flush-fn
+                           ;; returning a future gave neither backpressure nor error
+                           ;; propagation — it was called once per node and every failure
+                           ;; was dropped. The ClojureScript builder awaits its flush; this
+                           ;; makes the JVM agree for the case it can express.
+                           (let [r (flush-fn)]
+                             (when (instance? clojure.lang.IDeref r) @r)))
                          {:key (.maxKey node)
                           :address addr
                           :count (if (instance? ISubtreeCount node)
@@ -425,12 +520,16 @@
        (let [s (seq entries)]
          (cond
            (nil? s)
-           (PersistentSortedSet. {} cmp storage settings)
+           ;; `(:meta opts)`, not `{}`: `sorted-set*` and the ClojureScript
+           ;; `from-sorted-seq` both honour it, and this silently dropped it —
+           ;; measured, JVM `(meta (from-sorted-seq … {:meta {:x 1}}))` was `{}`
+           ;; against `{:x 1}` from `sorted-set*` and from cljs.
+           (PersistentSortedSet. (:meta opts) cmp storage settings)
 
            (nil? (next s))
            (let [{:keys [address count]} (first s)]
              ;; root is referenced by address and loaded on demand, like a restore
-             (PersistentSortedSet. {} cmp address storage nil (int count) settings 0))
+             (PersistentSortedSet. (:meta opts) cmp address storage nil (int count) settings 0))
 
            :else
            (recur (inc level) (branch-level level s))))))))
@@ -484,15 +583,48 @@
 (defn restore
   "Constructs lazily-loaded set from storage and root address.
    Supports all operations that normal in-memory impl would,
-   will fetch missing nodes by calling IStorage::restore when needed"
+   will fetch missing nodes by calling IStorage::restore when needed.
+
+   Honours `:comparator` in `opts`, defaulting to the natural one. It used to
+   hard-code `RT/DEFAULT_COMPARATOR` and DISCARD an explicit `:comparator`, which
+   matters because `restore-by` is JVM-only: portable `.cljc` code restoring a
+   custom-comparator set has no other spelling, and ClojureScript honours the key.
+   So the same source gave a working set on one runtime and a broken one on the
+   other. Measured on a descending-comparator set of 0..19 stored and restored:
+
+       (vec r)          => [19 18 ... 1 0]   correct
+       (count r)        => 20                correct
+       (contains? r 5)  => FALSE             (restore-by desc => true)
+       (disj r 5)       => a no-op
+       (conj r 5)       => 21 elements, a DUPLICATE 5, durable once stored
+
+   Every cheap oracle — seq, count, printing — looks right, because the TREE is
+   fine; only the comparator the set navigates it with was wrong."
   ([address storage]
    (restore-by RT/DEFAULT_COMPARATOR address storage {}))
   ([address ^IStorage storage opts]
-   (restore-by RT/DEFAULT_COMPARATOR address storage opts)))
+   ;; `:cmp` as well as `:comparator`: `btset/restore` reads `(or (:comparator opts)
+   ;; (:cmp opts) compare)` and this file's own `sorted-set*` accepts `:cmp`, so a caller who
+   ;; wrote `(restore addr st {:cmp cmp})` still hit the whole defect on the JVM alone after
+   ;; the `:comparator` half was fixed. Measured on the fixed build before this line:
+   ;;     {:cmp desc}   JVM (contains? r 5) => FALSE      cljs => true
+   ;;     {:comparator} JVM (contains? r 5) => true       cljs => true
+   (restore-by (or (:comparator opts) (:cmp opts) RT/DEFAULT_COMPARATOR) address storage opts)))
 
 (defn walk-addresses
-  "Visit each address used by this set. Usable for cleaning up
-   garbage left in storage from previous versions of the set"
+  "Visit each address used by this set. Usable for cleaning up garbage left in
+   storage from previous versions of the set.
+
+   THE RETURN VALUE OF `consume-fn` IS A CONTINUE FLAG, and a falsey one stops the
+   walk. Measured on a 20000-element tree at bf 16: a fn returning `true` visits
+   1819 addresses; one returning `nil` or `false` visits 1. So a side-effecting
+   `#(delete! %)` whose `delete!` returns nil enumerates ONE address and reports
+   nothing wrong — which matters because the usual reason to call this is GC.
+   Return `true` unless you deliberately want to prune.
+
+   The two levels disagree on what falsey means: at the root it aborts the whole
+   walk (PersistentSortedSet.walkAddresses), inside a branch it prunes only that
+   subtree (Branch.walkAddresses)."
   [^PersistentSortedSet set consume-fn]
   (.walkAddresses set consume-fn))
 
@@ -610,13 +742,204 @@
 (defn compact
   "Rebuild the tree with optimal fill factors from the current elements.
    Useful after heavy insert/delete churn that may have degraded node
-   fill ratios. Preserves comparator, settings, and metadata.
+   fill ratios. Preserves comparator, settings, storage and metadata.
    Returns a new set with the same elements in a freshly built tree.
+
+   It did not always preserve those last three, while claiming to. The
+   boundary was dropped by `settings->map`, so compacting an MST set
+   returned a count B-tree; the storage was never passed on, so a later
+   `(store compacted)` threw NullPointerException; and the metadata was
+   reset to `{}`, dropping the `:pss/storage-id` the wire codec resolves
+   on. All three verified before the fix.
 
    Note: currently materializes all elements in memory. For large
    IStorage-backed sets, ensure sufficient heap space."
   [^PersistentSortedSet set]
   (let [arr   (to-array (clojure.core/seq set))
         len   (alength arr)
-        opts  (settings->map (.-_settings set))]
-    (from-sorted-array (.comparator set) arr len opts)))
+        opts  (assoc (settings->map (.-_settings set)) :storage (.-_storage set))
+        ^PersistentSortedSet compacted (from-sorted-array (.comparator set) arr len opts)]
+    ;; the builder constructs without storage and it is attached afterwards, the same
+    ;; way `datahike.index.persistent-set` does after `from-sorted-seq`
+    (set! (.-_storage compacted) (.-_storage set))
+    (with-meta compacted (meta set))))
+
+;; ---------------------------------------------------------------------------
+;; diff — what changed between two versions of a set that share structure.
+;;
+;; The walk is LEVEL-SYNCHRONIZED and never loads a node it can prove it does
+;; not need. A frontier entry names a node without loading it:
+;;
+;;     [node parent idx addr prunable?]
+;;
+;; `node` is nil until materialized, `addr` is the stored address (nil for a
+;; node that has never been stored), and `prunable?` says whether that address
+;; can be trusted to stand for the contents.
+;;
+;; Each round: intersect the two frontiers' addresses, drop what both sides
+;; hold, and load only the remainder. The addresses come from the parents,
+;; which are already loaded, so pruning itself costs no IO. That is what makes
+;; the READ count proportional to the change — an earlier version collected
+;; every address of both trees first, which is correct but loads both trees
+;; whole, and on a 100 000-element set read all 392 nodes to report a
+;; two-element delta.
+
+(defn- child-refs
+  "Frontier entries for every child of `branches` (already materialized)."
+  [branches]
+  (into []
+        (mapcat (fn [[node]]
+                  (let [^Branch b node
+                        ;; ONE snapshot for the pair. `addressArray` and `slots` are two
+                        ;; independent volatile reads, and this decides prunability from
+                        ;; BOTH — a pre-settle address paired with post-settle slots names
+                        ;; a stale address and marks it prunable, so the other side prunes
+                        ;; against it and the buffered delta vanishes from the answer. See
+                        ;; Branch.addressesAndSlots.
+                        pair  (.addressesAndSlots b)
+                        addrs (aget ^objects pair 0)
+                        ;; diff-buf: a branch buffers a child's changes in its
+                        ;; OWN slots and leaves the child's ADDRESS untouched,
+                        ;; so for a buffered child an address match no longer
+                        ;; proves the subtrees are equal. Measured before this
+                        ;; guard existed: a 5000-element set with 7 additions
+                        ;; reported NONE of them under -Dpss.diffBufSize=256.
+                        ;;
+                        ;; The guard is per CHILD, not per branch. `bufEntries`
+                        ;; is a whole-branch count, and using it made one
+                        ;; buffered child poison all 390 of its siblings —
+                        ;; correct, but it read every node of a 100 000-element
+                        ;; set for a two-element delta. `slots` is indexed by
+                        ;; child and equally IO-free: a nil slot means that
+                        ;; child has no buffered diff, so its address still
+                        ;; stands for its contents. A non-nil slot is
+                        ;; unprunable whatever its shape — for a BRANCH child
+                        ;; `diff` is null and the real diff lives in the
+                        ;; subtree, so nil-diff does not mean nil-change.
+                        slots (aget ^objects pair 1)]
+                    (map (fn [i] [nil b i (when addrs (aget ^objects addrs i))
+                                  (or (nil? slots) (nil? (aget ^objects slots i)))])
+                         (range (.len b))))))
+        branches))
+
+(defn- materialize
+  "Load every entry that is not resident. One `restore` each, at most."
+  [^IStorage storage refs]
+  (mapv (fn [[node ^Branch parent idx :as ref]]
+          (if (some? node) ref (assoc ref 0 (.child parent storage (int idx)))))
+        refs))
+
+(defn- prune-shared
+  "Drop from each frontier the entries the other side holds at the same
+   address — identical subtrees, which cannot contain a difference. No IO."
+  [fa fb]
+  (let [addrs   (fn [f] (into #{} (keep (fn [[_ _ _ addr prunable?]]
+                                          (when (and (some? addr) prunable?) addr)))
+                              f))
+        sa      (addrs fa)
+        sb      (addrs fb)
+        shared? (fn [other] (fn [[_ _ _ addr prunable?]]
+                              (and (some? addr) prunable? (contains? other addr))))]
+    ;; an entry the OTHER side marked unprunable never entered its address set,
+    ;; so neither side prunes against a buffered branch.
+    [(into [] (remove (shared? sb)) fa)
+     (into [] (remove (shared? sa)) fb)]))
+
+(defn- descend
+  "One level down. At level 0 the entries are leaves and contribute their keys
+   to `cand`; above it they contribute their children to the next frontier."
+  [storage refs level cand]
+  (let [nodes (materialize storage refs)]
+    (if (zero? (long level))
+      [[] (reduce (fn [c [node]] (reduce clojure.core/conj c (.keys ^ANode node))) cand nodes)]
+      [(child-refs nodes) cand])))
+
+(defn- sorted-diff
+  "Elements of `xs` absent from `ys`. Both ascending under `cmp`; O(n+m), no IO."
+  [^java.util.Comparator cmp xs ys]
+  (loop [xs (clojure.core/seq xs) ys (clojure.core/seq ys) out (transient [])]
+    (cond
+      (nil? xs) (persistent! out)
+      (nil? ys) (persistent! (reduce conj! out xs))
+      :else     (let [c (.compare cmp (first xs) (first ys))]
+                  (cond
+                    (neg? c) (recur (next xs) ys (conj! out (first xs)))
+                    (pos? c) (recur xs (next ys) out)
+                    :else    (recur (next xs) (next ys) out))))))
+
+(defn diff
+  "Keys added and removed between two sets that SHARE STRUCTURE.
+
+   Returns `{:added [...] :removed [...]}`, both in the sets' sort order.
+
+   ## Why this is not `clojure.set/difference`
+
+   Cost is proportional to what CHANGED, not to set size — in NODES READ, which
+   is the cost that matters for a set backed by storage. Two versions of a
+   persistent set share every node they have in common, so a subtree whose
+   address appears on both sides cannot contain a difference and is dropped
+   without being loaded. Measured on sets one two-element transaction apart,
+   against a storage that actually serializes:
+
+       elements   nodes on disk   nodes read
+          1 000               5          3-4
+        100 000             392          3-4
+
+   Two identical stored roots are answered without touching storage at all.
+
+   That is the property an incremental consumer needs — replication, an audit
+   trail, catching a migration target up — to be proportional to the delta
+   rather than to the database.
+
+   The answer is exact without any membership lookups: a key that lives in a
+   pruned (shared) leaf is present on BOTH sides and therefore appears as a
+   candidate on neither, so differencing the two candidate lists is the same
+   answer differencing against the full sets would give.
+
+   ## Requirements and limits
+
+   Both sets must come from the same lineage (one derived from the other by
+   `conj`/`disj`, or both from a common ancestor). Diffing unrelated sets is
+   CORRECT but pointless: nothing is shared, so nothing prunes and it degrades
+   to a full walk of both.
+
+   Sets must be STORED for pruning to work — an in-memory set has no addresses,
+   so every node is walked. Call `store` first, or diff two restored sets.
+
+   A rebalance that repartitions keys across leaves without changing them will
+   read those leaves and find no difference: pruning is an optimization on
+   reads, never on the answer.
+
+   Membership is decided by the set's comparator, so two keys that compare
+   equal are treated as the same key even if they are not `=`."
+  ([a b] (diff a b (.-_storage ^PersistentSortedSet b)))
+  ([^PersistentSortedSet a ^PersistentSortedSet b ^IStorage storage]
+   (let [addr-a (.-_address a)
+         addr-b (.-_address b)]
+     (if (and (some? addr-a) (= addr-a addr-b))
+       {:added [] :removed []}                       ; same root: zero reads
+       (let [cmp    (.comparator b)
+             ;; roots go through `root()` rather than a bare restore: it stamps
+             ;; the projection comparator that diff-buf needs on descent.
+             root-a (.root a)
+             root-b (.root b)]
+         (loop [fa [[root-a nil nil addr-a true]] la (.level ^ANode root-a)
+                fb [[root-b nil nil addr-b true]] lb (.level ^ANode root-b)
+                ca [] cb []]
+           (let [la (if (clojure.core/seq fa) (long la) -1)
+                 lb (if (clojure.core/seq fb) (long lb) -1)]
+             (if (and (neg? la) (neg? lb))
+               {:added (sorted-diff cmp cb ca) :removed (sorted-diff cmp ca cb)}
+               ;; addresses only mean the same thing at the same level, and a
+               ;; shared node keeps its level, so pruning across unequal levels
+               ;; would find nothing. Walk the deeper side down until they meet.
+               (let [[fa fb]   (if (== la lb) (prune-shared fa fb) [fa fb])
+                     la        (if (clojure.core/seq fa) la -1)
+                     lb        (if (clojure.core/seq fb) lb -1)
+                     down-a?   (and (>= la 0) (>= la lb))
+                     down-b?   (and (>= lb 0) (>= lb la))
+                     [fa' ca'] (if down-a? (descend storage fa la ca) [fa ca])
+                     [fb' cb'] (if down-b? (descend storage fb lb cb) [fb cb])]
+                 (recur fa' (if down-a? (dec la) la)
+                        fb' (if down-b? (dec lb) lb)
+                        ca' cb'))))))))))

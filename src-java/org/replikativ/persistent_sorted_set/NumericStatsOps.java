@@ -75,15 +75,23 @@ public class NumericStatsOps<Key> implements IMeasure<Key, NumericStats> {
         if (result.needsRecompute() && recompute != null) {
             NumericStats recomputed = recompute.get();
             if (recomputed != null) {
-                // Preserve the invertible stats (count, sum, sumSq) from result,
-                // but take min/max from recomputed
-                result = new NumericStats(
-                    result.count,
-                    result.sum,
-                    result.sumSq,
-                    recomputed.min,
-                    recomputed.max
-                );
+                // Take the recomputed stats WHOLESALE. Keeping the subtracted sum/sumSq
+                // here — which is what this did — threw away exact values that had just
+                // been paid for, and `sum`/`sumSq` are only invertible in exact
+                // arithmetic. In doubles the subtraction loses catastrophically:
+                // a leaf holding [1.0, 2.0, 1.0E16] with 1.0E16 removed gave
+                //     sum 4.0 (truth 3.0), sumSq 0.0 (truth 5.0)
+                // and therefore variance -4.0 — impossible for a variance — and a
+                // stdDev of NaN. `node->map` serializes `:measure`, so that lands on
+                // disk, is read back as authoritative, and changes the node's content
+                // address. Reachable from the public API: build and remove inside ONE
+                // transient, so the leaf is editable when the remove arrives, and the
+                // in-place path at Leaf.remove takes the incremental branch.
+                //
+                // The recompute is only requested when min or max was invalidated, so
+                // this costs nothing on the common path; when it IS requested, the
+                // accurate answer is already in hand.
+                result = recomputed;
             }
         }
 

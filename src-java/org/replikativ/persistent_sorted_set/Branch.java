@@ -45,11 +45,18 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   public static final long BUF_WRITE = -1;   // must write (rebalanced subtree)
   public static final long BUF_LAZY  = Slot.LAZY;  // restored, derive from slots on first read
 
-  // All settle-visible per-child state as ONE immutable snapshot. SHARED nodes have a
-  // single writer (the commit thread's settle) and many readers (apply-thread copies,
-  // query traversals): one volatile reference makes every observable state internally
-  // consistent — a reader/copier can never see addresses and children from different
-  // generations. Replaces the plain (_addresses, _children) pair whose two-step settle
+  // All settle-visible per-child state as ONE immutable snapshot. A shared node is assumed
+  // to have a single writer (a settle) and many readers (apply-thread copies, query
+  // traversals): one volatile reference makes every observable state internally consistent —
+  // a reader/copier can never see addresses and children from different generations.
+  //
+  // "Single writer" is a CONTRACT ON THE CALLER, not a property this class provides. Nothing
+  // here serialises store(), and structural sharing means two versions can share dirty nodes:
+  // measured on a pipelining-writer shape at bf 8 / n 1000, 3 Branch objects were reachable
+  // from both roots and dirty in both, and two concurrent stores settle those same objects.
+  // The required exclusion is therefore per LINEAGE (in practice per storage), not per tree —
+  // see doc/CONCURRENCY.md, which also records what does and does not go wrong when it is
+  // violated. The snapshot below defends readers; it does not defend writers from each other. Replaces the plain (_addresses, _children) pair whose two-step settle
   // (write _addresses[i], THEN wrap _children[i] in a Reference) tore under a
   // pipelining writer: a concurrent copy could mix a pre-settle (null) address with a
   // post-settle wrapped child — the forbidden "dirty child behind a SoftReference"
@@ -87,7 +94,17 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   }
 
   // The ONE mutable reference to this node's per-child state. Never null (every ctor
-  // installs a snapshot). Readers take ONE snapshot per method and use only its fields.
+  // installs a snapshot).
+  //
+  // Readers take ONE snapshot per method and use only its fields — WHERE THAT MATTERS,
+  // which is not everywhere, and the exceptions are safe for a different reason worth
+  // naming rather than leaving to be rediscovered. `depositKV` re-reads `_state` after its
+  // first snapshot, and `add`/`replace` call `child()` (which may itself publish a fill)
+  // after theirs. Neither is a torn-read bug, because both run on a node the calling thread
+  // OWNS: an editable transient, or an unpublished successor it is still building. The
+  // single-snapshot discipline is what protects a node that is already SHARED; owner-thread
+  // code is protected by ownership instead. Do not "fix" those sites by adding a re-read —
+  // the property they rely on is exclusivity, not atomicity.
   public volatile NodeState<Address> _state;
 
   // CAS access to _state for the publishers that can race the store()-time settle on a
@@ -105,7 +122,26 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // PersistentSortedSet.root()). A leaf-parent projects its buffered leaves with its own _projCmp,
   // so projection never depends on the comparator of whatever operation drove the descent. null
   // when diffBufSize==0 / projection never runs.
-  public Comparator _projCmp;
+  // VOLATILE, and stamped by CAS through PROJCMP_UPDATER rather than by a plain write. Two
+  // sets with different comparators can concurrently first-touch the SAME node a caching
+  // IStorage handed both of them; with a plain read-then-write both observe null, both stamp,
+  // and both proceed on the uncopied node — reinstating the very defect copy-on-conflict
+  // exists to prevent, since that arm only sees a conflict that is already visible.
+  //
+  // Two concurrent READERS over one storage is legal (the contract is one WRITER per lineage),
+  // so this is inside the supported region. Measured over 300 000 two-thread rounds: 9 rounds
+  // where both threads reached the same freshly-restored child, and 6 where set A's elements
+  // came back in set B's descending tie order — A expected [[0 0] [0 1] [0 2]] and got
+  // [[0 2] [0 1] [0 0]].
+  //
+  // Cost: a volatile READ on x86 is a plain load, and this field is read once per child()
+  // descent and written at most once per node.
+  public volatile Comparator _projCmp;
+
+  @SuppressWarnings("rawtypes")
+  private static final java.util.concurrent.atomic.AtomicReferenceFieldUpdater<Branch, Comparator>
+      PROJCMP_UPDATER = java.util.concurrent.atomic.AtomicReferenceFieldUpdater.newUpdater(
+          Branch.class, Comparator.class, "_projCmp");
 
   public Branch(int level, int len, Key[] keys, Address[] addresses, Object[] children, Settings settings) {
     this(level, len, keys, addresses, children, -1, settings);
@@ -193,6 +229,42 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   public Object[] addressArray() { return _state.addresses; }
   public Object[] childrenArray() { return _state.children; }
 
+  /**
+   * ONE snapshot's {addresses, slots} pair: `[0]` the address array (may be null),
+   * `[1]` the diff-buf slot array (may be null). Callers must NOT mutate either.
+   *
+   * Exists because `addressArray()` and `slots()` are two independent volatile reads,
+   * and a caller deciding something from BOTH must not straddle a settle. `diff`'s
+   * frontier does exactly that: it pairs each child's address with that child's slot to
+   * decide whether the address still stands for the subtree's contents. A pre-settle
+   * address paired with post-settle slots would name a stale address while reporting the
+   * child as unbuffered -- prunable -- and the other side of the diff, holding that same
+   * old address, would prune with it. The delta buffered in that slot would simply be
+   * missing from the answer.
+   *
+   * NOT reachable today, and the reason is worth writing down because it is not local.
+   * store()'s settle skips every child whose pre-settle address is NON-null (the
+   * "clean passthrough" branch): such a child keeps both its address and its slot, so
+   * there is nothing to tear. A child that IS settled had a null address going in --
+   * the mutation moved it into the slot's anchor -- and `prune-shared` ignores a null
+   * address outright (`(some? addr)`), so that entry never prunes whatever the slot
+   * says. Measured: a child mutated in the current generation reads [nil, SLOT]
+   * pre-settle and [ADDR, SLOT] after; an untouched one stays [ADDR, SLOT] across a
+   * sibling's overflow and across a structural split elsewhere.
+   *
+   * So this is a latent contract violation rather than a live defect. It is fixed
+   * anyway: the pairing is correct here by construction instead of by a coupling to
+   * which children the settle happens to touch, which is a property of a DIFFERENT
+   * method that no test pinned and a future change could quietly drop.
+   *
+   * `_len` is a plain field, not part of the snapshot, so it needs no pairing here.
+   */
+  public Object[] addressesAndSlots() {
+    final NodeState<Address> s = _state;
+    final BufState b = s.buf;
+    return new Object[]{ s.addresses, (b != null) ? b.slots : null };
+  }
+
   public Address address(int idx) {
     assert 0 <= idx && idx < _len;
 
@@ -232,7 +304,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // diff-buf: propagate the set's projection comparator down to each restored branch, so a
     // leaf-parent projects its buffered leaves with its own _projCmp — independent of whatever
     // operation (lookup with a prefix cmp, slice, count, …) drove this descent.
-    if (base instanceof Branch) ((Branch) base)._projCmp = _projCmp;
+    // Seed it when the restored node has none; COPY when it already carries a different one,
+    // because `base` is the object the IStorage returned and a caching storage shares it by
+    // address across sets. Overwriting it there is what let one set's comparator decide
+    // another set's leaf order — see withProjCmp for the measurement.
+    if (base instanceof Branch) base = ((Branch) base).stampOrCopy(_projCmp);
     // slots from the SAME snapshot as the address we restored from — the pair can't mix
     // a pre-settle address with post-settle slots (or vice versa).
     Object[] slots = (s.buf != null) ? s.buf.slots : null;
@@ -241,7 +317,22 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // leaf: batch-rebuild keys (with this leaf-parent's _projCmp); branch: install the nested
     // diff as the child's own slots + set its aggregates from ĝ. Runs once, here, at
     // materialization (reads stay baseline). Parent's slot supersedes any diff in the child.
-    if (_settings.diffBufSize() > 0 && sl != null && sl.diff != null) {
+    //
+    // Gated on the SLOT, not on `_settings.diffBufSize()`. The budget is a WRITE-side
+    // policy — how much this node may buffer before it must flush. Projection is a
+    // READ-side obligation: a slot carrying a diff describes the difference between the
+    // durable child and the current one, so skipping it does not "disable buffering", it
+    // returns the wrong data.
+    //
+    // The two came apart whenever a node's settings disagreed with the set's, which a
+    // storage decides — nodes are reconstructed with whatever `Settings` the IStorage
+    // hands them. A set at `:diff-buf-size 128` over a storage rebuilding nodes at 0
+    // silently DROPPED every buffered diff on read here, and then crashed at the next
+    // store in `assembleNested`, casting a Leaf to a Branch.
+    //
+    // Invariant I0 is untouched: at diffBufSize 0 no slot is ever created, so `sl` is
+    // always null and this is the same `child = base` it always was.
+    if (sl != null && sl.diff != null) {
       child = (base instanceof Leaf) ? (ANode) projectLeaf((Leaf) base, sl.diff, _projCmp)
                                      : (ANode) projectBranch((Branch) base, sl);
     } else {
@@ -275,6 +366,13 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // node — clears the slot's address and installs the bare child, both in place within
   // the current snapshot (unshared by contract; see NodeState).
   public ANode<Key, Address> child(int idx, ANode<Key, Address> child) {
+    // The "unshared by contract" in the comment above is the whole safety argument for
+    // writing into the snapshot's arrays in place, and nothing checked it. Under -ea (the
+    // :test alias) this turns the contract into something the suite enforces. Measured
+    // before adding it: 0 violations over 38,813,363 calls across the diff-buf namespaces,
+    // so it costs nothing today and fails loudly the moment a non-owner path appears.
+    assert editable() : "child(int,ANode) writes in place — it may only be called on an "
+                      + "editable (owner-thread, unshared) node, not a shared one";
     NodeState<Address> s = _state;
     if (s.addresses != null) {
       s.addresses[idx] = null;
@@ -317,11 +415,37 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
   // diff-buf restore: install reconstructed slots (fressian read side / storage impls)
   // as ONE atomically-published snapshot carrying the node's current {addresses,
-  // children} (restore-time: the node is not yet published, so the plain
-  // read-modify-write publish is single-threaded by contract). entries is usually
-  // BUF_LAZY (derived from the slots on first read), unless the caller knows the
-  // settled total.
+  // children}. entries is usually BUF_LAZY (derived from the slots on first read),
+  // unless the caller knows the settled total.
+  //
+  // The read-modify-write publish below is not atomic, and TWO DIFFERENT arguments make
+  // that safe depending on who is calling — the comment here used to give only the first,
+  // which is false of the second:
+  //   * STORAGE / codec callers, at restore time: the node is not yet published, so
+  //     nothing else can see it.
+  //   * `depositKV`, where the node IS published but is an editable TRANSIENT: the safety
+  //     comes from the single-writer ownership rule, not from non-publication.
+  // Either way there is exactly one thread, so a plain read-modify-write is sufficient;
+  // what must not be assumed is that "not yet published" covers every caller.
   public void installSlots(Object[] slots, long entries) {
+    // A node carrying buffered diffs whose SETTINGS say buffering is off is an
+    // incoherent reconstruction: the storage persisted `:slots` and is now
+    // rebuilding the node declaring there is no buffer. Every read of it is
+    // then subtly wrong rather than loudly broken — measured on the diff-buf
+    // stress sweep (bf 8, set budget 64, node budget 0): content mismatch with
+    // a MATCHING count, i.e. substituted elements, on 5 of 5 seeds.
+    //
+    // Refused rather than accommodated. The settings are the storage's to get
+    // right — they come from the blob the storage itself wrote — and a library
+    // that silently returns the wrong set is worse than one that says which
+    // half of the contract was broken.
+    if (slots != null && _settings.diffBufSize() <= 0) {
+      throw new IllegalStateException(
+          "diff-buf: a node reconstructed with diffBufSize=" + _settings.diffBufSize()
+          + " was handed buffered slots. The storage persisted this node's diff buffer "
+          + "and must reconstruct it with the same budget — see IStorage.restore and "
+          + "Settings.diffBufSize().");
+    }
     NodeState<Address> s = _state;
     _state = new NodeState<>(s.addresses, s.children, new BufState(slots, entries));
   }
@@ -398,6 +522,73 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (e != slow)
       throw new AssertionError("diff-buf: bufEntries " + e + " != recomputed " + slow + " (level " + _level + ")");
     return true;
+  }
+
+  // A branch-marker slot caches the child's whole-subtree buffered total as of DEPOSIT time.
+  // store() settles that child IN PLACE, so every OTHER version whose parent slot points at the
+  // same child object keeps the pre-settle total. Detect it post-order and poison the slot so
+  // Pass 1 writes the child wholesale.
+  //
+  // WHAT THIS DOES AND DOES NOT PROTECT — measured, so it is not re-litigated:
+  //
+  //   * It does NOT protect CONTENT. Of ~1175 stale slots observed with this repair DISABLED,
+  //     not one was ever actually buffered: the per-node budget test in Pass 2 flushed every
+  //     one. 0 content mismatches over 13164 trials (bf 4-16, B 1-256, four sharing orders
+  //     including forks and descendant-first). The budget test is what stands between a stale
+  //     slot and a wrong blob, not this walk.
+  //   * It does NOT protect the ANCHOR. The same settle calls markFreed on the anchor that the
+  //     other version's slot still names; with this repair ON or OFF the resulting dangling
+  //     anchors are byte-identical (25 read failures / 768 trials against a storage that
+  //     reclaims). See .internal/NEXT_SESSION.md — that is a separate, open defect, and it also
+  //     originates from LEAF-diff slots, which this walk never inspects.
+  //   * It DOES keep the delta-maintained bufEntries consistent with a fresh subtree walk, i.e.
+  //     it is what makes the -ea oracle assertBufEntries hold. Dropping the recursion below
+  //     costs 9 oracle failures / 1080 trials; dropping the repair entirely costs 21. Every one
+  //     is the oracle, never a content mismatch.
+  //
+  // WHY A STALE VALUE IS ALWAYS SAFE-HIGH (never stale-LOW, which WOULD be a correctness bug,
+  // since an under-count would let a blob exceed the budget B):
+  //
+  //   A published node's `entries` never increases. The only in-place writers are installSlots
+  //   (pre-publish, or on a node owned by the current transient), the BUF_LAZY->sum CAS
+  //   (resolution, not a change), this method (-> BUF_WRITE), and the settle. At a settle,
+  //   entries - embedded = the sum of csz[i] over bufferable children that were FLUSHED, and a
+  //   child is flushed with slotBE > 0 only when embedded + csz[i] > B (Pass 2 non-fit) or
+  //   embedded > B (the D3 overflow arm). So `entries` strictly decreases only if the
+  //   pre-settle value already exceeded B — which is exactly the value the other version's slot
+  //   cached. Hence stale implies over budget implies flushed. Measured: 0 stale-LOW and 0
+  //   over-budget blobs across 8100 trials with this repair disabled.
+  //
+  // Kept because the cost is inside the noise floor (-2.1% to +2.4% on a store-heavy workload,
+  // against a +-5-10% run-to-run spread), so there is nothing to buy by removing it. An earlier
+  // measurement of +4-12% was an artifact: that build incremented an AtomicLong per slot
+  // scanned, and the comparison arm skipped the counters along with the walk.
+  private void refreshMarkerSlots(IStorage storage) {
+    for (;;) {
+      NodeState<Address> s = _state;
+      BufState b = s.buf;
+      Object[] slots = (b != null) ? b.slots : null;
+      if (slots == null || s.children == null) return;
+      Object[] ns = null;
+      boolean poisoned = false;
+      for (int i = 0; i < _len; i++) {
+        Slot sl = (Slot) slots[i];
+        if (sl == null || sl.diff != null || sl.anchor == null) continue;   // marker slots only
+        if (sl.bufEntries == BUF_WRITE) continue;                            // already poisoned
+        Object ref = s.children[i];
+        if (ref == null) continue;                                           // not resident
+        ANode c = (ANode) _settings.readReference(ref);
+        if (!(c instanceof Branch)) continue;
+        ((Branch) c).refreshMarkerSlots(storage);                            // post-order
+        if (((Branch) c).bufEntries() == slotBE(sl)) continue;
+        if (ns == null) ns = Arrays.copyOf(slots, slots.length);
+        poisoned = true;
+        ns[i] = new Slot(sl.diff, sl.count, sl.measure, sl.anchor, BUF_WRITE);
+      }
+      if (ns == null) return;
+      long entries = poisoned ? BUF_WRITE : bufEntriesOf(b);
+      if (STATE_UPDATER.compareAndSet(this, s, new NodeState<>(s.addresses, s.children, new BufState(ns, entries)))) return;
+    }
   }
 
   private long bufEntriesSlow(IStorage storage) {
@@ -515,16 +706,39 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   }
 
   /**
-   * Helper to get subtree count from an ANode.
+   * Helper to get subtree count from an ANode, for the IN-MEMORY probe above ONLY.
+   *
+   * Returns -1 for a Branch whose count is unknown, rather than computing it. That is what
+   * tryComputeSubtreeCountFromChildren documents ("or has unknown count") and what the
+   * ClojureScript twin has always done; this side computed instead, and computeSubtreeCount
+   * descends through child(storage, i), which RESTORES every node below.
+   *
+   * The probe bails at the first non-resident child, scanning left to right, so it only ran
+   * to completion when a resident prefix reached the end — which `remove` arranges by
+   * materialising idx-1, idx and idx+1. At root fanout 2 that is every child, so one disj on
+   * a cold tree pulled in the whole thing. Measured, n=80000, a storage that does not persist
+   * counts:
+   *
+   *   bf  16  root fanout   2   11426 of 11426 blobs restored   (100%)
+   *   bf  64  root fanout   2    2580 of  2580 blobs restored   (100%)
+   *   bf  32  root fanout  19     547 restored for a LEFT-edge delete, 10 for a middle one
+   *   bf 512  root fanout 312       3-4 restored
+   *
+   * It is a one-time warmup, not an ongoing cost — the walk caches counts into the children it
+   * visits, so of 20 successive deletes only the first paid (11425, then 0 x19). What it costs
+   * is a latency spike on the first write after a restore and, worse, a resident set of the
+   * WHOLE tree, which is exactly the bound `:ref-type` exists to enforce.
+   *
+   * Returning -1 does not lose the count: the caller stores -1, and PersistentSortedSet already
+   * treats a negative root count as "unknown" and defers to count(), which computes and caches
+   * on demand. So the work moves to whoever actually asks for a count, instead of every delete.
    */
   private static long getSubtreeCount(ANode node, IStorage storage) {
     if (node instanceof ISubtreeCount) {
       long count = ((ISubtreeCount) node).subtreeCount();
       if (count >= 0) return count;
-      // Branch with unknown count - compute it
-      if (node instanceof Branch) {
-        return ((Branch) node).computeSubtreeCount(storage);
-      }
+      // Branch with unknown count: propagate unknown. Computing here would restore the subtree.
+      if (node instanceof Branch) return -1;
     }
     return node.count(storage);
   }
@@ -605,13 +819,70 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     }
 
     if (PersistentSortedSet.EARLY_EXIT == nodes) { // child signalling nothing to update
-      // Editable in-place path: processor didn't fire, exactly one element added
-      if (_subtreeCount >= 0) _subtreeCount += 1;
+      // Editable in-place path: exactly one element added — but ONLY without a leafProcessor.
+      // A processor may compact or expand the leaf it is handed, so adding one KEY need not
+      // raise the element count by one, and EARLY_EXIT does not mean "the processor did not
+      // fire" — a level-1 Branch handles the processor correctly and STILL returns EARLY_EXIT
+      // to its parent, which then applied +1 blindly. Same distinction the remove arms at
+      // :1223/:1279 make. Reachable only at level >= 2 with a transient, which is why the
+      // suite was green; measured before this guard, bf 8 / n 200 / conj:
+      //     set count 221   seq count 220   drift level 3 221/220, level 2 85/84
+      // and it is DURABLE — node->identity excludes :subtree-count, so the address does not
+      // change and the wrong count travels in the blob, invisible to a merkle audit.
+      //
+      // Shaped as if/else rather than the ternary the remove arms use, so that the
+      // processor-free path is EXACTLY what it was: delta when the count is known, and
+      // nothing at all when it is unknown. Folding "unknown" into the probe would make
+      // every such add walk the children — the very cost 04499a0 removed.
+      if (_settings.leafProcessor() == null) {
+        if (_subtreeCount >= 0) _subtreeCount += 1;
+      } else {
+        _subtreeCount = tryComputeSubtreeCountFromChildren(s0.children, _len, storage);
+      }
       // Update measure: recompute from children (child's stats were updated in place)
       IMeasure measureOps = _settings.measure();
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
+      // The child was mutated IN PLACE, so this node's addresses[ins] — which asserts
+      // "that child's whole subtree is already durable" — is now a LIE. store() reads it
+      // exactly that way (baseline Pass at :2073 `if (newAddresses[i] == null)`, diff-buf
+      // Pass 1 at :2138 `if (newAddresses[i] != null) continue`), so without this clear the
+      // subtree is skipped at every depth and the mutation NEVER REACHES DISK.
+      //
+      // Reachable from the public API: `store` a live transient, mutate it further, `store`
+      // again — the checkpointed bulk-ingest shape. Measured before this clear, second store
+      // silently missing the second batch:
+      //     bf 64 dbs 0   level 1   in-mem 220  reloaded 219  missing [21]
+      //     bf  8 dbs 0   level 3   in-mem 1220 reloaded 1219 missing [21]
+      //     bf  8 dbs 256 level 2   in-mem 218  reloaded 219  extra   [5]
+      // Baseline loses at every level; under diff-buf level 1 is masked because the slot
+      // carries the real leaf-diff, while level >= 2 deposits a MARKER (diff == null) whose
+      // content lives only in the live child, so the loss returns.
+      //
+      // Every other mutation path already clears it — child(int,ANode) at :328-337,
+      // newAddresses[ins] = null at :749 and :1655, as.copyOne(null) in each rebuild stitch.
+      // The EARLY_EXIT arms were the only ones that did not, because they install no new
+      // node. `anchor0` was captured above, so under diff-buf the child now classifies as
+      // dirty and Pass 2 re-points the address to that anchor.
+      //
+      // Free the address we are about to clear. The two pre-existing clear sites do this
+      // (see the `_settings.diffBufSize() <= 0 && ...markFreed` blocks around child(idx,node)
+      // in the non-EARLY_EXIT arms); these three did not, so a checkpointed transient left
+      // blobs that were unreachable AND never reported freed. Measured over 40 checkpoint
+      // rounds at bf 8 / dbs 0: disk 242, reachable 82, freed-reported 99, ORPHANS 61
+      // (levels {2 -> 37, 1 -> 24}). Content was correct — this is unbounded storage growth
+      // for any consumer that treats the freed stream as its GC candidate list, which
+      // datahike does.
+      //
+      // GATED on diffBufSize <= 0, exactly as the other sites are: under diff-buf the old
+      // address is re-pointed as the buffered anchor at store, so freeing it here would free
+      // a LIVE node. That gate is also why the measurement only shows orphans at dbs 0.
+      if (_settings.diffBufSize() <= 0 && storage != null
+          && s0.addresses != null && s0.addresses[ins] != null) {
+        storage.markFreed(s0.addresses[ins]);
+      }
+      child(ins, oldChild);  // clears addresses[ins] AND unwraps the child (a dirty child must be bare)
       if (_settings.diffBufSize() > 0) depositInto(storage, ins, key, key, anchor0); // content-only: Present(key) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
     }
@@ -786,8 +1057,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     Branch left = (Branch) _left;
     Branch right = (Branch) _right;
 
-    int idx = search(key, cmp);
-    if (idx < 0) idx = -idx - 1;
+    int idx = searchFirst(key, cmp);   // D1
 
     if (idx == _len) // not in set
       return PersistentSortedSet.UNCHANGED;
@@ -798,7 +1068,15 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           rightChild = idx < _len-1 ? child(storage, idx + 1) : null;
     int leftChildLen = safeLen(leftChild);
     int rightChildLen = safeLen(rightChild);
-    ANode[] nodes = child(storage, idx).remove(storage, key, leftChild, rightChild, cmp, settings);
+    // Ask the child to REPORT the element it removed, so the diff-buf deposits below record
+    // Absent(<what the leaf actually held>) rather than Absent(<the caller's search key>).
+    // Only at level 1: above it the slot is a branch marker whose diff is null, so the key
+    // is unused. See ANode's six-arg `remove` for the measured failure.
+    Object[] removedOut = (_settings.diffBufSize() > 0 && _level == 1) ? new Object[1] : null;
+    ANode<Key, Address> mutatedChild = child(storage, idx);
+    ANode[] nodes = mutatedChild.remove(storage, key, leftChild, rightChild, cmp, settings, removedOut);
+    @SuppressWarnings("unchecked")
+    Key removedKey = (removedOut != null && removedOut[0] != null) ? (Key) removedOut[0] : key;
 
     if (PersistentSortedSet.UNCHANGED == nodes) // child signalling element not in set
       return PersistentSortedSet.UNCHANGED;
@@ -814,14 +1092,86 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     Object anchor0 = (_settings.diffBufSize() > 0 && s0.addresses != null) ? s0.addresses[idx] : null;
 
     if (PersistentSortedSet.EARLY_EXIT == nodes) { // child signalling nothing to update
-      // Editable in-place path: processor didn't fire, exactly one element removed
-      if (_subtreeCount >= 0) _subtreeCount -= 1;
+      // Editable in-place path: exactly one element removed — but ONLY without a
+      // leafProcessor, for the reason spelled out in the `add` EARLY_EXIT arm above.
+      // Measured before this guard, bf 8 / n 200 / disj:
+      //     set count 179   seq count 178   drift level 3 179/178, level 2 75/74
+      // if/else, not a ternary — see the `add` arm: the processor-free path must stay a
+      // pure delta-or-nothing and must not fall into the children walk when unknown.
+      if (_settings.leafProcessor() == null) {
+        if (_subtreeCount >= 0) _subtreeCount -= 1;
+      } else {
+        _subtreeCount = tryComputeSubtreeCountFromChildren(s0.children, _len, storage);
+      }
       // Update measure: recompute from children (child's stats were updated in place)
       IMeasure measureOps = _settings.measure();
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.diffBufSize() > 0) depositInto(storage, idx, key, Slot.ABSENT, anchor0); // content-only: Absent(key) / branch marker
+      // NOTE `key` here is the caller's SEARCH key, not the element the leaf removed.
+      // Under a coarse operation comparator those differ, and this is the same shape as
+      // the `replace` deposit defect fixed in this cycle: `projectLeaf` replays the diff
+      // under the SET's comparator, so `Absent(<search key>)` would cancel nothing and the
+      // removal would be lost on reload.
+      //
+      // NOT corrected, deliberately — but the earlier claim here that `disj` "produced no
+      // slot at all" was WRONG and is corrected: a 40-element set at bf 8 with
+      // diff-buf 256 DOES deposit, and this line does run. What has not been shown is any
+      // resulting data loss. At level > 1 the slot is a branch marker whose diff is null,
+      // so the key is unused; at level 1 no construction tried has produced a wrong
+      // reload. Attempts: conj-built and bulk-built, bf 4/8/64, 40 and 400 elements,
+      // 2- and 3-level trees, persistent and transient, cold-restored with the storage's
+      // node settings carrying the same budget as the set, and searching with a COARSE
+      // operation comparator whose key is not equal to the stored element — every reload
+      // matched memory exactly.
+      //
+      // So this is a latent mismatch, not a demonstrated defect. Threading a
+      // removed-element channel through `remove` the way `replace` has one is the fix if
+      // it is ever shown to bite; doing it blind would be a signature change on a path
+      // with no test to hold it, which is the trade that put the last two defects here.
+      //
+      // If a construction is ever found that makes `disj` deposit, fix this first and
+      // treat the reproduction as the regression test.
+      // The child was mutated IN PLACE, so this node's addresses[idx] — which asserts
+      // "that child's whole subtree is already durable" — is now a LIE. store() reads it
+      // exactly that way (baseline Pass at :2073 `if (newAddresses[i] == null)`, diff-buf
+      // Pass 1 at :2138 `if (newAddresses[i] != null) continue`), so without this clear the
+      // subtree is skipped at every depth and the mutation NEVER REACHES DISK.
+      //
+      // Reachable from the public API: `store` a live transient, mutate it further, `store`
+      // again — the checkpointed bulk-ingest shape. Measured before this clear, second store
+      // silently missing the second batch:
+      //     bf 64 dbs 0   level 1   in-mem 220  reloaded 219  missing [21]
+      //     bf  8 dbs 0   level 3   in-mem 1220 reloaded 1219 missing [21]
+      //     bf  8 dbs 256 level 2   in-mem 218  reloaded 219  extra   [5]
+      // Baseline loses at every level; under diff-buf level 1 is masked because the slot
+      // carries the real leaf-diff, while level >= 2 deposits a MARKER (diff == null) whose
+      // content lives only in the live child, so the loss returns.
+      //
+      // Every other mutation path already clears it — child(int,ANode) at :328-337,
+      // newAddresses[ins] = null at :749 and :1655, as.copyOne(null) in each rebuild stitch.
+      // The EARLY_EXIT arms were the only ones that did not, because they install no new
+      // node. `anchor0` was captured above, so under diff-buf the child now classifies as
+      // dirty and Pass 2 re-points the address to that anchor.
+      //
+      // Free the address we are about to clear. The two pre-existing clear sites do this
+      // (see the `_settings.diffBufSize() <= 0 && ...markFreed` blocks around child(idx,node)
+      // in the non-EARLY_EXIT arms); these three did not, so a checkpointed transient left
+      // blobs that were unreachable AND never reported freed. Measured over 40 checkpoint
+      // rounds at bf 8 / dbs 0: disk 242, reachable 82, freed-reported 99, ORPHANS 61
+      // (levels {2 -> 37, 1 -> 24}). Content was correct — this is unbounded storage growth
+      // for any consumer that treats the freed stream as its GC candidate list, which
+      // datahike does.
+      //
+      // GATED on diffBufSize <= 0, exactly as the other sites are: under diff-buf the old
+      // address is re-pointed as the buffered anchor at store, so freeing it here would free
+      // a LIVE node. That gate is also why the measurement only shows orphans at dbs 0.
+      if (_settings.diffBufSize() <= 0 && storage != null
+          && s0.addresses != null && s0.addresses[idx] != null) {
+        storage.markFreed(s0.addresses[idx]);
+      }
+      child(idx, mutatedChild);  // clears addresses[idx] AND unwraps the child (a dirty child must be bare)
+      if (_settings.diffBufSize() > 0) depositInto(storage, idx, removedKey, Slot.ABSENT, anchor0); // content-only: Absent(removedKey) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
     }
 
@@ -917,16 +1267,56 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           }
         }
 
+        // Hygiene only — this clear frees NOTHING measurable, and the commit that added it
+        // (854c32e) claimed otherwise. Isolated afterwards: with the five Leaf clears kept
+        // and this one removed, the retention test passes with 0 failures and the measured
+        // numbers are bit-identical to having it. The reason is structural: the arm is
+        // guarded `editable() && idx < _len-2`, so `copyAll(children, idx+2, _len)` always
+        // shifts the tail LEFT, which makes every slot in [newLen, _len) a duplicate of one
+        // still live in [0, newLen). An instrumented run over the whole suite saw 4123
+        // executions and 4123 stale child slots, none of which held a node that was not
+        // still referenced below newLen.
+        //
+        // Kept because it costs four fills on a path that already copies arrays, and because
+        // "no shape was found where it matters" is weaker than a proof. But do NOT cite it
+        // as the source of any retention number: those all come from Leaf.
+        if (newLen < _len) {                                                       // TAILCLEAR
+          Arrays.fill(_keys, newLen, _len, null);
+          if (s0.addresses != null) Arrays.fill(s0.addresses, newLen, _len, null);
+          Arrays.fill(children, newLen, _len, null);
+          if (stitched != null) Arrays.fill(stitched, newLen, _len, null);
+        }
         _len = newLen;
         // Compute exact subtree count from children (accounts for processor changes)
-        _subtreeCount = tryComputeSubtreeCountFromChildren(children, newLen, storage);
+        // DELTA, not a recompute. `remove` deletes exactly one element, and in this arm no
+        // child leaves this node (any merge/borrow was between ITS OWN children), so the
+        // subtree total is exactly one less. The probe would instead bail to -1 the moment a
+        // single child is non-resident — discarding a number we already know — and that -1 is
+        // then SERIALIZED (`impl.nodes/node->map` writes `subtreeCount()` raw), so every later
+        // reader of the blob pays a subtree walk to recover it.
+        //
+        // 04499a0 stopped the probe restoring subtrees just to count them, which was right, but
+        // it made -1 the answer far more often and so degraded the on-disk counts. This closes
+        // that without reintroducing any IO. It also converges the runtimes: ClojureScript has
+        // always used the delta here (`branch.cljs`, `new-sc (if (>= old-sc 0) (dec old-sc) -1)`),
+        // and a census over 2259 nodes found 93 disagreeing on `:subtree-count`, 93 of 93 being
+        // "JVM -1, cljs exact" — never two different real values. cljs was right.
+        // ONLY without a leafProcessor. A processor may compact or expand a leaf, so removing
+        // one KEY need not reduce the element count by one — `PersistentSortedSet.disjoin`
+        // makes the same distinction ("count may differ from +1"). With a processor, fall back
+        // to the probe. Caught by leaf_processor/test-mixed-processor, which reported
+        // :subtree-count-mismatch {:branch-count 139, :children-sum 137} when this was
+        // unconditional.
+        _subtreeCount = (_settings.leafProcessor() == null && _subtreeCount >= 0)
+                        ? _subtreeCount - 1
+                        : tryComputeSubtreeCountFromChildren(children, newLen, storage);
         // Update measure: recompute from children
         if (measureOps != null && _measure != null) {
           _measure = tryComputeMeasure(storage);
         }
         if (_settings.diffBufSize() > 0) {
           if (!structural) {
-            depositInto(storage, idx, key, Slot.ABSENT, anchor0); // content-only: Absent(key) / branch marker
+            depositInto(storage, idx, removedKey, Slot.ABSENT, anchor0); // content-only: Absent(removedKey) / branch marker
           } else {
             // a child merged/borrowed with a sibling: structural → write in full. Single
             // publish of the stitched slots + BUF_WRITE poison (owner thread; carries the
@@ -967,14 +1357,22 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       cs.copyAll(myChildren, idx + 2, _len);
 
       // Compute exact subtree count from children (accounts for processor changes)
-      newCenter._subtreeCount = tryComputeSubtreeCountFromChildren(centerChildren, newLen, storage);
+      // DELTA, not a recompute — same reasoning as the in-place arm above. `newCenter` covers
+      // exactly this node's key range minus the one removed element: any merge/borrow here was
+      // between THIS node's own children (newLen may shrink, but no element left the subtree).
+      // The probe would bail to -1 at the first non-resident child and discard a number we
+      // already know, and that -1 is serialized.
+      // ONLY without a leafProcessor — see the in-place arm above.
+      newCenter._subtreeCount = (_settings.leafProcessor() == null && _subtreeCount >= 0)
+                                ? _subtreeCount - 1
+                                : tryComputeSubtreeCountFromChildren(centerChildren, newLen, storage);
       newCenter._measure = tryComputeMeasureFromChildren(centerChildren, newLen, storage, measureOps);
       if (settings.diffBufSize() > 0) {
         if (!leftChanged && !rightChanged && newLen == _len) {
           // content-only: carry the SAME snapshot's {slots, entries} pair aligned and
           // ACCUMULATE Absent onto the center's existing diff (it may already hold
           // buffered Present/Absent for this leaf).
-          newCenter.carryAndDeposit(storage, s0.buf, idx, key, Slot.ABSENT, anchor0);
+          newCenter.carryAndDeposit(storage, s0.buf, idx, removedKey, Slot.ABSENT, anchor0);
         } else {
           // structural: mirror the address Stitch; newCenter is unpublished, so one publish
           // installs the consistent {slots, BUF_WRITE} pair.
@@ -1028,8 +1426,23 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (nodes[2] != null) cs.copyOne(nodes[2]);
       cs.copyAll(s0.children, idx + 2, _len);
 
-      // Compute exact subtree count from children (accounts for processor changes)
-      join._subtreeCount = tryComputeSubtreeCountFromChildren(joinChildren, left._len + newLen, storage);
+      // DELTA, not a children walk. `join` is exactly `left` carried over untouched
+      // (ks/cs copyAll of all left._len children above) plus this node's content with the
+      // one element `remove` deleted. Both totals are already in hand, so the sum is exact
+      // and needs no child to be resident — which is the whole point: after a cold restore
+      // every node sits at minimum occupancy, so removing a single element cascades a JOIN
+      // up the entire spine, and the children walk answers -1 at every level because only
+      // idx-1/idx/idx+1 were ever materialized. That -1 is then SERIALIZED
+      // (`impl.nodes/node->map` writes subtreeCount raw), so the unknown becomes durable
+      // and every later reader pays to rebuild it. Measured at bf 16, one disj on a cold
+      // 10000-element tree: spine counts -1/-1/-1 under a root that knew 9999.
+      //
+      // Same leafProcessor caveat as the sibling delta above: a processor may compact or
+      // expand a leaf, so removing one KEY need not change the element count by one.
+      join._subtreeCount =
+          (settings.leafProcessor() == null && left._subtreeCount >= 0 && _subtreeCount >= 0)
+          ? left._subtreeCount + _subtreeCount - 1
+          : tryComputeSubtreeCountFromChildren(joinChildren, left._len + newLen, storage);
       join._measure = tryComputeMeasureFromChildren(joinChildren, left._len + newLen, storage, measureOps);
       if (settings.diffBufSize() > 0) {
         // merged with left: structural → written (BUF_WRITE), still buffers surviving
@@ -1083,8 +1496,13 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       cs.copyAll(s0.children,  idx + 2, _len);
       cs.copyAll(rs.children, 0, right._len);
 
-      // Compute exact subtree count from children (accounts for processor changes)
-      join._subtreeCount = tryComputeSubtreeCountFromChildren(joinChildren, newLen + right._len, storage);
+      // DELTA — the mirror of the left-join above: `join` is this node's content minus the
+      // one deleted element, plus `right` carried over untouched. See that comment for why
+      // the children walk cannot answer here and why the -1 it returns becomes durable.
+      join._subtreeCount =
+          (settings.leafProcessor() == null && right._subtreeCount >= 0 && _subtreeCount >= 0)
+          ? _subtreeCount - 1 + right._subtreeCount
+          : tryComputeSubtreeCountFromChildren(joinChildren, newLen + right._len, storage);
       join._measure = tryComputeMeasureFromChildren(joinChildren, newLen + right._len, storage, measureOps);
       if (settings.diffBufSize() > 0) {
         // merged with right: structural → written (BUF_WRITE), still buffers surviving
@@ -1271,8 +1689,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
   @Override
   public ANode removeContent(IStorage storage, Key key, Comparator<Key> cmp, Settings settings) {
-    int idx = search(key, cmp);
-    if (idx < 0) idx = -idx - 1;
+    int idx = searchFirst(key, cmp);   // D1
     if (idx == _len) return null; // key greater than everything → not present
 
     ANode oldChild = child(storage, idx);
@@ -1335,6 +1752,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     for (int i = 0; i < n; i++) keys[i] = ((ANode<Key, Address>) newChildren[i]).maxKey();
     long count = tryComputeSubtreeCountFromChildren(newChildren, n, storage);
     Object measure = tryComputeMeasureFromChildren(newChildren, n, storage, measureOps);
+    wrapAddressedChildren(newChildren, newAddresses, n, settings);   // AFTER the probes read them
     return new Branch(_level, n, keys, newAddresses, newChildren, count, measure, _projCmp, settings);
   }
 
@@ -1380,7 +1798,106 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     for (int i = 0; i < n; i++) keys[i] = ((ANode<Key, Address>) children[i]).maxKey();
     long count = tryComputeSubtreeCountFromChildren(children, n, storage);
     Object measure = tryComputeMeasureFromChildren(children, n, storage, measureOps);
+    wrapAddressedChildren(children, addrs, n, settings);             // AFTER the probes read them
     return new Branch(_level, n, keys, addrs, children, count, measure, _projCmp, settings);
+  }
+
+  /**
+   * Wrap every rebuilt child that still has a durable address per `:ref-type`, exactly as the
+   * count-mode settle in store() does.
+   *
+   * The MST rebuild paths (removeContent, mstMergeWith) copy each unchanged sibling forward as
+   * `child(storage, i)` — a BARE ANode — while keeping its still-valid address, and nothing on
+   * those paths ever called makeReference. `:ref-type :soft`/`:weak` therefore stopped bounding
+   * the tree, because a bare strong child pins its WHOLE subtree: an unwrapped node near the
+   * root makes everything beneath it unevictable regardless of how the rest is held.
+   *
+   * Measured, bf 8, n=20000, `:ref-type :soft`, 20 disj after a store and WITHOUT a second
+   * store (a checkpoint re-wraps everything and hides it), before -> after:
+   *
+   *   MST     cleared    0 references, 1375 of 1375 nodes resident (100% pinned)
+   *           after:   850 cleared,     525 of 1375 (38%)
+   *   count   cleared 2565 references, 4033 of 6598 resident (61%), unchanged both ways
+   *
+   * A correction to an earlier version of this comment, which claimed "no Reference was created
+   * anywhere in the tree" and cited `{:reference 4}`: that is false. A census on the unfixed
+   * build found `{:bare-strong-with-address 126, :bare-strong-no-address 32, :reference 1216}` —
+   * 1216 References did exist. What the MST paths unwrapped was 126 of them (~9%), and because
+   * an eviction walk stops at a bare strong child, those 126 were enough to drive the CLEARABLE
+   * count to zero. The pinning, not the reference count, is the defect.
+   *
+   * Only an addressed child may be wrapped: a cleared reference is recovered by restoring from
+   * the address, so a freshly built child (null address — the removal's successor, or a merge
+   * junction) must stay strong. Under `:ref-type :strong` makeReference returns the node itself,
+   * so this is a no-op there.
+   */
+  private void wrapAddressedChildren(Object[] children, Address[] addresses, int n, Settings settings) {
+    if (children == null || addresses == null) return;
+    for (int i = 0; i < n; ++i) {
+      if (addresses[i] != null && children[i] instanceof ANode) {
+        // The SET's settings, not this node's. A node reconstructed by an IStorage carries the
+        // STORAGE's Settings, and every in-tree storage builds them as `new Settings(bf, null, ..)`
+        // whose null refType normalizes to SOFT. Reading `_settings` here therefore made
+        // `:ref-type` on the set not govern this path in EITHER direction: measured MST, bf 8,
+        // n=4000, 30 deletes -- a `:strong` set over default storage nodes got 87 SoftReferences
+        // it never asked for (0 before), and a `:soft` set over strong-settings nodes got the wrap
+        // not at all (87 bare-strong-with-address, i.e. inert). The successor Branch two lines
+        // below is already built from `settings`; this now agrees with it.
+        children[i] = settings.makeReference(children[i]);
+      }
+    }
+  }
+
+  /**
+   * Must the parent's separator be refreshed because this child's max moved?
+   *
+   * BOTH tests are needed, and each alone has been wrong in this file:
+   *
+   *   - the OPERATION comparator (`cmp`) is wrong because it is deliberately coarser than the
+   *     set's — datahike's upsert searches [e a _ _] — so it calls a value change "unchanged"
+   *     and suppresses a propagation routing needs.
+   *   - the element's `=` (`Util.equiv`) is wrong in the OPPOSITE direction: it fails when `=`
+   *     is COARSER than the set's comparator. datahike's `equiv-datom` compares e/a/v while
+   *     `cmp-datoms-eavt` orders by e/a/v/tx, so two datoms differing only in tx are `=` but
+   *     not comparator-equal. Measured with an element type whose `=` ignores a field the set
+   *     orders by, inside a transient: 9 unfindable at n=40 bf=4, 24 at n=100, 46 at n=3000 —
+   *     identical to the numbers from before the `cmp` version was replaced, i.e. the same
+   *     defect, reachable through a different door. 24 of them survived a store/restore,
+   *     because the stale separator is a branch key and is serialized.
+   *
+   * So: propagate if the element CHANGED BY VALUE (content addressing needs the separator to
+   * equal the child's max element) OR if it moved under the SET's comparator (routing needs
+   * the separator to be in the right position). `_projCmp` is the set's comparator, seeded
+   * unconditionally at `PersistentSortedSet.root()` and inherited by every successor; when it
+   * is somehow absent we propagate rather than guess, which costs a spine rebuild and never
+   * correctness.
+   */
+  private boolean separatorMoved(Key newMaxKey, Key oldSeparator) {
+    if (!clojure.lang.Util.equiv(newMaxKey, oldSeparator)) return true;
+    if (_projCmp == null) return true;
+    return 0 != _projCmp.compare(newMaxKey, oldSeparator);
+  }
+
+  /**
+   * -ea only: the cross-leaf half of `replace`'s no-equal-sibling precondition.
+   *
+   * `Leaf.replace` checks the neighbours INSIDE the leaf; this checks the two that sit
+   * across a leaf boundary, which the leaf cannot see. Only meaningful at level 1, where
+   * the children are leaves.
+   */
+  private boolean noEqualSiblingAcrossBoundary(IStorage storage, int idx, Key oldKey, Comparator<Key> cmp) {
+    ANode<Key, Address> leaf = child(storage, idx);
+    int j = leaf.search(oldKey, cmp);
+    if (j < 0) return true;
+    if (j == 0 && idx > 0) {
+      ANode<Key, Address> prev = child(storage, idx - 1);
+      if (prev._len > 0 && 0 == cmp.compare(prev._keys[prev._len - 1], oldKey)) return false;
+    }
+    if (j == leaf._len - 1 && idx < _len - 1) {
+      ANode<Key, Address> next = child(storage, idx + 1);
+      if (next._len > 0 && 0 == cmp.compare(next._keys[0], oldKey)) return false;
+    }
+    return true;
   }
 
   @Override
@@ -1388,8 +1905,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     assert 0 == cmp.compare(oldKey, newKey) : "oldKey and newKey must compare as equal (cmp.compare must return 0)";
 
     // Find which child contains the key
-    int idx = search(oldKey, cmp);
-    if (idx < 0) idx = -idx - 1;
+    int idx = searchFirst(oldKey, cmp);   // D1
     if (idx == _len) idx = _len - 1; // key might be in last child
     assert 0 <= idx && idx < _len;
 
@@ -1398,8 +1914,52 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     final NodeState<Address> s0 = _state;
     // diff-buf: capture child idx's durable address before the mutation nulls it.
     Object anchor0 = (_settings.diffBufSize() > 0 && s0.addresses != null) ? s0.addresses[idx] : null;
+    // diff-buf: the element this replace will actually REMOVE, captured before the
+    // mutation removes it. Not the same thing as `oldKey`.
+    //
+    // `oldKey` is the caller's SEARCH key, matched under the operation comparator `cmp`,
+    // which may be COARSER than the set's own (datahike's value-changing datom upsert
+    // searches [e a _ _] and replaces the whole datom). The leaf-diff is keyed by the
+    // SET's comparator, so `Absent(oldKey)` only cancels the element in the leaf when the
+    // two happen to be equal under _projCmp — i.e. only while the leaf still holds the
+    // element the caller searched for.
+    //
+    // After ONE buffered replace it no longer does: the leaf holds the previous
+    // replacement, `Absent(oldKey)` matches nothing, and the new Present is ADDED
+    // alongside the old one. Measured, 16 elements, two replaces of one key in a single
+    // transient cycle, store, restore: [[5 1] [5 2]] for key 5, count 16 against a seq of
+    // 17. In memory it looked right — the transient leaf is mutated in place, so nothing
+    // projects the diff until a restore, and the corruption only surfaces on reload.
+    //
+    // Only at level 1 (leaf children) and only with buffering on: above level 1 the slot
+    // is a branch anchor whose diff is null, so the key is unused, and at diffBufSize 0
+    // there is no diff at all.
+    // The CROSS-LEAF half of replace's no-equal-sibling precondition; `Leaf` checks the
+    // in-leaf half. Assertion only -- it re-searches the leaf and may materialise a
+    // sibling, so it is exactly the work the reporting overload below exists to avoid,
+    // and it costs nothing once assertions are off.
+    //
+    // Needed because the two cmp-equal elements are NOT reliably in one leaf: measured at
+    // bf 4, a set of [k 0] for k in 0..39 plus [5 7] splits as ... [[4 0] [5 0]] |
+    // [[5 7] [6 0] [7 0]] ..., putting them either side of a boundary. A leaf-local check
+    // alone silently passed that case, which is the case this precondition exists for.
+    assert _level != 1 || noEqualSiblingAcrossBoundary(storage, idx, oldKey, cmp)
+      : "replace(" + oldKey + " -> " + newKey + "): the ADJACENT leaf holds another element the"
+      + " operation comparator calls equal, so which element is replaced is arbitrary and the"
+      + " result may be UNSORTED. `replace` requires at most one cmp-equal element;"
+      + " use disj+conj instead.";
+
+    // Asking the child to REPORT what it removed, rather than searching it here first:
+    // the leaf binary search is comparator-bound, and doing it twice cost +18% at bf 512,
+    // +10% at bf 64 and +4% at bf 32 on a replace-heavy workload (see ANode). Only at level 1
+    // and only with buffering on -- above level 1 the slot is a branch anchor whose diff
+    // is null, so the key is unused, and at diffBufSize 0 there is no diff at all.
+    Object[] removedOut = (_settings.diffBufSize() > 0 && _level == 1) ? new Object[1] : null;
     // Recursively replace in child
-    ANode[] nodes = child(storage, idx).replace(storage, oldKey, newKey, cmp, settings);
+    ANode<Key, Address> mutatedChild = child(storage, idx);
+    ANode[] nodes = mutatedChild.replace(storage, oldKey, newKey, cmp, settings, removedOut);
+    @SuppressWarnings("unchecked")
+    Key removedKey = (removedOut != null && removedOut[0] != null) ? (Key) removedOut[0] : oldKey;
 
     if (PersistentSortedSet.UNCHANGED == nodes) // key not found
       return PersistentSortedSet.UNCHANGED;
@@ -1410,7 +1970,46 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.diffBufSize() > 0) depositReplace(storage, idx, oldKey, newKey, anchor0); // content-only: Absent(oldKey)+Present(newKey) / branch marker
+      // The child was mutated IN PLACE, so this node's addresses[idx] — which asserts
+      // "that child's whole subtree is already durable" — is now a LIE. store() reads it
+      // exactly that way (baseline Pass at :2073 `if (newAddresses[i] == null)`, diff-buf
+      // Pass 1 at :2138 `if (newAddresses[i] != null) continue`), so without this clear the
+      // subtree is skipped at every depth and the mutation NEVER REACHES DISK.
+      //
+      // Reachable from the public API: `store` a live transient, mutate it further, `store`
+      // again — the checkpointed bulk-ingest shape. Measured before this clear, second store
+      // silently missing the second batch:
+      //     bf 64 dbs 0   level 1   in-mem 220  reloaded 219  missing [21]
+      //     bf  8 dbs 0   level 3   in-mem 1220 reloaded 1219 missing [21]
+      //     bf  8 dbs 256 level 2   in-mem 218  reloaded 219  extra   [5]
+      // Baseline loses at every level; under diff-buf level 1 is masked because the slot
+      // carries the real leaf-diff, while level >= 2 deposits a MARKER (diff == null) whose
+      // content lives only in the live child, so the loss returns.
+      //
+      // Every other mutation path already clears it — child(int,ANode) at :328-337,
+      // newAddresses[ins] = null at :749 and :1655, as.copyOne(null) in each rebuild stitch.
+      // The EARLY_EXIT arms were the only ones that did not, because they install no new
+      // node. `anchor0` was captured above, so under diff-buf the child now classifies as
+      // dirty and Pass 2 re-points the address to that anchor.
+      //
+      // Free the address we are about to clear. The two pre-existing clear sites do this
+      // (see the `_settings.diffBufSize() <= 0 && ...markFreed` blocks around child(idx,node)
+      // in the non-EARLY_EXIT arms); these three did not, so a checkpointed transient left
+      // blobs that were unreachable AND never reported freed. Measured over 40 checkpoint
+      // rounds at bf 8 / dbs 0: disk 242, reachable 82, freed-reported 99, ORPHANS 61
+      // (levels {2 -> 37, 1 -> 24}). Content was correct — this is unbounded storage growth
+      // for any consumer that treats the freed stream as its GC candidate list, which
+      // datahike does.
+      //
+      // GATED on diffBufSize <= 0, exactly as the other sites are: under diff-buf the old
+      // address is re-pointed as the buffered anchor at store, so freeing it here would free
+      // a LIVE node. That gate is also why the measurement only shows orphans at dbs 0.
+      if (_settings.diffBufSize() <= 0 && storage != null
+          && s0.addresses != null && s0.addresses[idx] != null) {
+        storage.markFreed(s0.addresses[idx]);
+      }
+      child(idx, mutatedChild);  // clears addresses[idx] AND unwraps the child (a dirty child must be bare)
+      if (_settings.diffBufSize() > 0) depositReplace(storage, idx, removedKey, newKey, anchor0); // Absent(removedKey)+Present(newKey) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
     }
 
@@ -1423,9 +2022,32 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // change must propagate so every separator up the spine stays canonical (mirrors the cljs
     // Branch.$replace value-based test). _keys[idx] is still the OLD separator here (overwritten
     // below). See doc/merkle-search-tree.md.
+    // Whether the change must PROPAGATE to this node's parent. `_keys[idx]` is written
+    // unconditionally below, so the immediate separator is always fresh; this decides
+    // whether the GRANDPARENT's separator (= this branch's max = _keys[_len-1]) is stale.
+    //
+    // The test is VALUE equality, not `cmp`. Asking the OPERATION comparator whether the
+    // max moved is wrong whenever that comparator is coarser than the one routing will
+    // use — datahike's value-changing upsert searches [e a _ _], so `cmp.compare` returns
+    // 0 for a datom whose v changed, propagation was suppressed, and every ancestor kept
+    // a separator naming the OLD element. A later descent comparing the new element
+    // against that stale separator routes past the child that holds it.
+    //
+    // Measured before this fix (elements [i 0], set cmp on (i,v), op cmp on i alone,
+    // replace [i 0] -> [i 5] for every i, inside a transient): 9 unfindable at n=40 bf=4,
+    // 24 at n=100 bf=4, 46 at n=3000 bf=16 — `contains?` false for an element that seq
+    // still lists, in a set that is sorted and counts correctly. Through datahike at
+    // branching-factor 8, 375 of 3000 datoms were invisible to `d/datoms db :eavt e a v`.
+    // Only trees of THREE levels or more are affected: with two levels the parent is the
+    // root and its separator is the one written unconditionally.
+    //
+    // `Util.equiv` rather than `Objects.equals` deliberately. Datom implements `equiv`
+    // (Clojure `=`) but not `Object.equals`, so `Objects.equals` is identity there and
+    // would propagate on EVERY upsert. `equiv` propagates exactly when the element really
+    // changed, which is the cheapest test that is still correct.
     boolean maxKeyChanged = settings.boundary().contentDefined()
       ? !java.util.Objects.equals(newMaxKey, _keys[idx])
-      : (idx == _len - 1) && (0 != cmp.compare(newMaxKey, _keys[idx]));
+      : (idx == _len - 1) && separatorMoved(newMaxKey, _keys[idx]);
     IMeasure measureOps = settings.measure();
 
     // Transient: can modify in place
@@ -1442,7 +2064,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (measureOps != null && _measure != null) {
         _measure = tryComputeMeasure(storage);
       }
-      if (_settings.diffBufSize() > 0) depositReplace(storage, idx, oldKey, newKey, anchor0); // content-only: Absent(oldKey)+Present(newKey) / branch marker
+      if (_settings.diffBufSize() > 0) depositReplace(storage, idx, removedKey, newKey, anchor0); // Absent(removedKey)+Present(newKey) / branch marker
       if (maxKeyChanged)
         return new ANode[]{this};
       else
@@ -1477,7 +2099,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     }
     // The SAME snapshot's {slots, entries} pair — carried together so the successor
     // can never mix a pre-settle total with post-settle slots (or vice versa).
-    if (settings.diffBufSize() > 0) newBranch.carryAndDepositReplace(storage, s0.buf, idx, oldKey, newKey, anchor0); // content-only: Present(newKey)
+    if (settings.diffBufSize() > 0) newBranch.carryAndDepositReplace(storage, s0.buf, idx, removedKey, newKey, anchor0); // Absent(removedKey)+Present(newKey)
 
     return new ANode[]{newBranch};
   }
@@ -1737,9 +2359,27 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       for (int j = 0; j < c._len; j++) {
         Slot sl = (Slot) cSlots[j];
         if (sl == null) continue;
-        Object d = (sl.diff != null)
-            ? (c._level == 1 ? leafDiffForStorage(sl.diff) : sl.diff)   // leaf child ⇒ comparator-agnostic storage form
-            : assembleNested(storage, (Branch) c.child(storage, j));
+        // A null `anchor` means this child has NO durable base to diff against, so store()
+        // Pass 1 writes it WHOLESALE and `depositKV` leaves its diff null for exactly that
+        // reason. There is no buffered difference to assemble, at any level.
+        //
+        // `Slot`'s javadoc says a null diff marks "a BRANCH anchor marker", and the
+        // recursion below read it that way — casting the child to a Branch. But the
+        // anchor-null case produces a null diff on a LEAF child too, and then the cast is
+        // a ClassCastException out of a plain store. Measured: `c.level=1 j=22
+        // childClass=Leaf slotDiffNull=true slotAnchor=false`.
+        if (sl.anchor == null) continue;
+        Object d;
+        if (sl.diff != null) {
+          d = (c._level == 1) ? leafDiffForStorage(sl.diff) : sl.diff;  // leaf child ⇒ comparator-agnostic storage form
+        } else {
+          // Null diff WITH an anchor: the branch-anchor marker proper. A leaf child cannot
+          // be one — say so here rather than let the cast below report it three frames on.
+          assert c._level > 1
+              : "diff-buf: level-1 slot has a null diff but a non-null anchor — a leaf child "
+              + "cannot be a branch-anchor marker (slot " + j + " of a level-" + c._level + " branch)";
+          d = assembleNested(storage, (Branch) c.child(storage, j));
+        }
         // c._keys[j] = grandchild j's CURRENT (post-diff) separator; carry it so a reconstructed
         // (buffered) c restores its separators instead of keeping the anchor's stale ones.
         IPersistentMap entry = (IPersistentMap) PersistentHashMap.EMPTY
@@ -1837,17 +2477,157 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     }
     // The copy's slots REPLACE any slots base's own blob carried (parent's nested diff is
     // the complete superseding state — same semantics as the historical in-place install).
-    // ĝ.count / ĝ.measure — no child summing. The copy aliases base's addresses array
-    // (read-only by the shared-snapshot contract; the copy is sealed, never edited in
-    // place). installSlots on the unpublished copy is single-threaded by construction.
-    Branch<Key, Address> proj = new Branch<>(base._level, base._len, newKeys, baseAddresses,
+    // ĝ.count / ĝ.measure — no child summing. installSlots on the unpublished copy is
+    // single-threaded by construction.
+    //
+    // COPY the addresses array. This used to alias base's, justified as "read-only by the
+    // shared-snapshot contract; the copy is sealed, never edited in place" — an invariant
+    // that held only because a projected copy inherits `base._settings`, whose `_edit` is
+    // null, so it is never editable and `child(int,ANode)` (which writes
+    // `addresses[idx] = null` IN PLACE) never reaches it. That is a long chain of
+    // reasoning protecting a caching IStorage's shared node: datahike's CachedStorage
+    // returns the same object by address across tree versions, so one nulled entry there
+    // would make another version see a phantom dirty child. `newKeys` and `slots` are
+    // already allocated here, so this adds a third array copy of the same length to a
+    // function that allocates two — and removes the aliasing entirely rather than
+    // documenting why it is currently survivable.
+    Address[] projAddresses = (baseAddresses != null)
+        ? Arrays.copyOf(baseAddresses, baseAddresses.length) : null;
+    Branch<Key, Address> proj = new Branch<>(base._level, base._len, newKeys, projAddresses,
                                              null, sl.count, sl.measure, _projCmp, base._settings);
     proj.installSlots(slots, BUF_LAZY);
     return proj;
   }
 
+  /**
+   * A copy of this branch that projects under `projCmp` instead of `_projCmp`.
+   *
+   * Needed because `_projCmp` is a FIELD on a node that a caching IStorage shares by address.
+   * Two sets over one storage whose comparators order ties differently — `restore-by cmpA` and
+   * `restore-by cmpB` on the same root, or `restore` (which hard-codes DEFAULT_COMPARATOR)
+   * where `restore-by` was meant — both stamped the same object, and whichever ran last won.
+   * `projectLeaf` then rebuilt a buffered leaf's key array in the OTHER set's order.
+   *
+   * Measured before this copy, two sets over one storage at bf 8 / diff-buf 64 / n 60, reading
+   * interleaved so B re-stamps the shared root between two steps of A's lazy seq:
+   *
+   *     count 129 (correct)   seq sorted under cmp1: FALSE   first disorder at idx 18
+   *     contains? false for [8 1] [9 0] [14 1] [14 2] [15 0] — all present in seq
+   *
+   * and it does not stay in memory: one `conj` into the mis-sorted cached leaf, one `store`,
+   * and a cold reload through a fresh cache has one element PERMANENTLY unfindable — in `seq`,
+   * `contains?` false — because the branch separator no longer bounds it.
+   *
+   * The children array is deliberately NOT shared. Sharing it would defeat the whole copy:
+   * the cache holds children already projected under the other set's comparator, so the next
+   * level down would hand back the same mis-ordered leaves. Addresses and keys are copied for
+   * the reason `projectBranch` records — a shared node must not be reachable through an array
+   * another version can write. `buf` IS shared: slots are immutable snapshots, and this copy
+   * gets its own `_state`, so its CASes never touch the base's.
+   *
+   * Cost: nothing on the single-comparator path, which is every normal use — the callers copy
+   * only when a node already carries a DIFFERENT comparator, and they publish the copy, so it
+   * happens once per node rather than once per read.
+   */
+  /**
+   * This node if it can carry `projCmp`, otherwise a copy that does.
+   *
+   * The seed is a CAS, not a plain write, so two threads first-touching the same shared node
+   * with different comparators cannot both conclude "it was null, it is mine now". The loser
+   * re-reads and takes the copy — see the `_projCmp` field comment for the measurement.
+   */
+  Branch<Key, Address> stampOrCopy(Comparator projCmp) {
+    Comparator cur = _projCmp;
+    if (cur == projCmp) return this;
+    if (cur == null && PROJCMP_UPDATER.compareAndSet(this, null, projCmp)) return this;
+    // Either it already carried a different comparator, or we lost the seed race. Re-read:
+    // the winner may have stamped OUR comparator, in which case there is nothing to escape.
+    return (_projCmp == projCmp) ? this : withProjCmp(projCmp);
+  }
+
+  Branch<Key, Address> withProjCmp(Comparator projCmp) {
+    NodeState<Address> s = _state;
+    Address[] addrCopy = (s.addresses != null)
+        ? Arrays.copyOf(s.addresses, s.addresses.length) : null;
+    Key[] keysCopy = Arrays.copyOf(_keys, _keys.length);
+    // Carry over every child that has NO durable address. Dropping the children array
+    // wholesale is right for a child that can be restored from its address and wrong for one
+    // that cannot: a slot with `addresses[i] == null` and `children[i]` a bare dirty ANode is
+    // the ONLY reference to that subtree, and nulling it produced the state the invariant
+    // forbids — address null AND child null. Measured before this, root _len 7 with a null
+    // address at index 6, at diffBufSize 0 and 64 alike:
+    //     (seq copy)   -> AssertionError at Branch.child's precondition
+    //     (store copy) -> AssertionError "dirty child must be a bare resident ANode ..."
+    // and under -da an NPE or a silently truncated subtree. A dirty child is this version's
+    // own, not the storage cache's, so carrying the reference shares nothing that the
+    // fresh-children-array rule exists to keep separate.
+    Object[] childCopy = null;
+    if (s.children != null) {
+      for (int i = 0; i < _len; ++i) {
+        if ((addrCopy == null || addrCopy[i] == null) && s.children[i] != null) {
+          if (childCopy == null) childCopy = new Object[s.children.length];
+          childCopy[i] = s.children[i];
+        }
+      }
+    }
+    Branch<Key, Address> copy = new Branch<>(_level, _len, keysCopy, addrCopy, childCopy,
+                                             _subtreeCount, _measure, projCmp, _settings);
+    copy._state = new NodeState<>(addrCopy, childCopy, s.buf);
+    return copy;
+  }
+
+  // -ea ONLY: detect two threads settling the SAME node concurrently.
+  //
+  // `store()` publishes the settled per-child state with a PLAIN write, not a CAS, and it
+  // publishes BEFORE `storage.store(this)`. Both are correct under the documented contract —
+  // one settle at a time per LINEAGE (doc/CONCURRENCY.md) — and neither is safe if two threads
+  // settle versions that share dirty nodes. Structural sharing makes that easy to do by
+  // accident: measured on a pipelining-writer shape at bf 8 / n 1000, 3 Branch objects were
+  // reachable from BOTH roots and dirty in both, so storing either settles the same objects.
+  //
+  // The contract is not enforced and cannot cheaply be: serialising store() would cost every
+  // single-threaded caller. So this DETECTS instead. Both methods run only inside `assert`, so
+  // with -da the map is never touched and there is no field, no allocation and no lookup —
+  // exactly the trade the rest of this class makes (an assertion that costs nothing in
+  // production but fails loudly in a user's tests).
+  //
+  // Keyed by node identity: ANode/Branch/Leaf override neither equals nor hashCode, so the
+  // ConcurrentHashMap compares by identity and cannot conflate two distinct nodes.
+  //
+  // What it CANNOT catch: two threads settling DISJOINT trees over one storage (legal), and a
+  // race whose windows never overlap in a given run. It is a detector, not a proof.
+  private static final java.util.concurrent.ConcurrentHashMap<Object, Thread> SETTLING =
+      new java.util.concurrent.ConcurrentHashMap<>();
+
+  private boolean beginSettle() {
+    Thread me = Thread.currentThread();
+    Thread other = SETTLING.putIfAbsent(this, me);
+    if (other != null && other != me) {
+      throw new AssertionError(
+          "concurrent settle of the same node by " + me + " and " + other
+          + ". store() may run on one thread at a time per LINEAGE (in practice per storage), "
+          + "not per tree: two versions can share dirty nodes, and both settles publish with a "
+          + "plain write before serializing. See doc/CONCURRENCY.md.");
+    }
+    return true;
+  }
+
+  private boolean endSettle() {
+    SETTLING.remove(this);
+    return true;
+  }
+
   @Override
   public Address store(IStorage<Key, Address> storage) {
+    assert beginSettle();
+    try {
+      return storeImpl(storage);
+    } finally {
+      assert endSettle();
+    }
+  }
+
+  private Address storeImpl(IStorage<Key, Address> storage) {
     if (_settings.diffBufSize() <= 0) {                           // baseline ⇒ byte-identical (I0)
       // SETTLE, baseline: stage the whole {addresses, children} pair on LOCAL copies of
       // ONE snapshot and publish ONCE. This replaces the historical per-slot two-step
@@ -1880,6 +2660,22 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
             if (newChildren == s0.children) newChildren = Arrays.copyOf(s0.children, s0.children.length);
             newChildren[i] = _settings.makeReference(newChildren[i]);
           }
+        } else if (newChildren != null && newChildren[i] instanceof ANode) {
+          // CLEAN passthrough, but still a BARE (strong) child. `Branch.remove` writes an
+          // UNCHANGED sibling into its successor as a bare ANode while keeping that
+          // sibling's still-valid address (as.copyOne(s0.addresses[...]) next to
+          // cs.copyOne(nodes[...]) in every arm), and copy-on-write carries it into every
+          // later version. Skipping it here — the settle only ever wrapped null-address
+          // children — meant each disj permanently converted up to two slots per level on
+          // its path into strong references, so `:ref-type :soft`/`:weak` stopped bounding
+          // the tree. Measured at bf 16 over 20000 elements, :ref-type :soft: after 400
+          // disj and a store, {:ref 780, :bare-STRONG-with-address 119} — the 119 never
+          // shrink. Present at diffBufSize 0 too, so it predates diff-buf.
+          //
+          // Safe to wrap for the same reason Pass 2 is: the address is non-null and still
+          // durable, so a cleared reference reloads.
+          if (newChildren == s0.children) newChildren = Arrays.copyOf(s0.children, s0.children.length);
+          newChildren[i] = _settings.makeReference(newChildren[i]);
         }
       }
       if (dirty || s0.addresses == null) {
@@ -1900,6 +2696,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // but are left untouched (flushing them would require loading their anchor). The running
     // total stays <= B strictly. See doc/diff-buffering.md (Store / eviction policy).
     final int budget = _settings.diffBufSize();
+    refreshMarkerSlots(storage);   // D2
     assert assertBufEntries(storage);  // -ea oracle: delta-maintained total == fresh subtree walk
 
     // Single-snapshot / single-publish settle (see NodeState): all three passes read ONE
@@ -1914,6 +2711,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     final BufState b0 = s0.buf;
     final Object[] slots0 = (b0 != null) ? b0.slots : null;
     final Object[] children0 = s0.children;
+    // Declared here rather than at Pass 2: Pass 1 now also wraps clean passthrough children,
+    // so the copy-on-write array must exist before that loop.
+    Object[] newChildren = children0;
     final Address[] newAddresses = (s0.addresses != null)
         ? Arrays.copyOf(s0.addresses, s0.addresses.length)
         : (Address[]) new Object[_keys.length];
@@ -1931,6 +2731,16 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       Slot sl = (slots0 != null) ? (Slot) slots0[i] : null;
       if (newAddresses[i] != null) {
         if (sl != null) passthrough += slotBE(sl);             // clean buffered-passthrough subtree total
+        // Wrap a clean passthrough child that is still BARE, exactly as the baseline settle
+        // now does. `Branch.remove` writes an unchanged sibling into its successor as a bare
+        // ANode while keeping its still-valid address, so without this each disj ratchets
+        // more of the tree into permanently strong references and `:ref-type` stops
+        // bounding anything. Measured at bf 16 / 20000 elements / :ref-type :soft, before:
+        // after 400 disj and a store, {:ref 780, :bare-STRONG-with-address 119}.
+        if (newChildren != null && newChildren[i] instanceof ANode) {
+          if (newChildren == children0) newChildren = Arrays.copyOf(children0, children0.length);
+          newChildren[i] = _settings.makeReference(newChildren[i]);
+        }
         continue;
       }
       // addresses[i] == null: dirty this commit ⇒ child is resident; its slot is live (deposited).
@@ -1944,7 +2754,24 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       } else if (sl.bufEntries == BUF_WRITE) {                  // subtree rebalanced (poison) ⇒ must write
         writeList.add(i);
       } else {                                                  // content-only ⇒ bufferable
-        csz[i] = (int) sl.bufEntries;
+        // RESOLVE, don't read raw — the passthrough arm above already calls slotBE(sl) for
+        // exactly this quantity. A slot reconstructed from storage carries Slot.LAZY (-2)
+        // (the 4-arg Slot ctor), and the gate above only rejects BUF_WRITE (-1), so a LAZY
+        // slot on a dirty child fell through to here and was sized as -2. That is not a
+        // small error, it is a NEGATIVE size: `bufferable` sorts it first, the budget test
+        // `embedded + csz[i] <= budget` always passes, and `embedded += csz[i]` moves the
+        // running total BACKWARDS — so the per-node budget stops bounding the blob, and the
+        // -2 is then written back into the slot as its settled size.
+        //
+        // Measured, budget 1, a level-2 root whose slot 0 carries a real restored diff, that
+        // child made dirty: raw read buffered it (addresses[idx] == anchor, no write, slot
+        // persisted with bufEntries -2) where the real diff must flush; with slotBE it
+        // flushes. Not reached by the current suite — 0 hits over 38.8M child(int,ANode)
+        // calls across the diff-buf namespaces — because every path that dirties a child
+        // also re-deposits its slot with a computed size. That makes this a latent
+        // inconsistency rather than a live defect, and the reason to close it is that the
+        // two arms must not disagree about how to read the same field.
+        csz[i] = slotBE(sl);
         cnested[i] = (sl.diff != null) ? sl.diff                // leaf-diff, or restored-nested branch-diff
                    : assembleNested(storage, (Branch)(ANode) _settings.readReference(children0[i])); // live branch marker
         bufferable.add(i);
@@ -1956,6 +2783,20 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // Staged on newAddresses/newSlots, local copies — nothing is visible to other threads yet.
     bufferable.sort((x, y) -> Integer.compare(csz[x], csz[y]));
     Object[] newSlots = (slots0 != null) ? Arrays.copyOf(slots0, slots0.length) : null;
+    // Children are WRAPPED here, exactly as the baseline settle wraps them. Publishing
+    // `children0` unchanged (what this did before) left every child that had been dirty in
+    // any commit a bare STRONG reference from its parent, and copy-on-write carried that
+    // into every successor — so with diff-buf on, `:ref-type :soft`/`:weak` silently stopped
+    // bounding anything and the resident set ratcheted toward the whole tree. Measured, bf 8
+    // and `:ref-type :soft`: diff-buf 0 gave {:ref 5} at the root, diff-buf 256 gave
+    // {:bare-strong 5}.
+    //
+    // Both settled kinds are safe to wrap because both end up with a durable address:
+    // a BUFFERED child is re-pointed to its anchor and its assembled diff is written back
+    // into the slot just below, so a cleared reference is re-derived as
+    // restore(anchor) + project(slot) — which is precisely why that writeback exists. A
+    // FLUSHED child is written outright. Copy-on-write, so the published array is never the
+    // snapshot's own.
     int embedded = passthrough;
     for (int i : bufferable) {
       Slot sl = (Slot) slots0[i];
@@ -1963,8 +2804,48 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         newAddresses[i] = (Address) sl.anchor;                  // re-point to durable anchor (no write)
         newSlots[i] = new Slot(cnested[i], sl.count, sl.measure, sl.anchor, csz[i]); // write back assembled diff + its size
         embedded += csz[i];
+        if (newChildren != null && newChildren[i] instanceof ANode) {
+          if (newChildren == children0) newChildren = Arrays.copyOf(children0, children0.length);
+          newChildren[i] = _settings.makeReference(newChildren[i]);
+        }
       } else {
         writeList.add(i);                                       // doesn't fit ⇒ flush
+      }
+    }
+
+    // D3: the merge/borrow arms (`remove`'s join/borrow, `add`'s stitchSlots) concatenate two
+    // nodes' slot arrays without re-checking the budget, so `passthrough` alone can start above
+    // B — and Pass 2, which only ever flushes DIRTY children, can never bring it down. Measured
+    // over ~157k written blobs before this: worst case ≈ 2B (B=1→2, 2→4, 4→8, 8→12, 16→26) on
+    // ~0.1% of blobs. It does not compound (200 adversarial shrink/refill rounds stayed at ~2B)
+    // and content was always correct — but the comment below claims the running total stays
+    // within B strictly, and it did not.
+    //
+    // Flush already-settled children (clean passthrough and newly buffered alike — both now
+    // carry an address AND a slot; Pass 1's must-write and Pass 2's flushed children have a null
+    // address and so are correctly excluded) biggest-first until the total fits. Measured:
+    // needed on 0.05% of written blobs, +0..3 writes out of 750-3500, and every flushed child
+    // was already resident under :ref-type strong, soft AND weak — so the restore below is a
+    // fallback, not a read in practice.
+    if (embedded > budget) {
+      java.util.ArrayList<Integer> pt = new java.util.ArrayList<>();
+      for (int i = 0; i < _len; ++i)
+        if (newAddresses[i] != null && newSlots != null && newSlots[i] != null) pt.add(i);
+      final Object[] fs = newSlots;
+      pt.sort((x, y) -> Integer.compare(slotBE((Slot) fs[y]), slotBE((Slot) fs[x])));
+      for (int i : pt) {
+        if (embedded <= budget) break;
+        Object ref = (children0 != null) ? children0[i] : null;
+        ANode c = (ref != null) ? (ANode) _settings.readReference(ref) : null;
+        if (c == null) c = child(storage, i);                   // not resident ⇒ restore+project
+        embedded -= slotBE((Slot) newSlots[i]);
+        storage.markFreed((Address) newAddresses[i]);
+        newAddresses[i] = ((ANode<Key, Address>) c).store(storage);
+        newSlots[i] = null;
+        if (newChildren != null && newChildren[i] instanceof ANode) {
+          if (newChildren == children0) newChildren = Arrays.copyOf(children0, children0.length);
+          newChildren[i] = _settings.makeReference(newChildren[i]);
+        }
       }
     }
 
@@ -1975,6 +2856,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (sl != null && sl.anchor != null) storage.markFreed((Address) sl.anchor);
       newAddresses[i] = ((ANode<Key, Address>) child).store(storage);
       if (newSlots != null) newSlots[i] = null;
+      if (newChildren != null && newChildren[i] instanceof ANode) {
+        if (newChildren == children0) newChildren = Arrays.copyOf(children0, children0.length);
+        newChildren[i] = _settings.makeReference(newChildren[i]);
+      }
     }
     // Settle: this node now equals its durable object, whose remaining slots are exactly the
     // children we BUFFERED (passthrough + newly buffered) — the flushed ones were nulled. So
@@ -1983,9 +2868,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // ONE publish of the WHOLE per-child state replaces the old in-place address writes +
     // per-slot nulling + late total reset (the torn windows); it happens BEFORE
     // storage.store(this) so the serializer (slotsForStorage / addresses()) sees the
-    // settled state, exactly as the old in-place mutation did. children are unchanged by
-    // the diff-buf settle (no wrapping here — identical to the historical behavior).
-    _state = new NodeState<>(newAddresses, children0, new BufState(newSlots, embedded));
+    // settled state, exactly as the old in-place mutation did. children are WRAPPED per
+    // `:ref-type`, same as the baseline settle — see the staging comment above.
+    _state = new NodeState<>(newAddresses, newChildren, new BufState(newSlots, embedded));
     return storage.store(this);
   }
 

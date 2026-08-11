@@ -30,9 +30,23 @@
                       :elide-asserts false
                       :optimizations :advanced}}
   :ci ;shadow-cljs compile ci && node target/pss/ci-tests.js
+  ;; MUST track :node-tests. This build is what CI actually runs, and it had drifted
+  ;; into testing materially less than the local suite:
+  ;;
+  ;;   * no :closure-defines, so `default-diff-buf-size` fell back to the library
+  ;;     default of 0 — every test that does not pass :diff-buf-size explicitly ran
+  ;;     with buffering OFF. The diff-buf path is where BOTH cljs defects of this
+  ;;     cycle lived (the replace-deposit key, the nested-diff assembly), so CI could
+  ;;     never have caught either one.
+  ;;   * it also skipped `storage` and `generative`, plus `structural-invariants`,
+  ;;     which does not exist (a dead exclusion, already noted on :node-tests).
+  ;;
+  ;; The classpath comes from the shared :deps aliases above, so none of those
+  ;; exclusions was dependency-driven — they were just stale.
   {:target    :node-test
    :output-to "target/pss/ci-tests.js"
-   :ns-regexp "^(?!org.replikativ.persistent-sorted-set.test.stress|org.replikativ.persistent-sorted-set.test.storage|org.replikativ.persistent-sorted-set.test.structural-invariants|org.replikativ.persistent-sorted-set.test.generative)"
+   :ns-regexp "^(?!org.replikativ.persistent-sorted-set.test.stress)"
+   :closure-defines {org.replikativ.persistent-sorted-set/default-diff-buf-size 256}
    :compiler-options {:infer-externs true
                       :parallel-build false
                       :static-fns true

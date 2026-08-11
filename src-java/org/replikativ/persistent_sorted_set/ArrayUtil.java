@@ -18,7 +18,22 @@ public class ArrayUtil {
     return ret;
   }
 
+  /**
+   * Compacts `arr` in place to its distinct prefix under `cmp` and returns that prefix's length.
+   *
+   * The empty case must be spelled out: the loop below starts at index 1, so for a zero-length
+   * array it never runs and `to + 1` would report ONE distinct element in an array that has
+   * none. `from-sequential` — the only caller — then built a set from a 1-element array whose
+   * sole slot was null, so `(from-sequential compare [])` returned a set containing nil:
+   *
+   *     count 1, (= s #{}) false, (empty? s) false, (contains? s nil) true
+   *
+   * and the nil survived store/restore. That is the one value the set refuses to accept
+   * anywhere else — `from-sequential` itself throws on a nil ELEMENT. ClojureScript's
+   * `sorted-arr-distinct` short-circuits on `alength <= 1` and was always correct here.
+   */
   public static int distinct(Comparator<Object> cmp, Object[] arr) {
+    if (arr.length == 0) return 0;
     int to = 0;
     for (int idx = 1; idx < arr.length; ++idx) {
       if (cmp.compare(arr[idx], arr[to]) != 0) {

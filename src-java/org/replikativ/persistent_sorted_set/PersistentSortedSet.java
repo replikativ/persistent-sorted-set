@@ -19,7 +19,24 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   public static final PersistentSortedSet EMPTY = new PersistentSortedSet();
 
   public Address _address;
-  public Object _root; // Object == ANode | SoftReference<ANode> | WeakReference<ANode>
+  /** VOLATILE, and it is the publication point for `_settings` as well as for itself.
+   *
+   *  `root()` lazily restores, then ADJUSTS `_settings` (branching factor, boundary,
+   *  diff-buf budget) from what the restored node turns out to carry, then writes
+   *  `_root` last. Those settings writes reach another thread only if the write that
+   *  follows them is a release and the read that precedes reading them is an acquire.
+   *  Hence volatile here — and hence the local `rootRef` in `root()`/`store()`.
+   *
+   *  Reading it through `_settings.readReference(_root)` is NOT enough, and was the
+   *  actual defect: Java evaluates the RECEIVER first, so that expression reads
+   *  `_settings` BEFORE `_root`. The read order is then the exact inverse of the write
+   *  order, and a thread can pair the newly published root with the pre-adoption
+   *  settings. That needs no store reordering to happen, so it is reachable on x86 TSO
+   *  and not only on a weak model — a set then runs at the wrong branching factor over
+   *  the restored node, which is the overrun documented at `root()` below.
+   *
+   *  Object == ANode | SoftReference<ANode> | WeakReference<ANode> */
+  public volatile Object _root;
   public int _count;
   public int _version;
   // Not final: a lazily-restored root self-describes its split strategy (the boundary); root()
@@ -55,23 +72,163 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   }
 
   public ANode<Key, Address> root() {
-    assert _address != null || _root != null;
-    ANode root = (ANode<Key, Address>) _settings.readReference(_root);
+    // ACQUIRE FIRST. `_settings.readReference(_root)` would read `_settings` first — Java
+    // evaluates the receiver before the argument — and so could pair a published root with
+    // the settings from before this method adopted them. See the field's javadoc.
+    final Object rootRef = _root;
+    assert _address != null || rootRef != null;
+    ANode root = (ANode<Key, Address>) _settings.readReference(rootRef);
     if (root == null && _address != null) {
       root = _storage.restore(_address);
-      _root = _settings.makeReference(root);
+      // NOTE the publish of `_root` is at the END of this block, not here. Everything
+      // below adjusts `_settings` from what the restored node turns out to carry, and one
+      // arm of it THROWS. Publishing first made both of those skippable, because the
+      // `root == null` guard above means a second entry never re-runs them:
+      //
+      //   * the leafProcessor refusal degraded into silent data loss. Measured, single
+      //     threaded: 1st root() -> THREW, 2nd root() -> NO-THROW with the set left at
+      //     diffBufSize 0 over nodes carrying slots — precisely the state the refusal
+      //     exists to prevent. Every read and every write calls root(), so one `count`
+      //     was enough to arm it.
+      //   * the diff-buf and boundary adoptions became racy: another thread observing the
+      //     published `_root` before the `_settings` write proceeds at budget 0 over
+      //     buffered nodes, and its next write drops their buffered elements.
+      //
+      // Publishing last makes the adopted settings visible before anything can use the
+      // root, and makes the refusal fire on every call rather than only the first.
+      // `makeReference` reads only `_refType`, which none of the adjustments below
+      // change, so deferring it is behaviour-preserving for the reference kind.
+
+      // self-describing BRANCHING FACTOR, and it is not optional. The rebalance arms decide
+      // whether a merge FITS from the NODE's settings (`Leaf.java:250` `left._len + centerLen <=
+      // _settings.branchingFactor()`, and its three siblings, plus the Branch twins) while the
+      // resulting array is allocated from the SET's (`ANode.java:259` caps `newLen` at
+      // `settings.branchingFactor()` when editable). Nothing made the two agree, so a node bf
+      // LARGER than the set's overruns the array it was just given.
+      //
+      // Reachable through the shipped codec, which is what makes this urgent rather than
+      // theoretical: `impl.nodes/blob->leaf|blob->branch` rebuild every node with the
+      // `:branching-factor` recorded in its OWN blob, so simply reopening a store with a
+      // different `:branching-factor` than it was written with is enough. Measured, 2000
+      // elements written at bf 64 and reopened at bf 8, one transient `disj`:
+      //
+      //     AssertionError at ANode.<init>:23   (-ea)
+      //     ArrayIndexOutOfBoundsException: last destination index 31 out of bounds for
+      //     object array[8]  in Stitch.copyAll   (-da)
+      //
+      // The persistent path does not throw — it silently builds leaves of up to NODE-bf keys
+      // inside a set that believes it is bf 8, which is worse.
+      //
+      // Adopting is the same principle already applied to the boundary and the diff-buf budget
+      // just below: the data knows the number and the caller cannot be expected to. Unlike
+      // those two this adopts UNCONDITIONALLY rather than only upward from a default, because
+      // there is no safe way to run at a smaller bf over larger nodes.
+      // STAGE ALL THREE ADOPTIONS ON A LOCAL, PUBLISH ONCE. They used to be three chained
+      // read-modify-writes on `_settings` (bf, then boundary, then diff-buf), each reading
+      // what the previous one wrote. CONCURRENCY.md classified that as contract (a), "a
+      // benign idempotent single-word cache fill" — which it is not: two threads taking
+      // this path on the same set can both read the pre-adoption settings and the second
+      // write then LOSES the first adoption. Both threads compute the same targets, so the
+      // result is never a wrong value, but it can be a MISSING one, and the cost of each
+      // missing adoption is spelled out in the comments below — leaves larger than the set
+      // believes its branching factor to be, or "81 elements silently gone".
+      //
+      // Staging costs nothing (Settings.with* already allocates a new Settings per step;
+      // this just stops publishing the intermediates) and turns the whole block into one
+      // publish of a fully-formed value, which IS contract (a).
+      Settings adopted = _settings;
+
+      if (root._settings.branchingFactor() != adopted.branchingFactor()) {
+        adopted = adopted.withBranchingFactor(root._settings.branchingFactor());
+      }
+
       // self-describing boundary: a restored node carries its split strategy; adopt it so this
       // set's own conj/disj use the right splitter even when restore opts didn't specify one.
       // Idempotent for the root-handler restore path (settings already carry the boundary).
       IBoundary nodeBoundary = root._settings.boundary();
-      if (nodeBoundary.contentDefined() && !_settings.boundary().contentDefined()) {
-        _settings = _settings.withBoundary(nodeBoundary);
+      if (nodeBoundary.contentDefined() && !adopted.boundary().contentDefined()) {
+        adopted = adopted.withBoundary(nodeBoundary);
       }
+      // diff-buf: self-describing in exactly the same way, and adopted for a stronger
+      // reason. A node carries its own budget in its blob, so a set restored WITHOUT
+      // `:diff-buf-size` ran at 0 over nodes at N: reads were fine (projection is driven
+      // by the NODE's settings through child()), but the next write rebuilt through the
+      // set's settings and dropped every surviving sibling's buffered elements. Measured
+      // before this adoption, bf 16 / budget 512 / 6000 elements, a tree stored WITH
+      // slots and then restored bare: 81 elements silently gone; zero when the caller
+      // passed the budget. The caller cannot be expected to remember a number the data
+      // already knows.
+      //
+      // Adopts upward from 0 — including over an EXPLICIT 0, which the previous wording
+      // ("an explicit budget wins") got backwards. `Settings` cannot distinguish an
+      // explicit 0 from an unset one, but more importantly it must not: honouring a
+      // request for 0 over nodes that carry slots is exactly the state described above,
+      // where the next write drops their buffered elements. A caller asking for baseline
+      // over buffered data is asking to lose it, so the data wins.
+      //
+      // Consequence for tests, which is how this was found: pinning `:diff-buf-size 0`
+      // in the SET's opts does NOT give baseline once the storage hands back nodes that
+      // carry a budget — and the `:test` alias sets `-Dpss.diffBufSize=256`, so every
+      // node a default test storage reconstructs carries 256. A baseline test must give
+      // the STORAGE 0 as well; see test/diff_buf_restore_cycle.clj's node-settings.
+      //
+      // `withDiffBufSize` still refuses to enable buffering under a content-defined
+      // boundary.
+      if (adopted.diffBufSize() <= 0 && root._settings.diffBufSize() > 0) {
+        if (adopted.leafProcessor() != null) {
+          // A leafProcessor and diff-buf corrupt together (a deposit records one element, a
+          // processor rewrites the whole leaf), so adopting is unsafe — but refusing is only
+          // right when there is something to lose. Decide on what the subtree ACTUALLY
+          // carries, not on the budget it declares: `bufEntries()` is 0 when there is no
+          // buffer at all, and otherwise the subtree total, resolved from slots already in
+          // memory with no IO.
+          long buffered = (root instanceof Branch) ? ((Branch) root).bufEntries() : 0;
+          if (buffered > 0) {
+            throw new IllegalStateException(
+              "cannot open this store with a leafProcessor: its nodes declare a diff-buf budget of "
+              + root._settings.diffBufSize() + " and carry " + buffered + " buffered element(s), but a "
+              + "leafProcessor forces buffering OFF (the two corrupt together), so those elements "
+              + "would be dropped on the next write. Open it without a leafProcessor, or rewrite it "
+              + "with diff-buf off.");
+          }
+          // Nothing buffered ⇒ nothing to preserve ⇒ stay at 0 and carry on.
+        } else {
+          adopted = adopted.withDiffBufSize(root._settings.diffBufSize());
+        }
+      }
+      _settings = adopted;                     // ONE publish of the fully-adopted settings
+      _root = _settings.makeReference(root);   // PUBLISH LAST — see the note above
+    }
+    // A DIRTY root (no address) must be held strongly — see markDirty. If it is gone
+    // there is no durable copy to fall back on, so say so rather than dereference null
+    // three frames later.
+    if (root == null) {
+      throw new IllegalStateException(
+          "PersistentSortedSet has neither a resident root nor an address: a dirty root's "
+          + "reference was cleared. `_address == null` must imply a strongly-held root.");
     }
     // diff-buf: seed the projection comparator at the root; Branch.child propagates it down
     // as nodes materialize, so a leaf-parent can project buffered leaves with the set's
     // comparator. (Idempotent; no-op for a Leaf root, which has no buffered children.)
-    if (root instanceof Branch) ((Branch) root)._projCmp = _cmp;
+    // Seed it when the root carries none; COPY when it already carries a DIFFERENT one. The
+    // object in `_root` is whatever the IStorage returned, and a caching storage hands the
+    // same object to every set opened at that address — so an unconditional write here let
+    // the last set to call root() decide how every other set's buffered leaves are ordered.
+    // The copy is published into `_root`, so a conflicting pair costs one copy per set, not
+    // one per read; the single-comparator path is the same plain write it always was.
+    if (root instanceof Branch) {
+      Branch rb = (Branch) root;
+      ANode stamped = rb.stampOrCopy(_cmp);
+      if (stamped != rb) {
+        root = stamped;
+        // A DIRTY root (no address) must be held STRONGLY — there is no durable copy to fall
+        // back on, and the guard above throws IllegalStateException if its reference is ever
+        // cleared. Wrapping unconditionally demoted it: measured, `:soft` and `:weak` both
+        // turned the Branch into a Soft/WeakReference whose clear() then made the very next
+        // root() throw "a dirty root's reference was cleared". Same rule markDirty follows.
+        _root = (_address == null) ? root : _settings.makeReference(root);
+      }
+    }
     return root;
   }
 
@@ -369,7 +526,28 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
 
     IMeasure measureOps = _settings.measure();
     if (measureOps == null) {
-      throw new IllegalStateException("getNth requires measure to be configured");
+      // UNWEIGHTED: the nth ELEMENT by position, navigating the subtree counts the tree
+      // already maintains for countSlice. No measure needed, and none should be invented:
+      // requiring one here is what tempted `IMeasure.weight`'s old default to claim every
+      // entry weighed 1 — which is not a monoid homomorphism and made getNth answer null for
+      // every index above 0.
+      //
+      // Every element weighs exactly one, so the offset within the element is always 0.
+      long n = count();
+      if (rank < 0 || rank >= n) return null;
+      while (node instanceof Branch) {
+        Branch<Key, Address> branch = (Branch<Key, Address>) node;
+        boolean found = false;
+        for (int i = 0; i < branch._len; i++) {
+          ANode<Key, Address> child = branch.child(_storage, i);
+          long childCount = child.count(_storage);
+          if (rank < childCount) { node = child; found = true; break; }
+          rank -= childCount;
+        }
+        if (!found) return null;
+      }
+      if (outOffset != null) outOffset[0] = 0;
+      return ((Leaf<Key, Address>) node)._keys[(int) rank];
     }
 
     // Check bounds using root measure
@@ -424,7 +602,13 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     assert _storage != null;
 
     if (_address == null) {
-      ANode<Key, Address> root = (ANode) _settings.readReference(_root);
+      final Object rootRef = _root;   // acquire first — see the field's javadoc
+      ANode<Key, Address> root = (ANode) _settings.readReference(rootRef);
+      if (root == null) {
+        throw new IllegalStateException(
+            "PersistentSortedSet cannot be stored: it has no address and its root reference "
+            + "was cleared. `_address == null` must imply a strongly-held root (see markDirty).");
+      }
       address(root.store(_storage));
       _root = _settings.makeReference(root);
     }
@@ -432,6 +616,19 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     return _address;
   }
 
+  /** Attach `storage` and store whatever is not yet stored.
+   *
+   *  This does NOT copy an already-stored tree to a different backend, though the
+   *  signature invites that reading. `store()` returns early when `_address != null`,
+   *  so calling this with a second storage writes ZERO blobs and returns the FIRST
+   *  storage's address — a later restore from the second backend then fails on a
+   *  missing node. Verified.
+   *
+   *  It is left as-is deliberately: the address alone cannot say which backend it
+   *  belongs to, and two handles onto the same underlying store are a normal thing to
+   *  pass here (datahike constructs a CachedStorage per connection), so refusing on
+   *  identity would reject correct calls. To copy a tree to another backend, build a
+   *  fresh set there. */
   public Address store(IStorage<Key, Address> storage) {
     _storage = storage;
     return store();
@@ -516,11 +713,50 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     return result;
   }
 
+  /** INVARIANT: `_address == null` implies `_root` holds a STRONG reference.
+   *
+   *  A dirty root has no durable copy. If its Soft/WeakReference were cleared the
+   *  tree would be unrecoverable, and `root()`/`store()` would dereference null.
+   *  Every site that clears `_address` therefore publishes the root strongly, in
+   *  one place, rather than each remembering to.
+   *
+   *  This matters most for the EARLY_EXIT paths, where a node is mutated IN PLACE
+   *  and so no new root is produced to assign: those used to clear `_address` and
+   *  leave `_root` as whatever the last `store()` wrapped it in. That state was
+   *  not reachable through the public API when this was written — a just-stored
+   *  tree is not mutable in place, so the first mutation after a store always
+   *  returns a node — but nothing enforced it, and the cost of holding the
+   *  invariant is one assignment.
+   *
+   *  Note the reference type deliberately changes here: a dirty root is held
+   *  STRONGLY even when the set is configured `:soft`/`:weak`. That is the point.
+   *  A dirty root is the only copy in existence, so allowing the collector to take
+   *  it is never correct. */
+  /** Refuse a STALE TRANSIENT HANDLE — a set that was made transient and has since been
+   *  sealed by `persistent!`. Clojure throws here (`ensureEditable`, identical in
+   *  PersistentVector/HashMap/ArrayMap); this used to answer `editable() == false` and
+   *  quietly take the persistent path instead, returning a NEW set from what looked like
+   *  an in-place `conj!` — so the caller's mutation went somewhere they were not looking.
+   *
+   *  A set that was never transient has no edit reference and passes straight through. */
+  private void ensureLiveTransient() {
+    if (_settings.sealedTransient()) {
+      throw new IllegalAccessError("Transient used after persistent! call");
+    }
+  }
+
+  private void markDirty(ANode<Key, Address> root) {
+    _address = null;
+    _root = root;                      // bare node, never a Reference
+  }
+
   public PersistentSortedSet cons(Object key, Comparator cmp) {
     // nil is not a storable value (matches upstream persistent-sorted-set; nil would also be
     // ambiguous against the null "not found"/sentinel returns and comparator-dependent ordering).
     if (key == null) throw new IllegalArgumentException("PersistentSortedSet cannot store nil");
-    ANode[] nodes = root().add(_storage, (Key) key, cmp, _settings);
+    ensureLiveTransient();
+    final ANode<Key, Address> r = root();
+    ANode[] nodes = r.add(_storage, (Key) key, cmp, _settings);
 
     if (UNCHANGED == nodes) return this;
 
@@ -530,15 +766,15 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     }
 
     if (editable()) {
-      // Clear address - must always clear when tree is modified (including EARLY_EXIT case)
-      _address = null;
-
       if (1 == nodes.length) {
-        _root = nodes[0];
+        markDirty(nodes[0]);
       } else if (nodes.length >= 2) {
-        _root = growRoot(nodes);
+        markDirty(growRoot(nodes));
+      } else {
+        // EARLY_EXIT (nodes.length == 0): `r` was modified IN PLACE, so it is the
+        // new root and must be published strongly — see markDirty.
+        markDirty(r);
       }
-      // EARLY_EXIT case (nodes.length == 0): tree was modified in place, _address already cleared above
       // When processor is configured, count may differ from +1
       if (_settings.leafProcessor() != null) {
         long rootCount = getSubtreeCount(root());
@@ -569,6 +805,16 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   }
 
   public PersistentSortedSet disjoin(Object key, Comparator cmp) {
+    // BEFORE the mode split: a stale transient handle must be refused in BOTH modes. This used
+    // to sit below the content-defined arm, so `disj!` on a sealed handle took the MST path and
+    // silently degraded to a persistent remove — it returned a NEW set and left the handle the
+    // caller kept unchanged. Since discarding the return value is the whole point of a
+    // transient, the delete was lost with no signal. Measured, bf 8, 100 elements, a handle
+    // sealed by `persistent!`: count mode threw IllegalAccessError, MST returned a new set of
+    // count 99 while the stale handle still had 100 and still contained the key.
+    // `cons` and `replace` always guarded both modes; only this one did not.
+    ensureLiveTransient();
+
     // split-seam (MST/content mode): sibling-free removeContent recursion, then collapse a
     // single-child root (count path below is untouched / byte-identical).
     if (_settings.boundary().contentDefined()) {
@@ -591,7 +837,8 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       return new PersistentSortedSet(_meta, _cmp, null, _storage, newRoot, newCount, _settings, _version + 1);
     }
 
-    ANode[] nodes = root().remove(_storage, (Key) key, null, null, cmp, _settings);
+    final ANode<Key, Address> r = root();
+    ANode[] nodes = r.remove(_storage, (Key) key, null, null, cmp, _settings);
 
     // not in set
     if (UNCHANGED == nodes) return this;
@@ -603,9 +850,19 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
 
     // in place update
     if (nodes == EARLY_EXIT) {
-      // Clear address
-      _address = null;
-      _count = alterCount(-1);
+      // `r` was modified IN PLACE, so it is the new root and must be published
+      // strongly — see markDirty.
+      markDirty(r);
+      // When a processor is configured, count may differ from -1 — the same distinction
+      // `cons` makes above and the rebuild arms below. This arm returned early and so
+      // skipped the guard entirely; measured before the fix, count outran the elements by
+      // one per op (bf 8 / n 200: count 179, seq 178).
+      if (_settings.leafProcessor() != null) {
+        long rootCount = getSubtreeCount(root());
+        _count = (rootCount >= 0) ? (int) rootCount : -1;
+      } else {
+        _count = alterCount(-1);
+      }
       _version += 1;
       return this;
     }
@@ -662,7 +919,9 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       return disjoin(oldKey, cmp).cons(newKey, cmp);
     }
 
-    ANode[] nodes = root().replace(_storage, (Key) oldKey, (Key) newKey, cmp, _settings);
+    ensureLiveTransient();
+    final ANode<Key, Address> r = root();
+    ANode[] nodes = r.replace(_storage, (Key) oldKey, (Key) newKey, cmp, _settings);
 
     // Not in set
     if (UNCHANGED == nodes) return this;
@@ -674,8 +933,9 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
 
     // In-place update (transient)
     if (EARLY_EXIT == nodes) {
-      // Clear address
-      _address = null;
+      // `r` was modified IN PLACE, so it is the new root and must be published
+      // strongly — see markDirty.
+      markDirty(r);
       _version += 1;
       return this;
     }
@@ -683,9 +943,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     // New root node (persistent case or maxKey changed in transient)
     ANode newRoot = nodes[0];
     if (editable()) {
-      // Clear address
-      _address = null;
-      _root = newRoot;
+      markDirty(newRoot);
       _version += 1;
       return this;
     }
@@ -960,12 +1218,24 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     return cons(key, _cmp);
   }
 
+  /** Seal the transient and return the persistent set.
+   *
+   *  Returns a NEW PersistentSortedSet rather than `this`, as every Clojure transient
+   *  does. That is what lets a stale handle be DETECTED: while the two were the same
+   *  object, "the transient after persistent!" and "the persistent result" were
+   *  indistinguishable, so `conj!` on the stale handle could only degrade silently.
+   *  The result carries sealed settings (no edit reference); `this` keeps the sealed
+   *  edit reference and so answers `ensureLiveTransient` by throwing.
+   *
+   *  Shared nodes keep the old settings object, whose `editable()` is now false — which
+   *  is exactly the committed-node state they should be in. */
   public PersistentSortedSet persistent() {
     if (!editable()) {
       throw new IllegalStateException("Expected transient set");
     }
-    _settings.persistent();
-    return this;
+    Settings sealed = _settings.sealed();
+    _settings.persistent();                 // null the shared owner: this handle is now stale
+    return new PersistentSortedSet(_meta, _cmp, _address, _storage, _root, _count, sealed, _version);
   }
 
   // Iterable

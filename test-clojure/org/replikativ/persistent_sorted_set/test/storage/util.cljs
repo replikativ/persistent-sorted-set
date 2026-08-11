@@ -8,7 +8,20 @@
             [org.replikativ.persistent-sorted-set.impl.node :as node]
             [org.replikativ.persistent-sorted-set.btset :refer [BTSet]]
             [org.replikativ.persistent-sorted-set.leaf :refer [Leaf] :as leaf]
-            [org.replikativ.persistent-sorted-set.branch :refer [Branch] :as branch]))
+            [org.replikativ.persistent-sorted-set.branch :refer [Branch] :as branch]
+            [org.replikativ.persistent-sorted-set.impl.numeric-stats :as numeric-stats]))
+
+;; `:measure` is `pr-str`ed into the blob, so reading it back needs a reader for the record.
+;; This never mattered before: on ClojureScript the incremental path never gave any node a
+;; measure, so `:measure` was always nil in these blobs and the reader was never exercised.
+;; Once the measure bootstraps, an edn round-trip without this fails with
+;; "No reader function for tag ...NumericStats". The JVM test storage sidesteps it by not
+;; persisting `:measure` at all.
+(def ^:private edn-readers
+  {'org.replikativ.persistent-sorted-set.impl.numeric-stats.NumericStats
+   numeric-stats/map->NumericStats})
+
+(defn- read-blob [s] (edn/read-string {:readers edn-readers} s))
 
 (defn dbg [& args]
   nil)
@@ -47,7 +60,7 @@
     (assert (not (false? (:sync? opts))))
     (or
      (@*memory address)
-     (let [{:keys [keys addresses level measure slots] :as m} (edn/read-string (@*disk address))
+     (let [{:keys [keys addresses level measure slots] :as m} (read-blob (@*disk address))
            node (if addresses
                   (branch/from-map (assoc m :settings settings))
                   (Leaf. keys settings measure))
@@ -101,10 +114,27 @@
     (async
      (or
       (@*memory address)
-      (let [{:keys [keys addresses level measure] :as m} (edn/read-string (@*disk address))
+      (let [{:keys [keys addresses level measure slots] :as m} (read-blob (@*disk address))
             node (if addresses
                    (branch/from-map (assoc m :settings settings))
-                   (Leaf. keys settings measure))]
+                   (Leaf. keys settings measure))
+            ;; diff-buf: reconstruct per-child buffered diffs, exactly as the SYNC
+            ;; storage above does. This half was missing while `store` wrote
+            ;; `:slots` faithfully — a storage that persists buffered diffs and
+            ;; never reads them back, which is indistinguishable from a storage
+            ;; that lost them. It stayed invisible because the cljs set-level
+            ;; `:diff-buf-size` was being dropped by `select-keys`, so nothing
+            ;; buffered in the first place; with that fixed it showed up
+            ;; immediately as the async arm of the diff test reporting `:added []`
+            ;; where the sync arm reported the two added keys.
+            _    (when (and slots addresses)
+                   (let [arr (make-array (count keys))]
+                     (doseq [[idx entry] slots]
+                       (aset arr (int idx) {:diff    (:diff entry)
+                                            :count   (:count entry)
+                                            :measure (:measure entry)
+                                            :anchor  (nth (vec addresses) (int idx))}))
+                     (set! (.-_slots node) arr)))]
         (dbg "restored<" (type node) ">")
         (swap! *stats update :reads inc)
         (swap! *memory assoc address node)

@@ -100,8 +100,19 @@
                    (is (= (vec set-range) (vec (seq set-range)))) ;; checking IReduce on BTSetIter
                    (is (= (vec set-range) expected))
                    (is (= (into-via-doseq [] set-range) expected))
-                   (is (= (vec (rseq set-range)) (reverse expected)))
-                   (is (= (vec (rseq (rseq set-range))) expected))))
+                   ;; An EMPTY range is a legitimate outcome — `slice` answers nil, the way
+                   ;; `seq` does — and `rseq` cannot be called on it. This is reached about
+                   ;; once every few hundred runs, when the random [from,to] misses every
+                   ;; element (overwhelmingly when `xs` happens to hold a single distinct
+                   ;; value), and it made the suite intermittently NPE with a stack trace
+                   ;; that pointed at the library rather than at the test. Assert the nil
+                   ;; instead of dereferencing it.
+                   (if (nil? set-range)
+                     (is (empty? expected)
+                         "slice returned nil, so the expected range must be empty")
+                     (and
+                      (is (= (vec (rseq set-range)) (reverse expected)))
+                      (is (= (vec (rseq (rseq set-range))) expected))))))
                  (recur (rest ops))))
              true))
           (recur (inc i)))))))

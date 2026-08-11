@@ -13,19 +13,39 @@
    [clojure.string :as str]
    [org.replikativ.persistent-sorted-set :as set]
    #?(:cljs [org.replikativ.persistent-sorted-set.branch :refer [Branch]])
-   #?(:cljs [org.replikativ.persistent-sorted-set.leaf :refer [Leaf]]))
+   #?(:cljs [org.replikativ.persistent-sorted-set.leaf :refer [Leaf]])
+   #?(:cljs [org.replikativ.persistent-sorted-set.impl.measure :as measure])
+   #?(:cljs [org.replikativ.persistent-sorted-set.btset :as btset])
+   #?(:cljs [org.replikativ.persistent-sorted-set.impl.boundary :as b]))
   #?(:clj
      (:import
       [java.util Comparator]
-      [org.replikativ.persistent_sorted_set ANode Branch Leaf PersistentSortedSet Settings])))
+      [org.replikativ.persistent_sorted_set ANode Branch Leaf IMeasure PersistentSortedSet
+       Settings])))
 
 ;; =============================================================================
 ;; Platform-specific node access
 ;; =============================================================================
 
-(defn- get-root [set]
+(defn- get-root
+  "The root node, MATERIALIZED. On ClojureScript this must go through `btset/root-node`, not
+   `(.-root set)`: that field is nil until `-root` restores it, so every entry point here saw
+   an empty tree on a cold set and reported it healthy. Measured on a 5000-element cold
+   restore, identical for plain and MST trees:
+
+       validate / validate-full / validate-navigation / validate-counts-known
+       / validate-measures-known / validate-content   ALL true
+       validate-content called the user's content-fn ZERO times
+       tree-stats {:element-count 0 :leaf-count 0 :branch-count 0 :counts-known? true}
+       verification-coverage {:branches 0 :counts-verified 0 :counts-skipped 0}
+
+   The coverage line is the worst: that function exists so a caller can tell a real pass from
+   a vacuous one, and it reported NOTHING SKIPPED for a tree where nothing was looked at. One
+   `contains?` flipped the same set to {:branches 6 :counts-skipped 5}. The JVM half always
+   called the root() METHOD, which materializes, so this was a pure cross-runtime accident."
+  [set]
   #?(:clj  (.root ^PersistentSortedSet set)
-     :cljs (.-root set)))
+     :cljs (btset/root-node set)))
 
 (defn- get-cmp
   "Returns a callable comparator (IFn) for the set."
@@ -66,7 +86,14 @@
   [node i]
   #?(:clj
      (let [^Branch b node
-           children (.childrenArray b)]  ; one snapshot; read-only
+           ;; One snapshot PER CALL, read-only — not one per traversal. `children-seq`
+           ;; calls this once per index, so a walk over a branch takes N snapshots and can
+           ;; straddle a concurrent settle. That is acceptable HERE and only here: these
+           ;; are diagnostics, they never write, and a settle only ever replaces a null
+           ;; child with a restored one or a bare child with a Reference to it. Do not copy
+           ;; this pattern into the library proper, where the one-snapshot-per-method rule
+           ;; is what keeps a derived tree from baking in a torn pair.
+           children (.childrenArray b)]
        (when children
          (let [ref (aget ^objects children i)]
            (when ref
@@ -93,9 +120,26 @@
   #?(:clj  (.-_measure ^ANode node)
      :cljs (.-_measure node)))
 
-(defn- leaf-keys-array [node]
-  #?(:clj  (.-_keys ^ANode node)
-     :cljs (.-keys node)))
+(defn- leaf-keys-array
+  "The leaf's LIVE keys, truncated to `[0, _len)`.
+
+   It used to return `_keys` raw. `ANode` documents that array as valid only in `[0, _len-1]`
+   and `ANode.keys()` truncates; this was the one accessor that did not, and it feeds
+   `validate-content`, whose whole job is handing each leaf's keys to a user callback
+   (\"for Datahike: verify each datom exists in the expected index\").
+
+   After transient churn the surplus is about half the array. Measured, 20000 elements with
+   10000 random `disj!`: bf 8 gave 14903 slots for 10000 live elements (49% surplus), bf 64
+   and bf 512 gave 51%. Before tail-clearing landed those slots held the REMOVED elements, so
+   a \"does every datom still exist?\" callback was handed deleted datoms as live members;
+   since tail-clearing they are nil, so the same callback NPEs instead. Both are this
+   accessor's fault, not the caller's.
+
+   Persistent-only workloads never see it (no in-place shrink, no surplus), and neither does
+   ClojureScript, whose leaf arrays are exact — hence a churn-heavy transient probe to find it."
+  [node]
+  #?(:clj  (java.util.Arrays/copyOf ^objects (.-_keys ^ANode node) (nlen node))
+     :cljs (.slice (.-keys node) 0 (nlen node))))
 
 ;; =============================================================================
 ;; Invariant 1: Balanced tree (all leaves at same depth)
@@ -116,17 +160,47 @@
 ;; Invariant 2: Node sizes within [B/2, B] (except root)
 ;; =============================================================================
 
-(defn- check-sizes [node bf root?]
+(defn- content-defined?
+  "Does this node's own settings carry a content-defined (MST) boundary?"
+  [node]
+  #?(:clj  (.contentDefined (.boundary ^Settings (.-_settings ^ANode node)))
+     :cljs (boolean (b/content-boundary (.-settings node)))))
+
+(defn- check-sizes
+  "`[bf/2, bf]` for a B-tree; `len >= 1` for an MST tree, where `bf` is inert.
+
+   Under a content-defined boundary a node's size is decided by the hash level of its keys,
+   not by the branching factor, so the B-tree bound is the wrong invariant. It rejected
+   essentially every healthy MST tree — measured over n = 1..299, identical on both runtimes:
+   level-probability 2 and 3 threw for 297 of 299 sizes (from n=3), lzpl 4 for 248 of 299.
+   Per node at bf 32: 1582 of 1607 rejected at lzpl 2, 258 of 333 at lzpl 4 (44 of them as
+   :node-too-large). Since `validate-content` calls `validate-full` first, the Datahike-facing
+   entry point threw on MST too, so the only whole-tree oracle could not be aimed at MST at
+   all — the same blindness that hid a durable count corruption on the restore path earlier.
+
+   That `bf` is inert here is measured, not assumed: node lengths are IDENTICAL at bf 8, 32
+   and 512 for the same lzpl and n, with min 1, mean exactly 2^lzpl, and a max that grows with
+   n (123 at lzpl 4, n 50000). No fixed upper bound holds.
+
+   Dropping the bound loses little: an emptied leaf, a moved separator, a drifted count and a
+   shrunk leaf were all still caught by `check-separators` and `check-subtree-counts` in a
+   four-way injection test. `len >= 1` keeps the one case those two skip, since both bail on a
+   zero-length child."
+  [node bf root? mst?]
   (let [n (nlen node)
         min-bf (quot bf 2)
         errors (cond
+                 (and (not root?) mst? (< n 1))
+                 [{:error :node-too-small :level (nlevel node) :len n :min 1}]
+
+                 mst? []                       ; no upper bound exists under an MST boundary
                  root? []
                  (< n min-bf) [{:error :node-too-small :level (nlevel node) :len n :min min-bf}]
                  (> n bf) [{:error :node-too-large :level (nlevel node) :len n :max bf}]
                  :else [])]
     (if (branch? node)
       (reduce into errors
-              (map #(when % (check-sizes % bf false)) (children-seq node)))
+              (map #(when % (check-sizes % bf false mst?)) (children-seq node)))
       errors)))
 
 ;; =============================================================================
@@ -180,6 +254,30 @@
 ;; Invariant 5: Subtree counts consistent
 ;; =============================================================================
 
+(defn- deep-count
+  "Element count of `node`'s subtree computed from RESIDENT nodes only, or -1 when any part
+   of the subtree is not in memory. Never does IO: `child-node` returns nil for an absent
+   child rather than loading it.
+
+   Prefers a node's OWN cached count and descends only where it has none. That is induction
+   rather than laziness: every branch's cached count is itself verified at that branch by
+   `check-subtree-counts` recursing into it, so trusting it here does not create a hole, and
+   it keeps this from degenerating into a full tree walk at every level.
+
+   A Leaf always knows its count — `subtree-count*` answers its length — so the recursion
+   terminates and -1 can only ever mean a genuinely absent child."
+  [node]
+  (if (nil? node)
+    -1
+    (let [sc (subtree-count* node)]
+      (if (>= sc 0)
+        sc
+        (reduce (fn [acc c]
+                  (let [x (deep-count c)]
+                    (if (neg? x) (reduced -1) (+ acc x))))
+                0
+                (children-seq node))))))
+
 (defn- check-subtree-counts [node]
   (if (leaf? node)
     (let [sc (subtree-count* node)
@@ -187,26 +285,82 @@
       (if (not= sc n)
         [{:error :leaf-count-mismatch :count sc :actual-keys n}]
         []))
+    ;; A NON-RESIDENT child (nil) is not evidence of anything: its count lives in its own
+    ;; blob, and this node's count came from this node's blob. That is the ordinary state of
+    ;; every lazily-restored tree.
+    ;;
+    ;; It used to be mapped to the number 0, so `all-known?` stayed true and the branch's real
+    ;; count was compared against a sum of zeros. Every healthy cold-restored tree failed:
+    ;;
+    ;;     bf  8  n  200   validate true   validate-full :subtree-count-mismatch
+    ;;                                     {:branch-count 200, :children-sum 0}
+    ;;     bf  8  n 5000                   {:branch-count 5000, :children-sum 0}
+    ;;     bf 64  n  200 / 5000            same
+    ;;
+    ;; Nothing in the suite hit it because the in-tree test storage does not persist
+    ;; `:subtree-count`, so its restored branches carry -1 and the check skipped itself —
+    ;; the whole-tree oracle could not be run against the code path that most needs it.
+    ;;
+    ;; Mapping a missing child to -1 instead is NOT enough: that lands in the
+    ;; "known count, some child unknown" arm, which reported a different false positive on
+    ;; the same trees. A parent legitimately knows a count whose children are not loaded, and
+    ;; a resident Branch legitimately carries -1 ("lazy / post-split"), so neither case is a
+    ;; violation — both simply mean the sum CANNOT BE VERIFIED here. Skip, and keep
+    ;; descending into whichever children are resident.
     (let [sc (subtree-count* node)
           cs (children-seq node)
-          child-counts (mapv #(if % (subtree-count* %) 0) cs)
+          all-resident? (every? some? cs)
+          child-counts (mapv #(if % (subtree-count* %) -1) cs)
           all-known? (every? #(>= % 0) child-counts)]
       (into
        (cond
-         ;; Known count, all children known: verify sum
-         (and (>= sc 0) all-known?)
+         ;; Known count, every child resident AND self-describing: verify the sum. This is
+         ;; the only arm that can prove anything, and it is the one that catches a drift.
+         (and (>= sc 0) all-resident? all-known?)
          (let [expected (reduce + 0 child-counts)]
            (if (not= sc expected)
              [{:error :subtree-count-mismatch
                :level (nlevel node) :branch-count sc :children-sum expected}]
              []))
 
-         ;; Known count but some child unknown: violation
-         (and (>= sc 0) (not all-known?))
-         [{:error :count-known-child-unknown
-           :level (nlevel node) :branch-count sc :child-counts child-counts}]
+         ;; Every child RESIDENT, but at least one has no cached count of its own. This
+         ;; USED to be reported as `:count-known-child-unknown`, and that was wrong.
+         ;;
+         ;; The justification for reporting it searched only IN-MEMORY builds — bulk, conj,
+         ;; transient-conj, disj-churn — found the state never arose, and concluded it was
+         ;; not a legal state. It never looked at the RESTORE path, where it is completely
+         ;; ordinary: under diff-buf, `Branch.child` PROJECTS some children (projectBranch
+         ;; takes their count from the slot, so it is known) while their siblings restore
+         ;; plainly from a blob that carries no `:subtree-count` (so it is -1). A parent
+         ;; then legitimately has every child resident and only some of them
+         ;; self-describing. Measured: bf 4, diff-buf 128, n 200, transient conj + store +
+         ;; cold restore — 5 of 6 rounds reported 4-5 "violations" on a tree whose `count`,
+         ;; `seq` and contents were all exactly right.
+         ;;
+         ;; But the detection that arm was reinstated FOR is real: without it, a warm tree
+         ;; whose root count is wrong goes unnoticed when one resident child sits at -1.
+         ;; So rather than choose between a false positive and a blind spot, RESOLVE the
+         ;; unknown: a child with no cached count still has children of its own, and a leaf
+         ;; always knows its length. `deep-count` descends through resident nodes and
+         ;; answers -1 only when something genuinely is not in memory. That is strictly
+         ;; stronger than the old arm — it catches the drift the old arm caught, AND it
+         ;; catches drift the old arm could only shrug at — and it is silent on the lazy
+         ;; tree, which is not corrupt for being lazy.
+         (and (>= sc 0) all-resident? (not all-known?))
+         (let [resolved (mapv deep-count cs)]
+           (if (every? #(>= % 0) resolved)
+             (let [expected (reduce + 0 resolved)]
+               (if (not= sc expected)
+                 [{:error :subtree-count-mismatch
+                   :level (nlevel node) :branch-count sc :children-sum expected
+                   :resolved-by :deep-count}]
+                 []))
+             []))
 
-         ;; Branch has -1: fine (lazy / post-split)
+         ;; A child is NOT RESIDENT: its count lives in its own blob and cannot be seen from
+         ;; here. Unverifiable, not violated — this is the ordinary state of every lazily
+         ;; restored tree, and treating it as a violation is what made this check unusable
+         ;; against the restore path.
          :else [])
        (reduce into [] (map #(when % (check-subtree-counts %)) cs))))))
 
@@ -282,6 +436,68 @@
                      [])]
         (reduce into errors
                 (map #(when % (check-all-counts-known %)) (children-seq node))))))
+
+;; =============================================================================
+;; Invariant 9b: Cached measures AGREE with the subtree they summarize
+;; =============================================================================
+;;
+;; There was no such check anywhere. `validate-full`'s docstring has always said "including
+;; subtree counts, measures", but it ran `validate` + `check-subtree-counts` + navigation;
+;; the only measure code reachable from the public API was `check-all-measures-known`, which
+;; tests non-nil and nothing more. So a measure could be a WRONG NUMBER — the exact defect
+;; class of "a leaf shrunk by a sibling rebalance kept its pre-shrink measure" — and every
+;; validator in the tree would pass it.
+;;
+;; Verified bottom-up by induction, the same way the maintenance code computes: a leaf's
+;; measure is `identity` merged with each extracted key; a branch's is `identity` merged with
+;; its children's CACHED measures. Because every node is checked, a wrong child measure is
+;; caught at the child, so merging cached values at the parent loses nothing.
+;;
+;; Nothing is claimed where nothing can be seen: a nil cached measure means "not computed
+;; yet", which is legal everywhere, and a non-resident child means the parent's merge is
+;; unverifiable. Both skip rather than fail — the mistake that made the subtree-count check
+;; useless on restored trees.
+
+(defn- measure-ops [set]
+  (let [settings (get-settings set)]
+    #?(:clj  (.measure ^Settings settings)
+       :cljs (:measure settings))))
+
+(defn- m-identity [ops] #?(:clj (.identity ^IMeasure ops) :cljs (measure/identity-measure ops)))
+(defn- m-extract [ops k] #?(:clj (.extract ^IMeasure ops k) :cljs (measure/extract ops k)))
+(defn- m-merge [ops a b] #?(:clj (.merge ^IMeasure ops a b) :cljs (measure/merge-measure ops a b)))
+
+(defn- expected-measure
+  "The measure this node should carry, or ::unverifiable when it cannot be derived here."
+  [node ops]
+  (if (leaf? node)
+    (reduce (fn [acc i] (m-merge ops acc (m-extract ops (nkey node i))))
+            (m-identity ops)
+            (range (nlen node)))
+    (let [cs (children-seq node)
+          ms (mapv #(when % (node-measure %)) cs)]
+      (if (or (some nil? cs) (some nil? ms))
+        ::unverifiable
+        (reduce (fn [acc m] (m-merge ops acc m)) (m-identity ops) ms)))))
+
+(defn- check-measure-agreement [node ops]
+  (let [cached (node-measure node)
+        errors (if (nil? cached)
+                 []                       ; not computed yet — legal, no claim
+                 (let [expected (expected-measure node ops)]
+                   (cond
+                     (= ::unverifiable expected) []
+                     (= cached expected) []
+                     :else [{:error (if (branch? node)
+                                      :branch-measure-mismatch
+                                      :leaf-measure-mismatch)
+                             :level (nlevel node)
+                             :cached cached
+                             :expected expected}])))]
+    (if (branch? node)
+      (reduce into errors
+              (map #(when % (check-measure-agreement % ops)) (children-seq node)))
+      errors)))
 
 ;; =============================================================================
 ;; Invariant 10: All measures known (non-deterioration check)
@@ -401,7 +617,7 @@
       true
       (let [errors (concat
                     (check-balance root)
-                    (check-sizes root bf true)
+                    (check-sizes root bf true (content-defined? root))
                     (check-ordering root cmp)
                     (check-separators root cmp)
                     (check-root-shape root)
@@ -410,30 +626,133 @@
         (throw-errors errors "B-tree structural invariant violations")
         true))))
 
-(defn validate-full
-  "Full integrity check including subtree counts, measures, and element-wise
-   navigation. Every key in the tree is re-looked up from the root to verify
-   search paths are correct. Catches separator key corruption, comparator bugs,
-   and any issue where elements are structurally present but unreachable.
-   Returns true if valid, throws with structured error data."
+(defn fanout-profile
+  "The tree's SHAPE, bottom level first: a vector of vectors giving the element
+   count of every node at each level, root last.
+
+   Contents equality cannot see a shape difference — two trees holding the same
+   elements with different cuts are `=` and iterate identically, and differ only
+   in how they are stored. That difference is not cosmetic under
+   content-addressed storage, where the node bytes ARE the address: a different
+   cut is a different address, a different merkle root, and no node sharing
+   between two databases that hold the same data.
+
+   Reads only nodes already in memory (`child-node` returns nil for one that is
+   not), so it describes a resident tree and is not a substitute for walking
+   storage."
   [set]
-  (validate set)
   (let [root (get-root set)]
-    (when (and root (pos? (nlen root)))
-      (let [errors (check-subtree-counts root)]
-        (throw-errors errors "B-tree count/measure invariant violations"))
-      ;; Element-wise navigation check: every key must be findable via lookup
-      (let [all-keys (collect-all-keys root)
-            errors (reduce
-                    (fn [errs key]
-                      (let [found (set/lookup set key)]
-                        (if (nil? found)
-                          (clojure.core/conj errs {:error :key-not-found-via-lookup :key key})
-                          errs)))
-                    []
-                    all-keys)]
-        (throw-errors errors "Root-descend navigation verification failed")))
-    true))
+    (if (or (nil? root) (zero? (nlen root)))
+      []
+      (loop [level [root] acc []]
+        (let [widths (mapv subtree-count* level)
+              acc (clojure.core/conj acc widths)
+              kids (when (every? branch? level)
+                     (let [cs (into [] (mapcat children-seq) level)]
+                       (when (every? some? cs) cs)))]
+          (if (seq kids)
+            (recur kids acc)
+            (vec (reverse acc))))))))
+
+(defn validate-full
+  "Full integrity check including subtree counts and element-wise navigation. Every key in
+   the tree is re-looked up from the root to verify search paths are correct. Catches
+   separator key corruption, comparator bugs, and any issue where elements are structurally
+   present but unreachable. Returns true if valid, throws with structured error data.
+
+   MEASURES ARE NOT CHECKED unless you pass `{:check-measures? true}`, and the reason is
+   that the obvious check is only valid for SOME measures.
+
+   `check-measure-agreement` re-folds a leaf's keys from `identity` and compares the result
+   to the cached measure with `=`. But `IMeasure/remove` exists precisely so a measure can
+   be updated INCREMENTALLY — the shipped NumericStats subtracts from `sum` and `sumSq` and
+   only recomputes when min/max is invalidated — and floating-point addition is neither
+   associative nor exactly invertible. So for an inexact measure the cached value and the
+   re-folded value legitimately differ in the last bits, and an equality oracle calls that
+   corruption.
+
+   Measured, 72 shapes (bf 8/16/32/64/128/512 x n 100/200/500/1000 x 3 seeds), one transient
+   disj of interior elements: 55 of 72 reported a false `:leaf-measure-mismatch`, e.g.
+   cached sum 1593.6 vs expected 1593.5999999999995. Broken down by key type: `long` 0 of
+   24, `double` 15-17 of 24. Exact measures are fine; inexact ones are not, and this library
+   has no way to know which it was handed.
+
+   So the check is opt-in and its contract is on you: enable it only when your measure is
+   EXACT — integral counts, sums of integers, min/max of a totally ordered type — where
+   `merge` is associative and `remove` is exactly invertible. It has real teeth there (it
+   catches a wrong leaf measure and a wrong branch measure), which is why it is kept rather
+   than deleted. `validate-content` takes the same option and passes it through."
+  ([set] (validate-full set nil))
+  ([set {:keys [check-measures?] :or {check-measures? false}}]
+   (validate set)
+   (let [root (get-root set)]
+     (when (and root (pos? (nlen root)))
+       (let [errors (check-subtree-counts root)]
+         (throw-errors errors "B-tree count/measure invariant violations"))
+       (when check-measures?
+         (when-let [ops (measure-ops set)]
+           (throw-errors (check-measure-agreement root ops)
+                         "B-tree measure invariant violations")))
+       ;; Element-wise navigation check: every key must be findable via lookup
+       (let [all-keys (collect-all-keys root)
+             errors (reduce
+                     (fn [errs key]
+                       (let [found (set/lookup set key)]
+                         (if (nil? found)
+                           (clojure.core/conj errs {:error :key-not-found-via-lookup :key key})
+                           errs)))
+                     []
+                     all-keys)]
+         (throw-errors errors "Root-descend navigation verification failed")))
+     true)))
+
+(defn verification-coverage
+  "How much of `validate-full`'s count and measure checking actually ran.
+
+   `validate-full` cannot verify what it cannot see: a node whose children are not resident,
+   or whose cached count/measure is absent, is SKIPPED rather than failed. That is the only
+   correct behaviour — a lazily-restored tree is not corrupt for being lazy — but it means a
+   `true` can equally mean \"checked everything and it holds\" or \"could check nothing\".
+   The subtree-count check spent its whole life in the second state against restored trees
+   without anyone noticing, which is what this exists to make visible.
+
+   Returns `{:branches n :counts-verified n :counts-skipped n
+             :measures-verified n :measures-skipped n}`. A test that cares should assert
+   `counts-verified` is non-zero, not merely that `validate-full` returned true."
+  [set]
+  (let [root (get-root set)
+        ops  (measure-ops set)]
+    (if-not (and root (pos? (nlen root)))
+      {:branches 0 :counts-verified 0 :counts-skipped 0
+       :measures-verified 0 :measures-skipped 0}
+      (loop [[node & more] [root]
+             acc {:branches 0 :counts-verified 0 :counts-skipped 0
+                  :measures-verified 0 :measures-skipped 0}]
+        (if (nil? node)
+          acc
+          (let [branch? (branch? node)
+                cs      (when branch? (children-seq node))
+                ;; Mirrors `check-subtree-counts` EXACTLY, including its `deep-count`
+                ;; fallback — a child with no cached count of its own is still verifiable
+                ;; when its own subtree is resident. Before that fallback existed the two
+                ;; disagreed: a cold-restored diff-buf tree had nodes this function called
+                ;; `:counts-skipped` while the checker called them violations, so the pair
+                ;; could not both be right. They must move together or this stops describing
+                ;; the thing it claims to measure.
+                count-ok? (and branch?
+                               (>= (subtree-count* node) 0)
+                               (every? some? cs)
+                               (every? #(>= (deep-count %) 0) cs))
+                measure-ok? (and ops
+                                 (some? (node-measure node))
+                                 (not= ::unverifiable (expected-measure node ops)))
+                acc' (cond-> acc
+                       branch? (update :branches inc)
+                       (and branch? count-ok?) (update :counts-verified inc)
+                       (and branch? (not count-ok?)) (update :counts-skipped inc)
+                       (and ops measure-ok?) (update :measures-verified inc)
+                       (and ops (not measure-ok?)) (update :measures-skipped inc))]
+            (recur (concat (filter some? cs) more) acc')))))))
 
 (defn validate-counts-known
   "Verify every branch in the tree has a known subtree count (>= 0).
@@ -466,22 +785,27 @@
    or a map describing the error. For Datahike: verify each datom exists
    in the expected table/index.
 
-   Runs validate-full first, then walks all leaves."
-  [set content-fn]
-  (validate-full set)
-  (let [root (get-root set)]
-    (when (and root (pos? (nlen root)))
-      (letfn [(walk-leaves [node]
-                (if (leaf? node)
-                  (let [ks (leaf-keys-array node)
-                        error (content-fn ks)]
-                    (when error
-                      [error]))
-                  (reduce into []
-                          (map #(when % (walk-leaves %)) (children-seq node)))))]
-        (let [errors (walk-leaves root)]
-          (throw-errors errors "Content validation failed"))))
-    true))
+   Runs validate-full first, then walks all leaves.
+
+   Takes the same option map as `validate-full` and passes it through, so
+   `{:check-measures? true}` opts into measure checking here too — read that docstring
+   first, because the check is only valid for EXACT measures."
+  ([set content-fn] (validate-content set content-fn nil))
+  ([set content-fn opts]
+   (validate-full set opts)
+   (let [root (get-root set)]
+     (when (and root (pos? (nlen root)))
+       (letfn [(walk-leaves [node]
+                 (if (leaf? node)
+                   (let [ks (leaf-keys-array node)
+                         error (content-fn ks)]
+                     (when error
+                       [error]))
+                   (reduce into []
+                           (map #(when % (walk-leaves %)) (children-seq node)))))]
+         (let [errors (walk-leaves root)]
+           (throw-errors errors "Content validation failed"))))
+     true)))
 
 ;; =============================================================================
 ;; Root-descend verification

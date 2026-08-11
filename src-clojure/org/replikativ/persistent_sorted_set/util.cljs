@@ -86,32 +86,62 @@
          (arrays/array a2))
        (arrays/array a3)))))
 
-(defn rotate [node root? left right settings]
-  (let [min-len (/ (:branching-factor settings 32) 2)]
+(defn rotate
+  "Rebalance after a removal. Mirrors the JVM `Leaf.remove` / `Branch.remove` arms
+  EXACTLY — same underflow test, same arm order, same sibling choice, same split
+  point — because the two must build the same tree.
+
+  Three things differed before, all of them making ClojureScript rebalance where a
+  B-tree does not have to:
+
+  1. `min-len` was `(/ bf 2)`, and ClojureScript `/` is FLOAT division, so an odd
+     branching factor gave 7.5 where the JVM's `bf >>> 1` and `diagnostics`'
+     `(quot bf 2)` both give 7. `quot` now agrees with both.
+
+  2. The underflow test was `(> len min-len)` — i.e. rebalance when `len <= min`.
+     A node at exactly min fill is legally filled; the JVM leaves it alone
+     (`centerLen >= minBranchingFactor()`). Merging at min is not just extra work,
+     it THRASHES: a node at min joined with a sibling at min is exactly `bf`, so
+     the next insert splits it straight back, and every cycle rewrites O(bf) nodes
+     — which under content-addressed storage means new blobs and freed addresses,
+     not just CPU. Measured, bulk-built then delete every 3rd at bf 8: the JVM
+     shrank in place to `[4 x14, 5, 5]` (~52% full) while this merged to
+     `[8 8 8 8 6 6 8 8 6]` (~93% full), primed to split again.
+
+  3. The join and borrow arms asked different questions. The JVM joins when the
+     result FITS (`left.len + len <= bf`); this asked whether the sibling was
+     small (`left.len <= min-len`). And for redistribution the JVM borrows from
+     the LARGER sibling (`left.len >= right.len`); this took the SMALLER one.
+
+  Fixing (2) alone aligned 5 of 10 measured shapes with the JVM, including both
+  bulk cases; the rest needed (3)."
+  [node root? left right settings]
+  (let [bf      (:branching-factor settings 32)
+        min-len (quot bf 2)
+        len     (node/len node)]
     (cond
-    ;; root never merges
+      ;; root never merges
       root?
       (return-array node)
 
-    ;; enough keys, nothing to merge
-      (> (node/len node) min-len)
+      ;; at or above min fill, or no sibling to work with: nothing to do
+      (or (>= len min-len) (and (nil? left) (nil? right)))
       (return-array left node right)
 
-    ;; left and this can be merged to one
-      (and left (<= (node/len left) min-len))
-      (return-array (node/merge left node) right)
+      ;; join with left if the result fits
+      (and left (<= (+ (node/len left) len) bf))
+      (return-array nil (node/merge left node) right)
 
-    ;; right and this can be merged to one
-      (and right (<= (node/len right) min-len))
-      (return-array left (node/merge node right))
+      ;; join with right if the result fits
+      (and right (<= (+ len (node/len right)) bf))
+      (return-array left (node/merge node right) nil)
 
-    ;; left has fewer nodes, redestribute with it
-      (and left (or (nil? right)
-                    (< (node/len left) (node/len right))))
+      ;; borrow from left when it is the larger sibling (or the only one)
+      (and left (or (nil? right) (>= (node/len left) (node/len right))))
       (let [nodes (node/merge-split left node)]
         (return-array (arrays/aget nodes 0) (arrays/aget nodes 1) right))
 
-    ;; right has fewer nodes, redestribute with it
+      ;; otherwise borrow from right
       :else
       (let [nodes (node/merge-split node right)]
         (return-array left (arrays/aget nodes 0) (arrays/aget nodes 1))))))

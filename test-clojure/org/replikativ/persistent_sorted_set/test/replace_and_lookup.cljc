@@ -1,7 +1,11 @@
 (ns org.replikativ.persistent-sorted-set.test.replace-and-lookup
   (:require
    [org.replikativ.persistent-sorted-set :as set]
-   [clojure.test :as t :refer [is are deftest testing]]
+   ;; Used fully-qualified at the case-insensitive comparator below. It resolved transitively
+   ;; on both runtimes without this, which is one dependency-graph change away from a compile
+   ;; error under :advanced.
+   [clojure.string]
+   [clojure.test :refer [is deftest testing]]
    #?(:cljs [org.replikativ.persistent-sorted-set.btset :as btset])
    #?(:cljs [org.replikativ.persistent-sorted-set.impl.numeric-stats :as numeric-stats]))
   #?(:clj (:import [org.replikativ.persistent_sorted_set PersistentSortedSet NumericStats NumericStatsOps])))

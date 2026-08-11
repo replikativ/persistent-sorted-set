@@ -8,7 +8,10 @@
 (def org "replikativ")
 (def lib 'org.replikativ/persistent-sorted-set)
 (def current-commit (b/git-process {:git-args "rev-parse HEAD"}))
-(def version (format "0.4.%s" (b/git-count-revs nil)))
+;; The patch component is the commit count, so it keeps rising across a minor bump:
+;; 0.4.139 was the last 0.4 release and the first 0.5 one is 0.5.<count> — ordered, and
+;; every commit stays releasable. See CHANGES.md 0.5.x for why this is 0.5 and not 0.4.
+(def version (format "0.5.%s" (b/git-count-revs nil)))
 (def class-dir "target/classes")
 (def basis (b/create-basis {:project "deps.edn"}))
 (def jar-file (format "target/%s-%s.jar" (name lib) version))

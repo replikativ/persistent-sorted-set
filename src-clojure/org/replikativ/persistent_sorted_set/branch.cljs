@@ -67,13 +67,34 @@
     (Leaf. (into-array (vals m1)) (.-settings base) nil)))
 
 (defn- project-branch
-  "Push one level down: install the nested diff as base's own _slots (each grandchild's
-  diff + ĝ, anchored at base's durable child address) and set base's aggregates from ĝ.
-  Grandchildren project lazily on their own descent. Mirrors JVM Branch.projectBranch."
-  [^Branch base sl]
+  "Push one level down onto a COPY — never mutate `base`. Mirrors JVM
+  Branch.projectBranch, whose comment is the reference explanation for why.
+
+  Caching IStorage impls (datahike's CachedStorage, and this project's own test
+  storage) return restored nodes SHARED BY ADDRESS across tree versions, and this
+  projection is VERSION-SPECIFIC: consecutive commits buffer against the same
+  durable anchor with different accumulated diffs, so version N's exact child at
+  address B is the very object version N+1 projects {B, δ} onto. This used to
+  install slots, rewrite separators, count and measure directly on `base` and
+  return it, which leaked one version's projection into every other version's
+  reads. Measured on cljs before the fix (bf 8, 4000 elements, diff-buf 512, one
+  cache shared across two versions): v2 missing 115-121 elements, v1 missing
+  64-65, in both read orders; zero at diff-buf 0 and zero with a non-caching
+  storage. The JVM had and fixed the same bug (#19).
+
+  `children` stays nil on the copy: a grandchild with a nested slot must be
+  projected by the copy's own descent, and a passthrough grandchild re-restores
+  through the (pristine) cache. Leaving base's children in place handed version
+  N's already-projected grandchild to version N+1.
+
+  The copy aliases base's `addresses` — read-only by the shared-snapshot
+  contract — and takes the PARENT's projection comparator, since that is whose
+  diff is being projected."
+  [^Branch base sl proj-cmp]
   (let [diff      (:diff sl)
         base-keys (.-keys base)
         base-addr (.-addresses base)
+        new-keys  (arrays/aclone base-keys)
         slots     (make-array (arrays/alength base-keys))]
     (doseq [[k entry] (seq diff)]
       (let [i  (int k)
@@ -82,14 +103,81 @@
                        :count   (long (:count entry))
                        :measure (:measure entry)
                        :anchor  (arrays/aget base-addr i)})   ; anchor = grandchild's durable address
-        ;; Restore the separator: base came from the anchor whose _keys[i] is the PRE-diff
-        ;; max; the diff changed child i's max, so fix the separator here (the verified read bug).
+        ;; Restore the separator ON THE COPY: base came from the anchor whose _keys[i] is
+        ;; the PRE-diff max; the diff changed child i's max, so fix the separator here
+        ;; (the verified read bug) — without writing through to the shared node.
         (when (some? mk)
-          (arrays/aset base-keys i mk))))
-    (set! (.-_slots base) slots)
-    (set! (.-subtree-count base) (long (:count sl)))   ; ĝ.count — no child summing
-    (set! (.-_measure base) (:measure sl))             ; ĝ.measure
-    base))
+          (arrays/aset new-keys i mk))))
+    ;; _bufEntries -2 = LAZY, derived from the slots on first read (mirrors from-map).
+    ;; COPY the addresses array rather than aliasing base's. The JVM twin took this trade for
+    ;; the reason recorded at `Branch.projectBranch`: a caching IStorage returns the same
+    ;; object per address across versions, so any in-place write through this array would be
+    ;; seen by every other version. On this runtime the write-through is reachable — not
+    ;; under a consistent budget (a projected copy's `pass` equals the nested diff the parent
+    ;; buffered, and the parent only buffered it because it fit), but under a BUDGET
+    ;; MISMATCH: `install-slots!` refuses only a non-positive budget and `-root` adopts a
+    ;; node's budget only upward from 0, so a store written at `:diff-buf-size 512` whose
+    ;; storage rebuilds nodes at 8 gives a copy `pass` > `budget`, and the D3 over-budget
+    ;; flush writes `(aset addrs i ...)` in place. This function already allocates two arrays
+    ;; of this length; a third removes the reasoning chain entirely.
+    (Branch. (.-level base) new-keys nil (arrays/aclone base-addr)
+             (long (:count sl))                      ; ĝ.count — no child summing
+             (:measure sl)                           ; ĝ.measure
+             (.-settings base) slots -2 proj-cmp)))
+
+(defn with-proj-cmp
+  "A copy of `base` that projects under `proj-cmp` instead of its own `_projCmp`.
+
+   The ClojureScript half of the JVM's `Branch.withProjCmp`. `_projCmp` is a FIELD on a node
+   that a caching storage shares by address, so two sets over one storage whose comparators
+   order ties differently were overwriting each other's stamp, and whichever read last won.
+   `project-leaf` then rebuilt a buffered leaf's key array in the OTHER set's order.
+
+   Measured on the JVM before the equivalent fix, and the same shape applies here: count
+   correct, `seq` NOT sorted under the first set's comparator, `contains?` false for elements
+   present in `seq`, and — after one `conj` into the mis-sorted cached leaf plus a `store` —
+   an element permanently unfindable on a cold reload, because the branch separator no longer
+   bounds it.
+
+   The children array is NOT shared: it holds children already projected under the other
+   comparator, which is the whole thing being escaped. Children with NO durable address are
+   the exception and must be carried over — such a child is reachable only through this
+   array, and dropping it loses the subtree. Keys and addresses are copied; `_slots` and
+   `_bufEntries` are shared, since slots are immutable snapshots.
+
+   Copy rather than refuse: two semantically identical comparators are routinely distinct
+   objects (any caller building `(fn [a b] ...)` per restore) and they order the leaf
+   identically, so throwing there would break correct code."
+  [^Branch base proj-cmp]
+  (let [ks    (.-keys base)
+        n     (arrays/alength ks)
+        addrs (.-addresses base)
+        kids  (.-children base)
+        addr-copy (when (some? addrs) (arrays/aclone addrs))
+        kid-copy  (when (some? kids)
+                    (let [out (make-array (arrays/alength kids))]
+                      (dotimes [i n]
+                        (when (and (or (nil? addr-copy) (nil? (arrays/aget addr-copy i)))
+                                   (some? (arrays/aget kids i)))
+                          (aset out i (arrays/aget kids i))))
+                      out))]
+    (Branch. (.-level base) (arrays/aclone ks) kid-copy addr-copy
+             (.-subtree-count base) (.-_measure base) (.-settings base)
+             (.-_slots base) (.-_bufEntries base) proj-cmp)))
+
+(defn stamp-proj-cmp
+  "Seed `node`'s projection comparator, or return a COPY when it already carries a different
+   one. Returns the node to use. Both stamp sites — `btset/-root` and `branch/child`'s
+   restore arm — used to `set!` unconditionally onto the object the storage handed back."
+  [node proj-cmp]
+  (if-not (instance? Branch node)
+    node
+    (let [^Branch b node
+          cur (.-_projCmp b)]
+      (cond
+        (nil? cur) (do (set! (.-_projCmp b) proj-cmp) b)
+        (identical? cur proj-cmp) b
+        :else (with-proj-cmp b proj-cmp)))))
 
 (defn- project-child
   "Project a freshly-restored child against this parent's buffered slot (if any). Returns
@@ -101,7 +189,7 @@
       ;; operation/navigation comparator that drove the descent. Mirrors JVM Branch.child.
       (if (instance? Leaf base)
         (project-leaf base (:diff sl) (.-_projCmp node))
-        (project-branch base sl))
+        (project-branch base sl (.-_projCmp node)))
       base)))
 
 (defn ensure-children
@@ -115,6 +203,40 @@
   (when (nil? (.-addresses this))
     (set! (.-addresses this) (make-array (alength (.-keys this)))))
   (.-addresses this))
+
+(defn install-slots!
+  "diff-buf restore: install reconstructed slots on a not-yet-published node. The single
+   entry point for a storage/codec handing buffered diffs back to a restored Branch —
+   the ClojureScript twin of JVM `Branch.installSlots`, including its refusal.
+
+   A node carrying buffered diffs whose SETTINGS say buffering is off is an incoherent
+   reconstruction: the storage persisted `:slots` and is now rebuilding the node declaring
+   there is no buffer. Every read of it is then subtly wrong rather than loudly broken —
+   `store` takes the baseline path at budget 0 and writes the node WITHOUT its slots, so
+   the buffered element-changes are silently dropped. Measured on cljs before this check,
+   a restored root with 7 buffered slots whose contents were exact beforehand: one conj,
+   then store and cold restore, lost 13 previously committed elements.
+
+   The JVM has refused this since `Branch.java`'s installSlots; ClojureScript accepted it
+   and lost the data, so the same storage-contract violation was loud on one runtime and
+   silent on the other.
+
+   Refused rather than accommodated, for the same reason as on the JVM: the settings are
+   the storage's to get right — they come from the blob the storage itself wrote — and a
+   library that silently returns the wrong set is worse than one that says which half of
+   the contract was broken."
+  [node slots]
+  (when (and (some? slots)
+             (not (pos? (or (:diff-buf-size (.-settings node)) 0))))
+    (throw (ex-info (str "diff-buf: a node reconstructed with diff-buf-size "
+                         (pr-str (:diff-buf-size (.-settings node)))
+                         " was handed buffered slots. The storage persisted this node's "
+                         "diff buffer and must reconstruct it with the same budget — see "
+                         "IStorage restore and :diff-buf-size.")
+                    {:diff-buf-size (:diff-buf-size (.-settings node))
+                     :slot-count    (count (remove nil? (array-seq slots)))})))
+  (set! (.-_slots node) slots)
+  node)
 
 (defn child
   [^Branch node storage idx {:keys [sync?] :or {sync? true} :as opts}]
@@ -132,13 +254,17 @@
                    (let [addr (aget (.-addresses node) idx)
                          _    (assert (some? addr) "expected address to restore child")
                          _    (assert (some? storage) "expected storage")
-                         base (await (storage/restore storage addr opts))
+                         base0 (await (storage/restore storage addr opts))
                          ;; diff-buf: propagate the set's projection comparator down to the
                          ;; restored branch (the storage layer has no comparator), so a
                          ;; leaf-parent projects its buffered leaves with the set's own
                          ;; comparator — independent of the op that drove this descent.
-                         _    (when (instance? Branch base)
-                                (set! (.-_projCmp base) (.-_projCmp node)))
+                         ;; SEED it when the node carries none; COPY when it carries a
+                         ;; different one, because `base0` is the object the storage returned
+                         ;; and a caching storage shares it by address across sets. Writing
+                         ;; unconditionally is what let one set's comparator decide another
+                         ;; set's leaf order — see `with-proj-cmp`.
+                         base (stamp-proj-cmp base0 (.-_projCmp node))
                          ;; diff-buf: project this parent's buffered diff onto the freshly
                          ;; loaded child (leaf: rebuild keys; branch: install nested _slots).
                          c    (project-child node storage idx base)]
@@ -162,14 +288,31 @@
    address))
 
 (defn- $count
+  "Element count of this subtree.
+
+   A branch already KNOWS this most of the time: `subtree-count` is maintained by the
+   write paths and round-trips through the blob (`impl.nodes/branch->blob` writes it,
+   `blob->branch` reads it back), so a restored root can answer in O(1) without touching
+   storage. This used to recurse unconditionally, which made `count` on a stored set load
+   the ENTIRE tree — where the JVM (`Branch.count`, which returns `_subtreeCount` when it
+   is >= 0) loads one node. `-1` means genuinely unknown and is the only case that walks.
+
+   Deliberately NOT caching the walked result back into `subtree-count`, unlike the JVM.
+   The JVM can, because its in-place transient arms maintain the field; the ClojureScript
+   Branch has no in-place arms at all, so nothing here would keep a cached value honest
+   through a later mutation, and `btset/$count` already memoizes at the SET level (`.-cnt`)
+   which is where the repeated-call win actually comes from."
   [^Branch node storage {:keys [sync?] :or {sync? true} :as opts}]
   (async+sync sync?
               (async
-               (let [*cnt (atom 0)]
-                 (dotimes [i (alength (.-keys node))]
-                   (let [c (await (child node storage i opts))]
-                     (swap! *cnt + (await (node/$count c storage opts)))))
-                 @*cnt))))
+               (let [known (.-subtree-count node)]
+                 (if (>= known 0)
+                   known
+                   (let [*cnt (atom 0)]
+                     (dotimes [i (alength (.-keys node))]
+                       (let [c (await (child node storage i opts))]
+                         (swap! *cnt + (await (node/$count c storage opts)))))
+                     @*cnt))))))
 
 (defn- $contains?
   [^Branch node storage key cmp {:keys [sync?] :or {sync? true} :as opts}]
@@ -430,7 +573,7 @@
   "split-seam (MST): given the merged separators/children after absorbing a child split,
    cut at boundary keys (≤2-way for one incremental insert). Mirrors the JVM Branch.add seam
    path. MST forces diff-buf off, so no slots/addresses bookkeeping (anchorless re-store)."
-  [^Branch this bd new-keys new-children ins key]
+  [^Branch this bd new-keys new-children new-addrs ins key]
   (let [settings    (.-settings this)
         lvl         (.-level this)
         measure-ops (:measure settings)
@@ -440,15 +583,16 @@
     (if (nil? lens)
       (let [old-sc (.-subtree-count this)
             new-sc (if (>= old-sc 0) (inc old-sc) -1)
-            m      (when (and measure-ops (.-_measure this))
+            m      (when (and measure-ops (some? (.-_measure this)))
                      (measure/merge-measure measure-ops (.-_measure this) (measure/extract measure-ops key)))]
-        (arrays/array (Branch. lvl new-keys new-children nil new-sc m settings nil 0 (.-_projCmp this))))
+        (arrays/array (Branch. lvl new-keys new-children new-addrs new-sc m settings nil 0 (.-_projCmp this))))
       (loop [out (transient []), pos 0, ls lens]
         (if (seq ls)
           (let [l    (first ls)
                 kseg (.slice new-keys pos (+ pos l))
                 cseg (.slice new-children pos (+ pos l))
-                m    (when (and measure-ops (.-_measure this))
+                aseg (when new-addrs (.slice new-addrs pos (+ pos l)))
+                m    (when (and measure-ops (some? (.-_measure this)))
                        (reduce (fn [acc child]
                                  (if (nil? acc)
                                    (reduced nil)
@@ -456,7 +600,7 @@
                                      (if cs (measure/merge-measure measure-ops acc cs) (reduced nil)))))
                                (measure/identity-measure measure-ops) cseg))
                 sc   (try-compute-subtree-count-from-children cseg l)]
-            (recur (conj! out (Branch. lvl kseg cseg nil sc m settings nil 0 (.-_projCmp this)))
+            (recur (conj! out (Branch. lvl kseg cseg aseg sc m settings nil 0 (.-_projCmp this)))
                    (+ pos l) (next ls)))
           (arrays/into-array (persistent! out)))))))
 
@@ -482,7 +626,15 @@
                            new-children     (util/splice children idx (inc idx) nodes)
                            nodes-len        (arrays/alength nodes)]
                        (if bd
-                         (mst-branch-add this bd new-keys new-children idx key)
+                         ;; PROBE FIX: preserve unchanged siblings' durable addresses across the
+                         ;; MST rebuild, mirroring the JVM's allAddresses Stitch (copyAll +
+                         ;; copyOne(null) per new node). Also free the split child's old blob.
+                         (let [mst-addrs (when addrs
+                                           (util/splice addrs idx (inc idx)
+                                                        (arrays/make-array nodes-len)))]
+                           (when (and storage addrs (aget addrs idx))
+                             (storage/markFreed storage (aget addrs idx)))
+                           (mst-branch-add this bd new-keys new-children mst-addrs idx key))
                          (if (<= (arrays/alength new-children) branching-factor)
                            (let [new-addrs
                                  (when addrs
@@ -505,7 +657,7 @@
                                  new-sc (if (>= old-sc 0) (inc old-sc) -1)
                                ;; Update measure incrementally only if already computed
                                  measure-ops (:measure (.-settings this))
-                                 new-measure (when (and measure-ops (.-_measure this))
+                                 new-measure (when (and measure-ops (some? (.-_measure this)))
                                                (measure/merge-measure measure-ops (.-_measure this) (measure/extract measure-ops key)))
                                  nb (Branch. (.-level this) new-keys new-children new-addrs new-sc new-measure (.-settings this) nil 0 (.-_projCmp this))]
                            ;; diff-buf: nodes-len==1 ⇒ content-only ⇒ carry the source slots and
@@ -533,7 +685,7 @@
                                  measure-ops (:measure (.-settings this))
                                ;; Compute measure for split branches from their children only if already computed
                                ;; Return nil if any child measure is nil (don't silently undercount)
-                                 left-measure (when (and measure-ops (.-_measure this))
+                                 left-measure (when (and measure-ops (some? (.-_measure this)))
                                                 (reduce (fn [acc child]
                                                           (if (nil? acc)
                                                             (reduced nil)
@@ -543,7 +695,7 @@
                                                                 (reduced nil)))))
                                                         (measure/identity-measure measure-ops)
                                                         left-children))
-                                 right-measure (when (and measure-ops (.-_measure this))
+                                 right-measure (when (and measure-ops (some? (.-_measure this)))
                                                  (reduce (fn [acc child]
                                                            (if (nil? acc)
                                                              (reduced nil)
@@ -598,7 +750,42 @@
                          right-child (when (< idx (dec (arrays/alength keys)))
                                        (await (child this storage (inc idx) opts)))
                          child       (await (child this storage idx opts))
-                         disjoined   (await (node/$remove child storage key left-child right-child cmp opts))]
+                         ;; Ask the child to REPORT the element it removed. This branch
+                         ;; subtracts that element's contribution from its cached measure
+                         ;; below, and the caller's `key` is not it whenever `cmp` is
+                         ;; coarser than the set's comparator — the same search-key-is-not-
+                         ;; the-stored-element defect as the leaf's, one level up. The JVM
+                         ;; branch does not have it because it RECOMPUTES from children
+                         ;; (`tryComputeMeasure`) instead of subtracting.
+                         ;; Needed by BOTH the measure subtraction below and the diff-buf
+                         ;; Absent deposit — the deposit records the element the leaf really
+                         ;; held, not the caller's search key, which differ under a coarse
+                         ;; operation comparator. Allocating this only when a measure was
+                         ;; configured left the deposit falling back to `key`, which is the
+                         ;; JVM defect reproduced in ANode's six-arg `remove`.
+                         ;; NB `diff-buf?` is a LOCAL boolean here (bound above), not the
+                         ;; predicate fn of the same name — calling it threw TypeError.
+                         removed-out (when (or (:measure (.-settings this))
+                                               (and diff-buf? (== 1 (.-level this))))
+                                       (arrays/make-array 1))
+                         disjoined   (await (node/$remove child storage key left-child right-child cmp
+                                                          (if removed-out
+                                                            (assoc opts :removed-out removed-out)
+                                                            opts)))
+                         ;; `if-some`, not `or`: `false` is a legal ELEMENT, and `or` fell
+                         ;; through to the caller's comparator-equivalent probe whenever the
+                         ;; stored element was `false`. The in-memory result was right and the
+                         ;; DIFF recorded the wrong key, so a cold restore applied an absence
+                         ;; for something that was never there and `false` came back from the
+                         ;; dead. Measured at bf 4 / budget 128: removing `false` through an
+                         ;; equivalent probe gave count 5 in memory and count 6 after restore;
+                         ;; a shape sweep over bf [4 6 8 10 16] failed 1489 of 1721 cells.
+                         ;; Correct at budget 0 (no diff is recorded) and on the JVM, which
+                         ;; tests the array slot for null. Same class as the `false`-measure
+                         ;; defect fixed in 071038c — that pass converted the measure sites
+                         ;; and missed these two element sites.
+                         removed-element (if-some [r (some-> removed-out (arrays/aget 0))]
+                                           r key)]
                      (when disjoined
                        (let [left-idx  (if left-child  (dec idx) idx)
                              right-idx (if right-child (+ idx 2) (inc idx))
@@ -642,11 +829,28 @@
                              new-sc (if (>= old-sc 0) (dec old-sc) -1)
                              ;; Update measure only if already computed
                              measure-ops (:measure (.-settings this))
-                             new-measure (when (and measure-ops (.-_measure this))
-                                           (measure/remove-measure measure-ops (.-_measure this) key
-                                                                   #(node/try-compute-measure
-                                                                     (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this) nil 0 (.-_projCmp this))
-                                                                     storage measure-ops {:sync? true})))
+                             ;; RECOMPUTE from the (already rebuilt) children — never subtract.
+                             ;; This mirrors the JVM's `Branch.remove`, which assigns
+                             ;; `tryComputeMeasure(storage)` and offers no branch-level
+                             ;; subtraction at all.
+                             ;;
+                             ;; Subtracting was wrong twice over. It presumed INVERTIBILITY: a
+                             ;; measure is a monoid, not a group, so min/max — which stratum
+                             ;; uses — cannot be un-merged, and `remove-measure`'s recompute-fn
+                             ;; exists precisely because the implementation must decide. And it
+                             ;; is arithmetic on a total that a structural rebalance may already
+                             ;; have changed by more than the one removed element.
+                             ;;
+                             ;; This was tried once before and made every cljs measure nil. That
+                             ;; was a SYMPTOM of the leaf bug fixed alongside it: `Leaf/merge`
+                             ;; and `merge-split` built successors with a nil measure, and a
+                             ;; branch above a nil-measure child can only postpone. With the
+                             ;; leaves carrying their measures again, folding them is both
+                             ;; possible and exact.
+                             new-measure (when (and measure-ops (some? (.-_measure this)))
+                                           (node/try-compute-measure
+                                            (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this) nil 0 (.-_projCmp this))
+                                            storage measure-ops {:sync? true}))
                              center (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-measure (.-settings this) nil 0 (.-_projCmp this))]
                          ;; diff-buf: install the center's slots BEFORE rotate (so a subsequent
                          ;; rotate merge/merge-split with this node's siblings carries them).
@@ -655,7 +859,7 @@
                          (when diff-buf?
                            (if content-only?
                              (do (set! (.-_bufEntries center) (buf-entries this)) ; carry running total (or -1) onto successor
-                                 (await (carry-and-deposit center storage (.-_slots this) idx key ABSENT anchor0 opts)))
+                                 (await (carry-and-deposit center storage (.-_slots this) idx removed-element ABSENT anchor0 opts)))
                              (do (set! (.-_bufEntries center) -1) ; child merged/borrowed: structural → must write
                                  ;; diff-buf: free this node's dropped (merged/borrowed) children — the
                                  ;; range [left-idx, right-idx) minus unchanged surviving siblings (the
@@ -682,6 +886,38 @@
   (when measure-ops
     (node/try-compute-measure branch storage measure-ops {:sync? true})))
 
+(defn- no-equal-sibling-across-boundary?
+  "-ea only (see `$replace`): does no ADJACENT leaf hold an element `cmp` calls
+   equal to `old-key`?
+
+   `leaf.cljs` checks the neighbours inside the leaf; those are invisible to it.
+   The two cmp-equal elements are not reliably in one leaf — measured at bf 4, a
+   set of [k 0] for k in 0..39 plus [5 7] splits as ... [[4 0] [5 0]] |
+   [[5 7] [6 0] [7 0]] ..., either side of a boundary — so a leaf-local check
+   alone silently passes the very case the precondition exists for.
+
+   Best-effort by design: it reads only children that are already RESIDENT, so it
+   stays synchronous inside an assert and never provokes a restore. A cold
+   sibling is simply not checked."
+  [^Branch this child idx old-key cmp]
+  (let [children (.-children this)
+        n        (arrays/alength (.-keys this))
+        resident (fn [i] (when (and children (<= 0 i) (< i n)) (aget children i)))
+        ks       (.-keys child)
+        j        (garr/binarySearch ks old-key cmp)]
+    (if (neg? j)
+      true
+      (let [left  (when (== j 0) (resident (dec idx)))
+            right (when (== j (dec (arrays/alength ks))) (resident (inc idx)))
+            eq?   (fn [node pick]
+                    (when node
+                      (let [nks (.-keys node)
+                            len (arrays/alength nks)]
+                        (when (pos? len)
+                          (== 0 (cmp (arrays/aget nks (pick len)) old-key))))))]
+        (not (or (eq? left (fn [len] (dec len)))
+                 (eq? right (fn [_] 0))))))))
+
 (defn $replace
   [^Branch this storage old-key new-key cmp {:keys [sync?] :or {sync? true} :as opts}]
   (assert (== 0 (cmp old-key new-key)) "old-key and new-key must compare as equal (cmp must return 0)")
@@ -689,7 +925,6 @@
               (async
                (let [keys (.-keys this)
                      settings (.-settings this)
-                     editable? (:edit settings)
                      measure-ops (:measure settings)
                      idx  (let [arr-l (arrays/alength keys)
                                 i     (util/binary-search-l cmp keys (dec arr-l) old-key)]
@@ -699,7 +934,49 @@
                      anchor0 (when (and diff-buf? (.-addresses this) (not= -1 idx)) (aget (.-addresses this) idx))]
                  (when-not (== -1 idx)
                    (let [child  (await (child this storage idx opts))
-                         nodes  (await (node/$replace child storage old-key new-key cmp opts))]
+                         ;; diff-buf: the element this replace will actually REMOVE. NOT the
+                         ;; same as `old-key`, which is the caller's SEARCH key under a possibly
+                         ;; COARSER operation comparator. The leaf-diff is keyed by the SET's
+                         ;; comparator, so Absent(old-key) only cancels the leaf's element while
+                         ;; the leaf still holds the element the caller searched for — after one
+                         ;; buffered replace it does not, and the new Present is added ALONGSIDE
+                         ;; the old. Mirrors the JVM fix in Branch.replace; see
+                         ;; test/diff_buf_restore_cycle.clj for the measured shape.
+                         ;;
+                         ;; The leaf REPORTS it (via `:removed-out`) rather than being searched
+                         ;; again here. Both for cost — the comparator-bound binary search runs
+                         ;; once, not twice, worth +18% at bf 512 on the JVM — and because the
+                         ;; two searches must agree: `binarySearch` is arbitrary among elements
+                         ;; equal under the operation comparator, so a second search could name
+                         ;; a different element than the one the leaf overwrote, recording
+                         ;; Absent for one while replacing another.
+                         ;;
+                         ;; Only at level 1 — above it the slot is a branch anchor whose diff is
+                         ;; null, so the key is unused.
+                         removed-out (when (and diff-buf? (== 1 (.-level this)))
+                                       (arrays/make-array 1))
+                         ;; PRECONDITION (assertion only; release builds elide it): the
+                         ;; cross-leaf half of replace's no-equal-sibling rule — `leaf.cljs`
+                         ;; checks the in-leaf half. Best-effort: only inspects siblings already
+                         ;; RESIDENT, so it stays synchronous and never triggers a restore.
+                         ;; Mirrors Branch.noEqualSiblingAcrossBoundary on the JVM.
+                         _ (assert (or (not= 1 (.-level this))
+                                       (no-equal-sibling-across-boundary? this child idx old-key cmp))
+                                   (str "replace(" (pr-str old-key) " -> " (pr-str new-key) "): the"
+                                        " ADJACENT leaf holds another element the operation comparator"
+                                        " calls equal, so which element is replaced is arbitrary and the"
+                                        " result may be UNSORTED. `replace` requires at most one"
+                                        " cmp-equal element; use disj+conj instead."))
+                         nodes  (await (node/$replace child storage old-key new-key cmp
+                                                      (if removed-out
+                                                        (assoc opts :removed-out removed-out)
+                                                        opts)))
+                         ;; `if-some`, not `or` — see the remove path above. Replacing a
+                         ;; stored `false` recorded the probe instead, so a cold restore kept
+                         ;; BOTH: count 16 in memory, 17 after restore, with `false` and the
+                         ;; replacement both present.
+                         removed-key (if-some [r (some-> removed-out (arrays/aget 0))]
+                                       r old-key)]
                      (cond
                        ;; Not found in child
                        (nil? nodes)
@@ -709,7 +986,7 @@
                        ;; deposit Present(new-key) at this level (mirrors JVM EARLY_EXIT path).
                        (= nodes :early-exit)
                        (do
-                         (when diff-buf? (await (deposit-replace this storage idx old-key new-key anchor0 opts)))
+                         (when diff-buf? (await (deposit-replace this storage idx removed-key new-key anchor0 opts)))
                          :early-exit)
 
                        ;; Child returned updated node
@@ -718,92 +995,109 @@
                              new-max-key   (node/max-key new-node)
                              children      (ensure-children this)
                              addrs         (.-addresses this)
-                             last-child?   (== idx (dec (arrays/alength keys)))
                              ;; split-seam (MST): the separator keys[idx] must equal the child's max for
                              ;; canonical content-addressing, so ANY value change (even at the same
                              ;; comparator position, and for a non-rightmost child) must rebuild keys[idx]
                              ;; and propagate up the spine. Count mode is routing-only (by cmp), so its
-                             ;; original last-child?/cmp test is preserved byte-for-byte. Mirrors JVM
+                             ;; original last-child/cmp test is preserved byte-for-byte. Mirrors JVM
                              ;; Branch.replace, which always writes _keys[idx] = newMaxKey.
-                             max-key-changed (if (b/content-boundary settings)
-                                               (not= new-max-key (arrays/aget keys idx))
-                                               (and last-child? (not (== 0 (cmp new-max-key (arrays/aget keys idx))))))]
+                             ;; VALUE equality, and for EVERY child — not `cmp`, and not only
+                             ;; the last one.
+                             ;;
+                             ;; Asking the OPERATION comparator whether the max moved is wrong
+                             ;; whenever that comparator is coarser than the one routing uses:
+                             ;; datahike's value-changing upsert searches [e a _ _], so `cmp`
+                             ;; returns 0 for a datom whose v changed, this arm took the
+                             ;; "reuse keys array" branch, and `keys[idx]` kept naming the OLD
+                             ;; element while the child held the new one. A later descent
+                             ;; comparing the new element against that stale separator routes
+                             ;; past the child that holds it.
+                             ;;
+                             ;; The JVM writes `_keys[idx] = newMaxKey` UNCONDITIONALLY and its
+                             ;; persistent path always returns the successor, so only its
+                             ;; transient path was affected. ClojureScript gated the keys
+                             ;; rebuild on this flag too, which is why its default (persistent)
+                             ;; path was. Testing the value for every child makes the rebuild
+                             ;; and the propagation match the JVM persistent path exactly.
+                             ;;
+                             ;; `not=` (Clojure `=`, i.e. -equiv) rather than identity: a Datom
+                             ;; implements equiv but not reference equality, so this propagates
+                             ;; exactly when the element really changed.
+                             ;; Mirrors the JVM's `separatorMoved` (Branch.java:1596). VALUE
+                             ;; equality alone is not enough: it answers "is this the same
+                             ;; element?", and the question here is "does the separator still
+                             ;; sit where the SET's comparator puts it?". Those come apart for
+                             ;; any type whose `=` is COARSER than the set comparator —
+                             ;; datahike's Datom, whose `equiv-datom` compares e/a/v while
+                             ;; `cmp-datoms-eavt` orders by e/a/v/tx. `not=` then says
+                             ;; "unchanged", the separator is left naming the OLD element, and
+                             ;; a later descent comparing the new element against that stale
+                             ;; separator routes past the child that holds it.
+                             ;;
+                             ;; Measured with an element type whose `=` ignores a field the set
+                             ;; orders by, value-changing upsert over the whole set, elements
+                             ;; that `seq` still lists but `lookup` cannot find:
+                             ;;
+                             ;;     bf  4 n   40   JVM 0   cljs 19
+                             ;;     bf  8 n  400   JVM 0   cljs 99
+                             ;;     bf 16 n 3000   JVM 0   cljs 374
+                             ;;
+                             ;; A control with plain vectors (exact `=`) is 0 on both, so the
+                             ;; probe is sound. This was fixed on the JVM and not ported here.
+                             max-key-changed
+                             (let [old-sep (arrays/aget keys idx)
+                                   pcmp    (.-_projCmp this)]
+                               (or (not= new-max-key old-sep)
+                                   (nil? pcmp)
+                                   (not (zero? (pcmp new-max-key old-sep)))))]
                          (if max-key-changed
                            ;; maxKey changed - update keys array
-                           (if editable?
-                             ;; Transient: mutate in place
-                             (do
-                               (aset keys idx new-max-key)
-                               (aset children idx new-node)
-                               (when addrs
-                                 ;; Mark old child address as freed before clearing (deferred under diff-buf)
-                                 (when (and (not diff-buf?) storage (aget addrs idx))
-                                   (storage/markFreed storage (aget addrs idx)))
-                                 (aset addrs idx nil))
-                               (when (and measure-ops (.-_measure this))
-                                 (set! (.-_measure this)
-                                       (replace-measure this storage measure-ops)))
-                               (when diff-buf? (await (deposit-replace this storage idx old-key new-key anchor0 opts)))
-                               (arrays/array this))
-                             ;; Persistent: clone arrays
-                             (let [new-keys     (arrays/aclone keys)
-                                   new-children (arrays/aclone children)
-                                   new-addrs    (when addrs
-                                                  (let [na (arrays/aclone addrs)]
+                           ;; Clone arrays. There is no in-place arm: see
+                           ;; .internal/transient-support-cljs.md — cljs has no node
+                           ;; ownership, so mutating `this` would edit a node other
+                           ;; versions share.
+                           (let [new-keys     (arrays/aclone keys)
+                                 new-children (arrays/aclone children)
+                                 new-addrs    (when addrs
+                                                (let [na (arrays/aclone addrs)]
                                                     ;; Mark old child address as freed before clearing (deferred under diff-buf)
-                                                    (when (and (not diff-buf?) storage (aget addrs idx))
-                                                      (storage/markFreed storage (aget addrs idx)))
-                                                    (aset na idx nil)
-                                                    na))
-                                   _            (aset new-keys idx new-max-key)
-                                   _            (aset new-children idx new-node)
-                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil 0 (.-_projCmp this))
-                                   new-measure    (when (and measure-ops (.-_measure this))
-                                                    (replace-measure new-branch storage measure-ops))]
-                               (set! (.-_measure new-branch) new-measure)
+                                                  (when (and (not diff-buf?) storage (aget addrs idx))
+                                                    (storage/markFreed storage (aget addrs idx)))
+                                                  (aset na idx nil)
+                                                  na))
+                                 _            (aset new-keys idx new-max-key)
+                                 _            (aset new-children idx new-node)
+                                 new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil 0 (.-_projCmp this))
+                                 new-measure    (when (and measure-ops (some? (.-_measure this)))
+                                                  (replace-measure new-branch storage measure-ops))]
+                             (set! (.-_measure new-branch) new-measure)
                                ;; diff-buf: content-only replace ⇒ carry source slots + deposit Present(new-key).
-                               (when diff-buf?
-                                 (set! (.-_bufEntries new-branch) (buf-entries this)) ; carry running total (or -1) onto successor
-                                 (await (carry-and-deposit-replace new-branch storage (.-_slots this) idx old-key new-key anchor0 opts)))
-                               (arrays/array new-branch)))
+                             (when diff-buf?
+                               (set! (.-_bufEntries new-branch) (buf-entries this)) ; carry running total (or -1) onto successor
+                               (await (carry-and-deposit-replace new-branch storage (.-_slots this) idx removed-key new-key anchor0 opts)))
+                             (arrays/array new-branch))
                            ;; maxKey unchanged - reuse keys array
-                           (if editable?
-                             ;; Transient: mutate in place
-                             (do
-                               (aset children idx new-node)
-                               (when addrs
-                                 ;; Mark old child address as freed before clearing (deferred under diff-buf)
-                                 (when (and (not diff-buf?) storage (aget addrs idx))
-                                   (storage/markFreed storage (aget addrs idx)))
-                                 (aset addrs idx nil))
-                               (when (and measure-ops (.-_measure this))
-                                 (set! (.-_measure this)
-                                       (replace-measure this storage measure-ops)))
-                               (when diff-buf? (await (deposit-replace this storage idx old-key new-key anchor0 opts)))
-                               (if last-child?
-                                 (arrays/array this)  ; Last child, need to propagate
-                                 :early-exit))        ; Not last child, early exit
-                             ;; Persistent: clone ALL arrays — sharing would allow a
-                             ;; later transient editable path to corrupt the original
-                             (let [new-keys     (arrays/aclone keys)
-                                   new-children (arrays/aclone children)
-                                   new-addrs    (when addrs
-                                                  (let [na (arrays/aclone addrs)]
+                           ;; Clone ALL arrays — sharing any of them would let a future
+                           ;; in-place path corrupt the original.
+                           (let [new-keys     (arrays/aclone keys)
+                                 new-children (arrays/aclone children)
+                                 new-addrs    (when addrs
+                                                (let [na (arrays/aclone addrs)]
                                                     ;; Mark old child address as freed before clearing (deferred under diff-buf)
-                                                    (when (and (not diff-buf?) storage (aget addrs idx))
-                                                      (storage/markFreed storage (aget addrs idx)))
-                                                    (aset na idx nil)
-                                                    na))
-                                   _            (aset new-children idx new-node)
-                                   new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil 0 (.-_projCmp this))
-                                   new-measure    (when (and measure-ops (.-_measure this))
-                                                    (replace-measure new-branch storage measure-ops))]
-                               (set! (.-_measure new-branch) new-measure)
+                                                  (when (and (not diff-buf?) storage (aget addrs idx))
+                                                    (storage/markFreed storage (aget addrs idx)))
+                                                  (aset na idx nil)
+                                                  na))
+                                 _            (aset new-children idx new-node)
+                                 new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil 0 (.-_projCmp this))
+                                 new-measure    (when (and measure-ops (some? (.-_measure this)))
+                                                  (replace-measure new-branch storage measure-ops))]
+                             (set! (.-_measure new-branch) new-measure)
                                ;; diff-buf: content-only replace ⇒ carry source slots + deposit Present(new-key).
-                               (when diff-buf?
-                                 (set! (.-_bufEntries new-branch) (buf-entries this)) ; carry running total (or -1) onto successor
-                                 (await (carry-and-deposit-replace new-branch storage (.-_slots this) idx old-key new-key anchor0 opts)))
-                               (arrays/array new-branch))))))))))))
+                             (when diff-buf?
+                               (set! (.-_bufEntries new-branch) (buf-entries this)) ; carry running total (or -1) onto successor
+                               (await (carry-and-deposit-replace new-branch storage (.-_slots this) idx removed-key new-key anchor0 opts)))
+                             (arrays/array new-branch)))))))))))
 
 ;; ---- diff-buf store-side helpers (mirror JVM Branch) ----
 
@@ -832,6 +1126,53 @@
 ;; by the O(1) _bufEntries aggregate: a child's subtree size is (buf-entries child) and its
 ;; must-write status is the -1 poison that already climbed the deposit sum — see store/deposit-kv.)
 
+(defn- refresh-marker-slots!
+  "Mirrors JVM `Branch.refreshMarkerSlots`. A branch-MARKER slot (`:diff` nil, `:anchor`
+  non-nil) caches the child's whole-subtree buffered total as of DEPOSIT time, and carries no
+  diff of its own — the diff is derived from the LIVE child at store time by `assemble-nested`.
+
+  `store` settles that child IN PLACE (`set! (.-_bufEntries child) embedded`, and its slots are
+  rewritten), and nodes are SHARED between versions, so every other version's parent slot keeps
+  both the pre-settle total AND the pre-settle `:anchor`. Nothing is overwritten — blobs are
+  immutable and a re-store gets a fresh address — but the slot's two halves now straddle the
+  settle: the derived diff moved forward while the anchor did not, and the flush already
+  `markFreed` that anchor.
+
+  Correcting the NUMBER is the wrong fix and was measured wrong on the JVM: 25/35/37 content
+  mismatches per config at B in {1,4}. The inflated stale value is accidentally protective —
+  it forces `embedded + csz > budget`, so the child is FLUSHED; correcting it lets the child be
+  BUFFERED against the stale anchor and the restore loses everything the child flushed.
+
+  So detect the settle and poison the slot to -1 (must-write): Pass 1 then writes the child
+  wholesale and it gets a fresh, coherent anchor. On the JVM this changed write counts by zero
+  — the flush was already happening, for the wrong reason.
+
+  Only detects staleness for a RESIDENT child; a child settled and then evicted is invisible
+  here. Instrumented on the JVM across the diff-buf namespaces: 0 non-resident markers out of
+  4382 examined, so that hole is real but unobserved."
+  [^Branch node]
+  (let [slots (.-_slots node)]
+    (when (some? slots)
+      (let [children (.-children node)
+            len      (arrays/alength (.-keys node))]
+        (when (some? children)
+          (loop [i 0, poisoned? false]
+            (if (>= i len)
+              (when poisoned? (set! (.-_bufEntries node) -1))
+              (let [sl (aget slots i)]
+                (if (or (nil? sl) (some? (:diff sl)) (nil? (:anchor sl))
+                        (== -1 (:buf-entries sl)))
+                  (recur (inc i) poisoned?)                    ; not a live marker slot
+                  (let [c (aget children i)]
+                    (if-not (instance? Branch c)
+                      (recur (inc i) poisoned?)                ; absent or a leaf
+                      (do
+                        (refresh-marker-slots! c)              ; post-order
+                        (if (== (buf-entries c) (slot-be sl (dec (.-level node))))
+                          (recur (inc i) poisoned?)
+                          (do (aset slots i (assoc sl :buf-entries -1))
+                              (recur (inc i) true)))))))))))))))
+
 (defn- assemble-nested
   "Assemble c's serializable nested diff {idx -> {:count :measure :diff :max-key}}, recursing
   markers into the (resident) live subtree. Mirrors JVM assembleNested."
@@ -846,7 +1187,21 @@
                        (if (>= j len)
                          m
                          (let [sl (aget slots j)]
-                           (if (nil? sl)
+                           (if (or (nil? sl) (nil? (:anchor sl)))
+                             ;; Skip an ANCHORLESS slot, mirroring JVM assembleNested. A null
+                             ;; anchor means the child has no durable base to diff against, so
+                             ;; store() writes it WHOLESALE and `deposit-kv` leaves its diff nil
+                             ;; for that reason — there is no buffered difference to assemble,
+                             ;; at any level.
+                             ;;
+                             ;; Without the skip a nil diff was read as "branch marker" and this
+                             ;; recursed: it awaited a restore the JVM never performs, and for a
+                             ;; LEAF child `(.-_slots c)` is undefined so the recursion returned
+                             ;; {} — emitting an entry anchored at `(aget base-addr j)`, an
+                             ;; address belonging to a DIFFERENT, older child. The JVM hit the
+                             ;; same shape as a ClassCastException out of a plain store
+                             ;; (`c.level=1 j=22 childClass=Leaf slotDiffNull=true
+                             ;; slotAnchor=false`), which is what put the guard there.
                              (recur (inc j) m)
                              (let [gc     (when (nil? (:diff sl)) (await (child c storage j opts)))
                                    d      (if (some? (:diff sl))
@@ -902,7 +1257,8 @@
                  ;; share of the budget is written proportionally often and can't jam the buffer.
                  ;; Only dirty (resident) children are flushed (no read); clean passthrough consumes
                  ;; budget but is left untouched. Mirrors JVM Branch.store (see doc/diff-buffering.md).
-                 (let [addrs  (.-addresses this)
+                 (let [_      (refresh-marker-slots! this)   ; see the fn: detect a settled child
+                       addrs  (.-addresses this)
                        slots  (.-_slots this)
                        budget (or (:diff-buf-size (.-settings this)) 0)
                        len    (arrays/alength (.-keys this))
@@ -925,8 +1281,18 @@
                                    (== (:buf-entries sl) -1)                   ; subtree rebalanced (poison) ⇒ must write
                                    (recur (inc i) pass buf (conj wl i))
                                    :else                                       ; content-only ⇒ bufferable, size O(1)
+                                   ;; RESOLVE with slot-be, don't read `:buf-entries` raw — the
+                                   ;; passthrough arm above already calls it for exactly this
+                                   ;; quantity. A slot reconstructed from storage carries no
+                                   ;; `:buf-entries` (the cljs analogue of JVM Slot.LAZY), and the
+                                   ;; gate above only rejects the -1 poison, so a restored slot on a
+                                   ;; dirty child fell through to here and was sized as nil — which
+                                   ;; `+` coerces to 0, so the budget test always passes, the running
+                                   ;; total never advances, and nil is then written back into the
+                                   ;; slot as its settled size. The JVM closed this in 31e41a6; the
+                                   ;; two arms must not disagree about how to read the same field.
                                    (let [nested (if (some? (:diff sl)) (:diff sl) (await (assemble-nested storage child opts)))]
-                                     (recur (inc i) pass (conj buf {:i i :sz (:buf-entries sl) :nested nested}) wl))))))))
+                                     (recur (inc i) pass (conj buf {:i i :sz (slot-be sl (dec level)) :nested nested}) wl))))))))
                        ;; Pass 2: buffer SMALLEST-first while running total ≤ budget; flush the rest.
                        [embedded flushed]
                        (reduce (fn [[emb wl] {:keys [i sz nested]}]
@@ -937,7 +1303,45 @@
                                      [(+ emb sz) wl])
                                    [emb (conj wl i)]))
                                [(:pass classified) (:wl classified)]
-                               (sort-by :sz (:buf classified)))]
+                               (sort-by :sz (:buf classified)))
+                       ;; D3: the merge/borrow arms (`concat-slots`, `merge`, `merge-split`)
+                       ;; concatenate two nodes' slot arrays without re-checking the budget, so the
+                       ;; passthrough total alone can start above B — and Pass 2, which only ever
+                       ;; flushes DIRTY children, can never bring it back down. Measured over ~157k
+                       ;; written blobs before this: worst case ≈ 2B (B=1→2, 2→4, 4→8, 8→12,
+                       ;; 16→26) on ~0.1% of blobs. It does not compound, and content was always
+                       ;; correct — but it is a budget the code claims to enforce and did not.
+                       ;;
+                       ;; Flush already-settled children (clean passthrough and newly buffered
+                       ;; alike — both now carry an address AND a slot) biggest-first until the
+                       ;; total fits. Candidate test and write order both mirror the JVM arm: the
+                       ;; child is stored HERE, before Pass 3, so both runtimes issue the same
+                       ;; `store` call sequence and a backend that assigns addresses in call order
+                       ;; produces the same disk image.
+                       embedded
+                       (loop [emb   embedded
+                              cands (when (and slots (> embedded budget))
+                                      (->> (range len)
+                                           (filter (fn [i] (and (some? (aget addrs i))
+                                                                (some? (aget slots i)))))
+                                           (sort-by (fn [i] (- (slot-be (aget slots i) (dec level)))))
+                                           seq))]
+                         (if (or (<= emb budget) (nil? cands))
+                           emb
+                           (let [i  (first cands)
+                                 sl (aget slots i)
+                                 ;; resident if we still hold it, else restore+project — the
+                                 ;; settled child was re-pointed at its anchor, so this is
+                                 ;; restore(anchor) + project(slot), never a wrong node. Measured
+                                 ;; on the JVM: every flushed child was already resident under
+                                 ;; :ref-type strong, soft AND weak, so this is a fallback rather
+                                 ;; than a read in practice.
+                                 c  (or (when-some [cs (.-children this)] (aget cs i))
+                                        (await (child this storage i opts)))]
+                             (storage/markFreed storage (aget addrs i))
+                             (aset addrs i (await (node/store c storage opts)))
+                             (aset slots i nil)
+                             (recur (- emb (slot-be sl (dec level))) (next cands)))))]
                    ;; Pass 3: write flushed/structural children (all resident ⇒ no read).
                    (loop [ws (seq flushed)]
                      (when ws
@@ -1012,7 +1416,7 @@
                              (if (nil? child)
                                nil ;; child not in memory, postpone
                                (let [child-measure (node/measure child)]
-                                 (if child-measure
+                                 (if (some? child-measure)
                                    (recur (inc i)
                                           (measure/merge-measure measure-ops acc child-measure))
                                    nil)))) ;; child measure unavailable, postpone
@@ -1030,7 +1434,7 @@
                               (if (nil? child)
                                 nil
                                 (let [child-measure (node/measure child)]
-                                  (if child-measure
+                                  (if (some? child-measure)
                                     (recur (inc i)
                                            (measure/merge-measure measure-ops acc child-measure))
                                     nil))))
@@ -1050,7 +1454,7 @@
                                           child-measure (or (node/measure child)
                                                             (await (node/force-compute-measure child storage measure-ops opts)))]
                                       (recur (inc i)
-                                             (if child-measure
+                                             (if (some? child-measure)
                                                (measure/merge-measure measure-ops acc child-measure)
                                                acc)))
                                     acc))]

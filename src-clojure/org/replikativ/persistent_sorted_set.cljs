@@ -19,16 +19,76 @@
    :diff-buf-size default-diff-buf-size})
 
 (defn- with-defaults [opts]
-  (merge default-opts opts))
+  ;; nil-AWARE: a plain `merge` lets an explicit nil beat the default, which the JVM's
+  ;; `map->settings` never does — it uses `(or (:diff-buf-size m) (default))` and normalizes
+  ;; a non-positive branching factor to 512. Measured before this, `{:branching-factor nil}`
+  ;; gave a 3-element set on the JVM and exhausted the Node heap here (`arr-partition-approx`
+  ;; loops forever with a chunk length of 0), and `{:diff-buf-size nil}` gave the JVM default
+  ;; but 0 here.
+  (reduce-kv (fn [acc k v] (if (nil? v) acc (assoc acc k v)))
+             default-opts opts))
+
+(defn- reject-nil!
+  "`replace` was one of the two ways nil got into a set that documents itself as unable to
+   store one — every other mutation path refuses it. O(1), so unconditional, the same
+   treatment `conj` gives."
+  [k]
+  (when (nil? k)
+    (throw (ex-info "PersistentSortedSet cannot store nil" {}))))
+
+(defn- assert-sorted!
+  "Under `*assert*` only: verify strictly ascending order, as the JVM half does.
+
+   Unsorted input does not fail on its own — it produces a tree whose invariants are quietly
+   false, so lookups miss and slices return the wrong range while `count` and `seq` both look
+   perfect. This runtime had NO check at all, while the JVM has had one since the beginning,
+   so the same call was refused on one runtime and silently accepted on the other. Measured on
+   ClojureScript before this:
+
+       (from-sorted-array compare #js [3 1 2] 3)
+       seq => [3 1 2]   count => 3   but contains? 1 => false, contains? 3 => false
+       1000 shuffled elements => count 1000, only 3 of them findable by contains?
+
+   Duplicates were accepted too (`#js [1 2 2 3]` => count 4), and `#js [1 nil 3]` made nil a
+   durable member of a set whose own namespace docstring says it \"can't store nil\" — the one
+   hole, since `conj` and `from-sequential` both refuse nil here. An ascending check closes
+   that case as well, because nil compares below any number.
+
+   Behind `assert` for the same reason as the JVM: O(n) comparisons on a documented fast
+   path, so it is live in dev and test and elided by `:elide-asserts` in a production build.
+   `from-sorted-seq` checks unconditionally instead — it is streaming, so the check is a fold
+   it performs anyway."
+  [cmp arr len]
+  (assert (loop [i 1]
+            (cond
+              (>= i len) true
+              (>= 0 (cmp (arrays/aget arr i) (arrays/aget arr (dec i)))) false
+              :else (recur (inc i))))
+          "from-sorted-array requires strictly ascending, distinct input"))
 
 (defn from-sorted-array
-  "Fast path to create a set if you already have a sorted array of elements on your hands."
+  "Fast path to create a set if you already have a sorted array of elements on your hands.
+
+   Only the first `len` elements are used; the rest of `arr` is ignored. (`len` was formerly
+   accepted and then discarded here, so a caller passing a reusable buffer got its stale tail
+   as set members — see `btset/from-sorted-array`.)
+
+   Input MUST be strictly ascending and distinct under `cmp`; checked under `*assert*`."
   ([cmp arr]
    (from-sorted-array cmp arr (arrays/alength arr)))
-  ([cmp arr _len]
-   (from-sorted-array cmp arr _len {}))
-  ([cmp arr _len opts]
-   (btset/from-sorted-array cmp arr _len (with-defaults opts))))
+  ([cmp arr len]
+   (from-sorted-array cmp arr len {}))
+  ([cmp arr len opts]
+   ;; NIL REJECTION, unconditional — see the JVM twin. `conj` and `from-sequential` both
+   ;; refuse nil here too, so this was the one hole through which a set that "can't store
+   ;; nil" could be given one, under the default comparator and with no exotic setup.
+   (let [n (min len (arrays/alength arr))]
+     (dotimes [i n]
+       (when (nil? (arrays/aget arr i))
+         (throw (ex-info (str "PersistentSortedSet cannot store nil (index " i ")")
+                         {:index i}))))
+     (assert-sorted! cmp arr n))
+   (btset/from-sorted-array cmp arr len (with-defaults opts))))
 
 (defn from-sequential
   "Create a set with custom comparator and a collection of keys. Useful when you't want to call [[clojure.core/apply]] on [[sorted-set-by]]."
@@ -36,6 +96,27 @@
    (from-sequential cmp seq {}))
   ([cmp seq opts]
    (btset/from-sequential cmp seq (with-defaults opts))))
+
+(defn from-sorted-seq
+  "Bulk-build a set from a SORTED, DISTINCT seq, storing every node to `:storage`
+   as it fills. Peak memory is O(depth x branching-factor), independent of the
+   element count — which is what makes it the right builder for a restore, where
+   the data does not fit in memory and `from-sorted-array` therefore cannot run.
+
+   The result is address-rooted, the same shape a restore produces: nodes hold
+   child ADDRESSES, not child pointers, and load lazily. `(store set)` returns
+   the root address without re-storing anything.
+
+   Builds the same tree as the JVM's `from-sorted-seq` — same cuts, same node
+   contents — so an address means the same thing on either runtime.
+
+   Options beyond the usual: `:storage` (required), `:flush-fn` (called and
+   awaited after each node is stored, for backpressure), `:sync?`.
+
+   Three-arity only, matching the JVM: `:storage` is mandatory, so a call
+   without opts is always an error."
+  ([cmp xs opts]
+   (btset/from-sorted-seq cmp xs (with-defaults opts))))
 
 (defn sorted-set-by
   ([cmp]
@@ -124,11 +205,37 @@
   "Replace an existing key with a new key at the same logical position.
    The comparator must return 0 for both old-key and new-key.
    This is a single-traversal update - faster than disj + conj.
+
+   PRECONDITION, and it is the caller's to uphold: under the comparator passed to
+   THIS call, no element other than old-key itself may compare equal to old-key.
+   The single-traversal update rewrites in place at the position it finds, so if a
+   comparator-EQUAL sibling exists, the rewrite can order the two wrongly and leave
+   the node unsorted. The sibling then still appears in iteration but is no longer
+   reachable by binary search, and the disorder becomes durable the moment the set
+   is stored — after which every later search on that node is arbitrary.
+
+   This matters specifically when the comparator is COARSER than the set's own —
+   the `[id value]`-compared-by-id pattern these docstrings advertise. A set built
+   under a full comparator may legitimately hold two elements that a coarser one
+   cannot tell apart; `replace` under that coarser comparator is then outside
+   contract.
+
+   It is checked by assertions only, so it is NOT checked in ordinary production
+   builds. That is deliberate — the check costs a scan on a hot write path — but it
+   means violating this silently corrupts the structure rather than throwing. If you
+   cannot guarantee uniqueness under the comparator, use disj + conj.
+
    returns BTSet by default
    returns continuation yielding BTSet when {:sync? false}"
-  ([^BTSet set old-key new-key]          (btset/$replace set old-key new-key))
-  ([^BTSet set old-key new-key arg]      (btset/$replace set old-key new-key arg))
-  ([^BTSet set old-key new-key cmp opts] (btset/$replace set old-key new-key cmp opts)))
+  ([^BTSet set old-key new-key]
+   (reject-nil! new-key)
+   (btset/$replace set old-key new-key))
+  ([^BTSet set old-key new-key arg]
+   (reject-nil! new-key)
+   (btset/$replace set old-key new-key arg))
+  ([^BTSet set old-key new-key cmp opts]
+   (reject-nil! new-key)
+   (btset/$replace set old-key new-key cmp opts)))
 
 (defn slice
   "An iterator for part of the set with provided boundaries.
@@ -216,6 +323,36 @@
   ([^BTSet set arg] (btset/store set arg))
   ([^BTSet set storage opts] (btset/store set storage opts)))
 
+(defn diff
+  "Keys added and removed between two sets that SHARE STRUCTURE.
+
+   Returns `{:added [...] :removed [...]}`, both in the sets' sort order, or a
+   continuation yielding it when `{:sync? false}`.
+
+   Cost is proportional to what CHANGED, not to set size, in NODES READ — which
+   here means async round trips. Two versions of a persistent set share every
+   node they have in common, so a subtree whose address appears on both sides
+   cannot contain a difference and is dropped without being loaded. Measured on
+   the JVM against a serializing storage, sets one two-element transaction
+   apart: 3-4 nodes read whether the set holds 1 000 elements or 100 000. Two
+   identical stored roots are answered without touching storage at all.
+
+   Both sets must come from the same lineage (one derived from the other, or
+   both from a common ancestor) and must be STORED for pruning to work — an
+   in-memory set has no addresses, so every node is walked. Diffing unrelated
+   sets is CORRECT but degrades to a full walk of both.
+
+   Membership is decided by the set's comparator, so two keys that compare equal
+   are treated as the same key even if they are not `=`.
+
+   Same algorithm and same answers as the JVM `diff`."
+  ([^BTSet a ^BTSet b]
+   (btset/diff a b (.-storage b) {:sync? true}))
+  ([^BTSet a ^BTSet b storage]
+   (btset/diff a b storage {:sync? true}))
+  ([^BTSet a ^BTSet b storage opts]
+   (btset/diff a b storage opts)))
+
 (defn restore
   "Restore a set from storage given root-address-or-info and storage.
    This operation is always synchronous and does not initiate io.
@@ -289,10 +426,19 @@
    fill ratios. Preserves comparator, settings, and metadata.
    Returns a new set with the same elements in a freshly built tree.
 
-   Note: currently materializes all elements in memory."
+   Note: currently materializes all elements in memory.
+
+   `(.-settings set)` is the NODE settings — `[:branching-factor :measure :boundary
+   :diff-buf-size]` only — so passing it alone dropped both the storage and the metadata that
+   the docstring promises and that the wire codec resolves `:pss/storage-id` from. Measured
+   before the fix: `(meta (compact s))` nil for `(meta s)` `{:x 1}`, `(.-storage (compact s))`
+   nil, and `(store (compact s))` throwing \"BTSet/store requires IStorage in second
+   argument\". This is the ClojureScript half of the defect fixed on the JVM."
   [^BTSet set]
   (let [arr (into-array (btset/$seq set))
         len (alength arr)
-        opts (.-settings set)]
+        opts (assoc (.-settings set)
+                    :storage (.-storage set)
+                    :meta (meta set))]
     (btset/from-sorted-array (.-comparator set) arr len opts)))
 

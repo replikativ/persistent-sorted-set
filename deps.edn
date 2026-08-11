@@ -88,6 +88,27 @@
    :exec-args   {:dirs ["test-clojure"]
                  :patterns ["org\\.replikativ\\.persistent-sorted-set\\.test.*"]}}
 
+  ;; STRICT TRANSIENTS. `Settings.STRICT_TRANSIENTS` (Settings.java) reads
+  ;; `-Dpss.strictTransients`, and the ownership refusal it gates is real code with a real
+  ;; test — `transient-ownership/concurrent-mutation-is-refused-under-the-flag`, tagged
+  ;; ^:strict-transients. Nothing set the property, so that deftest contributed ZERO
+  ;; assertions in every configuration the project ran while still counting as a pass.
+  ;;
+  ;; Separate alias rather than folding it into `:test` because the default suite must keep
+  ;; exercising the DEFAULT (unchecked) ownership mode, which is what users get.
+  :test-strict
+  {:extra-paths ["test-clojure" "test-resources"]
+   :extra-deps  {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}
+                 org.clojure/test.check {:mvn/version "1.1.1"}
+                 org.clojure/data.fressian {:mvn/version "1.1.0"}
+                 org.replikativ/boring {:mvn/version "0.1.6"}
+                 com.cognitect/transit-clj {:mvn/version "1.0.333"}
+                 org.replikativ/hasch {:mvn/version "0.4.98"}}
+   :jvm-opts    ["-Dpss.strictTransients=true" "-ea"]
+   :main-opts   ["-m" "cognitect.test-runner"
+                 "-d" "test-clojure"
+                 "-n" "org.replikativ.persistent-sorted-set.test.transient-ownership"]}
+
   :bench
   {:extra-paths ["test-clojure" "bench-clojure"]
    :extra-deps
