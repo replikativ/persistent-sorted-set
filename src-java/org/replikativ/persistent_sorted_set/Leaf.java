@@ -92,7 +92,8 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       if (ins == _len) {
         _keys[_len] = key;
         _len += 1;
-        // Update stats incrementally only if already computed
+        // Update stats incrementally only if already computed. Appending at the END, so the
+        // fold is in sorted order and no commutativity is needed even here.
         if (measureOps != null && _measure != null) {
           _measure = measureOps.merge(_measure, measureOps.extract(key));
         }
@@ -101,9 +102,23 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
         ArrayUtil.copy(_keys, ins, _len, _keys, ins+1);
         _keys[ins] = key;
         _len += 1;
-        // Update stats incrementally only if already computed
+        // Update stats incrementally only if already computed. This inserts into the MIDDLE,
+        // so folding `key` in at the end is exact only for a commutative merge — an
+        // order-sensitive measure (a concatenation, a first/last) gets the elements in
+        // insertion order instead of key order. A leaf can always answer exactly from its own
+        // keys, and does so here rather than silently reordering; the branch above has no such
+        // cheap exact answer and postpones instead (Branch.measureAfterInsert).
+        //
+        // This arm is transient-only, so an order-sensitive measure used through the ordinary
+        // persistent API was already correct on the JVM and this changes nothing for it. It is
+        // fixed alongside IMeasure.commutativeMerge because declaring a contract while one
+        // implementation still quietly violates it is worse than not declaring it — and
+        // ClojureScript, which takes the delta unconditionally, is the one that made the
+        // assumption visible.
         if (measureOps != null && _measure != null) {
-          _measure = measureOps.merge(_measure, measureOps.extract(key));
+          _measure = measureOps.commutativeMerge()
+              ? measureOps.merge(_measure, measureOps.extract(key))
+              : tryComputeMeasure(storage);
         }
         return PersistentSortedSet.EARLY_EXIT;
       }
@@ -199,8 +214,11 @@ public class Leaf<Key, Address> extends ANode<Key, Address> implements ISubtreeC
       // contribution. Measured, 200 longs 3,13,23,... removed via a decade comparator
       // inside a transient: the set ended EMPTY with a cached sum of 24.0 (bf 8) and
       // 48.0 (bf 16) instead of 0. `node->map` serializes `:measure`, so that lands on
-      // disk and changes the node's content address. The persistent path below never
-      // had this — it recomputes from the new leaf's keys.
+      // disk and is read back as authoritative. (This comment used to add "and changes
+      // the node's content address" — not true: `node->identity` strips `:measure`
+      // precisely because it is a cache that may or may not be populated. The durability
+      // is the problem; the address is not.) The persistent path below never had this —
+      // it recomputes from the new leaf's keys.
       Key removedElement = _keys[idx];
       ArrayUtil.copy(_keys, idx + 1, _len, _keys, idx);
       Arrays.fill(_keys, newLen, _len, null);   // TAILCLEAR

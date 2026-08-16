@@ -770,6 +770,103 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     return result;
   }
 
+  /**
+   * Measure maintenance for a single-element INSERT on this node's mutation return path.
+   * `recomputed` is whatever `tryComputeMeasure` / `tryComputeMeasureFromChildren` produced;
+   * `base` is this node's PRE-insert measure. Returns the value to cache.
+   *
+   * The recompute is preferred whenever it is available, so a fully resident node behaves
+   * EXACTLY as before — which matters because the stress suite's oracle compares a cached
+   * measure against a recomputation from the node's own content, and a delta drifts from that
+   * in floating point (the same drift 641a109 documents on the transient remove path).
+   *
+   * It is null whenever ANY child is non-resident or itself measureless, and on a lazily
+   * restored tree that is the NORMAL case: only the descent path is in memory. Caching that
+   * null destroys the aggregate at every level from the touched leaf's parent up to the root,
+   * and the next reader then pays `forceComputeMeasure`, which restores every child of every
+   * nulled branch. Measured, bf 64 / n 200000 / `:ref-type :weak`, an exact long measure,
+   * against a storage that counts blob reads — five `conj` that read 4 blobs between them:
+   *
+   *     cold `measure`                 1 blob   (the root's own, restored with it)
+   *     5 conj                         4 blobs  root _measure -> NULL
+   *     the `measure` right after     79 blobs  = 39 branches + 40 LEAVES
+   *
+   * and under `:weak` (where the pulled children are dropped again) it did not amortize: the
+   * same 79 at every round, 399 over five write/read rounds on a 6451-blob tree. At bf 512 the
+   * same shape pulled 194 of 196 blobs — the whole tree — which is what makes this a
+   * correctness-shaped cost rather than a warmup: a consumer whose leaves are FAT (stratum
+   * carries ~4MB of column chunk inline per leaf) reads hundreds of MB to answer a question
+   * whose entire answer was already cached in the branches.
+   *
+   * So when the recompute is unavailable, fold the inserted key in instead. `add` inserts
+   * exactly one element and `merge` is the monoid's own operation, so this is exact FOR AN
+   * EXACT COMMUTATIVE MEASURE — see the two qualifications below, neither of which is
+   * hypothetical.
+   *
+   * The count is delta-maintained at every one of these sites and therefore survives a cold
+   * tree; the measure was the one aggregate that did not. But the two deltas are NOT peers,
+   * and saying they mirror each other hides the asymmetry that justifies the guard: only the
+   * EARLY_EXIT arm does `_subtreeCount += 1`. The other three compute
+   * `_subtreeCount - oldChildCount + newChildrenCount` — MEASURED from the nodes the child
+   * actually returned, so it needs no leafProcessor guard and stays right even when a
+   * processor changed the element count. The measure delta has no such measurement available
+   * (a returned child reports its count, not its measure), so it must ASSUME +1 element, and
+   * the guard below is what keeps that assumption true.
+   *
+   * It is also what ClojureScript has always done. `branch.cljs` folds
+   * `merge(_measure, extract(key))` on both the same-len arm and the absorb arm, and consults
+   * the children only on the SPLIT arm — the same boundary drawn here, for the same reason.
+   * So this is the JVM catching up to the other runtime rather than a new strategy; the two
+   * differ only in that cljs takes the delta unconditionally while this prefers an available
+   * recompute, to keep the stress oracle's per-node equality exact.
+   *
+   * QUALIFICATION 1 — ORDER. The key is merged at the END rather than at its sorted position,
+   * which is exact for a COMMUTATIVE merge and WRONG for an order-sensitive one. This is a
+   * real narrowing, not merely the status quo restated: `Leaf.add`'s delta fires only on the
+   * TRANSIENT in-place path, so an order-sensitive measure driven through the ordinary
+   * persistent API used to be correct on the JVM, and this arm runs on that path. Measured
+   * with a concatenating measure, bf 8, `:ref-type :weak`, a cold-restored set of
+   * `(range 0 400 2)` then `conj` of 37 39 41 43 45: three nodes ended holding the elements in
+   * insertion order rather than key order. So `IMeasure.commutativeMerge()` exists and is
+   * consulted below — a measure that declines it postpones exactly as before.
+   *
+   * QUALIFICATION 2 — FLOATING POINT. Commutativity does not buy exactness: `+` on doubles is
+   * commutative but not associative, so the delta and a recomputation from children can differ
+   * in the last bits, and here it is the DELTA that is cached. Measured with a
+   * `sum of 1/(k+1)` measure, bf 8, 2000 elements cold plus 300 appends: cached
+   * 8.236631351723583 against a recomputation of 8.236631351723577. That value is serialized
+   * by `node->map` and `forceComputeMeasure` only recurses into a child whose measure is null,
+   * so it is durable and never self-heals — where before this arm it was a null that the next
+   * reader replaced with an exact fold. `NumericStats` sums doubles, so this is reachable with
+   * the shipped ops; its count/min/max stay exact, and `node->identity` excludes `:measure`, so
+   * content addresses and dedup are unaffected. `validate-full`'s measure check already refuses
+   * to police inexact measures for exactly this reason (see 641a109).
+   *
+   * REFUSED when a leafProcessor is configured, on EITHER the node's settings or the
+   * operation's: the processor may compact or expand the leaf it is handed, so "one key added"
+   * is not "one element added". Checking both is deliberate — `impl/nodes` builds a RESTORED
+   * node's Settings with a null leaf-processor, so `_settings` alone is not a reliable probe of
+   * whether the operation runs one. (The pre-existing `_subtreeCount` guard checks only
+   * `_settings` and is nonetheless safe, because a restored node is never `editable()` and so
+   * is rebuilt with the operating settings before it can reach EARLY_EXIT.) A set that DOES
+   * configure a processor keeps the old postpone-and-force behaviour.
+   *
+   * Not applied to `remove` or `replace`. Both would need the ELEMENT the leaf actually
+   * removed rather than the caller's search key (the defect CHANGES.md records as "the measure
+   * subtracted the search key"), and `remove` is only invertible for measures that are — a
+   * min/max measure must consult the remaining children, which is the very IO this avoids. Those
+   * paths still null, and still force. See the `remove-does-not-take-the-delta` note in
+   * test/measure_cold_maintenance.clj.
+   */
+  private Object measureAfterInsert(Settings settings, IMeasure measureOps, Object recomputed, Object base, Key key) {
+    if (recomputed != null) return recomputed;
+    if (measureOps == null || base == null) return null;
+    if (_settings.leafProcessor() != null) return null;
+    if (settings != null && settings.leafProcessor() != null) return null;
+    if (!measureOps.commutativeMerge()) return null;
+    return measureOps.merge(base, measureOps.extract(key));
+  }
+
   // OWNER-THREAD ONLY (editable transient or not-yet-published node): make sure the
   // current snapshot carries a children array, allocating + republishing if absent.
   // Callers must use the RETURN VALUE. Never call on a possibly-shared node.
@@ -839,10 +936,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       } else {
         _subtreeCount = tryComputeSubtreeCountFromChildren(s0.children, _len, storage);
       }
-      // Update measure: recompute from children (child's stats were updated in place)
+      // Update measure: recompute from children (child's stats were updated in place), or
+      // fold in the one inserted key when a child is not resident (see measureAfterInsert).
       IMeasure measureOps = _settings.measure();
       if (measureOps != null && _measure != null) {
-        _measure = tryComputeMeasure(storage);
+        _measure = measureAfterInsert(settings, measureOps, tryComputeMeasure(storage), _measure, key);
       }
       // The child was mutated IN PLACE, so this node's addresses[ins] — which asserts
       // "that child's whole subtree is already durable" — is now a LIE. store() reads it
@@ -919,9 +1017,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         _subtreeCount = _subtreeCount - oldChildCount + newChildrenCount;
       else
         _subtreeCount = -1;
-      // Update measure: recompute from children
+      // Update measure: recompute from children, or fold in the one inserted key when a
+      // child is not resident (see measureAfterInsert).
       if (measureOps != null && _measure != null) {
-        _measure = tryComputeMeasure(storage);
+        _measure = measureAfterInsert(settings, measureOps, tryComputeMeasure(storage), _measure, key);
       }
       if (_settings.diffBufSize() > 0) depositInto(storage, ins, key, key, anchor0); // content-only: Present(key) / branch marker
       if (ins == _len - 1)
@@ -957,7 +1056,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // Exact subtree count using delta from old vs new child
       long newCount = (_subtreeCount >= 0 && oldChildCount >= 0 && newChildrenCount >= 0)
           ? _subtreeCount - oldChildCount + newChildrenCount : -1;
-      Object newMeasure = tryComputeMeasureFromChildren(newChildren, _len, storage, measureOps);
+      Object newMeasure = measureAfterInsert(settings, measureOps,
+          tryComputeMeasureFromChildren(newChildren, _len, storage, measureOps), _measure, key);
       Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, newCount, newMeasure, _projCmp, settings);
       // The SAME snapshot's {slots, entries} pair — carried together so the successor
       // can never mix a pre-settle total with post-settle slots (or vice versa).
@@ -1008,7 +1108,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // Use delta formula: exact and O(1), avoids scanning all children
       long count = (_subtreeCount >= 0 && oldChildCount >= 0 && newChildrenCount >= 0)
           ? _subtreeCount - oldChildCount + newChildrenCount : -1;
-      Object measure = tryComputeMeasureFromChildren(allChildren, newLen, storage, measureOps);
+      // Absorb keeps every element this node held and gains the one inserted key, so the
+      // insert delta is exact here too when the recompute is unavailable.
+      Object measure = measureAfterInsert(settings, measureOps,
+          tryComputeMeasureFromChildren(allChildren, newLen, storage, measureOps), _measure, key);
       Branch<Key, Address> nb = new Branch(_level, newLen, allKeys, allAddresses, allChildren, count, measure, _projCmp, settings);
       if (settings.diffBufSize() > 0) {
         // absorbed a child split: structural → written (BUF_WRITE), but it still buffers
@@ -1037,6 +1140,28 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
     long count1 = tryComputeSubtreeCountFromChildren(children1, half1, storage);
     long count2 = tryComputeSubtreeCountFromChildren(children2, half2, storage);
+    // No insert delta here, unlike every arm above: a split PARTITIONS this node's elements
+    // between two new nodes, and the monoid has no operation that divides one measure into the
+    // two halves — that needs the per-child measures the recompute is already asking for. So a
+    // split of a branch whose children are not all resident still produces a measureless node,
+    // and the next `forceComputeMeasure` restores that node's children to fill it.
+    //
+    // That fill is NOT one-time, as this comment first claimed. `forceComputeMeasure` assigns
+    // to the in-memory object only; if the node was STORED while measureless its blob carries
+    // no `:measure` (node->map omits a null), so every later cold restore produces a
+    // measureless instance again and pays the descent again — under `:weak` that is every time
+    // the node is dropped. What makes it small is how few such nodes there are. Measured,
+    // 50000 elements built, stored, cold-restored, 5000 more inserted, re-stored:
+    //
+    //     bf   8   4587 stored branches   15 without a measure   cold reader's `measure`: 1 blob
+    //     bf  64     56 stored branches    2 without a measure   cold reader's `measure`: 1 blob
+    //     bf 512      2 stored branches    0 without a measure   cold reader's `measure`: 1 blob
+    //
+    // The root is not normally the split node, so it keeps its measure and `set/measure`
+    // answers without descending at all. The residual is paid only by a reader that descends
+    // INTO one of those nodes — `measure-slice`, or `getNth` routing through it. A split is
+    // also one insert in every `branchingFactor`, where the arms above ran on every insert,
+    // which is why they were the whole cost and this is what is left.
     Object measure1 = tryComputeMeasureFromChildren(children1, half1, storage, measureOps);
     Object measure2 = tryComputeMeasureFromChildren(children2, half2, storage, measureOps);
     Branch<Key, Address> sb1 = new Branch(_level, half1, keys1, addresses1, children1, count1, measure1, _projCmp, settings);

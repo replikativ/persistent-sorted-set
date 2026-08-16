@@ -1,3 +1,91 @@
+# Unreleased
+
+- **Fix (measure): a write to a cold tree erased the aggregate, and the next reader restored
+  the subtree to rebuild it.** `_subtreeCount` is delta-maintained — `Branch.add` does
+  `_subtreeCount += 1`, with no reference to the siblings. `_measure` was not: every arm of
+  `Branch.add` recomputed it with `tryComputeMeasure`, which folds the measures of ALL `_len`
+  children and returns `null` the moment one of them is not resident.
+
+  On a lazily restored tree that is the ordinary case — only the descent path is in memory — so
+  one `conj` erased the cached measure at every level from the touched leaf's parent to the
+  root. The value was never WRONG, it was absent, which is why no contents assertion anywhere
+  in the suite saw it; the bill landed entirely on the next reader, which rebuilt it through
+  `forceComputeMeasure` and its `child(storage, i)` descent.
+
+  Measured with an exact long measure, bf 64, 200 000 elements, `:ref-type :weak`, against a
+  storage that counts blob reads — five `conj` that read 4 blobs between them:
+
+      cold `measure`                 1 blob   (the root's own, restored alongside it)
+      5 conj                         4 blobs  root _measure -> NIL
+      the `measure` right after     79 blobs  = 39 branches and 40 LEAVES
+
+  and it did not amortise: under `:weak` the pulled children are dropped again, so every round
+  paid the same 79 — 399 blob reads over five write-then-read rounds on a 6451-blob tree. At
+  bf 512 the same shape pulled 194 of 196 blobs, the whole tree, because the cost is
+  `fanout x depth` rather than a function of how much was written. The 40 are LEAVES, and a
+  consumer who configures a measure usually has fat ones: stratum carries a column chunk inline
+  per leaf entry, so a stats query read hundreds of MB to produce numbers already cached in the
+  branches it walked past.
+
+  When the recompute is unavailable the inserted key is now folded in instead —
+  `merge(_measure, extract(key))`, exact because `add` inserts exactly one element. Same
+  measurement after: 0 blob reads, at every branching factor and every ref-type.
+
+  This is the JVM catching up to ClojureScript, not a new strategy. `branch.cljs` has always
+  folded the inserted key on the same-len and absorb arms and consulted children only on the
+  SPLIT arm, which is exactly the boundary drawn here — a split PARTITIONS a measure, and the
+  monoid has no operation that divides one. The recompute is still preferred wherever it is
+  available, so a fully resident node is byte-identical to before and the stress oracle's
+  per-node equality stays exact.
+
+  The split arm therefore still leaves a measureless node when its children are cold, and that
+  fill is NOT one-time: `forceComputeMeasure` assigns to the in-memory object, so a node stored
+  while measureless has no `:measure` in its blob and every later cold restore pays the descent
+  again. What makes it small is how few such nodes there are — measured, 50 000 elements built,
+  stored, cold-restored, 5000 more inserted, re-stored: 15 of 4587 stored branches at bf 8, 2 of
+  56 at bf 64, 0 of 2 at bf 512, and a cold reader's `measure` costs 1 blob at all three because
+  the root is not normally the split node. Only a reader descending INTO such a node
+  (`measure-slice`, `get-nth`) pays it.
+
+  **New: `IMeasure.commutativeMerge()`, defaulting to true.** The delta folds the inserted key
+  in at the END of the node's measure rather than at its sorted position, which is exact for a
+  commutative merge and WRONG for an order-sensitive one (a concatenation, a first/last, an
+  order-dependent hash). That is a real narrowing, not the status quo restated: `Leaf.add`'s
+  delta fires only on the TRANSIENT in-place path, so such a measure driven through the
+  ordinary persistent API used to be correct on the JVM. Measured with a concatenating measure,
+  bf 8, a cold-restored `(range 0 400 2)` then `conj` of 37 39 41 43 45: three nodes ended
+  holding their elements in insertion order. Returning false from `commutativeMerge` restores
+  postpone-and-force, and now also makes `Leaf.add`'s middle-insert arm recompute from its own
+  keys — so the contract is enforced rather than merely declared. Every shipped measure (count,
+  sum, sumSq, min, max) is commutative and is unaffected.
+
+  **Commutativity does not buy exactness for a floating-point measure**, and this is the one
+  place the fix trades something away. `+` on doubles is commutative but not associative, so
+  the delta and a recomputation can differ in the last bits — measured with a `sum of 1/(k+1)`
+  measure, bf 8, 2000 elements cold plus 300 appends: cached `8.236631351723583` against a
+  recomputation of `8.236631351723577`. `node->map` serializes `:measure` and
+  `forceComputeMeasure` only recurses into a child whose measure is null, so that value is
+  durable and does not self-heal, where before it was a null the next reader replaced with an
+  exact fold. `NumericStats` sums doubles, so this is reachable with the shipped ops; count,
+  min and max stay exact, and `node->identity` excludes `:measure`, so content addressing and
+  dedup are unaffected. `validate-full`'s measure check already refuses to police inexact
+  measures for this exact reason (641a109).
+
+  **Refused when a `leafProcessor` is configured**, on either the node's settings or the
+  operation's, since a processor may compact or expand the leaf and "one key added" is then not
+  "one element added". Such a set keeps the old postpone-and-force behaviour.
+
+  **Not applied to `remove` or `replace`**, deliberately. A subtraction delta needs the element
+  the LEAF actually removed rather than the caller's search key — `removedOut` is threaded only
+  at level 1 and only under diff-buf — and `IMeasure/remove` is invertible only for measures
+  that are, since min/max must consult the remaining children, which is the very IO this
+  avoids. Those paths still null and still force.
+
+  Regression test: `test.measure-cold-maintenance`, the measure twin of
+  `durable-count-read-side`. Red against the unfixed build with 13 failures across both
+  invariants (the root measure is nil after a write; reading it restores the subtree), green
+  after, and every measure-VALUE assertion in it passes either way — which is the point.
+
 # 0.5.x
 
 A correctness release, and the version is 0.5 for that reason rather than for the feature list.
