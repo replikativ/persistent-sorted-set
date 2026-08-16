@@ -26,6 +26,19 @@ public interface IMeasure<Key, M> {
     /**
      * Merge two measure objects.
      * This operation must be associative: merge(a, merge(b, c)) == merge(merge(a, b), c)
+     *
+     * IT MUST ALSO BE COMMUTATIVE — merge(a, b) == merge(b, a) — if you want an insert into
+     * the middle of the set to be measured exactly. Both `Leaf.add` and `Branch.add` maintain
+     * a node's cached measure incrementally as merge(cached, extract(insertedKey)), which folds
+     * the new element in at the END rather than at its sorted position. Every measure the
+     * library ships (count, sum, sumSq, min, max) is commutative, and so is every aggregate
+     * this is useful for; a genuinely order-sensitive measure (a first/last, a concatenation)
+     * will read correctly only after a recomputation from children.
+     *
+     * This was always the case — the incremental arms of `Leaf.add` have folded at the end
+     * since the measure landed. It is written down here rather than left implicit in one
+     * implementation because `Branch.add` now relies on it as well, on the path where the
+     * children are not resident.
      */
     M merge(M m1, M m2);
 
