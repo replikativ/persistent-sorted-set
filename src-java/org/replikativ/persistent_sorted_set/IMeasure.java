@@ -27,20 +27,43 @@ public interface IMeasure<Key, M> {
      * Merge two measure objects.
      * This operation must be associative: merge(a, merge(b, c)) == merge(merge(a, b), c)
      *
-     * IT MUST ALSO BE COMMUTATIVE — merge(a, b) == merge(b, a) — if you want an insert into
-     * the middle of the set to be measured exactly. Both `Leaf.add` and `Branch.add` maintain
-     * a node's cached measure incrementally as merge(cached, extract(insertedKey)), which folds
-     * the new element in at the END rather than at its sorted position. Every measure the
-     * library ships (count, sum, sumSq, min, max) is commutative, and so is every aggregate
-     * this is useful for; a genuinely order-sensitive measure (a first/last, a concatenation)
-     * will read correctly only after a recomputation from children.
-     *
-     * This was always the case — the incremental arms of `Leaf.add` have folded at the end
-     * since the measure landed. It is written down here rather than left implicit in one
-     * implementation because `Branch.add` now relies on it as well, on the path where the
-     * children are not resident.
+     * It is NOT required to be commutative. If yours is not, say so by overriding
+     * {@link #commutativeMerge()} — see there for what changes.
      */
     M merge(M m1, M m2);
+
+    /**
+     * May the tree fold a newly inserted key in at the END of a node's cached measure, rather
+     * than at that key's sorted position? True iff {@link #merge} is COMMUTATIVE.
+     *
+     * The incremental arms of `Leaf.add` and `Branch.add` maintain a node's measure as
+     * merge(cached, extract(insertedKey)). For an insert into the MIDDLE of a node that folds
+     * the new element out of order, which is exact for a commutative merge and wrong for an
+     * order-sensitive one (a concatenation, a first/last, an order-dependent hash). Returning
+     * false makes both recompute from content instead — a leaf from its own keys, a branch
+     * from its children, postponing (caching null) when a child is not resident.
+     *
+     * The default is true because that is what the tree has always assumed. It was assumed
+     * SILENTLY, and unevenly: `Leaf.add`'s delta fires only on the transient in-place path,
+     * so an order-sensitive measure used through the ordinary persistent API was correct on
+     * the JVM, while ClojureScript — whose `branch.cljs` has taken the delta unconditionally
+     * since measures landed — was not. `Branch.add` now takes it on the persistent path too,
+     * when the children are not resident, which is what turned an implicit assumption into
+     * one worth being able to decline.
+     *
+     * Cost of returning false: the measure of a cold-tree write is postponed rather than
+     * maintained, so the reader that needs it pays a `forceComputeMeasure` descent — the
+     * behaviour every measure had before this was introduced.
+     *
+     * Every measure the library ships (count, sum, sumSq, min, max) is commutative and leaves
+     * this alone. NOTE that commutativity does not buy EXACTNESS for a floating-point measure:
+     * `+` on doubles is commutative but not associative, so a delta and a recomputation can
+     * differ in the last bits and the cached value is the one that reaches disk. That is the
+     * same inexactness `validate-full`'s `{:check-measures? true}` already refuses to police.
+     */
+    default boolean commutativeMerge() {
+        return true;
+    }
 
     /**
      * Remove a key's contribution from a measure.

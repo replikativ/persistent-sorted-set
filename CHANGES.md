@@ -38,11 +38,42 @@
   available, so a fully resident node is byte-identical to before and the stress oracle's
   per-node equality stays exact.
 
-  **`IMeasure.merge` must be commutative** for an insert into the middle of the set to be
-  measured exactly, since the key is folded in at the end rather than at its sorted position.
-  That was always true of `Leaf.add`'s in-place arms; it is now written on the interface rather
-  than left implicit in one implementation. Every shipped measure (count, sum, sumSq, min, max)
-  satisfies it.
+  The split arm therefore still leaves a measureless node when its children are cold, and that
+  fill is NOT one-time: `forceComputeMeasure` assigns to the in-memory object, so a node stored
+  while measureless has no `:measure` in its blob and every later cold restore pays the descent
+  again. What makes it small is how few such nodes there are — measured, 50 000 elements built,
+  stored, cold-restored, 5000 more inserted, re-stored: 15 of 4587 stored branches at bf 8, 2 of
+  56 at bf 64, 0 of 2 at bf 512, and a cold reader's `measure` costs 1 blob at all three because
+  the root is not normally the split node. Only a reader descending INTO such a node
+  (`measure-slice`, `get-nth`) pays it.
+
+  **New: `IMeasure.commutativeMerge()`, defaulting to true.** The delta folds the inserted key
+  in at the END of the node's measure rather than at its sorted position, which is exact for a
+  commutative merge and WRONG for an order-sensitive one (a concatenation, a first/last, an
+  order-dependent hash). That is a real narrowing, not the status quo restated: `Leaf.add`'s
+  delta fires only on the TRANSIENT in-place path, so such a measure driven through the
+  ordinary persistent API used to be correct on the JVM. Measured with a concatenating measure,
+  bf 8, a cold-restored `(range 0 400 2)` then `conj` of 37 39 41 43 45: three nodes ended
+  holding their elements in insertion order. Returning false from `commutativeMerge` restores
+  postpone-and-force, and now also makes `Leaf.add`'s middle-insert arm recompute from its own
+  keys — so the contract is enforced rather than merely declared. Every shipped measure (count,
+  sum, sumSq, min, max) is commutative and is unaffected.
+
+  **Commutativity does not buy exactness for a floating-point measure**, and this is the one
+  place the fix trades something away. `+` on doubles is commutative but not associative, so
+  the delta and a recomputation can differ in the last bits — measured with a `sum of 1/(k+1)`
+  measure, bf 8, 2000 elements cold plus 300 appends: cached `8.236631351723583` against a
+  recomputation of `8.236631351723577`. `node->map` serializes `:measure` and
+  `forceComputeMeasure` only recurses into a child whose measure is null, so that value is
+  durable and does not self-heal, where before it was a null the next reader replaced with an
+  exact fold. `NumericStats` sums doubles, so this is reachable with the shipped ops; count,
+  min and max stay exact, and `node->identity` excludes `:measure`, so content addressing and
+  dedup are unaffected. `validate-full`'s measure check already refuses to police inexact
+  measures for this exact reason (641a109).
+
+  **Refused when a `leafProcessor` is configured**, on either the node's settings or the
+  operation's, since a processor may compact or expand the leaf and "one key added" is then not
+  "one element added". Such a set keeps the old postpone-and-force behaviour.
 
   **Not applied to `remove` or `replace`**, deliberately. A subtraction delta needs the element
   the LEAF actually removed rather than the caller's search key — `removedOut` is threaded only
