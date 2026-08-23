@@ -2,7 +2,13 @@
   (:require [org.replikativ.persistent-sorted-set.arrays :as arrays]
             [org.replikativ.persistent-sorted-set.impl.node :as node]))
 
-(defn- binary-search-l [cmp arr r k]
+(defn binary-search-l
+  "Leftmost index in [0, r+1] whose element is cmp->= `k` — the ClojureScript
+   counterpart of the JVM's `ANode.searchFirst`, and public for the same caller
+   (`org.replikativ.persistent-sorted-set.warm`'s range pruning). Two
+   implementations of one search would drift; the JVM/cljs pair is already one
+   pair too many."
+  [cmp arr r k]
   (loop [l 0
          r (long r)]
     (if (<= l r)

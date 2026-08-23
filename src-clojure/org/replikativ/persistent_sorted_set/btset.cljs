@@ -105,6 +105,14 @@
                        (branch/stamp-proj-cmp (.-root set) (.-comparator set))))
                (.-root set))))
 
+(def $root
+  "Async-capable root accessor: materializes an address-rooted set's root (one
+   restore) and adopts the restored node's settings, exactly as every internal
+   reader does. Public for `org.replikativ.persistent-sorted-set.warm`, whose
+   walk needs the root under BOTH `{:sync? true}` and `{:sync? false}` —
+   `root-node` above is the sync-only diagnostic accessor."
+  -root)
+
 (defn $count
   [^BTSet set {:keys [sync?] :or {sync? true} :as opts}]
   (async+sync sync?
