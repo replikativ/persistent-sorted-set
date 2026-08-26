@@ -1,5 +1,13 @@
 # Unreleased
 
+- **Add cross-platform `walk-delta` for incremental hydration and replication.**
+  It uses `diff`'s level-synchronised, diff-buffer-aware paired frontier to
+  restore and report only new-side nodes that cannot be pruned as structurally
+  shared with an older set. It does not materialize element differences, an
+  identical root performs no IO, and ClojureScript supports both synchronous
+  and partial-CPS asynchronous storage. Callback returns are observational and
+  cannot accidentally truncate hydration.
+
 - **Fix (measure): a write to a cold tree erased the aggregate, and the next reader restored
   the subtree to rebuild it.** `_subtreeCount` is delta-maintained — `Branch.add` does
   `_subtreeCount += 1`, with no reference to the siblings. `_measure` was not: every arm of

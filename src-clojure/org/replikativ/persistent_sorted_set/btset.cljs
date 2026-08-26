@@ -624,6 +624,69 @@
                                     fb' (if down-b? (dec lb) lb)
                                     ca' cb')))))))))))
 
+(defn- walk-delta-descend
+  "Materialize one frontier and return its children without retaining keys.
+   `on-address` is nil on the old side and observational on the new side."
+  [storage refs level on-address {:keys [sync?] :or {sync? true} :as opts}]
+  (async+sync sync?
+              (async
+               (let [n (count refs)
+                     nodes
+                     (loop [i 0 nodes []]
+                       (if (< i n)
+                         (let [[nd parent idx :as ref] (nth refs i)]
+                           (if (some? nd)
+                             (recur (inc i) (conj nodes ref))
+                             (recur (inc i)
+                                    (conj nodes
+                                          (assoc ref 0
+                                                 (await (branch/child parent storage idx opts)))))))
+                         nodes))]
+                 (when on-address
+                   (doseq [[_ _ _ address] nodes]
+                     (when (some? address)
+                       (on-address address))))
+                 (if (zero? level) [] (diff-child-refs nodes))))))
+
+(defn walk-delta
+  "Restore and visit the stored nodes in `b` that cannot be pruned as subtrees
+   shared with `a`.
+
+   Uses the same paired-frontier and diff-buffer-aware pruning rules as `diff`,
+   but does not retain or compare elements. `on-address` observes successfully
+   materialized new-side addresses; its return value is ignored so callback return
+   values cannot accidentally prune an incomplete hydration. Old-side restores
+   are not reported.
+
+   Returns nil when synchronous, or a continuation yielding nil under
+   `{:sync? false}`."
+  [^BTSet a ^BTSet b storage on-address {:keys [sync?] :or {sync? true} :as opts}]
+  (async+sync sync?
+              (async
+               (let [addr-a (.-address a)
+                     addr-b (.-address b)]
+                 (when-not (and (some? addr-a) (= addr-a addr-b))
+                   (let [root-a (await (-root a opts))
+                         root-b (await (-root b opts))]
+                     (loop [fa [[root-a nil nil addr-a true]] la (diff-level root-a)
+                            fb [[root-b nil nil addr-b true]] lb (diff-level root-b)]
+                       (let [la (if (seq fa) la -1)
+                             lb (if (seq fb) lb -1)]
+                         (when-not (and (neg? la) (neg? lb))
+                           (let [[fa fb] (if (== la lb) (diff-prune fa fb) [fa fb])
+                                 la      (if (seq fa) la -1)
+                                 lb      (if (seq fb) lb -1)
+                                 down-a? (and (>= la 0) (>= la lb))
+                                 down-b? (and (>= lb 0) (>= lb la))
+                                 fa'     (if down-a?
+                                           (await (walk-delta-descend storage fa la nil opts))
+                                           fa)
+                                 fb'     (if down-b?
+                                           (await (walk-delta-descend storage fb lb on-address opts))
+                                           fb)]
+                             (recur fa' (if down-a? (dec la) la)
+                                    fb' (if down-b? (dec lb) lb))))))))))))
+
 (defn lookup
   [^BTSet set key cmp {:keys [sync?] :or {sync? true} :as opts}]
   (async+sync sync?
@@ -2460,4 +2523,3 @@
    (from-opts {:comparator cmp}))
   ([cmp & keys]
    (from-sequential cmp keys {})))
-
