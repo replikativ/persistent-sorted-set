@@ -180,6 +180,72 @@
                      c)))
       (is (zero? (reads))))))
 
+(deftest walk-delta-visits-and-restores-only-the-new-side-frontier
+  (testing "the synchronous hydration walk is delta-shaped and observational"
+    (let [{:keys [a b storage on-disk]} (delta-scenario 100000 2)
+          visited (atom [])]
+      (reset-reads!)
+      (is (nil? (s/walk-delta a b storage #(do (swap! visited conj %) nil))))
+      (let [delta-reads (reads)
+            reachable  (atom #{})]
+        (s/walk-addresses b #(do (swap! reachable conj %) true))
+        (is (> (count @visited) 1)
+            "nil callback return does not truncate the walk")
+        (is (every? @reachable @visited)
+            "the callback never sees old-only nodes")
+        (is (< (count @visited) (count @reachable))
+            "a small delta does not visit the whole tree")
+        (is (<= delta-reads 8)
+            (str "read " delta-reads " nodes of " on-disk " for a two-element delta")))))
+
+  (testing "identical roots perform no IO and make no callback"
+    (let [disk (atom {})
+          w (u/storage disk)
+          a (build w (range 10000))
+          ra (s/store a w)
+          c (u/storage disk)
+          x (s/restore ra c {:comparator compare})
+          y (s/restore ra c {:comparator compare})
+          visited (atom [])]
+      (reset-reads!)
+      (is (nil? (s/walk-delta x y c #(swap! visited conj %))))
+      (is (empty? @visited))
+      (is (zero? (reads))))))
+
+(deftest the-async-walk-delta-arm-matches-the-sync-arm
+  (cljs.test/async
+   done
+   (let [n 5000
+         disk (atom {})
+         w (u/storage disk)
+         a0 (reduce #(s/conj %1 %2 compare) (s/sorted-set-by compare) (range n))
+         ra (s/store a0 w)
+         b0 (reduce #(s/conj %1 %2 compare) a0 [(+ n 1) (+ n 2)])
+         rb (s/store b0 w)
+         sync-storage (u/storage disk)
+         async-storage (u/async-storage disk)
+         sa (s/restore ra sync-storage {:comparator compare})
+         sb (s/restore rb sync-storage {:comparator compare})
+         aa (s/restore ra async-storage {:comparator compare})
+         ab (s/restore rb async-storage {:comparator compare})
+         sync-seen (atom [])
+         async-seen (atom [])]
+     (reset-reads!)
+     (s/walk-delta sa sb sync-storage #(swap! sync-seen conj %))
+     (let [sync-reads (reads)]
+       (reset-reads!)
+       ((s/walk-delta aa ab async-storage #(swap! async-seen conj %) {:sync? false})
+        (fn [result]
+          (is (nil? result))
+          (is (= @sync-seen @async-seen)
+              "both platforms of the generated walk visit the same frontier")
+          (is (= sync-reads (reads))
+              (str "sync read " sync-reads ", async read " (reads)))
+          (done))
+        (fn [e]
+          (is false (str "async walk-delta failed: " e))
+          (done)))))))
+
 (deftest the-async-arm-gives-the-same-answer
   (testing "`async+sync` emits both arms from one source, so they must agree —
             same elements AND the same number of reads, since a divergence in

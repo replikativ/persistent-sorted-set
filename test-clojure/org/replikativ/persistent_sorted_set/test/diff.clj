@@ -177,6 +177,48 @@
              (s/diff (s/restore-by compare ra c) (s/restore-by compare ra c) c)))
       (is (zero? (reads))))))
 
+(deftest walk-delta-visits-and-restores-only-the-new-side-frontier
+  (testing "the hydration walk has delta-shaped IO and reports only addresses
+            reachable from the new tree"
+    (let [{:keys [a b storage on-disk]} (delta-scenario 100000 2)
+          visited (atom [])]
+      (reset-reads!)
+      (is (nil? (s/walk-delta a b storage #(swap! visited conj %))))
+      (let [delta-reads (reads)
+            reachable  (atom #{})]
+        (s/walk-addresses b #(do (swap! reachable conj %) true))
+        (is (seq @visited) "a changed root has a new-side frontier")
+        (is (every? @reachable @visited)
+            "the callback never sees old-only nodes")
+        (is (< (count @visited) (count @reachable))
+            "a small delta does not visit the whole new tree")
+        (is (<= delta-reads 8)
+            (str "read " delta-reads " nodes of " on-disk " for a two-element delta")))))
+
+  (testing "callback return values are observational, not an accidental prune flag"
+    (let [{:keys [a b storage]} (delta-scenario 10000 2)
+          visited (atom [])]
+      (s/walk-delta a b storage #(swap! visited conj %))
+      (is (> (count @visited) 1)
+          "swap! returns a truthy vector here; establish a multi-node frontier")
+      (reset! visited [])
+      (s/walk-delta a b storage #(do (swap! visited conj %) nil))
+      (is (> (count @visited) 1)
+          "nil from a side-effecting callback must not truncate hydration")))
+
+  (testing "identical roots are a zero-read, zero-callback operation"
+    (let [st (mk-storage)
+          a  (build (:storage st) (range 10000))
+          ra (s/store a (:storage st))
+          c  (cold st)
+          x  (s/restore-by compare ra c)
+          y  (s/restore-by compare ra c)
+          visited (atom [])]
+      (reset-reads!)
+      (is (nil? (s/walk-delta x y c #(swap! visited conj %))))
+      (is (empty? @visited))
+      (is (zero? (reads))))))
+
 (deftest diff-of-unrelated-sets-is-correct-if-not-cheap
   (testing "no shared structure means nothing prunes. The answer must still be
             right — a caller who diffs unrelated sets gets a slow correct result,

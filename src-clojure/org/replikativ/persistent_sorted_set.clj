@@ -943,3 +943,76 @@
                  (recur fa' (if down-a? (dec la) la)
                         fb' (if down-b? (dec lb) lb)
                         ca' cb'))))))))))
+
+(defn- walk-delta-descend
+  "Materialize one frontier and return its children, without retaining keys.
+
+   `on-address` is observational and is invoked only for this frontier's stored
+   addresses, after their nodes have been materialized successfully. A nil callback
+   is used for the old side: those nodes may be needed to discover sharing, but
+   they do not belong to the new-side delta."
+  [^IStorage storage refs level on-address]
+  (let [nodes (materialize storage refs)]
+    (when on-address
+      (doseq [[_ _ _ address] nodes]
+        (when (some? address)
+          (on-address address))))
+    (if (zero? (long level)) [] (child-refs nodes))))
+
+(defn walk-delta
+  "Restore and visit the stored nodes in `b` that cannot be pruned as subtrees
+   shared with `a`.
+
+   This is the node-level counterpart of [[diff]]. It uses the same
+   level-synchronised paired-frontier walk and the same diff-buffer-aware
+   pruning rule, but never collects or compares set elements. Cost is therefore
+   proportional to the structural delta when the sets share lineage. It is
+   intended for hydration and replication: restoring a new-side node through a
+   read-through storage can populate a local tier without enumerating the whole
+   store.
+
+   `on-address` is called once for each non-pruned NEW-side frontier entry that
+   has a stored address, after that node was restored or found resident. Its return
+   value is deliberately ignored: only structural sharing may prune this walk,
+   so a side-effecting callback that returns nil cannot silently produce an
+   incomplete hydration. Nodes read only from `a` are not reported.
+
+   Identical stored roots perform no reads and make no callback. Unstored or
+   unrelated sets remain correct but cannot prune effectively and may degrade
+   to a full walk. Returns nil.
+
+   The five-argument form is cross-platform. The JVM supports only synchronous
+   storage and refuses `{:sync? false}`; ClojureScript returns a continuation in
+   that mode."
+  ([^PersistentSortedSet a ^PersistentSortedSet b on-address]
+   (walk-delta a b (.-_storage b) on-address {:sync? true}))
+  ([^PersistentSortedSet a ^PersistentSortedSet b ^IStorage storage on-address]
+   (walk-delta a b storage on-address {:sync? true}))
+  ([^PersistentSortedSet a ^PersistentSortedSet b ^IStorage storage on-address opts]
+   (when (false? (:sync? opts true))
+     (throw (ex-info "walk-delta does not own a thread on the JVM; use :sync? true"
+                     {:type :persistent-sorted-set/async-unsupported
+                      :operation :walk-delta})))
+   (let [addr-a (.-_address a)
+         addr-b (.-_address b)]
+     (when-not (and (some? addr-a) (= addr-a addr-b))
+       (let [root-a (.root a)
+             root-b (.root b)]
+         (loop [fa [[root-a nil nil addr-a true]] la (.level ^ANode root-a)
+                fb [[root-b nil nil addr-b true]] lb (.level ^ANode root-b)]
+           (let [la (if (clojure.core/seq fa) (long la) -1)
+                 lb (if (clojure.core/seq fb) (long lb) -1)]
+             (when-not (and (neg? la) (neg? lb))
+               (let [[fa fb] (if (== la lb) (prune-shared fa fb) [fa fb])
+                     la      (if (clojure.core/seq fa) la -1)
+                     lb      (if (clojure.core/seq fb) lb -1)
+                     down-a? (and (>= la 0) (>= la lb))
+                     down-b? (and (>= lb 0) (>= lb la))
+                     fa'     (if down-a?
+                               (walk-delta-descend storage fa la nil)
+                               fa)
+                     fb'     (if down-b?
+                               (walk-delta-descend storage fb lb on-address)
+                               fb)]
+                 (recur fa' (if down-a? (dec la) la)
+                        fb' (if down-b? (dec lb) lb)))))))))))

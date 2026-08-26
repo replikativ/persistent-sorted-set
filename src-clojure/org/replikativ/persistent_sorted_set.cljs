@@ -353,6 +353,21 @@
   ([^BTSet a ^BTSet b storage opts]
    (btset/diff a b storage opts)))
 
+(defn walk-delta
+  "Restore and visit the stored nodes in `b` that are not structurally shared
+   with `a`.
+
+   This is a node-level, allocation-light counterpart to [[diff]] for hydration
+   and replication. `on-address` is called after each new-side node is restored
+   or found resident; its return value is ignored. Returns nil synchronously or a continuation
+   yielding nil with `{:sync? false}`."
+  ([^BTSet a ^BTSet b on-address]
+   (btset/walk-delta a b (.-storage b) on-address {:sync? true}))
+  ([^BTSet a ^BTSet b storage on-address]
+   (btset/walk-delta a b storage on-address {:sync? true}))
+  ([^BTSet a ^BTSet b storage on-address opts]
+   (btset/walk-delta a b storage on-address opts)))
+
 (defn restore
   "Restore a set from storage given root-address-or-info and storage.
    This operation is always synchronous and does not initiate io.
@@ -441,4 +456,3 @@
                     :storage (.-storage set)
                     :meta (meta set))]
     (btset/from-sorted-array (.-comparator set) arr len opts)))
-

@@ -244,6 +244,20 @@ actually references, e.g. to GC unreferenced objects from your storage:
   @*alive-addresses)
 ```
 
+When two stored versions share lineage, `walk-delta` restores only the new-side
+nodes that are not part of a structurally shared subtree. This incrementally
+hydrates a read-through cache without listing the backing store:
+
+```clojure
+(set/walk-delta old-set new-set storage
+                (fn [address] (record-hydrated! address)))
+```
+
+The callback runs after each new-side node is restored or found resident. Its return
+value is ignored; unlike `walk-addresses`, it cannot prune the walk. In
+ClojureScript, pass `{:sync? false}` as the fifth argument for a continuation.
+Shared roots do no IO, and a small change reads only the changed frontier.
+
 See [test-clojure/org/replikativ/persistent_sorted_set/test/storage.clj](test-clojure/org/replikativ/persistent_sorted_set/test/storage.clj)
 for more examples.
 
