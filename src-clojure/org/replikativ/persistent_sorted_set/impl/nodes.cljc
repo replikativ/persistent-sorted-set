@@ -312,7 +312,7 @@
   [ctx blob]
   (let [{:keys [keys measure]} blob
         settings (blob-settings ctx blob)]
-    #?(:clj (let [l (Leaf. ^List keys settings)]
+    #?(:clj (let [l (Leaf. ^List keys ^Settings settings)]
               (when (some? measure) (set! (.-_measure ^ANode l) measure))
               l)
        :cljs (Leaf. (to-array keys) settings measure))))
@@ -322,7 +322,7 @@
   [ctx blob]
   (let [{:keys [level keys addresses subtree-count measure slots]} blob
         settings (blob-settings ctx blob)]
-    #?(:clj (let [b (Branch. (int level) ^List keys ^List addresses settings)]
+    #?(:clj (let [b (Branch. (int level) ^List keys ^List addresses ^Settings settings)]
               (set! (.-_subtreeCount b) (long (or subtree-count -1)))
               (when (some? measure) (set! (.-_measure ^ANode b) measure))
               (when slots (attach-slots! b addresses slots))
