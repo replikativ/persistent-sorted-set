@@ -138,7 +138,7 @@
    Persistent-only workloads never see it (no in-place shrink, no surplus), and neither does
    ClojureScript, whose leaf arrays are exact — hence a churn-heavy transient probe to find it."
   [node]
-  #?(:clj  (java.util.Arrays/copyOf ^objects (.-_keys ^ANode node) (nlen node))
+  #?(:clj  (java.util.Arrays/copyOf ^objects (.-_keys ^ANode node) (int (nlen node)))
      :cljs (.slice (.-keys node) 0 (nlen node))))
 
 ;; =============================================================================
