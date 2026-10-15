@@ -1,7 +1,8 @@
 {:paths ["src-clojure" "target/classes"]
  :deps
  {org.clojure/clojure {:mvn/version "1.12.0"}
-  is.simm/partial-cps {:mvn/version "0.1.59"}}
+  ;; partial-cps moved to org.replikativ (namespaces unchanged)
+  org.replikativ/partial-cps {:mvn/version "0.1.68"}}
  :deps/prep-lib {:ensure "target/classes"
                  :alias :build
                  :fn java}
