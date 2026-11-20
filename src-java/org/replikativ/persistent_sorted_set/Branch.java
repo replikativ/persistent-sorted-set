@@ -1727,6 +1727,16 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         newLeft._measure = tryComputeMeasureFromChildren(newLeftChildren, newLeftLen, storage, measureOps);
       }
       newCenter._subtreeCount = tryComputeSubtreeCountFromChildren(centerChildren, newCenterLen, storage);
+      // A borrow REDISTRIBUTES two nodes' elements, minus the one deleted. How they divide
+      // needs the moved children's counts, which the probe has only for residents — but the
+      // pair's TOTAL is known whenever both sources knew theirs, so one known half gives the
+      // other. Both unknown is what remains on a fully cold pair; the parent keeps its own
+      // count by delta regardless. (Not with a leaf processor: one key is not one element.)
+      if (settings.leafProcessor() == null && left._subtreeCount >= 0 && _subtreeCount >= 0) {
+        long pair = left._subtreeCount + _subtreeCount - 1;
+        if (newLeft._subtreeCount < 0 && newCenter._subtreeCount >= 0) newLeft._subtreeCount = pair - newCenter._subtreeCount;
+        else if (newCenter._subtreeCount < 0 && newLeft._subtreeCount >= 0) newCenter._subtreeCount = pair - newLeft._subtreeCount;
+      }
       newCenter._measure = tryComputeMeasureFromChildren(centerChildren, newCenterLen, storage, measureOps);
       if (settings.diffBufSize() > 0) {
         // borrowed from left: structural → BUF_WRITE. newLeft/newCenter are unpublished:
@@ -1807,6 +1817,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (newRightChildren != null) {
         newRight._subtreeCount = tryComputeSubtreeCountFromChildren(newRightChildren, newRightLen, storage);
         newRight._measure = tryComputeMeasureFromChildren(newRightChildren, newRightLen, storage, measureOps);
+      }
+      // Same as the borrow from left: the pair's total is known, so one half gives the other.
+      if (settings.leafProcessor() == null && right._subtreeCount >= 0 && _subtreeCount >= 0) {
+        long pair = _subtreeCount - 1 + right._subtreeCount;
+        if (newRight._subtreeCount < 0 && newCenter._subtreeCount >= 0) newRight._subtreeCount = pair - newCenter._subtreeCount;
+        else if (newCenter._subtreeCount < 0 && newRight._subtreeCount >= 0) newCenter._subtreeCount = pair - newRight._subtreeCount;
       }
       if (settings.diffBufSize() > 0) {
         // borrowed from right: structural → BUF_WRITE. newCenter/newRight are unpublished:

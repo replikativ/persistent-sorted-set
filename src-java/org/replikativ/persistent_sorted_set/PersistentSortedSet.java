@@ -284,6 +284,22 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
    * knew its total before the insert and gained exactly one element, so the new root's count
    * is known regardless. Not with a leaf processor, where one key is not one element.
    */
+  /**
+   * The mirror for a removal. The new root is whatever the old root's remove returned, and
+   * when the old root is left with a single child that child BECOMES the root — a join of two
+   * nodes, unknown as soon as either was (a borrow on a cold pair leaves both halves unknown,
+   * and a later join inherits it). The set held `rootCountBefore` and lost exactly one
+   * element. Measured before this, bf 8 / 3000 elements / cold: the delete that collapsed the
+   * root took it from a known 2488 to -1, and it was stored that way.
+   */
+  private ANode countShrunkRoot(ANode root, long rootCountBefore) {
+    if (root instanceof Branch && rootCountBefore >= 0 && _settings.leafProcessor() == null) {
+      Branch b = (Branch) root;
+      if (b._subtreeCount < 0) b._subtreeCount = rootCountBefore - 1;
+    }
+    return root;
+  }
+
   private ANode countGrownRoot(ANode grown, long rootCountBefore) {
     if (grown instanceof Branch && rootCountBefore >= 0 && _settings.leafProcessor() == null) {
       Branch b = (Branch) grown;
@@ -834,12 +850,14 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     // split-seam (MST/content mode): sibling-free removeContent recursion, then collapse a
     // single-child root (count path below is untouched / byte-identical).
     if (_settings.boundary().contentDefined()) {
+      final long mstCountBefore = getSubtreeCount(root());
       ANode newRoot = root().removeContent(_storage, (Key) key, cmp, _settings);
       if (newRoot == null) return this; // not in set
       if (_storage != null && _address != null) _storage.markFreed(_address);
       while (newRoot instanceof Branch && newRoot._len == 1) {
         newRoot = ((Branch) newRoot).child(_storage, 0);
       }
+      newRoot = countShrunkRoot(newRoot, mstCountBefore);
       if (editable()) {
         _address = null;
         _root = newRoot;
@@ -854,6 +872,8 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     }
 
     final ANode<Key, Address> r = root();
+    // Read BEFORE the remove: an editable root is mutated in place.
+    final long rootCountBefore = getSubtreeCount(r);
     ANode[] nodes = r.remove(_storage, (Key) key, null, null, cmp, _settings);
 
     // not in set
@@ -887,6 +907,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     if (editable()) {
       if (newRoot instanceof Branch && newRoot._len == 1)
         newRoot = ((Branch) newRoot).child(_storage, 0);
+      newRoot = countShrunkRoot(newRoot, rootCountBefore);
       // Clear address
       _address = null;
       _root = newRoot;
@@ -903,6 +924,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     if (newRoot instanceof Branch && newRoot._len == 1) {
       newRoot = ((Branch) newRoot).child(_storage, 0);
     }
+    newRoot = countShrunkRoot(newRoot, rootCountBefore);
     // Use root's subtreeCount for exact count (works correctly even with processor)
     long rootCount = getSubtreeCount(newRoot);
     int newCount = (rootCount >= 0) ? (int) rootCount : -1;

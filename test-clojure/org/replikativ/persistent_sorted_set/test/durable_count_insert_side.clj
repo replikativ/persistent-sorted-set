@@ -134,3 +134,68 @@
       (is (identical? cold same))
       (is (set/has-subtree-counts? same))
       (is (= n (count same))))))
+
+;; ---- removal, and removal mixed with insert ----
+;;
+;; `Branch.remove` already kept a node's own count by delta (991bdcf, and the joins after
+;; it). What it could not keep is the count of the node that BECOMES the root: when the old
+;; root is left with one child, that child — a join — is promoted, and a join is unknown as
+;; soon as either side was. A borrow on a cold pair leaves both halves unknown, so a few
+;; deletes later the promoted node had no count and neither did the set.
+
+(defn- removal-generations
+  "`gens` rounds of (cold restore, apply ops, store). pattern picks what is deleted:
+   :prefix / :scattered from the live keys, or :mixed deletes interleaved with appends.
+   Every round also deletes keys that are NOT there, which must change nothing."
+  [disk bf n gens per pattern transient?]
+  (let [opts (opts-for bf)
+        w    (atom 0)
+        s0   (reduce #(set/conj %1 %2 compare) (set/sorted-set* opts) (range n))]
+    (loop [addr (set/store s0 (storage disk w bf)) gen 0 live (set (range n)) unknown-roots 0]
+      (if (= gen gens)
+        {:addr addr :live live :unknown-roots unknown-roots}
+        (let [cold   (set/restore-by compare addr (storage disk w bf) opts)
+              sorted (vec (sort live))
+              dels   (case pattern
+                       :prefix    (take per sorted)
+                       :scattered (take per (take-nth (max 1 (quot (count sorted) per)) sorted))
+                       :mixed     (take (quot per 2) (take-nth 5 sorted)))
+              adds   (if (= pattern :mixed)
+                       (map #(+ 100000 % (* gen 1000)) (range (quot per 2)))
+                       [])
+              absent (map #(- -1 %) (range 20))
+              ops    (concat (map vector (repeat :del) absent)
+                             (interleave (map vector (repeat :del) dels)
+                                         (concat (map vector (repeat :add) adds) (repeat [:del -1]))))
+              s      (if transient?
+                       (persistent! (reduce (fn [s [op k]] (if (= op :del) (disj! s k) (conj! s k)))
+                                            (transient cold) ops))
+                       (reduce (fn [s [op k]] (if (= op :del) (set/disj s k compare) (set/conj s k compare)))
+                               cold ops))
+              live'  (reduce conj (reduce disj live dels) adds)
+              addr'  (set/store s (storage disk w bf))
+              root   (edn/read-string (@disk addr'))]
+          (recur addr' (inc gen) live'
+                 (cond-> unknown-roots
+                   (and (:addresses root) (neg? (long (or (:subtree-count root) -1)))) inc)))))))
+
+(deftest the-root-keeps-its-count-through-cold-removals
+  (testing "removals on a cold tree — through root collapses, borrows and joins, with
+            absent keys and with inserts mixed in — never store a root without a count"
+    (doseq [[bf n per] [[8 3000 450] [16 3000 450] [64 20000 3000]]
+            pattern    [:prefix :scattered :mixed]
+            transient? [false true]
+            :let [label (str (if transient? :transient :persistent) " " pattern " bf=" bf)]]
+      (let [disk (atom {})
+            {:keys [addr live unknown-roots]} (removal-generations disk bf n 6 per pattern transient?)
+            r    (atom 0)
+            cold (set/restore-by compare addr (storage disk r bf) (opts-for bf))]
+        (is (zero? unknown-roots)
+            (str label ": " unknown-roots " of 6 stored roots carry an unknown count"))
+        (reset! r 0)
+        (is (= (count live) (count cold))
+            (str label ": the count is exact (absent keys removed nothing)"))
+        (is (<= @r 1)
+            (str label ": a cold reader answers count from the root, paid " @r " restores"))
+        (is (= (sort live) (seq cold))
+            (str label ": and the elements are the right ones"))))))
