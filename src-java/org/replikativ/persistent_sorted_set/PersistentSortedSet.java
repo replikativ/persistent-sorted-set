@@ -279,6 +279,20 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   }
 
   /**
+   * The root split: `grown` wraps the pieces, and its count is their sum — unknown as soon as
+   * one piece is (a half of a branch whose children are on disk; see Branch.add). The set
+   * knew its total before the insert and gained exactly one element, so the new root's count
+   * is known regardless. Not with a leaf processor, where one key is not one element.
+   */
+  private ANode countGrownRoot(ANode grown, long rootCountBefore) {
+    if (grown instanceof Branch && rootCountBefore >= 0 && _settings.leafProcessor() == null) {
+      Branch b = (Branch) grown;
+      if (b._subtreeCount < 0) b._subtreeCount = rootCountBefore + 1;
+    }
+    return grown;
+  }
+
+  /**
    * Build the new root from the children the root's add() returned. Count ⇒ a single wrap
    * (byte-identical). MST ⇒ promote by boundary level until one node remains: a separator
    * whose key rises to level+1 ends a parent chunk, so one high-level key can grow several
@@ -756,6 +770,8 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     if (key == null) throw new IllegalArgumentException("PersistentSortedSet cannot store nil");
     ensureLiveTransient();
     final ANode<Key, Address> r = root();
+    // Read BEFORE the add: an editable root is mutated in place.
+    final long rootCountBefore = getSubtreeCount(r);
     ANode[] nodes = r.add(_storage, (Key) key, cmp, _settings);
 
     if (UNCHANGED == nodes) return this;
@@ -769,7 +785,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       if (1 == nodes.length) {
         markDirty(nodes[0]);
       } else if (nodes.length >= 2) {
-        markDirty(growRoot(nodes));
+        markDirty(countGrownRoot(growRoot(nodes), rootCountBefore));
       } else {
         // EARLY_EXIT (nodes.length == 0): `r` was modified IN PLACE, so it is the
         // new root and must be published strongly — see markDirty.
@@ -790,7 +806,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     if (1 == nodes.length) {
       newRoot = nodes[0];
     } else {
-      newRoot = growRoot(nodes);
+      newRoot = countGrownRoot(growRoot(nodes), rootCountBefore);
     }
 
     // Use root's subtreeCount for exact count (works correctly even with processor)
