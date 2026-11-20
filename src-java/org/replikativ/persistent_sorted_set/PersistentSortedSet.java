@@ -865,6 +865,11 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
 
     // split-seam (MST/content mode): sibling-free removeContent recursion, then collapse a
     // single-child root (count path below is untouched / byte-identical).
+    // Materialize the root BEFORE asking the settings which algorithm to run: root() is what
+    // adopts a stored tree's boundary into `_settings`. Asked first, a set restored without
+    // `:boundary` over a content-defined tree took the count-based path for its first removal
+    // and rebalanced by position — right elements, non-canonical shape.
+    root();
     if (_settings.boundary().contentDefined()) {
       final long mstCountBefore = totalBefore(root());
       ANode newRoot = root().removeContent(_storage, (Key) key, cmp, _settings);
@@ -967,6 +972,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     // hash across a level boundary the node would have to re-split/merge, so fall back to
     // disjoin+cons (the history-independent rebuild). Count mode is position-only ⇒ always in-place.
     // See doc/merkle-search-tree.md.
+    root(); // adopts a stored tree's boundary into _settings; see disjoin
     IBoundary boundary = _settings.boundary();
     if (boundary.contentDefined()
         && boundary.keyLevel(oldKey, _settings) != boundary.keyLevel(newKey, _settings)) {

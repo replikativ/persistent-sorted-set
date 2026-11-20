@@ -379,7 +379,10 @@
   ([^BTSet set old-key new-key cmp {:keys [sync?] :or {sync? true} :as opts}]
    (async+sync sync?
                (async
-                (let [bd (b/content-boundary (.-settings set))]
+                ;; root first: -root is what adopts a stored tree's boundary into the set's
+                ;; settings (as `disjoin` already does, and the JVM's replace now does)
+                (let [_  (await (-root set opts))
+                      bd (b/content-boundary (.-settings set))]
                   (if (and bd (not= (b/-key-level bd old-key) (b/-key-level bd new-key)))
                     ;; split-seam (MST): an in-place replace keeps the tree's boundary structure, which
                     ;; is canonical ONLY when old-key and new-key rise to the same level. When a partial
