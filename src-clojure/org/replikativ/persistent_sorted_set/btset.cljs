@@ -294,6 +294,19 @@
   (let [c (.-cnt set)]
     (if (neg? c) (node/subtree-count root) c)))
 
+(defn- -settings
+  "The settings this set's tree was actually written with. The `settings` field is
+   PROVISIONAL until the root has been read: a lazily restored set starts with what its
+   caller passed, and `-root` adopts the branching factor, boundary and diff-buf budget the
+   stored root carries. An algorithm decision must read them through here, so that no
+   function has to remember to load the root first — `$replace` did not, and its first
+   level-changing replace after a restore without `:boundary` was done in place."
+  [^BTSet set {:keys [sync?] :or {sync? true} :as opts}]
+  (async+sync sync?
+              (async
+               (do (await (-root set opts))
+                   (.-settings set)))))
+
 (defn- with-root-count
   "`root`, knowing `total` when it is a Branch that did not."
   [root total]
@@ -379,7 +392,7 @@
   ([^BTSet set old-key new-key cmp {:keys [sync?] :or {sync? true} :as opts}]
    (async+sync sync?
                (async
-                (let [bd (b/content-boundary (.-settings set))]
+                (let [bd (b/content-boundary (await (-settings set opts)))]
                   (if (and bd (not= (b/-key-level bd old-key) (b/-key-level bd new-key)))
                     ;; split-seam (MST): an in-place replace keeps the tree's boundary structure, which
                     ;; is canonical ONLY when old-key and new-key rise to the same level. When a partial
@@ -433,8 +446,8 @@
   ([^BTSet set key cmp {:keys [sync?] :or {sync? true} :as opts}]
    (async+sync sync?
                (async
-                (let [root (await (-root set opts))
-                      bd   (b/content-boundary (.-settings set))]
+                (let [bd   (b/content-boundary (await (-settings set opts)))
+                      root (await (-root set opts))]
                   (if bd
                     ;; split-seam (MST): sibling-free removeContent + single-child root collapse
                     ;; (≡ JVM disjoin content branch). Storage-aware (await child materialization).

@@ -42,6 +42,18 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   // Not final: a lazily-restored root self-describes its split strategy (the boundary); root()
   // adopts it on first materialization so conj/disj use the right splitter even when the restore
   // opts didn't specify one (the restore-by path). Like the _root lazy cache, a one-time write.
+  /**
+   * PROVISIONAL until the root has been read. A lazily restored set starts with the settings
+   * its caller passed, and the caller may not know the branching factor, the boundary or the
+   * diff-buf budget; the stored root does, and root() adopts them into this field. So a read
+   * of this field before the first root() can see the caller's guess.
+   *
+   * Algorithm decisions must therefore go through {@link #settings()}, which owns that
+   * transition. Reading the field directly is right only where the provisional value is the
+   * intended one: inside root() itself, when copying a handle (the copy adopts again), and for
+   * the properties that are never adopted from a node (ownership/editable, leaf processor,
+   * measure, reference type).
+   */
   public Settings _settings;
   public IStorage<Key, Address> _storage;
 
@@ -285,6 +297,23 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
    * is known regardless. Not with a leaf processor, where one key is not one element.
    */
   /**
+   * The settings this set's tree was actually written with: materializes the root if it has
+   * not been read yet, which is what adopts them (see `_settings`).
+   *
+   * This exists so that no method has to remember an ordering. `disjoin` and `replace` asked
+   * `_settings.boundary()` which algorithm to run BEFORE reading the root; on a set restored
+   * without `:boundary` over a content-defined tree the answer was still the caller's guess,
+   * so the first removal rebalanced by position and the first level-changing replace was
+   * done in place — right elements, non-canonical shape. Every later operation was fine.
+   *
+   * root() is called by every operation anyway and is a field read once the root is resident.
+   */
+  private Settings settings() {
+    root();
+    return _settings;
+  }
+
+  /**
    * What the set held before a write, or -1: the root's own count, else the count the SET
    * carries. The two are independent caches — the set header and the root blob are separate
    * on disk — so a root that lost its count (stored that way by an earlier build) can sit
@@ -328,7 +357,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
    * collapsing them is a follow-up). The rightmost child is never a cut (global max).
    */
   private ANode growRoot(ANode[] nodes) {
-    IBoundary boundary = _settings.boundary();
+    IBoundary boundary = settings().boundary();
     if (!boundary.contentDefined()) {
       return makeBranchFromChildren(nodes);
     }
@@ -339,7 +368,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       int start = 0;
       for (int i = 0; i < nodes.length; i++) {
         boolean cut = i < nodes.length - 1
-                      && boundary.keyLevel(nodes[i].maxKey(), _settings) >= thresh;
+                      && boundary.keyLevel(nodes[i].maxKey(), settings()) >= thresh;
         if (cut || i == nodes.length - 1) {
           branches.add(makeBranchFromChildren(Arrays.copyOfRange(nodes, start, i + 1)));
           start = i + 1;
@@ -802,7 +831,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     final ANode<Key, Address> r = root();
     // Read BEFORE the add: an editable root is mutated in place.
     final long rootCountBefore = totalBefore(r);
-    ANode[] nodes = r.add(_storage, (Key) key, cmp, _settings);
+    ANode[] nodes = r.add(_storage, (Key) key, cmp, settings());
 
     if (UNCHANGED == nodes) return this;
 
@@ -865,9 +894,9 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
 
     // split-seam (MST/content mode): sibling-free removeContent recursion, then collapse a
     // single-child root (count path below is untouched / byte-identical).
-    if (_settings.boundary().contentDefined()) {
+    if (settings().boundary().contentDefined()) {
       final long mstCountBefore = totalBefore(root());
-      ANode newRoot = root().removeContent(_storage, (Key) key, cmp, _settings);
+      ANode newRoot = root().removeContent(_storage, (Key) key, cmp, settings());
       if (newRoot == null) return this; // not in set
       if (_storage != null && _address != null) _storage.markFreed(_address);
       while (newRoot instanceof Branch && newRoot._len == 1) {
@@ -890,7 +919,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     final ANode<Key, Address> r = root();
     // Read BEFORE the remove: an editable root is mutated in place.
     final long rootCountBefore = totalBefore(r);
-    ANode[] nodes = r.remove(_storage, (Key) key, null, null, cmp, _settings);
+    ANode[] nodes = r.remove(_storage, (Key) key, null, null, cmp, settings());
 
     // not in set
     if (UNCHANGED == nodes) return this;
@@ -967,16 +996,16 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     // hash across a level boundary the node would have to re-split/merge, so fall back to
     // disjoin+cons (the history-independent rebuild). Count mode is position-only ⇒ always in-place.
     // See doc/merkle-search-tree.md.
-    IBoundary boundary = _settings.boundary();
+    IBoundary boundary = settings().boundary();
     if (boundary.contentDefined()
-        && boundary.keyLevel(oldKey, _settings) != boundary.keyLevel(newKey, _settings)) {
+        && boundary.keyLevel(oldKey, settings()) != boundary.keyLevel(newKey, settings())) {
       if (!root().contains(_storage, (Key) oldKey, cmp)) return this; // not found ⇒ no-op
       return disjoin(oldKey, cmp).cons(newKey, cmp);
     }
 
     ensureLiveTransient();
     final ANode<Key, Address> r = root();
-    ANode[] nodes = r.replace(_storage, (Key) oldKey, (Key) newKey, cmp, _settings);
+    ANode[] nodes = r.replace(_storage, (Key) oldKey, (Key) newKey, cmp, settings());
 
     // Not in set
     if (UNCHANGED == nodes) return this;
