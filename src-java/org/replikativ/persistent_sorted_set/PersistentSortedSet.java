@@ -279,6 +279,48 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   }
 
   /**
+   * The root split: `grown` wraps the pieces, and its count is their sum — unknown as soon as
+   * one piece is (a half of a branch whose children are on disk; see Branch.add). The set
+   * knew its total before the insert and gained exactly one element, so the new root's count
+   * is known regardless. Not with a leaf processor, where one key is not one element.
+   */
+  /**
+   * What the set held before a write, or -1: the root's own count, else the count the SET
+   * carries. The two are independent caches — the set header and the root blob are separate
+   * on disk — so a root that lost its count (stored that way by an earlier build) can sit
+   * under a set that still knows its total.
+   */
+  private long totalBefore(ANode root) {
+    long c = getSubtreeCount(root);
+    return c >= 0 ? c : _count;
+  }
+
+  /**
+   * Give the root that results from a successful write its count, if it has none.
+   *
+   * A node that BECOMES the root does not always know its count. The wrap built when the root
+   * splits sums its pieces, unknown as soon as one is (a half of a branch whose children are
+   * on disk; see Branch.add). The single child promoted when the root collapses is a join,
+   * unknown as soon as either joined node was. And a root restored without a count stays
+   * that way through every in-place and one-node return. None of these needs a walk: a
+   * successful write changed the set by exactly one element, so the result holds
+   * `totalBefore + delta`. Not with a leaf processor, where one key is not one element.
+   *
+   * Filling an unknown count on a node shared with another version of the set is sound: the
+   * node IS the whole set here, so the value is a property of the subtree, not of the version.
+   *
+   * Measured before this, bf 8 / 3000 elements / cold: the delete that collapsed the root took
+   * it from a known 2488 to -1, and it was stored that way.
+   */
+  private ANode countRoot(ANode root, long totalBefore, int delta) {
+    if (root instanceof Branch && totalBefore >= 0 && _settings.leafProcessor() == null) {
+      Branch b = (Branch) root;
+      if (b._subtreeCount < 0) b._subtreeCount = totalBefore + delta;
+    }
+    return root;
+  }
+
+  /**
    * Build the new root from the children the root's add() returned. Count ⇒ a single wrap
    * (byte-identical). MST ⇒ promote by boundary level until one node remains: a separator
    * whose key rises to level+1 ends a parent chunk, so one high-level key can grow several
@@ -310,9 +352,11 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   }
 
   /**
-   * Check whether all nodes in this tree have precomputed subtree counts.
-   * When true, countSlice is guaranteed O(log n).
-   * When false, countSlice may degrade to O(n) for subtrees missing counts.
+   * Whether the ROOT knows its element count — and only that. True means `count` is answered
+   * without reading the tree. It does NOT promise that every node below is counted: both halves
+   * of a branch that split while its children were on disk stay unknown by design (see
+   * Branch.add), and a countSlice that fully covers such a node counts it by descending.
+   * When false, the set as a whole has no count and countSlice may degrade to O(n).
    */
   public boolean hasSubtreeCounts() {
     ANode root = root();
@@ -756,6 +800,8 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     if (key == null) throw new IllegalArgumentException("PersistentSortedSet cannot store nil");
     ensureLiveTransient();
     final ANode<Key, Address> r = root();
+    // Read BEFORE the add: an editable root is mutated in place.
+    final long rootCountBefore = totalBefore(r);
     ANode[] nodes = r.add(_storage, (Key) key, cmp, _settings);
 
     if (UNCHANGED == nodes) return this;
@@ -775,6 +821,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
         // new root and must be published strongly — see markDirty.
         markDirty(r);
       }
+      countRoot(root(), rootCountBefore, 1);
       // When processor is configured, count may differ from +1
       if (_settings.leafProcessor() != null) {
         long rootCount = getSubtreeCount(root());
@@ -792,6 +839,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     } else {
       newRoot = growRoot(nodes);
     }
+    countRoot(newRoot, rootCountBefore, 1);
 
     // Use root's subtreeCount for exact count (works correctly even with processor)
     long rootCount = getSubtreeCount(newRoot);
@@ -818,12 +866,14 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     // split-seam (MST/content mode): sibling-free removeContent recursion, then collapse a
     // single-child root (count path below is untouched / byte-identical).
     if (_settings.boundary().contentDefined()) {
+      final long mstCountBefore = totalBefore(root());
       ANode newRoot = root().removeContent(_storage, (Key) key, cmp, _settings);
       if (newRoot == null) return this; // not in set
       if (_storage != null && _address != null) _storage.markFreed(_address);
       while (newRoot instanceof Branch && newRoot._len == 1) {
         newRoot = ((Branch) newRoot).child(_storage, 0);
       }
+      newRoot = countRoot(newRoot, mstCountBefore, -1);
       if (editable()) {
         _address = null;
         _root = newRoot;
@@ -838,6 +888,8 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     }
 
     final ANode<Key, Address> r = root();
+    // Read BEFORE the remove: an editable root is mutated in place.
+    final long rootCountBefore = totalBefore(r);
     ANode[] nodes = r.remove(_storage, (Key) key, null, null, cmp, _settings);
 
     // not in set
@@ -853,6 +905,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       // `r` was modified IN PLACE, so it is the new root and must be published
       // strongly — see markDirty.
       markDirty(r);
+      countRoot(r, rootCountBefore, -1);
       // When a processor is configured, count may differ from -1 — the same distinction
       // `cons` makes above and the rebuild arms below. This arm returned early and so
       // skipped the guard entirely; measured before the fix, count outran the elements by
@@ -871,6 +924,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     if (editable()) {
       if (newRoot instanceof Branch && newRoot._len == 1)
         newRoot = ((Branch) newRoot).child(_storage, 0);
+      newRoot = countRoot(newRoot, rootCountBefore, -1);
       // Clear address
       _address = null;
       _root = newRoot;
@@ -887,6 +941,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     if (newRoot instanceof Branch && newRoot._len == 1) {
       newRoot = ((Branch) newRoot).child(_storage, 0);
     }
+    newRoot = countRoot(newRoot, rootCountBefore, -1);
     // Use root's subtreeCount for exact count (works correctly even with processor)
     long rootCount = getSubtreeCount(newRoot);
     int newCount = (rootCount >= 0) ? (int) rootCount : -1;

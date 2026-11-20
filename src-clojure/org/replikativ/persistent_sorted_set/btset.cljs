@@ -275,6 +275,32 @@
             (first branches)
             (recur (arrays/into-array branches))))))))
 
+;; ---- the root's count after a write --------------------------------------------------
+;; A node that BECOMES the root is not always one that knows its count: the wrap built when
+;; the root splits sums two halves (unknown when their children are on disk), and the single
+;; child promoted when the root collapses is a join, unknown as soon as either joined node
+;; was. Neither needs a walk. A write that changed the set changed it by exactly one element,
+;; so the new root holds the old total +/- 1 — taken from the set's own count, or from the
+;; old root when the set never materialised one. An unknown root count is SERIALIZED
+;; (branch->blob writes it raw) and every later restore starts from it.
+;;
+;; Setting the field is safe here although `branch/$count` deliberately does not cache into
+;; it: that is a WALKED value on a node of unknown history, while this is exact by
+;; construction, and a ClojureScript Branch is never mutated in place afterwards.
+
+(defn- total-before
+  "The set's element count before a write, or -1: its own count, else the old root's."
+  [^BTSet set root]
+  (let [c (.-cnt set)]
+    (if (neg? c) (node/subtree-count root) c)))
+
+(defn- with-root-count
+  "`root`, knowing `total` when it is a Branch that did not."
+  [root total]
+  (when (and (instance? Branch root) (>= total 0) (neg? (.-subtree-count root)))
+    (set! (.-subtree-count root) total))
+  root)
+
 (defn conjoin
   ([^BTSet set key]
    (conjoin set key (.-comparator set) {:sync? true}))
@@ -297,9 +323,11 @@
                         (storage/markFreed (.-storage set) (.-address set)))
                       ;; If count is unknown (-1), keep it unknown; will be computed lazily when needed
                       (let [current-cnt (.-cnt set)
-                            new-cnt (if (neg? current-cnt) -1 (inc current-cnt))]
+                            new-cnt (if (neg? current-cnt) -1 (inc current-cnt))
+                            before  (total-before set root)
+                            root-total (if (neg? before) -1 (inc before))]
                         (if (== (arrays/alength roots) 1)
-                          (BTSet. (arrays/aget roots 0)
+                          (BTSet. (with-root-count (arrays/aget roots 0) root-total)
                                   new-cnt
                                   (.-comparator set)
                                   (.-meta set)
@@ -309,7 +337,7 @@
                                   (.-settings set))
                           (if-let [bd (b/content-boundary (.-settings set))]
                             ;; split-seam (MST): multi-level boundary promotion (≡ JVM growRoot)
-                            (BTSet. (mst-grow-root bd roots (.-settings set) (.-comparator set))
+                            (BTSet. (with-root-count (mst-grow-root bd roots (.-settings set) (.-comparator set)) root-total)
                                     new-cnt (.-comparator set) (.-meta set)
                                     UNINITIALIZED_HASH (.-storage set) nil (.-settings set))
                             (let [child0 (arrays/aget roots 0)
@@ -318,7 +346,7 @@
                                   child-counts (map node/subtree-count roots)
                                   subtree-count (if (every? #(>= % 0) child-counts)
                                                   (reduce + 0 child-counts)
-                                                  -1)
+                                                  root-total)
                                 ;; Compute measure from children if measure-ops available
                                   measure-ops (:measure (.-settings set))
                                 ;; Only compute root-measure when all children have measure;
@@ -422,7 +450,9 @@
                                              (recur (await (branch/child r (.-storage set) 0 opts)))
                                              r))
                                 current-cnt (.-cnt set)
-                                new-cnt (if (neg? current-cnt) -1 (dec current-cnt))]
+                                new-cnt (if (neg? current-cnt) -1 (dec current-cnt))
+                                before  (total-before set root)
+                                new-root (with-root-count new-root (if (neg? before) -1 (dec before)))]
                             (BTSet. new-root new-cnt (.-comparator set) (.-meta set)
                                     UNINITIALIZED_HASH (.-storage set) nil (.-settings set))))))
                     ;; count path (unchanged)
@@ -440,7 +470,9 @@
                                            new-root)
                                 ;; If count is unknown (-1), keep it unknown; will be computed lazily when needed
                                 current-cnt (.-cnt set)
-                                new-cnt (if (neg? current-cnt) -1 (dec current-cnt))]
+                                new-cnt (if (neg? current-cnt) -1 (dec current-cnt))
+                                before  (total-before set root)
+                                new-root (with-root-count new-root (if (neg? before) -1 (dec before)))]
                             (BTSet. new-root
                                     new-cnt
                                     (.-comparator set)
