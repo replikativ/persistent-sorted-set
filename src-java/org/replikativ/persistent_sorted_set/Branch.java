@@ -685,6 +685,26 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   }
 
   /**
+   * May a successful write be counted as exactly one element? Only when NO leaf processor can
+   * have fired: a processor may compact or expand the leaf it is handed, so one key is not
+   * one element.
+   *
+   * Both settings are asked, and the OPERATION's is the one that decides. `Leaf.add` /
+   * `Leaf.remove` run the processor from the settings the operation passes down, not from
+   * the node's own — and the two differ in exactly the case that matters: a node restored
+   * from storage is rebuilt with whatever Settings the IStorage hands it (the shipped decoder
+   * gives it no processor), while the set it belongs to may have been reopened WITH one.
+   * Guarding on the node alone then applied a unit delta to a write whose processor had just
+   * dropped the element. Measured: (range 200) stored at bf 8, reopened with a processor that
+   * drops each processed leaf's last entry, one conj — live and restored count 201, 200
+   * elements; one disj — count 199, 198 elements. A WRONG count is worse than an unknown one:
+   * it is durable and node identity excludes it.
+   */
+  private static boolean unitDelta(Settings node, Settings op) {
+    return node.leafProcessor() == null && (op == null || op.leafProcessor() == null);
+  }
+
+  /**
    * Try to compute subtree count from in-memory children.
    * Returns -1 if any child is not available in memory or has unknown count.
    */
@@ -931,7 +951,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // processor-free path is EXACTLY what it was: delta when the count is known, and
       // nothing at all when it is unknown. Folding "unknown" into the probe would make
       // every such add walk the children — the very cost 04499a0 removed.
-      if (_settings.leafProcessor() == null) {
+      if (unitDelta(_settings, settings)) {
         if (_subtreeCount >= 0) _subtreeCount += 1;
       } else {
         _subtreeCount = tryComputeSubtreeCountFromChildren(s0.children, _len, storage);
@@ -1018,7 +1038,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // Measured, bf 8 / 5000 conj-built / stored / cold-restored / 500 appended: root count
     // 5500 expected, -1 found, and still -1 six restore generations later.
     final long ownCountAfter =
-        (_settings.leafProcessor() == null && _subtreeCount >= 0)
+        (unitDelta(_settings, settings) && _subtreeCount >= 0)
             ? _subtreeCount + 1
             : ((_subtreeCount >= 0 && oldChildCount >= 0 && newChildrenCount >= 0)
                 ? _subtreeCount - oldChildCount + newChildrenCount : -1);
@@ -1249,7 +1269,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       //     set count 179   seq count 178   drift level 3 179/178, level 2 75/74
       // if/else, not a ternary — see the `add` arm: the processor-free path must stay a
       // pure delta-or-nothing and must not fall into the children walk when unknown.
-      if (_settings.leafProcessor() == null) {
+      if (unitDelta(_settings, settings)) {
         if (_subtreeCount >= 0) _subtreeCount -= 1;
       } else {
         _subtreeCount = tryComputeSubtreeCountFromChildren(s0.children, _len, storage);
@@ -1458,7 +1478,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         // to the probe. Caught by leaf_processor/test-mixed-processor, which reported
         // :subtree-count-mismatch {:branch-count 139, :children-sum 137} when this was
         // unconditional.
-        _subtreeCount = (_settings.leafProcessor() == null && _subtreeCount >= 0)
+        _subtreeCount = (unitDelta(_settings, settings) && _subtreeCount >= 0)
                         ? _subtreeCount - 1
                         : tryComputeSubtreeCountFromChildren(children, newLen, storage);
         // Update measure: recompute from children
@@ -1514,7 +1534,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // The probe would bail to -1 at the first non-resident child and discard a number we
       // already know, and that -1 is serialized.
       // ONLY without a leafProcessor — see the in-place arm above.
-      newCenter._subtreeCount = (_settings.leafProcessor() == null && _subtreeCount >= 0)
+      newCenter._subtreeCount = (unitDelta(_settings, settings) && _subtreeCount >= 0)
                                 ? _subtreeCount - 1
                                 : tryComputeSubtreeCountFromChildren(centerChildren, newLen, storage);
       newCenter._measure = tryComputeMeasureFromChildren(centerChildren, newLen, storage, measureOps);
@@ -1591,7 +1611,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // Same leafProcessor caveat as the sibling delta above: a processor may compact or
       // expand a leaf, so removing one KEY need not change the element count by one.
       join._subtreeCount =
-          (settings.leafProcessor() == null && left._subtreeCount >= 0 && _subtreeCount >= 0)
+          (unitDelta(_settings, settings) && left._subtreeCount >= 0 && _subtreeCount >= 0)
           ? left._subtreeCount + _subtreeCount - 1
           : tryComputeSubtreeCountFromChildren(joinChildren, left._len + newLen, storage);
       join._measure = tryComputeMeasureFromChildren(joinChildren, left._len + newLen, storage, measureOps);
@@ -1651,7 +1671,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // one deleted element, plus `right` carried over untouched. See that comment for why
       // the children walk cannot answer here and why the -1 it returns becomes durable.
       join._subtreeCount =
-          (settings.leafProcessor() == null && right._subtreeCount >= 0 && _subtreeCount >= 0)
+          (unitDelta(_settings, settings) && right._subtreeCount >= 0 && _subtreeCount >= 0)
           ? _subtreeCount - 1 + right._subtreeCount
           : tryComputeSubtreeCountFromChildren(joinChildren, newLen + right._len, storage);
       join._measure = tryComputeMeasureFromChildren(joinChildren, newLen + right._len, storage, measureOps);
@@ -1732,7 +1752,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // pair's TOTAL is known whenever both sources knew theirs, so one known half gives the
       // other. Both unknown is what remains on a fully cold pair; the parent keeps its own
       // count by delta regardless. (Not with a leaf processor: one key is not one element.)
-      if (settings.leafProcessor() == null && left._subtreeCount >= 0 && _subtreeCount >= 0) {
+      if (unitDelta(_settings, settings) && left._subtreeCount >= 0 && _subtreeCount >= 0) {
         long pair = left._subtreeCount + _subtreeCount - 1;
         if (newLeft._subtreeCount < 0 && newCenter._subtreeCount >= 0) newLeft._subtreeCount = pair - newCenter._subtreeCount;
         else if (newCenter._subtreeCount < 0 && newLeft._subtreeCount >= 0) newCenter._subtreeCount = pair - newLeft._subtreeCount;
@@ -1819,7 +1839,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         newRight._measure = tryComputeMeasureFromChildren(newRightChildren, newRightLen, storage, measureOps);
       }
       // Same as the borrow from left: the pair's total is known, so one half gives the other.
-      if (settings.leafProcessor() == null && right._subtreeCount >= 0 && _subtreeCount >= 0) {
+      if (unitDelta(_settings, settings) && right._subtreeCount >= 0 && _subtreeCount >= 0) {
         long pair = _subtreeCount - 1 + right._subtreeCount;
         if (newRight._subtreeCount < 0 && newCenter._subtreeCount >= 0) newRight._subtreeCount = pair - newCenter._subtreeCount;
         else if (newCenter._subtreeCount < 0 && newRight._subtreeCount >= 0) newCenter._subtreeCount = pair - newRight._subtreeCount;

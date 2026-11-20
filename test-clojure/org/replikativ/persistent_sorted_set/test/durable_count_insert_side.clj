@@ -21,7 +21,9 @@
   (:require [clojure.test :refer [deftest testing is]]
             [org.replikativ.persistent-sorted-set :as set]
             [clojure.edn :as edn])
-  (:import [org.replikativ.persistent_sorted_set Settings IStorage ANode Branch Leaf]))
+  (:import [org.replikativ.persistent_sorted_set Settings IStorage ANode Branch Leaf
+            ILeafProcessor PersistentSortedSet]
+           [java.util ArrayList List]))
 
 (set! *warn-on-reflection* true)
 
@@ -59,6 +61,24 @@
 (defn- root-count [disk addr]
   (:subtree-count (edn/read-string (@disk addr))))
 
+;; The oracle for WRONG counts, which no root assertion can see: a correct root hides a wrong
+;; interior count (a derived split or borrow half, say). Walks the whole tree and returns
+;; every branch whose cached count is known and is not the number of elements below it.
+(defn- wrong-counts [^PersistentSortedSet s]
+  (let [storage (.-_storage s)
+        bad     (volatile! [])]
+    (letfn [(walk [^ANode n]
+              (if (instance? Branch n)
+                (let [^Branch b n
+                      cached (.subtreeCount b)
+                      actual (reduce + 0 (map #(walk (.child b storage (int %))) (range (.len b))))]
+                  (when (and (>= cached 0) (not= cached actual))
+                    (vswap! bad conj {:level (.level b) :cached cached :actual actual}))
+                  actual)
+                (.len n)))]
+      (walk (.root s))
+      @bad)))
+
 (defn- generations
   "`gens` rounds of (cold restore, insert `per` NEW scattered keys and re-insert `per`
    keys that are already there, store). Returns {:addr :expected :unknown-roots}.
@@ -94,8 +114,10 @@
               {:s s' :lost (cond-> lost (not (set/has-subtree-counts? s')) inc)}))
           {:s s :lost 0} ks))
 
+;; A transient is checked once, on the result: there is no per-write value to look at.
 (defn- conj-transient [s ks]
-  {:s (persistent! (reduce conj! (transient s) ks)) :lost 0})
+  (let [s' (persistent! (reduce conj! (transient s) ks))]
+    {:s s' :lost (if (set/has-subtree-counts? s') 0 1)}))
 
 (deftest the-root-keeps-its-count-through-cold-inserts
   (testing "no insert on a cold tree may leave the root without a count, in memory or on
@@ -113,15 +135,19 @@
             (str label " bf=" bf ": " live-unknown " inserts left the live root without a count"))
         (is (zero? unknown-roots)
             (str label " bf=" bf ": " unknown-roots " of 6 stored roots carry an unknown count"))
+        ;; counter reset BEFORE anything touches the set, so the budget below includes the
+        ;; root read itself
+        (reset! r 0)
         (is (set/has-subtree-counts? cold)
             (str label " bf=" bf ": a cold reader's root knows its count"))
-        (reset! r 0)
         (is (= expected (count cold))
             (str label " bf=" bf ": the count is exact (redundant inserts added nothing)"))
         (is (<= @r 1)
             (str label " bf=" bf ": a cold reader answers count from the root, paid " @r " restores"))
         (is (= expected (count (seq cold)))
-            (str label " bf=" bf ": and it agrees with the elements"))))))
+            (str label " bf=" bf ": and it agrees with the elements"))
+        (is (empty? (wrong-counts cold))
+            (str label " bf=" bf ": every KNOWN count in the tree is the true one"))))))
 
 (deftest a-redundant-insert-on-a-cold-tree-changes-no-count
   (testing "an existing key: same set back, nothing restored beyond the path, count intact"
@@ -198,4 +224,98 @@
         (is (<= @r 1)
             (str label ": a cold reader answers count from the root, paid " @r " restores"))
         (is (= (sort live) (seq cold))
-            (str label ": and the elements are the right ones"))))))
+            (str label ": and the elements are the right ones"))
+        (is (empty? (wrong-counts cold))
+            (str label ": every KNOWN count in the tree is the true one"))))))
+
+;; ---- the root GROWS during the cold writes ----
+;;
+;; The generations above never raise the tree: root level 5 -> 5, 3 -> 3, 2 -> 2. So they
+;; cannot tell whether a root that SPLITS on a cold tree keeps its count. This one starts
+;; from a root one insert short of full and appends until it has grown a level.
+
+(deftest a-root-that-splits-on-a-cold-tree-keeps-its-count
+  (doseq [bf [8 16] transient? [false true]]
+    (let [disk (atom {}) w (atom 0) opts (opts-for bf)
+          level (fn [^PersistentSortedSet s] (.level ^ANode (.root s)))
+          ;; grow until the root has bf children, i.e. the next split below it splits it
+          s0   (loop [s (set/sorted-set* opts) i 0]
+                 (let [r (.root ^PersistentSortedSet s)]
+                   (if (and (instance? Branch r) (>= (.level ^Branch r) 2) (= bf (.len ^ANode r)))
+                     s
+                     (recur (set/conj s i compare) (inc i)))))
+          n    (count s0)
+          addr (set/store s0 (storage disk w bf))
+          cold (set/restore-by compare addr (storage disk w bf) opts)
+          l0   (level cold)
+          ks   (range n (+ n (* 4 bf bf)))
+          s1   (if transient?
+                 (persistent! (reduce conj! (transient cold) ks))
+                 (reduce #(set/conj %1 %2 compare) cold ks))
+          addr1 (set/store s1 (storage disk w bf))]
+      (is (> (long (level s1)) (long l0))
+          (str "bf=" bf ": precondition — the root grew a level during the cold writes"))
+      (is (set/has-subtree-counts? s1) (str "bf=" bf " transient=" transient? ": the grown root knows its count"))
+      (is (= (+ n (count ks)) (root-count disk addr1))
+          (str "bf=" bf " transient=" transient? ": and stores the right one"))
+      (is (empty? (wrong-counts s1))))))
+
+;; ---- a set reopened WITH a leaf processor over nodes restored WITHOUT one ----
+;;
+;; The unit delta is only right when no processor can fire, and the processor that fires is
+;; the OPERATION's (the set's), not the node's: restored nodes are rebuilt with whatever
+;; Settings the storage gives them. Guarding on the node alone counted a write whose
+;; processor had just dropped the element.
+
+(defn- drop-last-processor []
+  (reify ILeafProcessor
+    (shouldProcess [_ _leafSize _settings] true)
+    (processLeaf [_ entries _storage _settings]
+      (let [^List entries entries]
+        (if (> (.size entries) 1)
+          (ArrayList. (.subList entries 0 (dec (.size entries))))
+          entries)))))
+
+(deftest a-leaf-processor-write-never-stores-a-wrong-count
+  (doseq [[label op] [[:conj #(set/conj % 100000 compare)] [:disj #(set/disj % 198 compare)]]]
+    (let [bf 8 disk (atom {}) w (atom 0)
+          s0    (reduce #(set/conj %1 %2 compare) (set/sorted-set* (opts-for bf)) (range 200))
+          addr  (set/store s0 (storage disk w bf))
+          popts (assoc (opts-for bf) :leaf-processor (drop-last-processor))
+          cold  (set/restore-by compare addr (storage disk w bf) popts)
+          s1    (op cold)
+          addr1 (set/store s1 (storage disk w bf))
+          back  (set/restore-by compare addr1 (storage disk w bf) (opts-for bf))
+          actual (count (seq back))
+          stored (root-count disk addr1)]
+      (is (not (identical? cold s1)) (str label ": precondition — the write took effect"))
+      (is (or (neg? (long stored)) (= actual stored))
+          (str label ": the stored root count is the true one or unknown, never wrong — stored "
+               stored ", " actual " elements"))
+      (is (= actual (count back)) (str label ": and count agrees with the elements"))
+      (is (empty? (wrong-counts back)) (str label ": no wrong count anywhere in the tree")))))
+
+;; ---- a set that knows its total over a root that does not ----
+;;
+;; The set header and the root blob are separate caches. A store written by a build that lost
+;; the root's count can still carry the total in the header; the first write must put it back
+;; on the root, on every return path — not only when the root splits or collapses.
+
+(deftest a-known-set-count-repairs-an-unknown-root
+  (doseq [[label op delta] [[:conj #(set/conj % 100000 compare) 1]
+                            [:disj #(set/disj % 100 compare) -1]
+                            [:conj! #(persistent! (conj! (transient %) 100000)) 1]
+                            [:disj! #(persistent! (disj! (transient %) 100)) -1]]]
+    (let [bf 8 n 200 disk (atom {}) w (atom 0)
+          s0   (reduce #(set/conj %1 %2 compare) (set/sorted-set* (opts-for bf)) (range n))
+          addr (set/store s0 (storage disk w bf))
+          ;; erase the root blob's count, as an earlier build would have stored it
+          _    (swap! disk update addr #(pr-str (assoc (edn/read-string %) :subtree-count -1)))
+          st   (storage disk w bf)
+          cold (PersistentSortedSet. nil compare addr st nil (int n) (.-settings ^CountingStorage st) 0)
+          _    (is (not (set/has-subtree-counts? cold)) (str label ": precondition — the root is unknown"))
+          s1   (op cold)
+          addr1 (set/store s1 (storage disk w bf))]
+      (is (set/has-subtree-counts? s1) (str label ": the write gave the root its count back"))
+      (is (= (+ n (long delta)) (root-count disk addr1)) (str label ": and it is stored, and right"))
+      (is (empty? (wrong-counts s1))))))

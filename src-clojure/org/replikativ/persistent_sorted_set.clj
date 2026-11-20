@@ -55,9 +55,11 @@
    (.countSlice set from to cmp)))
 
 (defn has-subtree-counts?
-  "Check whether all nodes in this tree have precomputed subtree counts.
-   When true, count-slice is guaranteed O(log n).
-   When false, count-slice may degrade to O(n) for subtrees missing counts."
+  "Whether the ROOT knows its element count, and only that. True means `count` is answered
+   without reading the tree. It does not promise every node below is counted: both halves of
+   a branch that split while its children were on disk stay unknown by design, and a
+   count-slice that fully covers such a node counts it by descending. When false, the set as
+   a whole has no count and count-slice may degrade to O(n)."
   [^PersistentSortedSet set]
   (.hasSubtreeCounts set))
 
