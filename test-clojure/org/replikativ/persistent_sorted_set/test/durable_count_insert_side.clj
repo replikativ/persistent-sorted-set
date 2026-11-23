@@ -15,9 +15,10 @@
    below this node, and a node that knows its total knows the new one: old + 1. (Not with
    a leaf processor, which may compact or expand; those keep the old arithmetic.)
 
-   What stays unknown, deliberately: the two halves of a branch that split while its
-   children were on disk. Dividing a total needs per-child counts, and fetching them is the
-   whole-subtree restore 04499a0 removed. When ONE half is resident the other is derived."
+   The two halves of a branch that split while its children were on disk: when ONE half is
+   resident the other is derived. When neither is, this file used to accept two unknown
+   halves, and that was the gap — see `stored-counts`, which holds the invariant for every
+   stored branch, not only the root."
   (:require [clojure.test :refer [deftest testing is]]
             [org.replikativ.persistent-sorted-set :as set]
             [clojure.edn :as edn])

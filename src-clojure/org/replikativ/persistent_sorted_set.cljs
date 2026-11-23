@@ -313,6 +313,32 @@
   ([^BTSet set consume-fn opts]
    (btset/walk-addresses set consume-fn opts)))
 
+(defn count-census
+  "`{:branches n :unknown m}`: how many branches the tree has and how many of them have no
+   element count. A branch without one is correct but expensive: a count-slice that covers
+   it reads its children, on every cold start. Reads every branch and no leaf.
+   For a set with writes not yet stored the answer is what the next `store` will write.
+   Returns a continuation when {:sync? false}."
+  ([^BTSet set] (btset/count-census set {:sync? true}))
+  ([^BTSet set opts] (btset/count-census set opts)))
+
+(defn recount
+  "`set` with every branch counted and every branch that had no count marked to be
+   written: `store` the result and the counts are durable. Returns `set` itself when there
+   is nothing to do. Content, order and structure are unchanged.
+
+   For trees written before a split or a borrow kept its counts. Writes since keep every
+   count, so one `recount` + `store` is enough. It reads every branch, plus the leaves of
+   each leaf-parent that has no count, and rewrites each branch without a count and every
+   branch above one. Returns a continuation when {:sync? false}.
+
+   Leaves are left alone and buffered edits stay buffered, with one exception: a branch
+   that holds more buffered edits than its :diff-buf-size allows (rare — after a join, or
+   when the budget was changed between writes) gets the excess flushed when it is
+   rewritten, as on any write through it. Nothing is lost either way."
+  ([^BTSet set] (btset/recount set {:sync? true}))
+  ([^BTSet set opts] (btset/recount set opts)))
+
 (defn store
   "Flush set to storage. sync calls must be used with sync storage
    and async calls must be used with async storage.

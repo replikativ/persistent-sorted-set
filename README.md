@@ -299,6 +299,31 @@ Count elements in a range without iterating through them — O(log n) via subtre
 (set/count-slice s 1000 2000 my-comparator)
 ```
 
+Every stored branch carries its count, and writes keep it that way. A tree written by an earlier
+version can hold branches stored without one — `count-slice` is still correct there, but it
+reads the children of each such branch it covers. `(set/count-census s)` reports how many
+there are and `(set/store (set/recount s))` repairs them, once:
+
+```clojure
+(set/count-census s)            ;=> {:branches 1203, :unknown 418}
+(def s' (set/recount s))        ; same elements, same structure
+(set/store s')                  ; writes the branches that had no count
+(set/count-census s')           ;=> {:branches 1203, :unknown 0}
+```
+
+`recount` rewrites the branches that had no count and the branches above them. Leaves are left
+alone and buffered edits stay buffered, with one exception: a branch that holds more buffered
+edits than its `:diff-buf-size` allows (rare — after a join, or when the budget was changed
+between writes) gets the excess flushed when it is rewritten, as on any write through it.
+Nothing is lost either way. It is worth running before heavy use of such a tree: until it has run, a write with a diff buffer that passes a branch without a count works
+that count out by reading the branch's subtree, which on a large tree is a long read inside
+one write.
+
+What a write reads, on a tree with every count: the path to the key; on a delete, the
+neighbours of each node on the path (to decide whether to rebalance); and, when a branch
+splits or borrows, the children of one of the two results, one level deep, to divide the
+count between them.
+
 ### Rank-based access (`get-nth`)
 
 Access elements by position (rank) in O(log n), enabling percentile/quantile queries. Requires

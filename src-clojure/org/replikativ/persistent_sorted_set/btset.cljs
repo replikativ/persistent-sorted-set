@@ -308,11 +308,19 @@
                    (.-settings set)))))
 
 (defn- with-root-count
-  "`root`, knowing `total` when it is a Branch that did not."
-  [root total]
-  (when (and (instance? Branch root) (>= total 0) (neg? (.-subtree-count root)))
-    (set! (.-subtree-count root) total))
-  root)
+  "`root`, knowing `total` when it is a Branch that did not — as a NEW node. The root being
+   published can be one another version of the set still reaches at its old address (the
+   child a collapse promotes); writing the count into that node would make the other set
+   believe its blob carries it, and `count-census` / `recount` there would skip it."
+  [^Branch root total]
+  (if (and (instance? Branch root) (>= total 0) (neg? (.-subtree-count root)))
+    (Branch. (.-level root) (.slice (.-keys root))
+             (when-some [c (.-children root)] (.slice c))
+             (when-some [a (.-addresses root)] (.slice a))
+             total (.-_measure root) (.-settings root)
+             (when-some [sl (.-_slots root)] (.slice sl))
+             (.-_bufEntries root) (.-_projCmp root))
+    root))
 
 (defn conjoin
   ([^BTSet set key]
@@ -494,6 +502,44 @@
                                     (.-storage set)
                                     nil
                                     (.-settings set))))))))))))
+
+(defn count-census
+  "`{:branches n :unknown m}`: how many branches the tree has and how many of them have no
+   element count. A branch without one is correct but expensive: a count-slice that covers
+   it reads its children. Reads every branch and no leaf."
+  ([^BTSet set] (count-census set {:sync? true}))
+  ([^BTSet set {:keys [sync?] :or {sync? true} :as opts}]
+   (async+sync sync?
+               (async
+                (let [root (await (-root set opts))]
+                  (if (instance? Branch root)
+                    (let [r (await (branch/count-census root (.-storage set) opts))]
+                      {:branches (nth r 0) :unknown (nth r 1)})
+                    {:branches 0 :unknown 0}))))))
+
+(defn recount
+  "`set` with every branch counted and every branch that had no count marked to be
+   written: `store` the result and the counts are durable. Returns `set` itself when there
+   is nothing to do. Content, order and structure are unchanged.
+
+   For trees written before a split or a borrow kept its counts. It reads every branch,
+   plus the leaves of each leaf-parent that has no count, and rewrites each branch without
+   a count and every branch above one."
+  ([^BTSet set] (recount set {:sync? true}))
+  ([^BTSet set {:keys [sync?] :or {sync? true} :as opts}]
+   (async+sync sync?
+               (async
+                (let [root (await (-root set opts))]
+                  (if-not (instance? Branch root)
+                    set
+                    (let [nr (await (branch/recount root (.-storage set) opts))]
+                      (if (identical? nr root)
+                        set
+                        (do
+                          (when (and (.-storage set) (.-address set))
+                            (storage/markFreed (.-storage set) (.-address set)))
+                          (BTSet. nr (.-subtree-count nr) (.-comparator set) (.-meta set)
+                                  UNINITIALIZED_HASH (.-storage set) nil (.-settings set)))))))))))
 
 (defn store
   ([^BTSet set arg]
