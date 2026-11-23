@@ -973,10 +973,25 @@
                [:rep f] [:rep l]])))
 
 (defn- buffering-ops
-  "The first writes of a two-write case: one insert, one delete, one replace — each a kind
-   of edit a diff buffer can be left holding."
+  "The first writes of a two-write case: one insert, one delete, one replace in the path
+   leaf — each a kind of edit a diff buffer can be left holding — and an insert into and a
+   delete from the leaf on either side of it, so that a neighbour the second write weighs
+   for a join or a borrow is, with its buffered edit, not the size its blob says."
   [ks]
-  [[:add (inc (first ks))] [:del (nth ks (quot (count ks) 2))] [:rep (first ks)]])
+  (let [f (first ks) l (peek ks)]
+    [[:add (inc f)] [:del (nth ks (quot (count ks) 2))] [:rep f]
+     [:add (- f 3)] [:del (- f 4)] [:add (inc l)] [:del (+ l 2)]]))
+
+(defn- neighbour-write?
+  "Did the first write of a two-write case go into a leaf next to the path leaf, and the
+   second then rebalance the path leaf? Then the neighbour it weighed was not the size its
+   blob says."
+  [{:keys [ops r leaf-keys input-buffered?]}]
+  (let [[_ k1] (first ops)]
+    (boolean (and input-buffered? (= 2 (count ops))
+                  (or (< k1 (dec (first leaf-keys))) (> k1 (peek leaf-keys)))
+                  (some (fn [[k L]] (and (= 0 L) (#{:join-left :join-right :borrow-left :borrow-right} k)))
+                        (:events r))))))
 
 (defn- base [opts] {:branching-factor (:branching-factor opts) :diff-buf-size (:diff-buf-size opts)})
 
@@ -1059,9 +1074,10 @@
             (doseq [op1 (if second-step? (buffering-ops (:leaf-keys g)) ops)]
               (let [keep1 (set (keys @disk))
                     r1    (step disk (:addr g) opts before op1)
-                    [present1 delta1] (effect (set (:leaf-keys g)) op1)]
+                    present0 (set (:content before))
+                    [present1 delta1] (effect present0 op1)]
                 (record! tot r1 (first op1) :events :transitions
-                         (effective? (set (:leaf-keys g)) op1 delta1))
+                         (effective? present0 op1 delta1))
                 (check {:specs specs :disk disk :g g :before before :ops [op1] :r r1 :delta delta1})
                 ;; a second write, where the first one left buffered edits to write over
                 (when (and second-step? (buffered? disk (:addr r1)))
@@ -1072,7 +1088,7 @@
                             delta2 (second (effect present1 op2))]
                         (record! tot r2 (first op2) :events2 :transitions2 (effective? present1 op2 delta2))
                         (check {:specs specs :disk disk :g g :before (:shape r1) :ops [op1 op2] :r r2
-                                :delta delta2 :input-buffered? buffered})
+                                :delta delta2 :input-buffered? buffered :leaf-keys (:leaf-keys g)})
                         (swap! disk select-keys keep2)))))
                 (swap! disk select-keys keep1)))))))
     @tot))
@@ -1209,12 +1225,16 @@
         (let [H    2
               opts {:comparator compare :branching-factor 4 :diff-buf-size dbs}
               seen (atom 0)
+              next-door (atom 0)
               chk  (counted-check opts)
               r    (every-step opts H {:second-step? true
                                        :check (fn [m]
                                                 (when (:input-buffered? m) (swap! seen inc))
+                                                (when (neighbour-write? m) (swap! next-door inc))
                                                 (chk m))})]
           (is (pos? @seen) "precondition: some second steps started from buffered edits")
+          (is (pos? @next-door)
+              "precondition: some rebalanced against a neighbour that held a buffered edit")
           (is (= #{} (missing (expected-events H) (:events2 r)))
               "the writes over buffered edits took every kind of step at every level")
           (is (= #{} (missing (expected-transitions H) (:transitions2 r)))))))))
