@@ -842,11 +842,14 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         if (newSlots != null) newSlots[i] = null;
       }
     }
-    // The copy keeps THIS node's settings, not the set's: a set may be reopened with another
-    // buffer budget than the one a node was written under, and a copy built with the set's
-    // would flush — or refuse — slots that are fine where they are. Only the count changes.
-    final Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, -1, _measure, _projCmp, _settings);
-    if (newSlots != null || _settings.diffBufSize() > 0) nb.installSlots(newSlots, BUF_WRITE);
+    // Only the count changes, so the copy must be able to hold the slots it finds. A set can
+    // be reopened under another buffer budget than a node was written under, in either
+    // direction: slots written under a larger budget than the set's now, or slots the set
+    // deposited into a node that came back with a smaller one. The copy takes whichever of
+    // the two settings has the larger budget, so the next store flushes nothing.
+    final Settings cs = (settings.diffBufSize() > _settings.diffBufSize()) ? settings : _settings;
+    final Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, -1, _measure, _projCmp, cs);
+    if (newSlots != null || cs.diffBufSize() > 0) nb.installSlots(newSlots, BUF_WRITE);
     // A count already worked out in memory is used as it is. Otherwise the children are
     // counted now (below a leaf-parent they are leaves, which always are), so this is a sum;
     // it reads the leaves of a leaf-parent that was unknown.
@@ -3000,9 +3003,15 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
    * count into it would make that set believe its blob carries it.
    */
   Branch<Key, Address> withCount(long count) {
-    final Branch<Key, Address> copy = withProjCmp(_projCmp);
-    copy._subtreeCount = count;
-    copy._lazyCount = -1;
+    final NodeState<Address> s = _state;                          // one snapshot
+    final Address[] addrCopy = (s.addresses != null) ? Arrays.copyOf(s.addresses, s.addresses.length) : null;
+    // Unlike `withProjCmp` the comparator is the same, so every resident child stays valid
+    // for the copy — and dropping the ones that have an address would make the next store
+    // read them back.
+    final Object[] childCopy = (s.children != null) ? Arrays.copyOf(s.children, s.children.length) : null;
+    final Branch<Key, Address> copy = new Branch<>(_level, _len, Arrays.copyOf(_keys, _keys.length), addrCopy, childCopy,
+                                                   count, _measure, _projCmp, _settings);
+    copy._state = new NodeState<>(addrCopy, childCopy, s.buf);
     return copy;
   }
 
