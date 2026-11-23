@@ -43,6 +43,16 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     return (c >= 0) ? c : _lazyCount;
   }
 
+  // For an arm that edits THIS node in place without changing how many elements it holds
+  // (replace): the node is the transient's own and is being written to, so a count it worked
+  // out by reading becomes the count it is stored with.
+  private void ownLazyCount() {
+    if (_subtreeCount < 0) {
+      final long lazy = _lazyCount;
+      if (lazy >= 0) { _subtreeCount = lazy; _lazyCount = -1; }
+    }
+  }
+
   /** `node`'s element count if it can say without reading, else -1. */
   static long cnt(ANode node) {
     return (node instanceof Branch) ? ((Branch) node).knownCount() : node._len;
@@ -2393,6 +2403,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       return PersistentSortedSet.UNCHANGED;
 
     if (PersistentSortedSet.EARLY_EXIT == nodes) { // replaced in transient child, no updates needed
+      ownLazyCount();
       // Try to recompute measure from final state (after child replacement)
       IMeasure measureOps = settings.measure();
       if (measureOps != null && _measure != null) {
@@ -2480,6 +2491,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
     // Transient: can modify in place
     if (editable()) {
+      ownLazyCount();
       _keys[idx] = newMaxKey;
       // Mark old child address as freed before clearing. diff-buf: deferred to store
       // under diff-buf (old address may be re-pointed as a buffered anchor — see add()).
@@ -2572,7 +2584,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // out is used; otherwise this reads the subtree. Either way the child is the node the
     // write in progress just built or owns, so it is written — or buffered — by the coming
     // store, and takes the count with it instead of staying unknown under a slot that knows.
-    c = b.count(storage);
+    // Not `count(storage)`: that answers an int, and this number is stored.
+    c = b._lazyCount;
+    if (c < 0) c = b.computeSubtreeCount(storage);
     b._subtreeCount = c;
     b._lazyCount = -1;
     return c;

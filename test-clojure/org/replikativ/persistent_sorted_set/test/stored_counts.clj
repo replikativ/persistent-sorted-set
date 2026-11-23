@@ -556,3 +556,17 @@
       (is (= want (:unknown (set/count-census orig))))
       (let [addr' (set/store (set/recount orig) (storage disk))]
         (is (zero? (:unknown (disk-census disk addr'))))))))
+
+(deftest a-replace-in-place-keeps-a-count-that-was-worked-out
+  (testing "diff-buf off, a transient over an uncounted tree, its count worked out by a
+            reader: a replace edits the path in place and the nodes are written with it"
+    (let [bf 8, disk (atom {})
+          addr (build disk bf 0 400)
+          _    (erase-counts! disk addr (java.util.Random. 3) 1.0)
+          cold (set/restore-by compare addr (storage disk) (opts bf 0))
+          t    (reduce conj! (transient cold) [1 3 5])          ; the transient owns a path
+          _    (count-all! t)
+          t    (set/replace t 3 (Integer/valueOf (int 3)) compare)
+          addr' (set/store t (storage disk))]
+      (is (>= (long (:subtree-count (@disk addr') -1)) 0) "the root is stored counted")
+      (is (= [] (wrong-counts (set/restore-by compare addr' (storage disk) (opts bf 0))))))))

@@ -7,7 +7,8 @@
 
    The oracle reads the BLOBS. Both modes are pinned: the suite's default buffers, and under
    diff-buf a buffered write heals the child it passes through."
-  (:require [cljs.test :refer-macros [deftest testing is]]
+  (:require [cljs.test :as test :refer-macros [deftest testing is]]
+            [is.simm.partial-cps.async :refer [await] :refer-macros [async]]
             [clojure.edn :as edn]
             [clojure.string :as str]
             [org.replikativ.persistent-sorted-set :as s]
@@ -192,3 +193,39 @@
           "the original set still sees its own blobs as they are")
       (let [addr' (s/store (s/recount orig) (st))]
         (is (zero? (:unknown (disk-census disk addr'))))))))
+
+(defn- async-round-trip []
+  (async
+   (let [bf 8 n 700
+         {:keys [addr live disk opts]} (generations bf 64 n 3 (:mixed (patterns bf n)))
+         ast   #(u/async-storage (atom {}) disk opts)
+         a     {:sync? false}
+         _     (erase-counts! disk)
+         want  (:unknown (disk-census disk addr))
+         cold  (s/restore addr (ast) opts)
+         _     (is (pos? want))
+         _     (is (= want (:unknown (await (s/count-census cold a)))))
+         fixed (await (s/recount cold a))
+         addr' (await (s/store fixed (ast) a))
+         back  (s/restore addr' (ast) opts)
+         _     (is (zero? (:unknown (disk-census disk addr'))))
+         _     (is (= 0 (:unknown (await (s/count-census back a)))))
+         ;; cold writes through async storage keep it that way
+         s2    (loop [s' back, ks (map #(inc (* 2 %)) (range 0 n 5))]
+                 (if (seq ks)
+                   (recur (await (s/conj s' (first ks) compare a)) (next ks))
+                   s'))
+         s3    (loop [s' s2, ks (take 60 (sort live))]
+                 (if (seq ks)
+                   (recur (await (s/disj s' (first ks) compare a)) (next ks))
+                   s'))
+         addr2 (await (s/store s3 (ast) a))]
+     (is (zero? (:unknown (disk-census disk addr2))))
+     (is (= (:unknown (disk-census disk addr2))
+            (:unknown (await (s/count-census (s/restore addr2 (ast) opts) a))))))))
+
+(deftest the-async-arm-keeps-and-repairs-counts
+  (test/async done
+              ((async-round-trip)
+               (fn [_] (done))
+               (fn [err] (is (nil? err)) (js/console.error err) (done)))))
