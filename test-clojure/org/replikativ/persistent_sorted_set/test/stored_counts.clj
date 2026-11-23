@@ -669,8 +669,8 @@
 ;; lost to a join on either side), how full the node on the path is, and how full its left
 ;; and right neighbours under the same parent are. `shape-cases` lists every combination of
 ;; the three fills (every length a node can have, and `nil` for no neighbour) at every
-;; level, under each of four cascades from below (splits along the first children, splits
-;; along the last, joins to the left, joins to the right), with the path node first or last
+;; level, under each of five cascades from below (splits along the first children, through
+;; the middle, along the last; joins to the left, joins to the right), with the path node first or last
 ;; among its parent's other children, and with every root size. Neighbouring subtrees are
 ;; filled unevenly, so that a count divided by proportion instead of by reading is wrong.
 ;;
