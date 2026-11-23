@@ -618,3 +618,29 @@
                 (is (= (count (seq back)) (count back)) (str "round " i))
                 (is (zero? (:unknown (disk-census disk addr'))) (str "round " i))
                 (recur addr' (inc i))))))))))
+
+(deftest recount-reads-each-branch-once
+  (testing "only the root lacks its count: every branch is read once, no leaf"
+    (let [bf 8, disk (atom {})
+          addr (build disk bf 0 3000)
+          _    (swap! disk assoc-in [addr :subtree-count] -1)
+          cen  (disk-census disk addr)
+          restores (atom 0)
+          cold (set/restore-by compare addr (storage disk restores) (opts bf 0))
+          fixed (set/recount cold)]
+      (is (= 3000 (count fixed)))
+      (is (= (:branches cen) @restores)))))
+
+(deftest a-census-before-the-store-says-what-the-store-writes
+  (doseq [dbs [0 64]
+          transient? [false true]]
+    (let [{:keys [disk addr model]} (generations {:bf 8 :dbs dbs :n 900 :gens 2 :per 30 :rem-per 8
+                                                  :transient? false :pattern :scattered :seed 51})
+          _     (erase-counts! disk addr (java.util.Random. 5) 0.6)
+          cold  (set/restore-by compare addr (storage disk) (opts 8 dbs))
+          _     (count-all! cold)
+          dirty (write-batch cold (map #(inc (* 2 %)) (range 0 900 9)) (take 30 (seq model)) transient?)
+          _     (count-all! dirty)
+          warm  (:unknown (set/count-census dirty))
+          addr' (set/store dirty (storage disk))]
+      (is (= warm (:unknown (disk-census disk addr'))) (str "diff-buf " dbs " transient " transient?)))))

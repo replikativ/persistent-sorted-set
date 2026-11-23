@@ -94,10 +94,10 @@
    each leaf-parent that has no count, and rewrites each branch without a count and every
    branch above one.
 
-   No leaf is rewritten and buffered edits stay buffered, as long as the tree was written
-   under one :diff-buf-size. If the budget was changed between writes, a branch can hold
-   buffered edits that no longer fit it; those are flushed, as any write through that
-   branch would flush them. Nothing is lost either way."
+   Leaves are left alone and buffered edits stay buffered, with one exception: a branch
+   that holds more buffered edits than its :diff-buf-size allows (rare — after a join, or
+   when the budget was changed between writes) gets the excess flushed when it is
+   rewritten, as on any write through it. Nothing is lost either way."
   [^PersistentSortedSet set]
   (.recount set))
 

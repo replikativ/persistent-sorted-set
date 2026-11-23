@@ -816,10 +816,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   Branch<Key, Address> recount(IStorage storage, Settings settings) {
     final NodeState<Address> s0 = _state;                        // one snapshot
     ANode[] changed = null;
+    long below = 0;                       // the children's counts, summed while they are in hand
     if (_level > 1) {
       for (int i = 0; i < _len; i++) {
         final Branch child = (Branch) child(storage, i);
         final Branch nc = child.recount(storage, settings);
+        below = (below < 0 || nc._subtreeCount < 0) ? -1 : below + nc._subtreeCount;
         if (nc != child) {
           if (changed == null) changed = new ANode[_len];
           changed[i] = nc;
@@ -843,17 +845,20 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       }
     }
     // The copy keeps THIS node's settings — its budget, ref-type and the rest — not the
-    // set's: only the count changes. Under one buffer budget, which is the normal case, the
-    // slots it carries fit as they did. A tree whose budget was changed between writes can
-    // hold slots that no longer fit the node holding them; the next store flushes those, as
-    // it would after any write through that node (documented on `recount`).
+    // set's: only the count changes, and the slots are carried as they are. A node can hold
+    // more buffered edits than its budget (a join concatenates two nodes' slots; a budget
+    // changed between writes); the store of the copy brings it back within budget by
+    // flushing, exactly as it would after any write through that node. Documented on
+    // `recount`: it is the one way a leaf gets rewritten.
     final Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, -1, _measure, _projCmp, _settings);
     if (newSlots != null || _settings.diffBufSize() > 0) nb.installSlots(newSlots, BUF_WRITE);
     // A count already worked out in memory is used as it is. Otherwise the children are
     // counted now (below a leaf-parent they are leaves, which always are), so this is a sum;
     // it reads the leaves of a leaf-parent that was unknown.
     final long known = knownCount();
-    nb._subtreeCount = (known >= 0) ? known : nb.countChildrenReading(storage);
+    nb._subtreeCount = (known >= 0) ? known
+                     : (_level > 1 && below >= 0) ? below      // no second read of the children
+                     : nb.countChildrenReading(storage);
     return nb;
   }
 
