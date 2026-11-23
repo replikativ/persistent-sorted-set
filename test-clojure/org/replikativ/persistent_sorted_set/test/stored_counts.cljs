@@ -494,23 +494,44 @@
 
 (defn- buffering-ops
   "The first writes of a two-write case: an insert, a delete, a replace in the path leaf,
-   and an insert into the leaf before it and a delete from the one after it — so that a
-   neighbour the second write weighs is not the size its blob says."
+   and an insert just before its first key's predecessor and a delete just above its last
+   key — which land in the leaf before and after it where there is one. Where that leaf is
+   a sibling under the same parent, the second write weighs a neighbour that is not the
+   size its blob says; `neighbour-write` tells which second writes those were."
   [ks]
   (let [f (first ks) l (peek ks)]
     [[:add (inc f)] [:del (nth ks (quot (count ks) 2))] [:rep f]
      [:add (- f 3)] [:del (+ l 2)]]))
 
-(defn- neighbour-write?
-  "Did the first write of a two-write case go into a leaf next to the path leaf, and the
-   second then rebalance the path leaf? Then the neighbour it weighed was not the size its
-   blob says."
-  [{:keys [ops r leaf-keys input-buffered?]}]
-  (let [[_ k1] (first ops)]
-    (boolean (and input-buffered? (= 2 (count ops))
-                  (or (< k1 (dec (first leaf-keys))) (> k1 (peek leaf-keys)))
-                  (some (fn [[k L]] (and (= 0 L) (#{:join-left :join-right :borrow-left :borrow-right} k)))
-                        (:events r))))))
+(defn- rebalance-choice
+  "What an underfull path leaf must do given the leaf lengths `x` of its level: the rule of
+   `policy-violations`, stated forwards."
+  [bf x p [first? last?]]
+  (let [c (dec (x p))
+        fits-left  (and (not first?) (<= (+ (x (dec p)) c) bf))
+        fits-right (and (not last?) (<= (+ c (x (inc p))) bf))]
+    (cond fits-left  :join-left
+          fits-right :join-right
+          (and (not first?) (or last? (>= (x (dec p)) (x (inc p))))) :borrow-left
+          (not last?) :borrow-right)))
+
+(defn- neighbour-write
+  "For the second write of a two-write case that rebalanced the path leaf: did the first
+   write leave a buffered edit in a leaf the rebalance weighs — a sibling under the same
+   parent, whose length a restore finds (`before`) is then not the one its blob has
+   (`before0`)? :weighed if so, :changed if with the blob's length the leaf would have had
+   to do something else, nil otherwise."
+  [bf {:keys [ops r before before0 input-buffered?]}]
+  (let [x0 (get (:levels before0) 0) x1 (get (:levels before) 0) path (:path r)]
+    (when (and input-buffered? before0 (= 2 (count ops)) (= (count x0) (count x1))
+               (some (fn [[k L]] (and (= 0 L) (#{:join-left :join-right :borrow-left :borrow-right} k)))
+                     (:events r)))
+      (let [p (path 0)
+            [first? last? :as e] (edge before path 0)]
+        (when (and (= (x0 p) (x1 p))                     ; the first write was not in the path leaf
+                   (or (and (not first?) (not= (x0 (dec p)) (x1 (dec p))))
+                       (and (not last?) (not= (x0 (inc p)) (x1 (inc p))))))
+          (if (= (rebalance-choice bf x0 p e) (rebalance-choice bf x1 p e)) :weighed :changed))))))
 
 (defn- effective?
   "A write that did nothing must not stand in for an in-place write."
@@ -563,7 +584,7 @@
                             r2    (step disk (:addr r1) opts (:shape r1) op2)]
                         (rec r2 (first op2) :events2 :transitions2 (effective? present1 op2 (second (effect present1 op2))))
                         (check {:specs specs :disk disk :before (:shape r1) :ops [op1 op2] :r r2
-                                :delta (second (effect present1 op2)) :input-buffered? buffered
+                                :delta (second (effect present1 op2)) :input-buffered? buffered :before0 before
                                 :leaf-keys (:leaf-keys g)})
                         (swap! disk select-keys keep2)))))
                 (swap! disk select-keys keep1)))))))
@@ -607,7 +628,7 @@
                                    r2  (await (step-async disk (:addr r1) opts (:shape r1) op2))]
                                (rec r2 (first op2) :events2 :transitions2 (effective? present1 op2 (second (effect present1 op2))))
                                (check {:specs specs :disk disk :before (:shape r1) :ops [op1 op2] :r r2
-                                       :delta (second (effect present1 op2)) :input-buffered? buffered
+                                       :delta (second (effect present1 op2)) :input-buffered? buffered :before0 before
                                        :leaf-keys (:leaf-keys g)})
                                (swap! disk select-keys keep2)
                                (recur (inc j)))))))
@@ -663,7 +684,10 @@
                                 (not (and (= :rep (first op)) (some #{(second op)} (:content before))))))
                        (<= (:reads r) bound)
                        (or (pos? (:diff-buf-size opts)) (zero? (:store-reads r)))
-                       (empty? (policy-violations bf before (:path r) (:events r))))
+                       (empty? (policy-violations bf before (:path r) (:events r)))
+                       ;; a write that does nothing leaves every node as it was
+                       (or (not (zero? delta)) (= :rep (first op))
+                           (= (:levels sh) (:levels before))))
           (is false (str "case " (pr-str specs) " ops " (pr-str ops) " events " (pr-str (:events r))
                          ": unknown " (:unknown sh) ", wrong " (:wrong sh) ", elements " (:n sh)
                          " from " (:n before) ", content as expected " (= (:content sh) want)
@@ -703,16 +727,17 @@
     (let [H 2
           opts {:branching-factor 4 :diff-buf-size 2}
           seen (volatile! 0)
-          next-door (volatile! 0)
+          next-door (volatile! #{})
           chk  (counted-check opts)
           r (every-step opts H {:second-step? true
                                 :check (fn [m]
                                          (when (:input-buffered? m) (vswap! seen inc))
-                                         (when (neighbour-write? m) (vswap! next-door inc))
+                                         (when-let [w (neighbour-write 4 m)] (vswap! next-door conj w))
                                          (chk m))})]
       (is (pos? @seen) "precondition: some second steps started from buffered edits")
-      (is (pos? @next-door)
-          "precondition: some rebalanced against a neighbour that held a buffered edit")
+      (is (= #{:weighed :changed} @next-door)
+          "precondition: some rebalanced against a sibling that held a buffered edit, and some
+           of those had to do something else than the blobs alone would say")
       (is (= #{} (missing (expected-events H) (:events2 r)))
           "the writes over buffered edits took every kind of step at every level")
       (is (= #{} (missing (expected-transitions H) (:transitions2 r)))))))
@@ -797,17 +822,17 @@
   (test/async done
               (let [H 1 opts {:branching-factor 4 :diff-buf-size 2}
                     seen (volatile! 0)
-                    next-door (volatile! 0)
+                    next-door (volatile! #{})
                     chk  (counted-check opts)]
                 ((every-step-async opts H {:second-step? true
                                            :check (fn [m]
                                                     (when (:input-buffered? m) (vswap! seen inc))
-                                                    (when (neighbour-write? m) (vswap! next-door inc))
+                                                    (when-let [w (neighbour-write 4 m)] (vswap! next-door conj w))
                                                     (chk m))})
                  (fn [r]
                    (is (pos? @seen) "precondition: some second steps started from buffered edits")
-                   (is (pos? @next-door)
-                       "precondition: some rebalanced against a neighbour that held a buffered edit")
+                   (is (= #{:weighed :changed} @next-door)
+                       "precondition: some rebalanced against a sibling that held a buffered edit")
                    (is (= #{} (missing (expected-events H) (:events2 r))))
                    (is (= #{} (missing (expected-transitions H) (:transitions2 r))))
                    (done))
