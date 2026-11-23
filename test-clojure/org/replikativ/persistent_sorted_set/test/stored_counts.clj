@@ -977,9 +977,10 @@
    leaf — each a kind of edit a diff buffer can be left holding — and an insert just before
    and a delete just below the path leaf's first key, an insert just after and a delete
    just above its last. Where the path leaf has a leaf before or after it, those land
-   there (else in the path leaf, or nowhere), and where that leaf is a sibling under the
-   same parent, the second write weighs a neighbour that is, with its buffered edit, not
-   the size its blob says. `neighbour-write` tells which second writes those were."
+   there (else in the path leaf, or nowhere). Where that leaf is a sibling under the same
+   parent AND the rule comes to look at it, the second write weighs a neighbour that is,
+   with its buffered edit, not the size its blob says; `neighbour-write` tells for which
+   second writes that decided the rebalance."
   [ks]
   (let [f (first ks) l (peek ks)]
     [[:add (inc f)] [:del (nth ks (quot (count ks) 2))] [:rep f]
@@ -1001,8 +1002,9 @@
   "For the second write of a two-write case that rebalanced the path leaf: did the first
    write leave a buffered edit in a leaf the rebalance weighs — a sibling under the same
    parent, whose length a restore finds (`before`) is then not the one its blob has
-   (`before0`)? :weighed if so, :changed if with the blob's length the leaf would have had
-   to do something else, nil otherwise."
+   (`before0`)? :changed if with the blobs' lengths the leaf would have had to do something
+   else — the buffered edit decided the rebalance; :weighed if not, which includes a
+   sibling the rule never came to look at; nil otherwise. Only :changed is evidence."
   [bf {:keys [ops r before before0 input-buffered?]}]
   (let [x0 (get (:levels before0) 0) x1 (get (:levels before) 0) path (:path r)]
     (when (and input-buffered? before0 (= 2 (count ops)) (= (count x0) (count x1))
@@ -1078,7 +1080,8 @@
 (defn- every-step
   "Run every case of `shape-cases`; `check` is called per step with the case, the step's
    input and result. With `second-step?` the first write is one of `buffering-ops`, and
-   where it leaves buffered edits it is followed by every write, from the tree it stored. Returns {:trees :steps :max-reads :events :transitions}, and
+   where it leaves buffered edits it is followed by every write of `spine-ops` (on the path
+   leaf's original keys), from the tree it stored. Returns {:trees :steps :max-reads :events :transitions}, and
    {:events2 :transitions2} for the second writes."
   [opts H {:keys [check prepare second-step?]}]
   (let [bf  (:branching-factor opts)
@@ -1177,7 +1180,8 @@
                          ", overfull " (:overfull sh) ", mislevelled " (:mislevelled sh)
                          ", new root " (:new-root? r) ", reads " (:reads r) " (bound " bound
                          "), store reads " (:store-reads r) ", rebalanced against the policy "
-                         (pr-str (policy-violations bf before (:path r) (:events r))))))))))
+                         (pr-str (policy-violations bf before (:path r) (:events r)))
+                         ", node lengths " (pr-str (:levels before)) " -> " (pr-str (:levels sh)))))))))
 
 ;; ---- Part 1: single cold writes, enumerated ----
 
@@ -1258,9 +1262,9 @@
                                                 (when-let [w (neighbour-write 4 m)] (swap! next-door conj w))
                                                 (chk m))})]
           (is (pos? @seen) "precondition: some second steps started from buffered edits")
-          (is (= #{:weighed :changed} @next-door)
-              "precondition: some rebalanced against a sibling that held a buffered edit, and
-               some of those had to do something else than the blobs alone would say")
+          (is (contains? @next-door :changed)
+              "precondition: for some, a sibling's buffered edit decided the rebalance — the
+               leaf had to do something else than the blobs alone would say")
           (is (= #{} (missing (expected-events H) (:events2 r)))
               "the writes over buffered edits took every kind of step at every level")
           (is (= #{} (missing (expected-transitions H) (:transitions2 r)))))))))
