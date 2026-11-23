@@ -314,7 +314,7 @@
    believe its blob carries it, and `count-census` / `recount` there would skip it."
   [^Branch root total]
   (if (and (instance? Branch root) (>= total 0) (neg? (.-subtree-count root)))
-    (Branch. (.-level root) (.-keys root)
+    (Branch. (.-level root) (.slice (.-keys root))
              (when-some [c (.-children root)] (.slice c))
              (when-some [a (.-addresses root)] (.slice a))
              total (.-_measure root) (.-settings root)

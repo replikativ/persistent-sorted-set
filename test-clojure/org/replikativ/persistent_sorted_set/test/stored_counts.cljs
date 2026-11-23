@@ -11,6 +11,7 @@
             [clojure.edn :as edn]
             [clojure.string :as str]
             [org.replikativ.persistent-sorted-set :as s]
+            [org.replikativ.persistent-sorted-set.boundary :as boundary]
             [org.replikativ.persistent-sorted-set.test.storage.util :as u]))
 
 (defn- blob [disk a] (edn/read-string (@disk a)))
@@ -35,10 +36,26 @@
      addr nil)
     @acc))
 
+(defn- wrong-counts
+  "Every branch blob whose stored count is not the number of elements below it. Only for a
+   tree stored without buffers, where a blob is the whole truth about its subtree."
+  [disk addr]
+  (let [bad (volatile! [])]
+    ((fn walk [a]
+       (let [{:keys [addresses keys subtree-count]} (blob disk a)]
+         (if addresses
+           (let [n (reduce + 0 (map walk addresses))]
+             (when (and (some? subtree-count) (>= subtree-count 0) (not= n subtree-count))
+               (vswap! bad conj {:address a :stored subtree-count :actual n}))
+             n)
+           (count keys))))
+     addr)
+    @bad))
+
 (defn- generations
   "`gens` rounds of (restore cold, ops, store), checking the invariant after every store."
-  [bf dbs n gens ops-fn]
-  (let [opts {:branching-factor bf :diff-buf-size dbs}
+  [bf dbs n gens ops-fn & [extra]]
+  (let [opts (merge {:branching-factor bf :diff-buf-size dbs} extra)
         disk (atom {})
         st   #(u/storage (atom {}) disk opts)
         s0   (reduce s/conj (s/sorted-set* (assoc opts :storage (st))) (range 0 (* 2 n) 2))
@@ -56,6 +73,8 @@
               back  (s/restore addr' (st) opts)]
           (is (zero? (:unknown cen))
               (str "generation " gen ": " (:unknown cen) " of " (:branches cen) " stored branches have no count"))
+          (when (zero? dbs)
+            (is (= [] (wrong-counts disk addr')) (str "generation " gen ": and no count is wrong")))
           (when (zero? (mod gen 4))
             (is (= {:branches (:branches cen) :unknown 0} (s/count-census back)))
             (is (= (count live') (count back)))
@@ -122,3 +141,54 @@
   (let [s0 (into (s/sorted-set* {:branching-factor 8 :diff-buf-size 0}) (range 3))]
     (is (identical? s0 (s/recount s0)))
     (is (= {:branches 0 :unknown 0} (s/count-census s0)))))
+
+(deftest a-content-defined-tree-keeps-every-count
+  (testing "MST mode cuts where the keys say; its split divides a count like any other"
+    (let [bf 32 n 1500]
+      (generations bf 0 n 10 (:scattered (patterns 16 n)) {:boundary (boundary/mst-boundary 3)})
+      (generations bf 0 n 10 (:mixed (patterns 16 n)) {:boundary (boundary/mst-boundary 3)}))))
+
+(deftest a-buffered-write-over-an-uncounted-tree-stores-what-it-knows
+  (testing "a deposit works out the count of the child it passes; the child must be written
+            with it, and a warm census must say what a cold one does"
+    (let [bf 8 n 900
+          {:keys [addr disk opts]} (generations bf 64 n 2 (:mixed (patterns bf n)))
+          st    #(u/storage (atom {}) disk opts)
+          _     (erase-counts! disk)
+          cold  (s/restore addr (st) opts)
+          warm  (reduce s/conj cold (map #(inc (* 2 %)) (range 0 n 7)))
+          addr' (s/store warm (st))
+          want  (:unknown (disk-census disk addr'))]
+      (is (= want (:unknown (s/count-census (s/restore addr' (st) opts)))))
+      (is (= want (:unknown (s/count-census warm)))))))
+
+(deftest a-root-that-is-promoted-is-not-changed-for-the-set-it-came-from
+  (testing "in a content-defined tree a delete can empty one side of the root, and the other
+            child becomes the root AS IT IS — a node the original set still reaches at its
+            old address. The new set must not write its count into that node."
+    (let [bf    32
+          opts  {:branching-factor bf :diff-buf-size 0 :boundary (boundary/mst-boundary 3)}
+          disk  (atom {})
+          st    #(u/storage (atom {}) disk opts)
+          build (fn [n] (reduce s/conj (s/sorted-set* (assoc opts :storage (st))) (range n)))
+          shape (fn [n] (let [a (s/store (build n) (st)) b (blob disk a)] [(:level b) (count (:addresses b))]))
+          n     (first (filter #(let [[lvl len] (shape %)] (and (>= lvl 2) (= 2 len))) (range 200 4000 7)))
+          _     (is (some? n) "precondition: a tree whose root has two children")
+          addr  (s/store (build n) (st))
+          _     (erase-counts! disk)
+          _     (swap! disk update addr str/replace-first ":subtree-count -1" (str ":subtree-count " n))
+          want  (:unknown (disk-census disk addr))
+          level0 (:level (blob disk addr))
+          cache (atom {})                        ; ONE node object per address, for both sets
+          orig  (s/restore addr (u/storage cache disk opts) opts)
+          shrunk (loop [s' orig, k (dec n)]
+                   (if (or (neg? k)
+                           (let [a (s/store s' (st))] (< (:level (blob disk a)) level0)))
+                     s'
+                     (recur (s/disj s' k) (dec k))))]
+      (is (pos? want))
+      (is (not (identical? orig shrunk)))
+      (is (= want (:unknown (s/count-census orig)))
+          "the original set still sees its own blobs as they are")
+      (let [addr' (s/store (s/recount orig) (st))]
+        (is (zero? (:unknown (disk-census disk addr'))))))))
