@@ -66,23 +66,54 @@
 (defn- shape
   "The stored tree as a cold restore finds it: {:levels {level [node lengths, left to right]}
    :unknown branches without a count, :wrong branches whose count is not the number of
-   elements below them, :n elements}."
+   elements below them, :n elements, :content the elements in tree order, :misplaced
+   branch keys that are not the largest key of their child, :underfull / :overfull nodes
+   other than the root outside [bf/2, bf]}."
   [disk addr opts]
   (let [st   (storage disk (atom 0))
         s    (set/restore-by compare addr st opts)
-        acc  (volatile! {:levels (sorted-map) :unknown 0 :wrong 0})
+        bf   (long (:branching-factor opts))
+        mn   (quot bf 2)
+        root (.root ^PersistentSortedSet s)
+        acc  (volatile! {:levels (sorted-map) :unknown 0 :wrong 0 :misplaced 0 :underfull 0 :overfull 0})
+        out  (volatile! (transient []))
+        fill (fn [^ANode n]
+               (when-not (identical? n root)
+                 (cond (< (.len n) mn) (vswap! acc update :underfull inc)
+                       (> (.len n) bf) (vswap! acc update :overfull inc))))
+        ;; returns [elements below, largest key below]
         walk (fn walk [^ANode n]
+               (fill n)
                (if (instance? Branch n)
                  (let [^Branch br n
-                       c (reduce + 0 (map #(walk (.child br st (int %))) (range (.len n))))]
+                       ^List ks (.keys n)
+                       kids (mapv #(walk (.child br st (int %))) (range (.len n)))
+                       c    (reduce + 0 (map first kids))]
                    (vswap! acc update-in [:levels (.level br)] (fnil conj []) (.len n))
+                   (dotimes [i (.len n)]
+                     (when-not (= (.get ks (int i)) (second (kids i))) (vswap! acc update :misplaced inc)))
                    (cond (neg? (.subtreeCount br))     (vswap! acc update :unknown inc)
                          (not= c (.subtreeCount br))   (vswap! acc update :wrong inc))
-                   c)
-                 (do (vswap! acc update-in [:levels 0] (fnil conj []) (.len n))
-                     (.len n))))
-        total (walk (.root ^PersistentSortedSet s))]
-    (assoc @acc :n total)))
+                   [c (second (peek kids))])
+                 (let [^List ks (.keys n)]
+                   (vswap! acc update-in [:levels 0] (fnil conj []) (.len n))
+                   (dotimes [i (.len n)] (vswap! out conj! (.get ks (int i))))
+                   [(.len n) (when (pos? (.len n)) (.get ks (int (dec (.len n)))))])))
+        total (first (walk root))]
+    (assoc @acc :n total :content (persistent! @out))))
+
+(defn- sound?
+  "The tree holds exactly `expected`, in order, under keys that lead to it."
+  [sh expected]
+  (and (= (:content sh) expected) (zero? (:misplaced sh))))
+
+(defn- after-op
+  "The content a tree with `content` holds after `op`."
+  [content [op k]]
+  (case op
+    :add (vec (into (apply sorted-set content) [k]))
+    :del (vec (remove #(= % k) content))
+    :rep content))
 
 (defn- path-ordinals
   "Per level, the left-to-right position (within its level) of the node on the path to `k`."
@@ -301,18 +332,24 @@
                  [:del [e L]]))))
 
 (defn- counted-check
-  "A fully counted tree stays fully counted, with no wrong count and the right number of
-   elements, and the write read no more than its bound."
+  "A fully counted tree stays fully counted, with no wrong count; it holds exactly the
+   elements it should, in order, under branch keys that lead to them, in nodes that are
+   neither underfull nor overfull; and the write read no more than its bound."
   [opts H]
   (let [bound (read-bound (:branching-factor opts) (inc H))]
     (fn [{:keys [specs ops r before delta]}]
       (let [sh (:shape r)]
         (when-not (and (zero? (:unknown sh)) (zero? (:wrong sh))
                        (= (:n sh) (+ (:n before) delta))
+                       (sound? sh (after-op (:content before) (peek ops)))
+                       (zero? (:underfull sh)) (zero? (:overfull sh))
                        (<= (:reads r) bound))
           (is false (str "case " (pr-str specs) " ops " (pr-str ops) " events " (pr-str (:events r))
                          ": unknown " (:unknown sh) ", wrong " (:wrong sh) ", elements " (:n sh)
-                         " from " (:n before) ", reads " (:reads r) " (bound " bound ")")))))))
+                         " from " (:n before) ", content as expected "
+                         (= (:content sh) (after-op (:content before) (peek ops)))
+                         ", misplaced keys " (:misplaced sh) ", underfull " (:underfull sh)
+                         ", overfull " (:overfull sh) ", reads " (:reads r) " (bound " bound ")")))))))
 
 ;; ---- Part 1: single cold writes, enumerated ----
 
