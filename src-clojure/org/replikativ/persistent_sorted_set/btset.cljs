@@ -308,11 +308,19 @@
                    (.-settings set)))))
 
 (defn- with-root-count
-  "`root`, knowing `total` when it is a Branch that did not."
-  [root total]
-  (when (and (instance? Branch root) (>= total 0) (neg? (.-subtree-count root)))
-    (set! (.-subtree-count root) total))
-  root)
+  "`root`, knowing `total` when it is a Branch that did not — as a NEW node. The root being
+   published can be one another version of the set still reaches at its old address (the
+   child a collapse promotes); writing the count into that node would make the other set
+   believe its blob carries it, and `count-census` / `recount` there would skip it."
+  [^Branch root total]
+  (if (and (instance? Branch root) (>= total 0) (neg? (.-subtree-count root)))
+    (Branch. (.-level root) (.-keys root)
+             (when-some [c (.-children root)] (.slice c))
+             (when-some [a (.-addresses root)] (.slice a))
+             total (.-_measure root) (.-settings root)
+             (when-some [sl (.-_slots root)] (.slice sl))
+             (.-_bufEntries root) (.-_projCmp root))
+    root))
 
 (defn conjoin
   ([^BTSet set key]

@@ -14,15 +14,63 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // For lazy computation when restored from old storage format.
   public long _subtreeCount;
 
-  // True while `_subtreeCount` is a value this node's STORED form does not carry: it was
-  // restored unknown (-1) and filled in memory by a count. Such a node answers `count` but
-  // its blob still says -1, and nothing writes a clean node — so every later cold restore
-  // starts unknown again. `recount` and `countCensus` treat it as unknown; `store` clears it,
-  // because a node that is written is written with the count it has.
+  // A count worked out by READING (count(), computeSubtreeCount) for a node whose
+  // `_subtreeCount` is unknown. Kept apart on purpose.
   //
-  // Without it the damage is invisible to the process that could repair it: one `count`
-  // (the query planner's, a caller's) and every node it walked looks counted.
-  public boolean _countUnstored;
+  // `_subtreeCount` is what the node is, or will be, STORED with: restore sets it from the
+  // blob, a write sets it on the node it builds or owns, and nothing else touches it. So for
+  // a clean node it always equals the blob — which is the one thing `recount` and
+  // `countCensus` have to know, and what they could not know while a read filled the same
+  // field: one `count` (the query planner's, a caller's) and every node it walked looked
+  // counted, in this set and in every other set sharing the node through a caching storage.
+  //
+  // A write uses `knownCount()` as its base, so a node rebuilt from a lazily counted one is
+  // stored with its count — the healing a single field gave — while the clean original stays
+  // what its blob says. In-place arms reset this after assigning `_subtreeCount`.
+  //
+  // volatile: written on shared nodes by readers, and a long.
+  public volatile long _lazyCount = -1;
+
+  /** The count if this node has one by either route, else -1. Never reads. */
+  public long knownCount() {
+    final long c = _subtreeCount;
+    return (c >= 0) ? c : _lazyCount;
+  }
+
+  /** `node`'s element count if it can say without reading, else -1. */
+  static long cnt(ANode node) {
+    return (node instanceof Branch) ? ((Branch) node).knownCount() : node._len;
+  }
+
+  /** Sum of `cnt` over the non-null nodes; -1 if one of them cannot say. */
+  static long cnt3(ANode a, ANode b, ANode c) {
+    long total = 0;
+    for (ANode n : new ANode[]{ a, b, c }) {
+      if (n == null) continue;
+      final long x = cnt(n);
+      if (x < 0) return -1;
+      total += x;
+    }
+    return total;
+  }
+
+  /**
+   * This node's count after a remove below it, or -1. `ownBefore` and `touchedBefore` were
+   * read BEFORE the child's remove ran (it may mutate in place): this node's count, and the
+   * sum over the three children the remove may touch. `l`, `c`, `r` are those children after.
+   *
+   * Without a leaf processor exactly one element left: own - 1. With one, a leaf may be
+   * compacted or expanded, so one key is not one element — but everything the remove changed
+   * is in those three children, so `own - before + after` is exact. That used to be a probe
+   * over ALL the children, which answers -1 at the first one still on disk and so turned a
+   * counted branch into an uncounted one on any cold delete.
+   */
+  private long ownAfterRemove(Settings settings, long ownBefore, long touchedBefore, ANode l, ANode c, ANode r) {
+    if (ownBefore < 0) return -1;
+    if (unitDelta(_settings, settings)) return ownBefore - 1;
+    final long after = cnt3(l, c, r);
+    return (touchedBefore >= 0 && after >= 0) ? ownBefore - touchedBefore + after : -1;
+  }
 
   // diff-buf (only used when _settings.diffBufSize() > 0; null/false otherwise, so
   // diffBufSize==0 is byte-identical to baseline — invariant I0).
@@ -395,16 +443,14 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
   @Override
   public int count(IStorage storage) {
-    if (_subtreeCount < 0) {
-      long computed = computeSubtreeCount(storage);
-      // Cache the computed count. Safe for persistent (immutable) nodes since
-      // the count never changes. For transient nodes it's also safe since
-      // add/remove maintain the count incrementally.
-      _subtreeCount = computed;
-      _countUnstored = true;
-      return (int) computed;
+    long known = knownCount();
+    if (known < 0) {
+      known = computeSubtreeCount(storage);
+      // Cached apart from `_subtreeCount` — see `_lazyCount`. Sound on a shared persistent
+      // node (its content never changes) and on a transient (every in-place arm resets it).
+      _lazyCount = known;
     }
-    return (int) _subtreeCount;
+    return (int) known;
   }
 
   public int level() {
@@ -630,14 +676,13 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     for (int i = 0; i < _len; ++i) {
       ANode child = child(storage, i);
       if (child instanceof ISubtreeCount) {
-        long childCount = ((ISubtreeCount) child).subtreeCount();
+        long childCount = cnt(child);
         if (childCount < 0) {
           // Child is a Branch with unknown count, compute recursively
           childCount = ((Branch) child).computeSubtreeCount(storage);
           // Cache in child — safe for persistent (immutable count) and transient
           // (add/remove maintain counts; this only fires for unknown/-1 values)
-          ((Branch) child)._subtreeCount = childCount;
-          ((Branch) child)._countUnstored = true;
+          ((Branch) child)._lazyCount = childCount;
         }
         count += childCount;
       } else {
@@ -691,12 +736,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       ANode child = (s.children != null) ? (ANode) _settings.readReference(s.children[i]) : null;
       Slot sl = (slots != null) ? (Slot) slots[i] : null;
       long c = -1;
-      if (child != null) c = (child instanceof Branch) ? ((Branch) child)._subtreeCount : child._len;
+      if (child != null) c = cnt(child);
       if (c < 0 && sl != null) c = sl.count;
       if (c < 0 && child == null && sl == null) {
         if (storage == null || s.addresses == null || s.addresses[i] == null) return -1;
         ANode restored = (ANode) storage.restore(s.addresses[i]);
-        c = (restored instanceof Branch) ? ((Branch) restored)._subtreeCount : restored._len;
+        c = cnt(restored);
       }
       if (c < 0) return -1;
       total += c;
@@ -734,63 +779,42 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   }
 
   /**
-   * Is child `i`'s count missing from what is STORED? `child` is that child, materialized.
-   *
-   * A child restored through a slot that carries a diff is PROJECTED: it takes its count
-   * from the slot, whatever its own blob says, so it arrives here counted and unflagged.
-   * What is left is a child that is resident with a count it worked out in memory. It is
-   * counted on disk only if this node's slot will hand a restore the same number — a slot
-   * with a count AND a diff; a slot without a diff is not projected, and the child is then
-   * read from its blob as it is.
+   * Walk every branch below this one; `out[0]` += branches seen, `out[1]` += branches with no
+   * `_subtreeCount` — which for a clean node is what its blob says, and for a dirty one what
+   * it will be written with. (A child restored through a diff-buf slot is projected: it is
+   * built with the slot's count, so it is counted here as a restore would find it.) Reads
+   * every branch, no leaf.
    */
-  private boolean childCountUnstored(NodeState<Address> s, int i, Branch child) {
-    if (child._subtreeCount < 0) return true;
-    if (!child._countUnstored) return false;
-    final Object[] slots = (s.buf != null) ? s.buf.slots : null;
-    final Slot sl = (slots != null) ? (Slot) slots[i] : null;
-    return !(sl != null && sl.count >= 0 && sl.diff != null);
-  }
-
-  /**
-   * Walk every branch below this one; `out[0]` += branches seen, `out[1]` += branches whose
-   * stored form has no count. Reads every branch, no leaf.
-   */
-  void countCensus(IStorage storage, boolean selfUnstored, long[] out) {
+  void countCensus(IStorage storage, long[] out) {
     out[0]++;
-    if (selfUnstored) out[1]++;
+    if (_subtreeCount < 0) out[1]++;
     if (_level <= 1) return;
-    for (int i = 0; i < _len; i++) {
-      final NodeState<Address> s = _state;
-      final Branch child = (Branch) child(storage, i);
-      child.countCensus(storage, childCountUnstored(s, i, child), out);
-    }
+    for (int i = 0; i < _len; i++) ((Branch) child(storage, i)).countCensus(storage, out);
   }
 
   /**
    * This subtree with every branch counted and every branch that was not counted ON DISK made
    * dirty, so the next `store` writes it. Returns `this` when nothing below needs it.
-   * `selfUnstored`: this node's own stored form lacks its count (decided by the parent, which
-   * knows about slots).
    *
    * A rewritten child is handled as a structural replacement: its address and its slot are
    * dropped, its old blob is freed, and this node becomes one that must be written — the same
    * shape a split leaves behind. Nothing about the content changes: same keys, same children,
    * same measures.
    */
-  Branch<Key, Address> recount(IStorage storage, boolean selfUnstored, Settings settings) {
+  Branch<Key, Address> recount(IStorage storage, Settings settings) {
     final NodeState<Address> s0 = _state;                        // one snapshot
     ANode[] changed = null;
     if (_level > 1) {
       for (int i = 0; i < _len; i++) {
         final Branch child = (Branch) child(storage, i);
-        final Branch nc = child.recount(storage, childCountUnstored(s0, i, child), settings);
+        final Branch nc = child.recount(storage, settings);
         if (nc != child) {
           if (changed == null) changed = new ANode[_len];
           changed[i] = nc;
         }
       }
     }
-    if (changed == null && !selfUnstored) return this;
+    if (changed == null && _subtreeCount >= 0) return this;
 
     final Key[] newKeys = Arrays.copyOfRange(_keys, 0, _len);
     final Address[] newAddresses = (s0.addresses != null) ? Arrays.copyOfRange(s0.addresses, 0, _len) : null;
@@ -808,9 +832,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     }
     final Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, -1, _measure, _projCmp, settings);
     if (newSlots != null || settings.diffBufSize() > 0) nb.installSlots(newSlots, BUF_WRITE);
-    // The children are counted now (below a leaf-parent they are leaves, which always are),
-    // so this is a sum; it reads the leaves of a leaf-parent that was unknown.
-    nb._subtreeCount = (_subtreeCount >= 0) ? _subtreeCount : nb.countChildrenReading(storage);
+    // A count already worked out in memory is used as it is. Otherwise the children are
+    // counted now (below a leaf-parent they are leaves, which always are), so this is a sum;
+    // it reads the leaves of a leaf-parent that was unknown.
+    final long known = knownCount();
+    nb._subtreeCount = (known >= 0) ? known : nb.countChildrenReading(storage);
     return nb;
   }
 
@@ -934,7 +960,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
    */
   private static long getSubtreeCount(ANode node, IStorage storage) {
     if (node instanceof ISubtreeCount) {
-      long count = ((ISubtreeCount) node).subtreeCount();
+      long count = cnt(node);
       if (count >= 0) return count;
       // Branch with unknown count: propagate unknown. Computing here would restore the subtree.
       if (node instanceof Branch) return -1;
@@ -1104,7 +1130,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // (cache-fills CASed in after this read are simply not seen — state 3 stays state 3).
     final NodeState<Address> s0 = _state;
     ANode oldChild = child(storage, ins);
-    long oldChildCount = ((ISubtreeCount) oldChild).subtreeCount();
+    long oldChildCount = cnt(oldChild);   // BEFORE the add: an editable child is mutated in place
     // diff-buf: capture child ins's durable address BEFORE the mutation nulls it,
     // so a deposit at this level can record it as the buffer anchor.
     Object anchor0 = (_settings.diffBufSize() > 0 && s0.addresses != null) ? s0.addresses[ins] : null;
@@ -1130,10 +1156,20 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // processor-free path is EXACTLY what it was: delta when the count is known, and
       // nothing at all when it is unknown. Folding "unknown" into the probe would make
       // every such add walk the children — the very cost 04499a0 removed.
-      if (unitDelta(_settings, settings)) {
-        if (_subtreeCount >= 0) _subtreeCount += 1;
-      } else {
-        _subtreeCount = tryComputeSubtreeCountFromChildren(s0.children, _len, storage);
+      {
+        final long own = knownCount();
+        if (unitDelta(_settings, settings)) {
+          if (own >= 0) _subtreeCount = own + 1;
+        } else {
+          // The child was changed in place, and it is the only thing that was: its count
+          // before and after give this node's exactly. The probe over all children is what
+          // is left when one of the three numbers is missing.
+          final long now = cnt(oldChild);
+          _subtreeCount = (own >= 0 && oldChildCount >= 0 && now >= 0)
+              ? own - oldChildCount + now
+              : tryComputeSubtreeCountFromChildren(s0.children, _len, storage);
+        }
+        _lazyCount = -1;   // this node changed in place
       }
       // Update measure: recompute from children (child's stats were updated in place), or
       // fold in the one inserted key when a child is not resident (see measureAfterInsert).
@@ -1193,7 +1229,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // can populate oldChildCount, so the newChildrenCount guard is the one that must hold.)
     long newChildrenCount = 0;
     for (ANode n : nodes) {
-      long c = ((ISubtreeCount) n).subtreeCount();
+      long c = cnt(n);
       if (c < 0) { newChildrenCount = -1; break; }
       newChildrenCount += c;
     }
@@ -1216,11 +1252,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // `hasSubtreeCounts` stayed false for the store and the planner fell back to heuristics.
     // Measured, bf 8 / 5000 conj-built / stored / cold-restored / 500 appended: root count
     // 5500 expected, -1 found, and still -1 six restore generations later.
+    final long own = knownCount();
     final long ownCountAfter =
-        (unitDelta(_settings, settings) && _subtreeCount >= 0)
-            ? _subtreeCount + 1
-            : ((_subtreeCount >= 0 && oldChildCount >= 0 && newChildrenCount >= 0)
-                ? _subtreeCount - oldChildCount + newChildrenCount : -1);
+        (unitDelta(_settings, settings) && own >= 0)
+            ? own + 1
+            : ((own >= 0 && oldChildCount >= 0 && newChildrenCount >= 0)
+                ? own - oldChildCount + newChildrenCount : -1);
 
     IMeasure measureOps = _settings.measure();
 
@@ -1236,6 +1273,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       }
       child(ins, node);
       _subtreeCount = ownCountAfter;
+      _lazyCount = -1;   // this node changed in place
       // Update measure: recompute from children, or fold in the one inserted key when a
       // child is not resident (see measureAfterInsert).
       if (measureOps != null && _measure != null) {
@@ -1428,6 +1466,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // is unused. See ANode's six-arg `remove` for the measured failure.
     Object[] removedOut = (_settings.diffBufSize() > 0 && _level == 1) ? new Object[1] : null;
     ANode<Key, Address> mutatedChild = child(storage, idx);
+    // BEFORE the child's remove, which may mutate it and its siblings in place.
+    final long ownBefore = knownCount();
+    final long touchedBefore = cnt3(leftChild, mutatedChild, rightChild);
     ANode[] nodes = mutatedChild.remove(storage, key, leftChild, rightChild, cmp, settings, removedOut);
     @SuppressWarnings("unchecked")
     Key removedKey = (removedOut != null && removedOut[0] != null) ? (Key) removedOut[0] : key;
@@ -1452,10 +1493,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       //     set count 179   seq count 178   drift level 3 179/178, level 2 75/74
       // if/else, not a ternary — see the `add` arm: the processor-free path must stay a
       // pure delta-or-nothing and must not fall into the children walk when unknown.
-      if (unitDelta(_settings, settings)) {
-        if (_subtreeCount >= 0) _subtreeCount -= 1;
-      } else {
-        _subtreeCount = tryComputeSubtreeCountFromChildren(s0.children, _len, storage);
+      {
+        final long after = ownAfterRemove(settings, ownBefore, touchedBefore, leftChild, mutatedChild, rightChild);
+        if (after >= 0) _subtreeCount = after;
+        else if (!unitDelta(_settings, settings))
+          _subtreeCount = tryComputeSubtreeCountFromChildren(s0.children, _len, storage);
+        _lazyCount = -1;   // this node changed in place
       }
       // Update measure: recompute from children (child's stats were updated in place)
       IMeasure measureOps = _settings.measure();
@@ -1535,6 +1578,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     assert nodes.length == 3 : "child.remove() must return exactly 3 elements, got " + nodes.length;
     boolean leftChanged = leftChild != nodes[0] || leftChildLen != safeLen(nodes[0]);
     boolean rightChanged = rightChild != nodes[2] || rightChildLen != safeLen(nodes[2]);
+    // This node's elements after the remove, whatever shape they end up in below.
+    final long ownAfter = ownAfterRemove(settings, ownBefore, touchedBefore, nodes[0], nodes[1], nodes[2]);
 
     // Baseline: child idx was superseded by this remove, and the left/right siblings'
     // durable versions are superseded iff the rebalance consumed/changed them — on EVERY
@@ -1661,9 +1706,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         // to the probe. Caught by leaf_processor/test-mixed-processor, which reported
         // :subtree-count-mismatch {:branch-count 139, :children-sum 137} when this was
         // unconditional.
-        _subtreeCount = (unitDelta(_settings, settings) && _subtreeCount >= 0)
-                        ? _subtreeCount - 1
+        _subtreeCount = (ownAfter >= 0)
+                        ? ownAfter
                         : tryComputeSubtreeCountFromChildren(children, newLen, storage);
+        _lazyCount = -1;   // this node changed in place
         // Update measure: recompute from children
         if (measureOps != null && _measure != null) {
           _measure = tryComputeMeasure(storage);
@@ -1717,8 +1763,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // The probe would bail to -1 at the first non-resident child and discard a number we
       // already know, and that -1 is serialized.
       // ONLY without a leafProcessor — see the in-place arm above.
-      newCenter._subtreeCount = (unitDelta(_settings, settings) && _subtreeCount >= 0)
-                                ? _subtreeCount - 1
+      newCenter._subtreeCount = (ownAfter >= 0)
+                                ? ownAfter
                                 : tryComputeSubtreeCountFromChildren(centerChildren, newLen, storage);
       newCenter._measure = tryComputeMeasureFromChildren(centerChildren, newLen, storage, measureOps);
       if (settings.diffBufSize() > 0) {
@@ -1794,8 +1840,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // Same leafProcessor caveat as the sibling delta above: a processor may compact or
       // expand a leaf, so removing one KEY need not change the element count by one.
       join._subtreeCount =
-          (unitDelta(_settings, settings) && left._subtreeCount >= 0 && _subtreeCount >= 0)
-          ? left._subtreeCount + _subtreeCount - 1
+          (left.knownCount() >= 0 && ownAfter >= 0)
+          ? left.knownCount() + ownAfter
           : tryComputeSubtreeCountFromChildren(joinChildren, left._len + newLen, storage);
       join._measure = tryComputeMeasureFromChildren(joinChildren, left._len + newLen, storage, measureOps);
       if (settings.diffBufSize() > 0) {
@@ -1854,8 +1900,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // one deleted element, plus `right` carried over untouched. See that comment for why
       // the children walk cannot answer here and why the -1 it returns becomes durable.
       join._subtreeCount =
-          (unitDelta(_settings, settings) && right._subtreeCount >= 0 && _subtreeCount >= 0)
-          ? _subtreeCount - 1 + right._subtreeCount
+          (right.knownCount() >= 0 && ownAfter >= 0)
+          ? ownAfter + right.knownCount()
           : tryComputeSubtreeCountFromChildren(joinChildren, newLen + right._len, storage);
       join._measure = tryComputeMeasureFromChildren(joinChildren, newLen + right._len, storage, measureOps);
       if (settings.diffBufSize() > 0) {
@@ -1935,8 +1981,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // pair's TOTAL is known whenever both sources knew theirs, so one known half gives the
       // other. Both unknown is what remains on a fully cold pair (divideCount, below); the parent keeps its own
       // count by delta regardless. (Not with a leaf processor: one key is not one element.)
-      if (unitDelta(_settings, settings) && left._subtreeCount >= 0 && _subtreeCount >= 0) {
-        long pair = left._subtreeCount + _subtreeCount - 1;
+      if (left.knownCount() >= 0 && ownAfter >= 0) {
+        long pair = left.knownCount() + ownAfter;
         if (newLeft._subtreeCount < 0 && newCenter._subtreeCount >= 0) newLeft._subtreeCount = pair - newCenter._subtreeCount;
         else if (newCenter._subtreeCount < 0 && newLeft._subtreeCount >= 0) newCenter._subtreeCount = pair - newLeft._subtreeCount;
       }
@@ -1966,8 +2012,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         newCenter.installSlots(nc, BUF_WRITE);
       }
       // A fully cold pair: read one node's children, the other is the remainder. See divideCount.
-      if (unitDelta(_settings, settings) && left._subtreeCount >= 0 && _subtreeCount >= 0)
-        divideCount(newLeft, newCenter, left._subtreeCount + _subtreeCount - 1, storage);
+      if (left.knownCount() >= 0 && ownAfter >= 0)
+        divideCount(newLeft, newCenter, left.knownCount() + ownAfter, storage);
       return new ANode[] { newLeft, newCenter, right };
     }
 
@@ -2025,8 +2071,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         newRight._measure = tryComputeMeasureFromChildren(newRightChildren, newRightLen, storage, measureOps);
       }
       // Same as the borrow from left: the pair's total is known, so one half gives the other.
-      if (unitDelta(_settings, settings) && right._subtreeCount >= 0 && _subtreeCount >= 0) {
-        long pair = _subtreeCount - 1 + right._subtreeCount;
+      if (right.knownCount() >= 0 && ownAfter >= 0) {
+        long pair = ownAfter + right.knownCount();
         if (newRight._subtreeCount < 0 && newCenter._subtreeCount >= 0) newRight._subtreeCount = pair - newCenter._subtreeCount;
         else if (newCenter._subtreeCount < 0 && newRight._subtreeCount >= 0) newCenter._subtreeCount = pair - newRight._subtreeCount;
       }
@@ -2055,8 +2101,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         newRight.installSlots(nr, BUF_WRITE);
       }
       // A fully cold pair, as in the borrow from left.
-      if (unitDelta(_settings, settings) && right._subtreeCount >= 0 && _subtreeCount >= 0)
-        divideCount(newCenter, newRight, _subtreeCount - 1 + right._subtreeCount, storage);
+      if (right.knownCount() >= 0 && ownAfter >= 0)
+        divideCount(newCenter, newRight, ownAfter + right.knownCount(), storage);
       return new ANode[] { left, newCenter, newRight };
     }
 
@@ -2469,7 +2515,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     newChildren[idx] = newChild;
 
     // Try to recompute measure from final state (after child replacement) for new branch
-    Branch<Key, Address> newBranch = new Branch(_level, _len, newKeys, newAddresses, newChildren, _subtreeCount, null, _projCmp, settings);
+    Branch<Key, Address> newBranch = new Branch(_level, _len, newKeys, newAddresses, newChildren, knownCount(), null, _projCmp, settings);
     if (measureOps != null && _measure != null) {
       newBranch._measure = newBranch.tryComputeMeasure(storage);
     }
@@ -2512,11 +2558,15 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // Exact subtree count of the in-memory child i (cheap: maintained by add/remove).
   private long childCount(IStorage storage, int i) {
     ANode child = child(storage, i);
-    if (child instanceof ISubtreeCount) {
-      long c = ((ISubtreeCount) child).subtreeCount();
-      if (c >= 0) return c;
-    }
-    return child.count(storage);
+    long c = cnt(child);
+    if (c >= 0) return c;
+    // An unknown branch (a tree not yet `recount`ed): this reads its children. The child is
+    // the node the write in progress just built or owns, so it is written — or buffered — by
+    // the coming store, and takes the count with it instead of staying unknown under a slot
+    // that knows.
+    c = child.count(storage);
+    ((Branch) child)._subtreeCount = c;
+    return c;
   }
 
   // In-place deposit into this branch's slot for child i. anchor0 is child i's
@@ -2921,6 +2971,18 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     return (_projCmp == projCmp) ? this : withProjCmp(projCmp);
   }
 
+  /**
+   * This node knowing `count`, as a NEW node. For a root that is being published: the node
+   * may be one another version of the set still reaches at its old address, and writing the
+   * count into it would make that set believe its blob carries it.
+   */
+  Branch<Key, Address> withCount(long count) {
+    final Branch<Key, Address> copy = withProjCmp(_projCmp);
+    copy._subtreeCount = count;
+    copy._lazyCount = -1;
+    return copy;
+  }
+
   Branch<Key, Address> withProjCmp(Comparator projCmp) {
     NodeState<Address> s = _state;
     Address[] addrCopy = (s.addresses != null)
@@ -2949,6 +3011,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     Branch<Key, Address> copy = new Branch<>(_level, _len, keysCopy, addrCopy, childCopy,
                                              _subtreeCount, _measure, projCmp, _settings);
     copy._state = new NodeState<>(addrCopy, childCopy, s.buf);
+    copy._lazyCount = _lazyCount;   // a cache of the same content
     return copy;
   }
 
@@ -3057,7 +3120,6 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (dirty || s0.addresses == null) {
         _state = new NodeState<>(newAddresses, newChildren, s0.buf); // ONE publish
       }
-      _countUnstored = false;   // written with the count it has
       return storage.store(this);
     }
 
@@ -3248,7 +3310,6 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // settled state, exactly as the old in-place mutation did. children are WRAPPED per
     // `:ref-type`, same as the baseline settle — see the staging comment above.
     _state = new NodeState<>(newAddresses, newChildren, new BufState(newSlots, embedded));
-    _countUnstored = false;   // written with the count it has
     return storage.store(this);
   }
 

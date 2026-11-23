@@ -335,8 +335,10 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
    * successful write changed the set by exactly one element, so the result holds
    * `totalBefore + delta`. Not with a leaf processor, where one key is not one element.
    *
-   * Filling an unknown count on a node shared with another version of the set is sound: the
-   * node IS the whole set here, so the value is a property of the subtree, not of the version.
+   * Returns the root to publish — NOT always `root`. A new root can be a node another version
+   * of the set still reaches at its old address (the child a collapse promotes), and writing
+   * the count into that node would make the other set believe its blob carries it. An owned
+   * (editable) root is filled in place; any other is copied.
    *
    * Measured before this, bf 8 / 3000 elements / cold: the delete that collapsed the root took
    * it from a known 2488 to -1, and it was stored that way.
@@ -344,9 +346,11 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   private ANode countRoot(ANode root, long totalBefore, int delta) {
     if (root instanceof Branch && totalBefore >= 0 && _settings.leafProcessor() == null) {
       Branch b = (Branch) root;
-      // Not `_countUnstored`: every caller publishes `root` as the set's new root, and a root
-      // is written by the next store.
-      if (b._subtreeCount < 0) b._subtreeCount = totalBefore + delta;
+      if (b._subtreeCount < 0) {
+        if (!b.editable()) return b.withCount(totalBefore + delta);
+        b._subtreeCount = totalBefore + delta;
+        b._lazyCount = -1;
+      }
     }
     return root;
   }
@@ -409,7 +413,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     final ANode root = root();
     if (root instanceof Branch) {
       final Branch b = (Branch) root;
-      b.countCensus(_storage, b._subtreeCount < 0 || b._countUnstored, out);
+      b.countCensus(_storage, out);
     }
     return out;
   }
@@ -428,7 +432,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     final ANode root = root();
     if (!(root instanceof Branch)) return this;
     final Branch b = (Branch) root;
-    final Branch nb = b.recount(_storage, b._subtreeCount < 0 || b._countUnstored, settings());
+    final Branch nb = b.recount(_storage, settings());
     if (nb == b) return this;
     if (_storage != null && _address != null) _storage.markFreed(_address);
     final long c = nb._subtreeCount;
@@ -893,7 +897,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
         // new root and must be published strongly — see markDirty.
         markDirty(r);
       }
-      countRoot(root(), rootCountBefore, 1);
+      { final ANode cr = root(), counted = countRoot(cr, rootCountBefore, 1); if (counted != cr) markDirty(counted); }
       // When processor is configured, count may differ from +1
       if (_settings.leafProcessor() != null) {
         long rootCount = getSubtreeCount(root());
@@ -911,7 +915,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     } else {
       newRoot = growRoot(nodes);
     }
-    countRoot(newRoot, rootCountBefore, 1);
+    newRoot = countRoot(newRoot, rootCountBefore, 1);
 
     // Use root's subtreeCount for exact count (works correctly even with processor)
     long rootCount = getSubtreeCount(newRoot);
@@ -977,7 +981,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
       // `r` was modified IN PLACE, so it is the new root and must be published
       // strongly — see markDirty.
       markDirty(r);
-      countRoot(r, rootCountBefore, -1);
+      { final ANode counted = countRoot(r, rootCountBefore, -1); if (counted != r) markDirty(counted); }
       // When a processor is configured, count may differ from -1 — the same distinction
       // `cons` makes above and the rebuild arms below. This arm returned early and so
       // skipped the guard entirely; measured before the fix, count outran the elements by

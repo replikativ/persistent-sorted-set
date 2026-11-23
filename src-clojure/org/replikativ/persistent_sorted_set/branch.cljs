@@ -401,7 +401,15 @@
               (async
                (let [c  (await (child node storage i opts))
                      sc (node/subtree-count c)]
-                 (if (>= sc 0) sc (await (node/$count c storage opts)))))))
+                 (if (>= sc 0)
+                   sc
+                   ;; An unknown branch (a tree not yet `recount`ed): this reads its
+                   ;; children. `c` is the node the write in progress just built, so it is
+                   ;; written — or buffered — by the coming store, and takes the count with
+                   ;; it instead of being flushed unknown under a slot that knows.
+                   (let [n (await (node/$count c storage opts))]
+                     (when (instance? Branch c) (set! (.-subtree-count c) n))
+                     n))))))
 
 (defn- deposit-kv
   "Core leaf-diff deposit (mirrors JVM depositKV): accumulate the given [k v] pairs onto this
@@ -754,6 +762,17 @@
                    (+ pos l) (next ls)))
           (arrays/into-array (persistent! out)))))))
 
+(defn- mst-divide!
+  "The pieces `mst-branch-add` cut (at most two for one insert) hold this node's elements
+   plus the inserted one. Same settlement as the count-mode split."
+  [^Branch this pieces storage opts]
+  (if (== 2 (arrays/alength pieces))
+    (let [old-sc (.-subtree-count this)]
+      (divide-count! (arrays/aget pieces 0) (arrays/aget pieces 1)
+                     (if (>= old-sc 0) (inc old-sc) -1) storage opts))
+    (let [sync? (not (false? (:sync? opts)))]
+      (async+sync sync? (async nil)))))
+
 (defn add
   [^Branch this storage key cmp opts]
   (let [{:keys [sync?] :or {sync? true}} opts
@@ -784,7 +803,9 @@
                                                         (arrays/make-array nodes-len)))]
                            (when (and storage addrs (aget addrs idx))
                              (storage/markFreed storage (aget addrs idx)))
-                           (mst-branch-add this bd new-keys new-children mst-addrs idx key))
+                           (let [pieces (mst-branch-add this bd new-keys new-children mst-addrs idx key)]
+                             (await (mst-divide! this pieces storage opts))
+                             pieces))
                          (if (<= (arrays/alength new-children) branching-factor)
                            (let [new-addrs
                                  (when addrs

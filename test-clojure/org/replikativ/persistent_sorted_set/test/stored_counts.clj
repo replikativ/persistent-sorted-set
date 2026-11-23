@@ -17,8 +17,10 @@
    which is what hid this from most of the suite."
   (:require [clojure.test :refer [deftest testing is]]
             [org.replikativ.persistent-sorted-set :as set]
+            [org.replikativ.persistent-sorted-set.boundary :as boundary]
             [org.replikativ.persistent-sorted-set.impl.nodes :as nodes])
-  (:import [org.replikativ.persistent_sorted_set IStorage ANode Branch PersistentSortedSet]))
+  (:import [org.replikativ.persistent_sorted_set IStorage ANode Branch ILeafProcessor PersistentSortedSet]
+           [java.util List]))
 
 (set! *warn-on-reflection* true)
 
@@ -97,10 +99,12 @@
 (defn- generations
   "`gens` rounds of (restore cold, insert `per` keys, delete `rem-per`, store), checking the
    invariant after every store. Returns the final {:addr :model :max-restores}."
-  [{:keys [bf dbs n gens per rem-per transient? pattern seed]}]
+  [{:keys [bf dbs n gens per rem-per transient? pattern seed extra dels-from]}]
   (let [disk (atom {})
         rnd  (java.util.Random. (long seed))
-        a0   (build disk bf dbs n)]
+        opts (fn [bf dbs] (merge (opts bf dbs) extra))
+        a0   (set/store (reduce #(set/conj %1 %2 compare) (set/sorted-set* (opts bf dbs)) (range 0 (* 2 n) 2))
+                        (storage disk))]
     (is (zero? (:unknown (disk-census disk a0))) "a warm build stores every count")
     (loop [addr a0, g 0, model (into (sorted-set) (range 0 (* 2 n) 2)), max-restores 0]
       (if (= g gens)
@@ -110,7 +114,12 @@
               news  (case pattern
                       :append    (let [m (inc (long (or (last model) 0)))] (range m (+ m per)))
                       :scattered (repeatedly per #(inc (* 2 (.nextInt rnd (* 4 n))))))
-              dels  (take rem-per (shuffle (seq model)))
+              dels  (case (or dels-from :anywhere)
+                      :anywhere (take rem-per (shuffle (seq model)))
+                      ;; one end of the key range: every underflow has a sibling on one
+                      ;; side only, so each borrow direction is taken on its own
+                      :low      (take rem-per (seq model))
+                      :high     (take rem-per (rseq model)))
               s     (write-batch cold news dels transient?)
               addr' (set/store s (storage disk restores))
               model (reduce disj (into model news) dels)
@@ -253,3 +262,172 @@
   (testing "a transient is refused"
     (is (thrown? IllegalStateException
                  (set/recount (transient (into (set/sorted-set* (opts 8 0)) (range 100))))))))
+
+(deftest each-borrow-direction-keeps-its-counts
+  (doseq [dbs  [0 64]
+          from [:low :high]]
+    (testing (str "diff-buf " dbs ", deleting from the " (name from) " end")
+      (generations {:bf 8 :dbs dbs :n 600 :gens 20 :per 10 :rem-per 50
+                    :transient? false :pattern :scattered :seed 3 :dels-from from}))))
+
+(defn- identity-processor
+  "A processor that fires on every leaf and changes nothing: enough to take every write off
+   the `one key = one element` shortcut and onto the arithmetic over the touched children."
+  []
+  (reify ILeafProcessor
+    (shouldProcess [_ _leaf-size _settings] true)
+    (processLeaf [_ entries _storage _settings] entries)))
+
+(deftest a-leaf-processor-write-keeps-every-count
+  (testing "with a processor a write cannot assume it changed the count by one, and used to
+            fall back to summing ALL children — unknown at the first one on disk. A cold
+            delete then turned a counted branch into an uncounted one."
+    (doseq [transient? [false true]
+            [pattern rem-frac] [[:scattered 3] [:scattered 1]]]
+      (let [per 96]
+        (generations {:bf 8 :dbs 0 :n 480 :gens 20 :per per :rem-per (quot per rem-frac)
+                      :transient? transient? :pattern pattern :seed 17
+                      :extra {:leaf-processor (identity-processor)}})))))
+
+(deftest a-content-defined-tree-keeps-every-count
+  (testing "MST mode cuts where the keys say, through the same split seam"
+    (doseq [transient? [false true]]
+      (generations {:bf 32 :dbs 0 :n 1500 :gens 15 :per 200 :rem-per 40
+                    :transient? transient? :pattern :scattered :seed 23
+                    :extra {:boundary (boundary/mst-boundary 3)}}))))
+
+;; ---- what a count in memory may not do ----
+
+(defn- caching-storage
+  "One node OBJECT per address, shared by every set that restores through it — what a
+   caching IStorage (datahike's) does."
+  [disk]
+  (let [inner (storage disk)
+        cache (atom {})]
+    (reify IStorage
+      (store [_ node] (.store ^IStorage inner node))
+      (accessed [_ _] nil)
+      (restore [_ address]
+        (or (@cache address)
+            (let [n (.restore ^IStorage inner address)]
+              (swap! cache assoc address n)
+              n))))))
+
+(deftest a-count-in-memory-reaches-no-other-set
+  (doseq [dbs [0 64]]
+    (testing (str "diff-buf " dbs)
+      (let [{:keys [disk addr]} (generations {:bf 8 :dbs dbs :n 900 :gens 2 :per 30 :rem-per 8
+                                              :transient? true :pattern :scattered :seed 5})
+            _      (erase-counts! disk addr (java.util.Random. 9) 1.0)
+            want   (:unknown (disk-census disk addr))
+            shared (caching-storage disk)
+            a      (set/restore-by compare addr shared (opts 8 dbs))
+            n      (count a)]
+        (is (= n (set/count-slice a nil nil)))
+        (testing "the same nodes, through the same cache"
+          (let [b (set/restore-by compare addr shared (opts 8 dbs))]
+            (is (= want (:unknown (set/count-census b))))
+            (is (= want (:unknown (set/count-census a))))))
+        (testing "and through a copy made for another comparator"
+          (let [cmp2 (fn [x y] (compare x y))
+                c    (set/restore-by cmp2 addr shared (assoc (opts 8 dbs) :comparator cmp2))]
+            (is (= n (count c)))
+            (is (= want (:unknown (set/count-census c))))
+            (let [addr' (set/store (set/recount c) (storage disk))]
+              (is (not= addr addr'))
+              (is (zero? (:unknown (disk-census disk addr')))))))))))
+
+(defn- root-branch ^Branch [s]
+  (let [r (.root ^PersistentSortedSet s)] (when (instance? Branch r) r)))
+
+(deftest a-root-that-is-promoted-is-not-changed-for-the-set-it-came-from
+  (testing "in a content-defined tree a delete can empty one side of the root, and the other
+            child is promoted to root AS IT IS — a node the original set still reaches at its
+            old address. (In count mode the promoted node is always a fresh join.) If the new
+            set writes its count into that node, the original believes its blob carries one,
+            and its census and its recount pass over it."
+    (let [bf    32
+          opts  (assoc (opts bf 0) :boundary (boundary/mst-boundary 3))
+          build (fn [n] (reduce #(set/conj %1 %2 compare) (set/sorted-set* opts) (range n)))
+          ;; a tree whose root has exactly two children
+          n     (first (filter (fn [n]
+                                 (let [r (root-branch (build n))]
+                                   (and r (>= (.level r) 2) (= 2 (.len r)))))
+                               (range 200 4000 7)))
+          _     (is (some? n) "precondition: such a tree exists in the searched range")
+          disk  (atom {})
+          addr  (set/store (build n) (storage disk))
+          _     (erase-counts! disk addr (java.util.Random. 4) 1.0)
+          ;; the root keeps its count: it is the nodes below that are legacy
+          _     (swap! disk assoc-in [addr :subtree-count] n)
+          want  (:unknown (disk-census disk addr))
+          orig  (set/restore-by compare addr (caching-storage disk) opts)
+          level0 (.level (root-branch orig))
+          ;; delete from the high end until the root is lower: the last child empties and
+          ;; the first, untouched, is what is left
+          shrunk (loop [s orig, k (dec n)]
+                   (let [r (root-branch s)]
+                     (if (or (nil? r) (< (.level r) level0) (neg? k))
+                       s
+                       (recur (set/disj s k compare) (dec k)))))]
+      (is (pos? want))
+      (is (< (.level (root-branch shrunk)) level0) "precondition: the root collapsed")
+      (is (= want (:unknown (set/count-census orig)))
+          "the original set still sees its own blobs as they are")
+      (let [addr' (set/store (set/recount orig) (storage disk))]
+        (is (zero? (:unknown (disk-census disk addr')))))
+      (testing "and the new set is stored with a counted root"
+        (let [addr2 (set/store shrunk (storage disk))
+              back  (set/restore-by compare addr2 (storage disk) opts)]
+          (is (>= (long (:subtree-count (@disk addr2) -1)) 0))
+          (is (= (count (seq back)) (count back)))
+          (is (= [] (wrong-counts back))))))))
+
+(deftest a-divide-over-an-uncounted-child-reads-no-further
+  (testing "the node knows its total, one of the children it must read does not: the result
+            stays unknown, nothing below that child is read, and no count is invented"
+    (let [bf 8, disk (atom {}), n 6000
+          addr (build disk bf 0 n)
+          ;; erase the leaf-parents only: their parents still know their totals
+          _    (doseq [[a blob] @disk :when (and (:addresses blob) (= 1 (:level blob)))]
+                 (swap! disk assoc-in [a :subtree-count] -1))
+          rnd  (java.util.Random. 6)]
+      (loop [addr addr, i 0, worst 0]
+        (if (= i 400)
+          (do (is (<= worst (+ 12 (* 2 bf) 2)))
+              (is (= [] (wrong-counts (set/restore-by compare addr (storage disk) (opts bf 0))))))
+          (let [restores (atom 0)
+                cold (set/restore-by compare addr (storage disk restores) (opts bf 0))
+                s    (if (even? i)
+                       (set/conj cold (inc (* 2 (.nextInt rnd n))) compare)
+                       (set/disj cold (first (set/slice cold (.nextInt rnd (* 2 n)) nil)) compare))
+                used (long @restores)]
+            (recur (set/store s (storage disk)) (inc i) (max worst used))))))))
+
+(deftest recount-of-a-set-with-unstored-writes
+  (doseq [dbs [0 64]]
+    (let [{:keys [disk addr model]} (generations {:bf 8 :dbs dbs :n 700 :gens 2 :per 30 :rem-per 8
+                                                  :transient? true :pattern :scattered :seed 8})
+          _     (erase-counts! disk addr (java.util.Random. 2) 0.7)
+          cold  (set/restore-by compare addr (storage disk) (opts 8 dbs))
+          news  (map #(inc (* 2 %)) (range 0 700 5))
+          dirty (write-batch cold news (take 40 (seq model)) false)
+          model (reduce disj (into model news) (take 40 (seq model)))
+          addr' (set/store (set/recount dirty) (storage disk))
+          back  (set/restore-by compare addr' (storage disk) (opts 8 dbs))]
+      (is (zero? (:unknown (disk-census disk addr'))))
+      (is (= (seq model) (seq back)))
+      (is (= (count model) (count back)))
+      (is (= [] (wrong-counts back))))))
+
+(deftest a-warm-census-says-what-a-cold-one-does
+  (testing "after buffered writes over a tree that is not yet recounted"
+    (let [{:keys [disk addr]} (generations {:bf 8 :dbs 64 :n 900 :gens 2 :per 30 :rem-per 8
+                                            :transient? true :pattern :scattered :seed 12})
+          _    (erase-counts! disk addr (java.util.Random. 3) 1.0)
+          cold (set/restore-by compare addr (storage disk) (opts 8 64))
+          warm (reduce #(set/conj %1 %2 compare) cold (map #(inc (* 2 %)) (range 0 900 7)))
+          addr' (set/store warm (storage disk))]
+      (is (= (:unknown (disk-census disk addr'))
+             (:unknown (set/count-census (set/restore-by compare addr' (storage disk) (opts 8 64))))
+             (:unknown (set/count-census warm)))))))
