@@ -299,6 +299,18 @@ Count elements in a range without iterating through them — O(log n) via subtre
 (set/count-slice s 1000 2000 my-comparator)
 ```
 
+Every stored branch carries its count, and writes keep it that way. A tree written by an earlier
+version can hold branches stored without one — `count-slice` is still correct there, but it
+reads the children of each such branch it covers. `(set/count-census s)` reports how many
+there are and `(set/store (set/recount s))` repairs them, once:
+
+```clojure
+(set/count-census s)            ;=> {:branches 1203, :unknown 418}
+(def s' (set/recount s))        ; same elements, same structure
+(set/store s')                  ; writes the branches that had no count
+(set/count-census s')           ;=> {:branches 1203, :unknown 0}
+```
+
 ### Rank-based access (`get-nth`)
 
 Access elements by position (rank) in O(log n), enabling percentile/quantile queries. Requires

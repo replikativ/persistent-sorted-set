@@ -384,9 +384,11 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
 
   /**
    * Whether the ROOT knows its element count — and only that. True means `count` is answered
-   * without reading the tree. It does NOT promise that every node below is counted: both halves
-   * of a branch that split while its children were on disk stay unknown by design (see
-   * Branch.add), and a countSlice that fully covers such a node counts it by descending.
+   * without reading the tree. It says nothing about the branches below the root: a tree
+   * written by an earlier version can hold branches stored without a count (both results of a
+   * split or a borrow whose children were on disk), and a countSlice that fully covers one
+   * counts it by reading its children. `countCensus` answers for the whole tree and `recount`
+   * repairs it; writes keep every count (Branch.divideCount).
    * When false, the set as a whole has no count and countSlice may degrade to O(n).
    */
   public boolean hasSubtreeCounts() {

@@ -1,0 +1,124 @@
+(ns org.replikativ.persistent-sorted-set.test.stored-counts
+  "The ClojureScript twin of the JVM `stored-counts`.
+
+   THE INVARIANT: every branch that is stored is stored with its element count. A branch
+   that DIVIDES — a split, a borrow — needs its children's counts, and when those children
+   were on disk both results were stored unknown; nothing on the write path heals that.
+
+   The oracle reads the BLOBS. Both modes are pinned: the suite's default buffers, and under
+   diff-buf a buffered write heals the child it passes through."
+  (:require [cljs.test :refer-macros [deftest testing is]]
+            [clojure.edn :as edn]
+            [clojure.string :as str]
+            [org.replikativ.persistent-sorted-set :as s]
+            [org.replikativ.persistent-sorted-set.test.storage.util :as u]))
+
+(defn- blob [disk a] (edn/read-string (@disk a)))
+
+(defn- disk-census
+  "What a restore of `addr` finds: {:branches n :unknown m :leaves #{addr}}. A parent's slot
+   that carries a diff is PROJECTED onto the branch below it — count from the slot, slots
+   from the slot's nested diff — superseding what that branch's own blob says."
+  [disk addr]
+  (let [acc (volatile! {:branches 0 :unknown 0 :leaves #{}})]
+    ((fn walk [a entry]
+       (let [{:keys [addresses level subtree-count] :as b} (blob disk a)
+             projected? (and entry (some? (:diff entry)))]
+         (if addresses
+           (let [slots (if projected? (:diff entry) (:slots b))]
+             (vswap! acc update :branches inc)
+             (when (neg? (if projected? (:count entry) (or subtree-count -1)))
+               (vswap! acc update :unknown inc))
+             (dotimes [i (count addresses)]
+               (walk (nth addresses i) (when (> level 1) (get slots i)))))
+           (vswap! acc update :leaves conj a))))
+     addr nil)
+    @acc))
+
+(defn- generations
+  "`gens` rounds of (restore cold, ops, store), checking the invariant after every store."
+  [bf dbs n gens ops-fn]
+  (let [opts {:branching-factor bf :diff-buf-size dbs}
+        disk (atom {})
+        st   #(u/storage (atom {}) disk opts)
+        s0   (reduce s/conj (s/sorted-set* (assoc opts :storage (st))) (range 0 (* 2 n) 2))
+        a0   (s/store s0 (st))]
+    (is (zero? (:unknown (disk-census disk a0))) "a warm build stores every count")
+    (loop [addr a0, gen 0, live (set (range 0 (* 2 n) 2))]
+      (if (= gen gens)
+        {:addr addr :live live :disk disk :opts opts}
+        (let [cold  (s/restore addr (st) opts)
+              ops   (ops-fn gen (vec (sort live)))
+              s1    (reduce (fn [s [op k]] (if (= op :del) (s/disj s k) (s/conj s k))) cold ops)
+              live' (reduce (fn [l [op k]] (if (= op :del) (disj l k) (conj l k))) live ops)
+              addr' (s/store s1 (st))
+              cen   (disk-census disk addr')
+              back  (s/restore addr' (st) opts)]
+          (is (zero? (:unknown cen))
+              (str "generation " gen ": " (:unknown cen) " of " (:branches cen) " stored branches have no count"))
+          (when (zero? (mod gen 4))
+            (is (= {:branches (:branches cen) :unknown 0} (s/count-census back)))
+            (is (= (count live') (count back)))
+            (is (= (sort live') (vec (s/seq back)))))
+          (recur addr' (inc gen) live'))))))
+
+(defn- patterns [bf n]
+  (let [per (* 12 bf)]
+    {:append    (fn [gen sorted] (let [m (inc (peek sorted))] (map #(vector :add (+ m %)) (range per))))
+     :scattered (fn [gen _] (map #(vector :add (inc (* 2 (mod (* 7919 (+ % (* gen per))) (* 2 n))))) (range per)))
+     :mixed     (fn [gen sorted]
+                  (concat (map #(vector :add (inc (* 2 (mod (* 7919 (+ % (* gen per))) (* 2 n))))) (range per))
+                          (map #(vector :del %) (take (quot per 4) (take-nth (max 1 (quot (count sorted) (quot per 4))) sorted)))))
+     :deletes   (fn [gen sorted] (map #(vector :del %) (take per (take-nth (max 1 (quot (count sorted) per)) sorted))))}))
+
+(deftest every-stored-branch-keeps-its-count-through-cold-writes
+  (doseq [dbs [0 64]
+          bf  [8 16]
+          :let [n (* 60 bf)]
+          [label ops-fn] (patterns bf n)]
+    (testing (str "bf " bf ", diff-buf " dbs ", " (name label))
+      (generations bf dbs n 12 ops-fn))))
+
+(defn- erase-counts!
+  "Rewrite every branch blob without its own count, the state an earlier version left
+   behind. Slot counts are left alone: they were always written."
+  [disk]
+  (swap! disk (fn [m] (into {} (map (fn [[a s]] [a (str/replace s #":subtree-count \d+" ":subtree-count -1")])) m))))
+
+(deftest recount-restores-every-count-and-stores-it
+  (doseq [dbs [0 64]
+          bf  [8 16]]
+    (testing (str "bf " bf ", diff-buf " dbs)
+      (let [n (* 80 bf)
+            {:keys [addr live disk opts]} (generations bf dbs n 3 (:mixed (patterns bf n)))
+            st     #(u/storage (atom {}) disk opts)
+            _      (erase-counts! disk)
+            cen0   (disk-census disk addr)
+            cold   (s/restore addr (st) opts)]
+        (is (pos? (:unknown cen0)))
+        (is (= (:unknown cen0) (:unknown (s/count-census cold))) "the census sees what is stored")
+        (is (= (count live) (count cold)))
+        (let [fixed (s/recount cold)
+              addr' (s/store fixed (st))
+              cen1  (disk-census disk addr')
+              back  (s/restore addr' (st) opts)]
+          (is (not (identical? cold fixed)))
+          (is (zero? (:unknown cen1)) "every stored branch has its count")
+          (is (= (:branches cen0) (:branches cen1)) "same structure")
+          (is (= (:leaves cen0) (:leaves cen1)) "no leaf was rewritten")
+          (is (= (sort live) (vec (s/seq back))))
+          (is (= (count live) (count back)))
+          (is (= {:branches (:branches cen1) :unknown 0} (s/count-census back)))
+          (is (identical? back (s/recount back)) "nothing left to do")
+          (testing "and writes keep it that way"
+            (let [s2    (reduce s/conj back (map #(inc (* 2 %)) (range 0 n 3)))
+                  addr2 (s/store s2 (st))]
+              (is (zero? (:unknown (disk-census disk addr2)))))))))))
+
+(deftest recount-edges
+  (let [s0 (into (s/sorted-set* {:branching-factor 8 :diff-buf-size 0}) (range 1000))]
+    (is (identical? s0 (s/recount s0)))
+    (is (zero? (:unknown (s/count-census s0)))))
+  (let [s0 (into (s/sorted-set* {:branching-factor 8 :diff-buf-size 0}) (range 3))]
+    (is (identical? s0 (s/recount s0)))
+    (is (= {:branches 0 :unknown 0} (s/count-census s0)))))

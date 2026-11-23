@@ -569,6 +569,156 @@
           (when (and sl (some? (:anchor sl)))
             (storage/markFreed storage (:anchor sl))))))))
 
+;; ---- counts that need the children: split, borrow, recount (mirrors JVM Branch) ----
+
+(defn- children-to-read
+  "How many of this node's children cannot say their count from memory: not resident, and
+   with no diff-buf slot carrying it. The number of reads `count-children-reading` would do."
+  [^Branch node]
+  (let [children (.-children node)
+        n        (arrays/alength (.-keys node))]
+    (loop [i 0, acc 0]
+      (if (>= i n)
+        acc
+        (let [child (when children (aget children i))
+              sl    (slot-at node i)]
+          (recur (inc i)
+                 (if (or (some? child) (and sl (>= (:count sl -1) 0))) acc (inc acc))))))))
+
+(defn- count-children-reading
+  "The number of elements below this node, as the sum of its children's counts — READING
+   the children that are not in memory. -1 when a child cannot say (a branch whose own count
+   is unknown, or a child with neither a node nor an address); it never descends further, so
+   the cost is bounded by this node's fanout.
+
+   Per child, in this order:
+     resident — its own count (a leaf's length, a branch's subtree-count);
+     a slot   — the slot's count. Under diff-buf the slot is the ONLY right answer for a
+                child that is not resident: its durable blob predates the buffered changes,
+                so its stored count is stale by exactly those.
+     neither  — restore the blob and read it. The node is not kept: this is one number."
+  [^Branch node storage {:keys [sync?] :or {sync? true} :as opts}]
+  (async+sync sync?
+              (async
+               (let [children (.-children node)
+                     addrs    (.-addresses node)
+                     n        (arrays/alength (.-keys node))]
+                 (loop [i 0, total 0]
+                   (if (>= i n)
+                     total
+                     (let [child (when children (aget children i))
+                           sl    (slot-at node i)
+                           c0    (if (some? child) (node/subtree-count child) -1)
+                           c1    (if (and (neg? c0) sl) (:count sl -1) c0)
+                           addr  (when addrs (aget addrs i))
+                           c     (if (and (neg? c1) (nil? child) (nil? sl) (some? storage) (some? addr))
+                                   (node/subtree-count (await (storage/restore storage addr opts)))
+                                   c1)]
+                       (if (neg? c)
+                         -1
+                         (recur (inc i) (+ total c))))))))))
+
+(defn- divide-count!
+  "`a` and `b` are two freshly built nodes that together hold `total` elements. Where
+   neither could be counted from memory, read the children of the one that needs fewer
+   reads; give the other the remainder.
+
+   This is the one place a write reads beyond its path, and it is the format that makes it
+   necessary: a branch stores its total and nothing about how the total is spread over its
+   children, so a node that DIVIDES — a split, a borrow — finds the per-child numbers only
+   in the children. Leaving both unknown instead (what this did) is durable: the unknown is
+   serialized, no write heals it, and every later write through the node re-stores it
+   unknown. See JVM `Branch.divideCount` for the measurements."
+  [^Branch a ^Branch b total storage {:keys [sync?] :or {sync? true} :as opts}]
+  (async+sync sync?
+              (async
+               (let [ca (.-subtree-count a)
+                     cb (.-subtree-count b)]
+                 (cond
+                   (neg? total) nil
+                   (and (>= ca 0) (>= cb 0)) nil
+                   ;; one half was resident: the other is the remainder
+                   (>= ca 0) (when (<= ca total) (set! (.-subtree-count b) (- total ca)))
+                   (>= cb 0) (when (<= cb total) (set! (.-subtree-count a) (- total cb)))
+                   :else
+                   (let [read  (if (<= (children-to-read a) (children-to-read b)) a b)
+                         other (if (identical? read a) b a)
+                         c     (await (count-children-reading read storage opts))]
+                     (when (>= c 0)
+                       (set! (.-subtree-count read) c)
+                       ;; a total smaller than one of its parts was already wrong; do not
+                       ;; turn it into a second wrong number
+                       (when (<= c total)
+                         (set! (.-subtree-count other) (- total c))))))
+                 nil))))
+
+(defn count-census
+  "Walk every branch below (and including) `node`; returns [branches unknown], `unknown`
+   being the branches whose count is not known. A child restored through a slot that carries
+   a diff takes its count from the slot, so what is seen here is what a restore finds.
+   Reads every branch, no leaf."
+  [^Branch node storage {:keys [sync?] :or {sync? true} :as opts}]
+  (async+sync sync?
+              (async
+               (let [n    (arrays/alength (.-keys node))
+                     self (if (neg? (.-subtree-count node)) 1 0)]
+                 (if (<= (.-level node) 1)
+                   [1 self]
+                   (loop [i 0, branches 1, unknown self]
+                     (if (>= i n)
+                       [branches unknown]
+                       (let [c  (await (child node storage i opts))
+                             r  (await (count-census c storage opts))]
+                         (recur (inc i) (+ branches (nth r 0)) (+ unknown (nth r 1)))))))))))
+
+(defn recount
+  "This subtree with every branch counted and every branch that was not counted made dirty,
+   so the next `store` writes it. Returns `node` itself when nothing below needs it.
+
+   A rewritten child is handled as a structural replacement: its address and its slot are
+   dropped, its old blob is freed, and this node becomes one that must be written — the
+   same shape a split leaves behind. Content is unchanged: same keys, same children, same
+   measures. Mirrors JVM `Branch.recount`."
+  [^Branch node storage {:keys [sync?] :or {sync? true} :as opts}]
+  (async+sync sync?
+              (async
+               (let [n       (arrays/alength (.-keys node))
+                     changed (arrays/make-array n)
+                     any?    (if (<= (.-level node) 1)
+                               false
+                               (loop [i 0, any? false]
+                                 (if (>= i n)
+                                   any?
+                                   (let [c  (await (child node storage i opts))
+                                         nc (await (recount c storage opts))]
+                                     (if (identical? c nc)
+                                       (recur (inc i) any?)
+                                       (do (aset changed i nc)
+                                           (recur (inc i) true)))))))]
+                 (if (and (not any?) (>= (.-subtree-count node) 0))
+                   node
+                   (let [addrs     (.-addresses node)
+                         slots     (.-_slots node)
+                         children  (.-children node)
+                         new-kids  (if children (.slice children) (arrays/make-array n))
+                         new-addrs (when addrs (.slice addrs))
+                         new-slots (when slots (.slice slots))]
+                     (dotimes [i n]
+                       (when-some [nc (aget changed i)]
+                         (free-dropped-child node storage i)
+                         (when new-addrs (aset new-addrs i nil))
+                         (aset new-kids i nc)
+                         (when new-slots (aset new-slots i nil))))
+                     (let [nb (Branch. (.-level node) (.-keys node) new-kids new-addrs
+                                       (.-subtree-count node) (.-_measure node) (.-settings node)
+                                       new-slots (if (diff-buf? node) -1 0) (.-_projCmp node))]
+                       ;; The children are counted now (below a leaf-parent they are leaves,
+                       ;; which always are), so this is a sum; it reads the leaves of a
+                       ;; leaf-parent that was unknown.
+                       (when (neg? (.-subtree-count nb))
+                         (set! (.-subtree-count nb) (await (count-children-reading nb storage opts))))
+                       nb)))))))
+
 (defn- mst-branch-add
   "split-seam (MST): given the merged separators/children after absorbing a child split,
    cut at boundary keys (≤2-way for one incremental insert). Mirrors the JVM Branch.add seam
@@ -729,6 +879,11 @@
                                (when-let [all (stitch-slots this idx nodes-len new-len)]
                                  (set! (.-_slots left-b)  (.slice all 0 middle))
                                  (set! (.-_slots right-b) (.slice all middle))))
+                             ;; After the slots are in place: under diff-buf a slot is where
+                             ;; a non-resident child's count lives. One new element was added
+                             ;; below this node, so the halves share its old total + 1.
+                             (let [old-sc (.-subtree-count this)]
+                               (await (divide-count! left-b right-b (if (>= old-sc 0) (inc old-sc) -1) storage opts)))
                              (arrays/array left-b right-b)))))))))))
 
 (defn $remove
@@ -874,11 +1029,41 @@
                                  (set! (.-_slots center)
                                        (remove-stitch-slots this left-idx right-idx alen left-child right-child
                                                             left-unchanged right-unchanged (arrays/alength new-kids))))))
-                         (util/rotate center
-                                      (and (nil? left) (nil? right))
-                                      left
-                                      right
-                                      (.-settings this))))))))))
+                         (let [res (util/rotate center
+                                                (and (nil? left) (nil? right))
+                                                left
+                                                right
+                                                (.-settings this))]
+                           ;; A BORROW redistributes two nodes' elements between two new
+                           ;; ones, and `merge-split` (no storage, synchronous) counts them
+                           ;; from resident children only. The pair's total is known whenever
+                           ;; both sources knew theirs; settle the halves here, where storage
+                           ;; is. A join has a nil in the triple and sums; nothing to do.
+                           (let [n     (arrays/alength res)
+                                 has?  (fn [x] (loop [i 0] (cond (>= i n) false
+                                                                 (identical? x (arrays/aget res i)) true
+                                                                 :else (recur (inc i)))))
+                                 fresh (loop [i 0, acc []]
+                                         (if (>= i n)
+                                           acc
+                                           (let [x (arrays/aget res i)]
+                                             (recur (inc i)
+                                                    (if (or (identical? x left) (identical? x right) (identical? x center))
+                                                      acc
+                                                      (conj acc x))))))]
+                             ;; `rotate` drops nils, so the arms are told apart by identity:
+                             ;; two nodes that are none of left/center/right are a borrow's
+                             ;; two halves, and the sibling that is gone is the one they
+                             ;; were made from.
+                             (when (== 2 (count fresh))
+                               (let [sibling (cond (and (some? left) (not (has? left))) left
+                                                   (and (some? right) (not (has? right))) right)]
+                                 (when sibling
+                                   (await (divide-count! (nth fresh 0) (nth fresh 1)
+                                                         (if (and (>= (.-subtree-count sibling) 0) (>= new-sc 0))
+                                                           (+ (.-subtree-count sibling) new-sc) -1)
+                                                         storage opts))))))
+                           res)))))))))
 
 (defn- replace-measure
   "Try to recompute measure after replace (postpone if children unavailable)."
