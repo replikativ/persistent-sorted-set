@@ -28,6 +28,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // stored with its count — the healing a single field gave — while the clean original stays
   // what its blob says. In-place arms reset this after assigning `_subtreeCount`.
   //
+  // `store` does NOT turn this into the stored count. The node a `store` is called on is not
+  // always one this set owns: the root a collapse promotes is a node another version still
+  // reaches at its old address, and two handles can share an unstored root. A count that is
+  // only cached here is written by the next write through the node (which rebuilds it from
+  // `knownCount()`), by a deposit, or by `recount`.
+  //
   // volatile: written on shared nodes by readers, and a long.
   public volatile long _lazyCount = -1;
 
@@ -35,16 +41,6 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   public long knownCount() {
     final long c = _subtreeCount;
     return (c >= 0) ? c : _lazyCount;
-  }
-
-  // This node is about to be WRITTEN: a count it worked out by reading becomes the count it
-  // is stored with. Sound only here and in a deposit — a node being written has no blob yet
-  // for the field to disagree with.
-  private void takeLazyCount() {
-    if (_subtreeCount < 0) {
-      final long lazy = _lazyCount;
-      if (lazy >= 0) _subtreeCount = lazy;
-    }
   }
 
   /** `node`'s element count if it can say without reading, else -1. */
@@ -3133,7 +3129,6 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (dirty || s0.addresses == null) {
         _state = new NodeState<>(newAddresses, newChildren, s0.buf); // ONE publish
       }
-      takeLazyCount();
       return storage.store(this);
     }
 
@@ -3324,7 +3319,6 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // settled state, exactly as the old in-place mutation did. children are WRAPPED per
     // `:ref-type`, same as the baseline settle — see the staging comment above.
     _state = new NodeState<>(newAddresses, newChildren, new BufState(newSlots, embedded));
-    takeLazyCount();
     return storage.store(this);
   }
 

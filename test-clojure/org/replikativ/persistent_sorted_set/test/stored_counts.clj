@@ -482,8 +482,7 @@
   (testing "a transient over an uncounted tree splits a branch: the halves are its own nodes
             and it cannot count them. A reader then works their counts out. A replace that
             edits such a half in place deposits into the parent's slot — with the count —
-            and the half itself must carry it too, or a warm census and a cold one disagree.
-            The root, which nothing deposits for, takes its count when it is written."
+            and the half itself must carry it too, or a warm census and a cold one disagree."
     (doseq [dbs [64 4]]
       (let [bf   8
             disk (atom {})
@@ -508,7 +507,6 @@
                (:unknown (set/count-census cold'))
                (:unknown (set/count-census t)))
             (str "diff-buf " dbs))
-        (is (>= (long (:subtree-count (@disk addr') -1)) 0) "the root was written with its count")
         (is (= [] (wrong-counts cold')))))))
 
 (deftest recount-under-another-buffer-budget-writes-no-leaf
@@ -525,3 +523,36 @@
         (is (zero? (:unknown after)))
         (is (= (:leaves before) (:leaves after)) (str "reopened at " reopen ": no leaf was rewritten"))
         (is (= (seq model) (seq (set/restore-by compare addr' (storage disk) (opts 8 64)))))))))
+
+(deftest storing-a-set-writes-no-count-into-a-node-it-shares
+  (testing "the tree is uncounted, root included, so the root that a collapse promotes stays
+            the node the original set reaches at its old address. The new set works its
+            count out and is stored — a `store` of that root. The count must not land in
+            the node: the original's census and recount would pass over it, and its blob
+            has none."
+    (let [bf     32
+          opts   (assoc (opts bf 0) :boundary (boundary/mst-boundary 3))
+          build  (fn [n] (reduce #(set/conj %1 %2 compare) (set/sorted-set* opts) (range n)))
+          n      (first (filter (fn [n] (let [r (root-branch (build n))]
+                                          (and r (>= (.level r) 2) (= 2 (.len r)))))
+                                (range 200 4000 7)))
+          disk   (atom {})
+          addr   (set/store (build n) (storage disk))
+          _      (erase-counts! disk addr (java.util.Random. 4) 1.0)   ; root included
+          want   (:unknown (disk-census disk addr))
+          orig   (set/restore-by compare addr (caching-storage disk) opts)
+          level0 (.level (root-branch orig))
+          shrunk (loop [s orig, k (dec n)]
+                   (let [r (root-branch s)]
+                     (if (or (nil? r) (< (.level r) level0) (neg? k))
+                       s
+                       (recur (set/disj s k compare) (dec k)))))
+          _      (is (= (count (seq shrunk)) (count shrunk)))
+          before (:unknown (set/count-census shrunk))
+          addr2  (set/store shrunk (storage disk))]
+      (is (< (.level (root-branch shrunk)) level0) "precondition: the root collapsed")
+      (is (= before (:unknown (disk-census disk addr2)))
+          "the census before the store said what the store wrote")
+      (is (= want (:unknown (set/count-census orig))))
+      (let [addr' (set/store (set/recount orig) (storage disk))]
+        (is (zero? (:unknown (disk-census disk addr'))))))))

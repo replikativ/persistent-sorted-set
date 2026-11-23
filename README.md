@@ -311,8 +311,10 @@ there are and `(set/store (set/recount s))` repairs them, once:
 (set/count-census s')           ;=> {:branches 1203, :unknown 0}
 ```
 
-`recount` rewrites branches only — no leaf — and is worth running before heavy use of such a
-tree: until it has run, a write with a diff buffer that passes a branch without a count works
+`recount` rewrites branches only, no leaf — with one exception: buffered edits that no longer
+fit the budget of the branch holding them (a tree written under one `:diff-buf-size` and
+reopened under another) are flushed, as any write through that branch would flush them. It is
+worth running before heavy use of such a tree: until it has run, a write with a diff buffer that passes a branch without a count works
 that count out by reading the branch's subtree, which on a large tree is a long read inside
 one write.
 

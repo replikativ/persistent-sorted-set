@@ -92,7 +92,11 @@
    For trees written before a split or a borrow kept its counts. Writes since keep every
    count, so one `recount` + `store` is enough. It reads every branch, plus the leaves of
    each leaf-parent that has no count, and rewrites each branch without a count and every
-   branch above one."
+   branch above one.
+
+   No leaf is rewritten, with one exception: buffered edits that no longer fit the budget
+   of the branch holding them (a tree written under one :diff-buf-size and reopened under
+   another) are flushed, as any write through that branch would flush them."
   [^PersistentSortedSet set]
   (.recount set))
 
