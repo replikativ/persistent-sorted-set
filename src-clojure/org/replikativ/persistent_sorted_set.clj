@@ -61,7 +61,10 @@
    a split or a borrow whose children were on disk), and a count-slice that fully covers
    one counts it by reading its children. `count-census` answers for the whole tree and
    `recount` repairs it. When false, the set as a whole has no count and count-slice may
-   degrade to O(n)."
+   degrade to O(n).
+
+   Like `count-census` this is about the STORED root: a root whose count was only worked
+   out in memory (by `count`) still answers false until a write stores it."
   [^PersistentSortedSet set]
   (.hasSubtreeCounts set))
 
@@ -71,8 +74,12 @@
    count-slice that covers it reads its children, on every cold start. Reads every branch
    and no leaf.
 
-   A count computed in memory does not make a branch known here — what is asked is what a
-   fresh restore would find."
+   The answer is about the tree as it is, or will be, WRITTEN. For a set that is stored it
+   is what a fresh restore finds: a count that was only worked out in memory (by `count`,
+   by a count-slice) does not make a branch known. For a set with writes not yet stored it
+   is what the next `store` will write — so `(count-census (recount s))` reports zero
+   before anything has been stored; the address `s` was restored from is unchanged until
+   the result is stored and published."
   [^PersistentSortedSet set]
   (let [c (.countCensus set)]
     {:branches (aget c 0) :unknown (aget c 1)}))

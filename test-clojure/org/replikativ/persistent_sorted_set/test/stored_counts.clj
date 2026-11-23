@@ -443,9 +443,10 @@
              (:unknown (set/count-census (set/restore-by compare addr' (storage disk) (opts 8 64))))
              (:unknown (set/count-census warm)))))))
 
-(deftest a-write-over-a-lazily-counted-node-stores-the-count
-  (testing "a count worked out by reading is not what the blob says, but a write that goes
-            through the node uses it — for the root that collapses onto it as well"
+(deftest a-root-that-collapses-onto-a-lazily-counted-node-is-stored-counted
+  (testing "nothing on the delete path knows a total — the tree is uncounted, root included —
+            but the node that becomes the root has worked its own count out by reading. That
+            count is not what its blob says, and it is what the new root is stored with."
     (let [bf     32
           opts   (assoc (opts bf 0) :boundary (boundary/mst-boundary 3))
           build  (fn [n] (reduce #(set/conj %1 %2 compare) (set/sorted-set* opts) (range n)))
@@ -455,35 +456,60 @@
           disk   (atom {})
           addr   (set/store (build n) (storage disk))
           _      (erase-counts! disk addr (java.util.Random. 4) 1.0)   ; root included
+          level  #(some-> (root-branch %) .level)
+          ;; the deletes, from the high end, up to the one that collapses the root
+          run    (fn [s stop]
+                   (loop [s s, k (dec n)]
+                     (if (or (= k stop) (neg? k)) s (recur (set/disj s k compare) (dec k)))))
+          level0 (level (set/restore-by compare addr (storage disk) opts))
+          last-k (loop [s (set/restore-by compare addr (storage disk) opts), k (dec n)]
+                   (let [s' (set/disj s k compare)]
+                     (if (< (or (level s') 0) level0) k (recur s' (dec k)))))
           shared (caching-storage disk)
-          a      (set/restore-by compare addr shared opts)
-          _      (is (= n (count (seq a))))
-          _      (count-all! a)
-          b      (set/restore-by compare addr shared opts)
-          level0 (.level (root-branch b))
-          shrunk (loop [s b, k (dec n)]
-                   (let [r (root-branch s)]
-                     (if (or (nil? r) (< (.level r) level0) (neg? k))
-                       s
-                       (recur (set/disj s k compare) (dec k)))))
+          before (run (set/restore-by compare addr shared opts) last-k)
+          ^Branch promoted (.child (root-branch before) shared (int 0))
+          _      (is (neg? (.subtreeCount promoted)) "precondition: its blob has no count")
+          _      (is (neg? (.knownCount (root-branch before))) "precondition: nor does the root know a total")
+          _      (.count promoted shared)
+          shrunk (set/disj before last-k compare)
           addr'  (set/store shrunk (storage disk))]
-      (is (< (.level (root-branch shrunk)) level0) "precondition: the root collapsed")
+      (is (< (level shrunk) level0) "precondition: the root collapsed")
+      (is (neg? (.subtreeCount promoted)) "the shared node is as its blob says")
       (is (>= (long (:subtree-count (@disk addr') -1)) 0) "the new root is stored counted")
       (is (= [] (wrong-counts (set/restore-by compare addr' (storage disk) opts)))))))
 
-(deftest a-buffered-replace-under-a-lazily-counted-child
-  (testing "the deposit finds the child's count already worked out; the child must still be
-            written with it, or a warm census and a cold one disagree"
-    (let [{:keys [disk addr]} (generations {:bf 8 :dbs 64 :n 900 :gens 2 :per 30 :rem-per 8
-                                            :transient? true :pattern :scattered :seed 12})
-          _    (erase-counts! disk addr (java.util.Random. 3) 1.0)
-          cold (set/restore-by compare addr (storage disk) (opts 8 64))
-          _    (count-all! cold)
-          warm (reduce #(set/conj %1 %2 compare) cold (map #(inc (* 2 %)) (range 0 900 7)))
-          addr' (set/store warm (storage disk))]
-      (is (= (:unknown (disk-census disk addr'))
-             (:unknown (set/count-census (set/restore-by compare addr' (storage disk) (opts 8 64))))
-             (:unknown (set/count-census warm)))))))
+(deftest a-count-worked-out-on-an-owned-node-is-written-with-it
+  (testing "a transient over an uncounted tree splits a branch: the halves are its own nodes
+            and it cannot count them. A reader then works their counts out. A replace that
+            edits such a half in place deposits into the parent's slot — with the count —
+            and the half itself must carry it too, or a warm census and a cold one disagree.
+            The root, which nothing deposits for, takes its count when it is written."
+    (doseq [dbs [64 4]]
+      (let [bf   8
+            disk (atom {})
+            addr (build disk bf dbs 900)
+            _    (erase-counts! disk addr (java.util.Random. 3) 1.0)
+            cold (set/restore-by compare addr (storage disk) (opts bf dbs))
+            n0   (:branches (set/count-census cold))
+            ;; insert until one branch has split, and stop there
+            [t added] (loop [t (transient cold), k 1, added []]
+                        (if (or (> (:branches (set/count-census t)) n0) (> k 1800))
+                          [t added]
+                          (recur (conj! t k) (+ k 2) (conj added k))))
+            _    (is (> (:branches (set/count-census t)) n0) "precondition: a branch split")
+            _    (set/store t (storage disk))
+            _    (count-all! t)
+            ;; an equal but distinct key object, so that the replace is a write
+            t    (reduce #(set/replace %1 %2 (Integer/valueOf (int %2)) compare) t
+                         (concat added (range 0 1800 2)))
+            addr' (set/store t (storage disk))
+            cold' (set/restore-by compare addr' (storage disk) (opts bf dbs))]
+        (is (= (:unknown (disk-census disk addr'))
+               (:unknown (set/count-census cold'))
+               (:unknown (set/count-census t)))
+            (str "diff-buf " dbs))
+        (is (>= (long (:subtree-count (@disk addr') -1)) 0) "the root was written with its count")
+        (is (= [] (wrong-counts cold')))))))
 
 (deftest recount-under-another-buffer-budget-writes-no-leaf
   (testing "a set reopened with a smaller budget than its nodes were written under: recount

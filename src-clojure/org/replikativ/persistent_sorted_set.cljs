@@ -317,6 +317,7 @@
   "`{:branches n :unknown m}`: how many branches the tree has and how many of them have no
    element count. A branch without one is correct but expensive: a count-slice that covers
    it reads its children, on every cold start. Reads every branch and no leaf.
+   For a set with writes not yet stored the answer is what the next `store` will write.
    Returns a continuation when {:sync? false}."
   ([^BTSet set] (btset/count-census set {:sync? true}))
   ([^BTSet set opts] (btset/count-census set opts)))

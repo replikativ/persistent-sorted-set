@@ -37,6 +37,16 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     return (c >= 0) ? c : _lazyCount;
   }
 
+  // This node is about to be WRITTEN: a count it worked out by reading becomes the count it
+  // is stored with. Sound only here and in a deposit — a node being written has no blob yet
+  // for the field to disagree with.
+  private void takeLazyCount() {
+    if (_subtreeCount < 0) {
+      final long lazy = _lazyCount;
+      if (lazy >= 0) _subtreeCount = lazy;
+    }
+  }
+
   /** `node`'s element count if it can say without reading, else -1. */
   static long cnt(ANode node) {
     return (node instanceof Branch) ? ((Branch) node).knownCount() : node._len;
@@ -3123,6 +3133,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (dirty || s0.addresses == null) {
         _state = new NodeState<>(newAddresses, newChildren, s0.buf); // ONE publish
       }
+      takeLazyCount();
       return storage.store(this);
     }
 
@@ -3313,6 +3324,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // settled state, exactly as the old in-place mutation did. children are WRAPPED per
     // `:ref-type`, same as the baseline settle — see the staging comment above.
     _state = new NodeState<>(newAddresses, newChildren, new BufState(newSlots, embedded));
+    takeLazyCount();
     return storage.store(this);
   }
 
