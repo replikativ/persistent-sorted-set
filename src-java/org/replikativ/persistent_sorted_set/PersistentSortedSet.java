@@ -251,12 +251,15 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   /**
    * Helper to get subtree count from an ANode.
    */
+  // The count a node can give without reading — stored or lazily worked out. What a write
+  // bases its arithmetic on, and what the set's own `_count` is taken from.
   private static long getSubtreeCount(ANode node) {
-    if (node instanceof ISubtreeCount) {
-      return ((ISubtreeCount) node).subtreeCount();
-    }
-    // Fallback - shouldn't happen with proper implementation
-    return -1;
+    return Branch.cnt(node);
+  }
+
+  // The count the node is, or will be, STORED with. Only for questions about the blob.
+  private static long storedCount(ANode node) {
+    return (node instanceof ISubtreeCount) ? ((ISubtreeCount) node).subtreeCount() : -1;
   }
 
   /**
@@ -344,14 +347,18 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
    * it from a known 2488 to -1, and it was stored that way.
    */
   private ANode countRoot(ANode root, long totalBefore, int delta) {
-    if (root instanceof Branch && totalBefore >= 0 && _settings.leafProcessor() == null) {
-      Branch b = (Branch) root;
-      if (b._subtreeCount < 0) {
-        if (!b.editable()) return b.withCount(totalBefore + delta);
-        b._subtreeCount = totalBefore + delta;
-        b._lazyCount = -1;
-      }
-    }
+    if (!(root instanceof Branch)) return root;
+    final Branch b = (Branch) root;
+    if (b._subtreeCount >= 0) return root;
+    // The set's arithmetic, or a count the node itself worked out by reading (it describes
+    // the node as it is now, so it needs no delta — and holds with a processor too).
+    final long total = (totalBefore >= 0 && _settings.leafProcessor() == null)
+        ? totalBefore + delta
+        : b._lazyCount;
+    if (total < 0) return root;
+    if (!b.editable()) return b.withCount(total);
+    b._subtreeCount = total;
+    b._lazyCount = -1;
     return root;
   }
 
@@ -397,7 +404,7 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
    */
   public boolean hasSubtreeCounts() {
     ANode root = root();
-    return getSubtreeCount(root) >= 0;
+    return storedCount(root) >= 0;
   }
 
   /**

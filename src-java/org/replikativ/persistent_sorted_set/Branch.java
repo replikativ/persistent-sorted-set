@@ -44,14 +44,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
   /** Sum of `cnt` over the non-null nodes; -1 if one of them cannot say. */
   static long cnt3(ANode a, ANode b, ANode c) {
-    long total = 0;
-    for (ANode n : new ANode[]{ a, b, c }) {
-      if (n == null) continue;
-      final long x = cnt(n);
-      if (x < 0) return -1;
-      total += x;
-    }
-    return total;
+    final long x = (a == null) ? 0 : cnt(a);
+    final long y = (b == null) ? 0 : cnt(b);
+    final long z = (c == null) ? 0 : cnt(c);
+    return (x < 0 || y < 0 || z < 0) ? -1 : x + y + z;
   }
 
   /**
@@ -830,8 +826,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         if (newSlots != null) newSlots[i] = null;
       }
     }
-    final Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, -1, _measure, _projCmp, settings);
-    if (newSlots != null || settings.diffBufSize() > 0) nb.installSlots(newSlots, BUF_WRITE);
+    // The copy keeps THIS node's settings, not the set's: a set may be reopened with another
+    // buffer budget than the one a node was written under, and a copy built with the set's
+    // would flush — or refuse — slots that are fine where they are. Only the count changes.
+    final Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, -1, _measure, _projCmp, _settings);
+    if (newSlots != null || _settings.diffBufSize() > 0) nb.installSlots(newSlots, BUF_WRITE);
     // A count already worked out in memory is used as it is. Otherwise the children are
     // counted now (below a leaf-parent they are leaves, which always are), so this is a sum;
     // it reads the leaves of a leaf-parent that was unknown.
@@ -1468,7 +1467,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     ANode<Key, Address> mutatedChild = child(storage, idx);
     // BEFORE the child's remove, which may mutate it and its siblings in place.
     final long ownBefore = knownCount();
-    final long touchedBefore = cnt3(leftChild, mutatedChild, rightChild);
+    // Only a processor makes the sum necessary; without one the delta is one.
+    final long touchedBefore = unitDelta(_settings, settings) ? -1 : cnt3(leftChild, mutatedChild, rightChild);
     ANode[] nodes = mutatedChild.remove(storage, key, leftChild, rightChild, cmp, settings, removedOut);
     @SuppressWarnings("unchecked")
     Key removedKey = (removedOut != null && removedOut[0] != null) ? (Key) removedOut[0] : key;
@@ -2558,14 +2558,17 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // Exact subtree count of the in-memory child i (cheap: maintained by add/remove).
   private long childCount(IStorage storage, int i) {
     ANode child = child(storage, i);
-    long c = cnt(child);
+    if (!(child instanceof Branch)) return child._len;
+    final Branch b = (Branch) child;
+    long c = b._subtreeCount;
     if (c >= 0) return c;
-    // An unknown branch (a tree not yet `recount`ed): this reads its children. The child is
-    // the node the write in progress just built or owns, so it is written — or buffered — by
-    // the coming store, and takes the count with it instead of staying unknown under a slot
-    // that knows.
-    c = child.count(storage);
-    ((Branch) child)._subtreeCount = c;
+    // A branch with no stored count (a tree not yet `recount`ed). A count it already worked
+    // out is used; otherwise this reads the subtree. Either way the child is the node the
+    // write in progress just built or owns, so it is written — or buffered — by the coming
+    // store, and takes the count with it instead of staying unknown under a slot that knows.
+    c = b.count(storage);
+    b._subtreeCount = c;
+    b._lazyCount = -1;
     return c;
   }
 

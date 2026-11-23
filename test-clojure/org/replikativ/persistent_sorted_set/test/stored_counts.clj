@@ -313,6 +313,17 @@
               (swap! cache assoc address n)
               n))))))
 
+(defn- count-all!
+  "Make every branch of `s` work out its count by reading, the way a caller's `count` or a
+   range count does."
+  [s]
+  ((fn walk [^ANode n]
+     (when (instance? Branch n)
+       (.count n (.-_storage ^PersistentSortedSet s))
+       (when (> (.level ^Branch n) 1)
+         (dotimes [i (.len n)] (walk (.child ^Branch n (.-_storage ^PersistentSortedSet s) (int i)))))))
+   (.root ^PersistentSortedSet s)))
+
 (deftest a-count-in-memory-reaches-no-other-set
   (doseq [dbs [0 64]]
     (testing (str "diff-buf " dbs)
@@ -431,3 +442,60 @@
       (is (= (:unknown (disk-census disk addr'))
              (:unknown (set/count-census (set/restore-by compare addr' (storage disk) (opts 8 64))))
              (:unknown (set/count-census warm)))))))
+
+(deftest a-write-over-a-lazily-counted-node-stores-the-count
+  (testing "a count worked out by reading is not what the blob says, but a write that goes
+            through the node uses it — for the root that collapses onto it as well"
+    (let [bf     32
+          opts   (assoc (opts bf 0) :boundary (boundary/mst-boundary 3))
+          build  (fn [n] (reduce #(set/conj %1 %2 compare) (set/sorted-set* opts) (range n)))
+          n      (first (filter (fn [n] (let [r (root-branch (build n))]
+                                          (and r (>= (.level r) 2) (= 2 (.len r)))))
+                                (range 200 4000 7)))
+          disk   (atom {})
+          addr   (set/store (build n) (storage disk))
+          _      (erase-counts! disk addr (java.util.Random. 4) 1.0)   ; root included
+          shared (caching-storage disk)
+          a      (set/restore-by compare addr shared opts)
+          _      (is (= n (count (seq a))))
+          _      (count-all! a)
+          b      (set/restore-by compare addr shared opts)
+          level0 (.level (root-branch b))
+          shrunk (loop [s b, k (dec n)]
+                   (let [r (root-branch s)]
+                     (if (or (nil? r) (< (.level r) level0) (neg? k))
+                       s
+                       (recur (set/disj s k compare) (dec k)))))
+          addr'  (set/store shrunk (storage disk))]
+      (is (< (.level (root-branch shrunk)) level0) "precondition: the root collapsed")
+      (is (>= (long (:subtree-count (@disk addr') -1)) 0) "the new root is stored counted")
+      (is (= [] (wrong-counts (set/restore-by compare addr' (storage disk) opts)))))))
+
+(deftest a-buffered-replace-under-a-lazily-counted-child
+  (testing "the deposit finds the child's count already worked out; the child must still be
+            written with it, or a warm census and a cold one disagree"
+    (let [{:keys [disk addr]} (generations {:bf 8 :dbs 64 :n 900 :gens 2 :per 30 :rem-per 8
+                                            :transient? true :pattern :scattered :seed 12})
+          _    (erase-counts! disk addr (java.util.Random. 3) 1.0)
+          cold (set/restore-by compare addr (storage disk) (opts 8 64))
+          _    (count-all! cold)
+          warm (reduce #(set/conj %1 %2 compare) cold (map #(inc (* 2 %)) (range 0 900 7)))
+          addr' (set/store warm (storage disk))]
+      (is (= (:unknown (disk-census disk addr'))
+             (:unknown (set/count-census (set/restore-by compare addr' (storage disk) (opts 8 64))))
+             (:unknown (set/count-census warm)))))))
+
+(deftest recount-under-another-buffer-budget-writes-no-leaf
+  (testing "a set reopened with a smaller budget than its nodes were written under: recount
+            changes counts, it does not flush the slots it finds"
+    (doseq [reopen [1 0 8]]
+      (let [{:keys [disk addr model]} (generations {:bf 8 :dbs 64 :n 700 :gens 3 :per 20 :rem-per 5
+                                                    :transient? false :pattern :scattered :seed 31})
+            _      (erase-counts! disk addr (java.util.Random. 2) 1.0)
+            before (disk-census disk addr)
+            cold   (set/restore-by compare addr (storage disk) (opts 8 reopen))
+            addr'  (set/store (set/recount cold) (storage disk))
+            after  (disk-census disk addr')]
+        (is (zero? (:unknown after)))
+        (is (= (:leaves before) (:leaves after)) (str "reopened at " reopen ": no leaf was rewritten"))
+        (is (= (seq model) (seq (set/restore-by compare addr' (storage disk) (opts 8 64)))))))))
