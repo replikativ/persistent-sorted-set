@@ -842,14 +842,13 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         if (newSlots != null) newSlots[i] = null;
       }
     }
-    // Only the count changes, so the copy must be able to hold the slots it finds. A set can
-    // be reopened under another buffer budget than a node was written under, in either
-    // direction: slots written under a larger budget than the set's now, or slots the set
-    // deposited into a node that came back with a smaller one. The copy takes whichever of
-    // the two settings has the larger budget, so the next store flushes nothing.
-    final Settings cs = (settings.diffBufSize() > _settings.diffBufSize()) ? settings : _settings;
-    final Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, -1, _measure, _projCmp, cs);
-    if (newSlots != null || cs.diffBufSize() > 0) nb.installSlots(newSlots, BUF_WRITE);
+    // The copy keeps THIS node's settings — its budget, ref-type and the rest — not the
+    // set's: only the count changes. Under one buffer budget, which is the normal case, the
+    // slots it carries fit as they did. A tree whose budget was changed between writes can
+    // hold slots that no longer fit the node holding them; the next store flushes those, as
+    // it would after any write through that node (documented on `recount`).
+    final Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, -1, _measure, _projCmp, _settings);
+    if (newSlots != null || _settings.diffBufSize() > 0) nb.installSlots(newSlots, BUF_WRITE);
     // A count already worked out in memory is used as it is. Otherwise the children are
     // counted now (below a leaf-parent they are leaves, which always are), so this is a sum;
     // it reads the leaves of a leaf-parent that was unknown.

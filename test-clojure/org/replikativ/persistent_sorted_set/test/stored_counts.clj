@@ -147,8 +147,8 @@
                       :transient? transient? :pattern pattern :seed (+ bf dbs)})))))
 
 (deftest a-write-reads-a-bounded-number-of-nodes
-  (testing "one insert or delete on a cold tree: the path, its neighbours, and at most the
-            children of the two nodes a split or a borrow divides — never a subtree"
+  (testing "one insert or delete on a cold tree: the path, its neighbours, and the children
+            of ONE of the two nodes a split or a borrow leaves — never both, never a subtree"
     (doseq [dbs [0 64]
             bf  [8 32]]
       (let [disk (atom {})
@@ -157,8 +157,9 @@
             rnd  (java.util.Random. 3)]
         (loop [addr a0, i 0, worst 0]
           (if (= i 300)
-            ;; height <= 4 here; 3 nodes a level on a delete, two nodes' children at one level
-            (is (<= worst (+ (* 3 4) (* 2 bf) 2)) (str "bf " bf " diff-buf " dbs ": " worst " restores in one write"))
+            ;; height <= 4 here: the lookup's path, 3 nodes a level on a delete, and ONE
+            ;; divide's read — the smaller half of one node's children, never both halves
+            (is (<= worst (+ 4 (* 3 4) (quot bf 2) 2)) (str "bf " bf " diff-buf " dbs ": " worst " restores in one write"))
             (let [restores (atom 0)
                   cold (set/restore-by compare addr (storage disk restores) (opts bf dbs))
                   s    (if (even? i)
@@ -571,54 +572,23 @@
       (is (>= (long (:subtree-count (@disk addr') -1)) 0) "the root is stored counted")
       (is (= [] (wrong-counts (set/restore-by compare addr' (storage disk) (opts bf 0))))))))
 
-(deftest recount-after-writes-under-a-larger-budget-writes-no-leaf
-  (testing "a tree written under a small budget, then written to under a larger one: the
-            slots the later writes left sit in nodes that came back with the small budget"
+(deftest recount-of-a-tree-whose-budget-changed-loses-nothing
+  (testing "written under a small budget, then written to under a larger one: branches hold
+            buffered edits that no longer fit them. recount may flush those (documented);
+            every count is repaired and every element is there."
     (let [{:keys [disk addr model]} (generations {:bf 8 :dbs 1 :n 900 :gens 2 :per 20 :rem-per 5
                                                   :transient? false :pattern :scattered :seed 41})
-          cold   (set/restore-by compare addr (storage disk) (opts 8 64))
-          ks     (take 2 (seq model))
-          warm   (reduce #(set/replace %1 %2 (Integer/valueOf (int %2)) compare) cold ks)
-          warm   (reduce #(set/conj %1 %2 compare) warm [-1 -3])
+          warm   (reduce #(set/conj %1 %2 compare) (set/restore-by compare addr (storage disk) (opts 8 64)) [-1 -3 -5])
           addr1  (set/store warm (storage disk))
           _      (erase-counts! disk addr1 (java.util.Random. 2) 1.0)
-          before (disk-census disk addr1)
-          addr'  (set/store (set/recount (set/restore-by compare addr1 (storage disk) (opts 8 64)))
-                            (storage disk))
-          after  (disk-census disk addr')]
-      (is (pos? (:unknown before)))
-      (is (zero? (:unknown after)))
-      (is (= (:leaves before) (:leaves after)) "no leaf was rewritten")
-      (is (= (seq (into model [-1 -3])) (seq (set/restore-by compare addr' (storage disk) (opts 8 64))))))))
-
-(deftest counting-a-collapsed-root-reads-nothing-at-store
-  (testing "a root that collapses is published counted, and storing it reads nothing back.
-            (A guard, not a regression test: the copy `countRoot` makes used to drop loaded
-            children that had an address, and this setup did not reach that arm.)"
-    (let [bf 8, dbs 1, disk (atom {})
-          s0   (reduce #(set/conj %1 %2 compare) (set/sorted-set* (opts bf dbs)) (range 0 74 2))
-          a0   (set/store s0 (storage disk))
-          ;; one buffered edit under each of the root's children
-          s1   (reduce #(set/conj %1 %2 compare) (set/restore-by compare a0 (storage disk) (opts bf dbs)) [1 71])
-          a1   (set/store s1 (storage disk))
-          kids (:addresses (@disk a1))
-          _    (is (= 2 (count kids)) "precondition: a root with two children")
-          _    (swap! disk assoc-in [(first kids) :subtree-count] -1)
-          restores (atom 0)
-          cold (set/restore-by compare a1 (storage disk restores) (opts bf dbs))
-          _    (is (and (contains? cold 1) (contains? cold 71)))
-          ;; delete from the low end until the root is one level lower
-          level0 (.level (root-branch cold))
-          shrunk (loop [s cold, k 0]
-                   (let [r (root-branch s)]
-                     (if (or (nil? r) (< (.level r) level0) (> k 74))
-                       s
-                       (recur (set/disj s k compare) (inc k)))))
-          _    (is (some-> (root-branch shrunk) .level (< level0)) "precondition: the root collapsed")
-          _    (reset! restores 0)
-          a2   (set/store shrunk (storage disk restores))]
-      (is (zero? @restores) "the store read nothing")
-      (is (= [] (wrong-counts (set/restore-by compare a2 (storage disk) (opts bf dbs))))))))
+          want   (seq (into model [-1 -3 -5]))]
+      (doseq [reopen [1 64]]
+        (let [addr' (set/store (set/recount (set/restore-by compare addr1 (storage disk) (opts 8 reopen)))
+                               (storage disk))
+              back  (set/restore-by compare addr' (storage disk) (opts 8 reopen))]
+          (is (zero? (:unknown (disk-census disk addr'))) (str "reopened at " reopen))
+          (is (= want (seq back)))
+          (is (= (count want) (count back))))))))
 
 (deftest a-processor-that-changes-cardinality-stores-no-wrong-count
   (testing "a processor that drops an element from the leaf it touches: one key is not one

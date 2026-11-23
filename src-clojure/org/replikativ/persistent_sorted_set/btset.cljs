@@ -532,7 +532,7 @@
                 (let [root (await (-root set opts))]
                   (if-not (instance? Branch root)
                     set
-                    (let [nr (await (branch/recount root (.-storage set) (.-settings set) opts))]
+                    (let [nr (await (branch/recount root (.-storage set) opts))]
                       (if (identical? nr root)
                         set
                         (do

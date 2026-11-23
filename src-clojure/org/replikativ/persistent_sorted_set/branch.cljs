@@ -687,7 +687,7 @@
    dropped, its old blob is freed, and this node becomes one that must be written — the
    same shape a split leaves behind. Content is unchanged: same keys, same children, same
    measures. Mirrors JVM `Branch.recount`."
-  [^Branch node storage set-settings {:keys [sync?] :or {sync? true} :as opts}]
+  [^Branch node storage {:keys [sync?] :or {sync? true} :as opts}]
   (async+sync sync?
               (async
                (let [n       (arrays/alength (.-keys node))
@@ -698,7 +698,7 @@
                                  (if (>= i n)
                                    any?
                                    (let [c  (await (child node storage i opts))
-                                         nc (await (recount c storage set-settings opts))]
+                                         nc (await (recount c storage opts))]
                                      (if (identical? c nc)
                                        (recur (inc i) any?)
                                        (do (aset changed i nc)
@@ -717,17 +717,10 @@
                          (when new-addrs (aset new-addrs i nil))
                          (aset new-kids i nc)
                          (when new-slots (aset new-slots i nil))))
-                     (let [;; Only the count changes, so the copy must be able to hold the
-                           ;; slots it finds: it takes whichever of the node's and the
-                           ;; set's settings has the larger buffer budget (a set can be
-                           ;; reopened under another budget than a node was written under).
-                           budget #(or (:diff-buf-size %) 0)
-                           cs (if (> (budget set-settings) (budget (.-settings node)))
-                                set-settings
-                                (.-settings node))
+                     (let [;; The copy keeps this node's settings: only the count changes.
                            nb (Branch. (.-level node) (.-keys node) new-kids new-addrs
-                                       (.-subtree-count node) (.-_measure node) cs
-                                       new-slots (if (pos? (budget cs)) -1 0) (.-_projCmp node))]
+                                       (.-subtree-count node) (.-_measure node) (.-settings node)
+                                       new-slots (if (diff-buf? node) -1 0) (.-_projCmp node))]
                        ;; The children are counted now (below a leaf-parent they are leaves,
                        ;; which always are), so this is a sum; it reads the leaves of a
                        ;; leaf-parent that was unknown.

@@ -194,26 +194,6 @@
       (let [addr' (s/store (s/recount orig) (st))]
         (is (zero? (:unknown (disk-census disk addr'))))))))
 
-(deftest recount-under-another-buffer-budget-writes-no-leaf
-  (testing "written under a small budget, reopened and written to under a larger one. (The
-            other direction is not testable with this storage: it hands every node back under
-            ITS budget, so a node written at 64 comes back at 1 with slots that no longer fit
-            — the documented case, where any write flushes.)"
-    (doseq [[written reopened] [[1 64] [4 64]]]
-      (let [bf 8 n 700
-            {:keys [addr disk opts]} (generations bf written n 3 (:mixed (patterns bf n)))
-            opts'  (assoc opts :diff-buf-size reopened)
-            st     #(u/storage (atom {}) disk opts')
-            warm   (reduce s/conj (s/restore addr (st) opts') [-1 -3])
-            addr1  (s/store warm (st))
-            _      (erase-counts! disk)
-            before (disk-census disk addr1)
-            addr'  (s/store (s/recount (s/restore addr1 (st) opts')) (st))
-            after  (disk-census disk addr')]
-        (is (pos? (:unknown before)))
-        (is (zero? (:unknown after)) (str written " -> " reopened))
-        (is (= (:leaves before) (:leaves after)) (str written " -> " reopened ": no leaf was rewritten"))))))
-
 (defn- async-round-trip []
   (async
    (let [bf 8 n 700

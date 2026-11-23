@@ -332,10 +332,10 @@
    each leaf-parent that has no count, and rewrites each branch without a count and every
    branch above one. Returns a continuation when {:sync? false}.
 
-   No leaf is rewritten and buffered edits stay buffered, also when the set was reopened
-   under another :diff-buf-size than the tree was written under. The one way to make it
-   flush: a storage that hands nodes back under a smaller :diff-buf-size than their
-   buffered edits were written under, where any write through such a node flushes too."
+   No leaf is rewritten and buffered edits stay buffered, as long as the tree was written
+   under one :diff-buf-size. If the budget was changed between writes, a branch can hold
+   buffered edits that no longer fit it; those are flushed, as any write through that
+   branch would flush them. Nothing is lost either way."
   ([^BTSet set] (btset/recount set {:sync? true}))
   ([^BTSet set opts] (btset/recount set opts)))
 
