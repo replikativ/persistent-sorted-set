@@ -818,7 +818,8 @@
         [(= p start) (= p (+ start (dec (lens pp))))]))))
 
 (defn- policy-violations
-  "The rebalance a node chose against the one it must choose: a node left underfull joins
+  "The rebalance a node chose against the one it must choose: only a node left underfull
+   rebalances at all, and it joins
    its left neighbour if the two fit in one node, else its right one if those fit, else
    borrows from the fuller of the two, the left one when they are equal. Without this a
    borrow from the wrong side passes every other check."
@@ -832,11 +833,12 @@
               fits-left  (and (not first?) (<= (+ (x (dec p)) c) bf))
               fits-right (and (not last?) (<= (+ c (x (inc p))) bf))
               left-fuller (and (not first?) (or last? (>= (x (dec p)) (x (inc p)))))]
-        :when (case k
-                :join-left    (not fits-left)
-                :join-right   (or fits-left (not fits-right))
-                :borrow-left  (or fits-left fits-right (not left-fuller))
-                :borrow-right (or fits-left fits-right last? left-fuller))]
+        :when (or (>= c (quot bf 2))            ; not underfull: nothing to rebalance
+                  (case k
+                    :join-left    (not fits-left)
+                    :join-right   (or fits-left (not fits-right))
+                    :borrow-left  (or fits-left fits-right (not left-fuller))
+                    :borrow-right (or fits-left fits-right last? left-fuller)))]
     [k L]))
 
 ;; ---- one cold write ----
@@ -908,14 +910,17 @@
                    (let [{:keys [left right]} (specs (dec L))
                          need (+ 1 (if left 1 0) (if right 1 0))
                          sub  #(gen-sub disk ctr (dec L) % fill base)
-                         pads #(vec (repeatedly (- own need) (fn [] (sub fill))))]
+                         npad (- own need)
+                         ;; `:pad` is a side, or the number of padding children on the left
+                         nl   (cond (= pad :left) npad (number? pad) (min npad (long pad)) :else 0)
+                         pads #(vec (repeatedly % (fn [] (sub fill))))]
                      (when (>= own need)
                        ;; in key order: the keys come from one counter
-                       (let [pl (when (= pad :left) (pads))
+                       (let [pl (pads nl)
                              l  (when left (sub left))
                              c  (node (dec L))
                              r  (when (and c right) (sub right))
-                             pr (when (and c (not= pad :left)) (pads))]
+                             pr (when c (pads (- npad nl)))]
                          (when c
                            (gen-branch disk L (vec (concat pl (when l [l]) [c] (when r [r]) pr)) base))))))))
         root (node H)]
@@ -948,7 +953,12 @@
                                     :join-right  {:own mn :left nil :right mn})
                           :else   {:own (inc mn) :left (inc mn) :right (inc mn)})
                     ;; `:pad` lays out a node's children: the cascade's levels, then L itself
-                    :pad (cond (<= i L)      (if (= cascade :split-last) :left :right)
+                    :pad (cond (<= i L)      (case cascade
+                                               :split-last :left
+                                               ;; the path child one before the cut, so that
+                                               ;; its two halves fall one on each side
+                                               :split-mid  (- (quot (inc bf) 2) 2)
+                                               :right)
                                (= i (inc L)) pad
                                :else         :right)))))))
 
@@ -1017,13 +1027,16 @@
 
 (defn- record!
   "`ev` and `tr` are the keys the step's events and transitions are collected under: the
-   second write of a two-write case is collected apart from the first."
-  [tot r op ev tr]
-  (swap! tot (fn [t] (-> t
-                         (update :steps inc)
-                         (update :max-reads max (:reads r))
-                         (update ev into (map #(vector op %) (:events r)))
-                         (update tr into (:transitions r))))))
+   second write of a two-write case is collected apart from the first. A write that did
+   nothing (an insert of a key that is there, a delete or replace of one that is not) is
+   counted as a step and collected as nothing: it must not stand in for an in-place write."
+  [tot r op ev tr effective?]
+  (swap! tot (fn [t] (cond-> (-> t (update :steps inc) (update :max-reads max (:reads r)))
+                       effective? (-> (update ev into (map #(vector op %) (:events r)))
+                                      (update tr into (:transitions r)))))))
+
+(defn- effective? [present [op k] delta]
+  (or (not (zero? delta)) (and (= op :rep) (contains? present k))))
 
 (defn- every-step
   "Run every case of `shape-cases`; `check` is called per step with the case, the step's
@@ -1047,17 +1060,19 @@
               (let [keep1 (set (keys @disk))
                     r1    (step disk (:addr g) opts before op1)
                     [present1 delta1] (effect (set (:leaf-keys g)) op1)]
-                (record! tot r1 (first op1) :events :transitions)
+                (record! tot r1 (first op1) :events :transitions
+                         (effective? (set (:leaf-keys g)) op1 delta1))
                 (check {:specs specs :disk disk :g g :before before :ops [op1] :r r1 :delta delta1})
                 ;; a second write, where the first one left buffered edits to write over
                 (when (and second-step? (buffered? disk (:addr r1)))
                   (let [buffered true]
                     (doseq [op2 ops]
-                      (let [keep2 (set (keys @disk))
-                            r2    (step disk (:addr r1) opts (:shape r1) op2)]
-                        (record! tot r2 (first op2) :events2 :transitions2)
+                      (let [keep2  (set (keys @disk))
+                            r2     (step disk (:addr r1) opts (:shape r1) op2)
+                            delta2 (second (effect present1 op2))]
+                        (record! tot r2 (first op2) :events2 :transitions2 (effective? present1 op2 delta2))
                         (check {:specs specs :disk disk :g g :before (:shape r1) :ops [op1 op2] :r r2
-                                :delta (second (effect present1 op2)) :input-buffered? buffered})
+                                :delta delta2 :input-buffered? buffered})
                         (swap! disk select-keys keep2)))))
                 (swap! disk select-keys keep1)))))))
     @tot))
@@ -1137,6 +1152,31 @@
             "and was followed at the level above by everything that can follow it")
         (is (pos? (:steps r)))))))
 
+(deftest the-middle-cascade-splits-across-the-cut
+  (testing "precondition of `:split-mid`: the path child sits one before the place a full
+            branch is cut, so the two nodes its split leaves go one to each half"
+    (doseq [bf [4 5 6]]
+      (let [mn    (quot bf 2)
+            opts  {:comparator compare :branching-factor bf :diff-buf-size 0}
+            ;; a case whose levels 0 and 1 belong to the middle cascade
+            specs (first (filter (fn [sp] (and (number? (:pad (sp 1))) (number? (:pad (sp 2)))
+                                               (gen-spine (atom {}) sp mn (base opts))))
+                                 (shape-cases bf 3)))
+            disk  (atom {})
+            g     (gen-spine disk specs mn (base opts))
+            before (shape disk (:addr g) opts)
+            k     (inc (long (first (:leaf-keys g))))
+            path  (path-ordinals disk (:addr g) opts before k)
+            start (reduce + 0 (take (path 1) ((:levels before) 1)))
+            r     (step disk (:addr g) opts before [:add k])
+            cut   (quot (inc bf) 2)]
+        (is (some? g))
+        (is (= (dec cut) (- (long (path 0)) (long start))) (str "bf " bf ": the path leaf's place in its parent"))
+        (is (contains? (:events r) [:split 1]) "and the parent splits")
+        ;; the parent's two halves: `cut` children and the rest
+        (is (= [cut (- (inc bf) cut)]
+               (subvec ((:levels (:shape r)) 1) (path 1) (+ 2 (long (path 1))))))))))
+
 (deftest every-single-cold-write-on-a-root-that-is-a-leaf
   (doseq [bf [4 5 8] transient? [false true] size (range 1 (inc bf))]
     (let [opts   {:comparator compare :branching-factor bf :diff-buf-size 0 :transient? transient?}
@@ -1182,7 +1222,9 @@
 (deftest every-pair-of-writes-on-one-transient
   (testing "a single write after a cold restore meets only nodes it must copy. The second
             write on the same transient meets the nodes the first one made, which it may
-            change in place — the editable arms of every rebalance"
+            change in place. This reaches editable arms the single-write sweep cannot; it
+            does not reach all of them (a second delete that borrows from a left neighbour
+            the first write made does not occur among these pairs)"
     (let [H    2
           bf   4
           opts {:comparator compare :branching-factor bf :diff-buf-size 0}
@@ -1325,7 +1367,9 @@
                                       (:events r)))
                 (when-not (and (zero? (:unknown sh)) (zero? (:wrong sh))
                                (= (:content sh) (after-op (:content before) op))
-                               (zero? (:misplaced sh)) (zero? (:mislevelled sh)))
+                               (zero? (:misplaced sh)) (zero? (:mislevelled sh))
+                               ;; every one of these writes changes something
+                               (:new-root? r))
                   (is false (str n " keys, " (pr-str op) " " (pr-str (:events r))
                                  ": unknown " (:unknown sh) ", wrong " (:wrong sh)
                                  ", content as expected " (= (:content sh) (after-op (:content before) op))

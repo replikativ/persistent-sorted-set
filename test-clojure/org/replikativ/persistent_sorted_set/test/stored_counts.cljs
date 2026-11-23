@@ -351,7 +351,8 @@
         [(= p start) (= p (+ start (dec (lens pp))))]))))
 
 (defn- policy-violations
-  "The rebalance a node chose against the one it must choose: a node left underfull joins
+  "The rebalance a node chose against the one it must choose: only a node left underfull
+   rebalances at all, and it joins
    its left neighbour if the two fit in one node, else its right one if those fit, else
    borrows from the fuller of the two, the left one when they are equal. Without this a
    borrow from the wrong side passes every other check."
@@ -365,11 +366,12 @@
               fits-left  (and (not first?) (<= (+ (x (dec p)) c) bf))
               fits-right (and (not last?) (<= (+ c (x (inc p))) bf))
               left-fuller (and (not first?) (or last? (>= (x (dec p)) (x (inc p)))))]
-        :when (case k
-                :join-left    (not fits-left)
-                :join-right   (or fits-left (not fits-right))
-                :borrow-left  (or fits-left fits-right (not left-fuller))
-                :borrow-right (or fits-left fits-right last? left-fuller))]
+        :when (or (>= c (quot bf 2))            ; not underfull: nothing to rebalance
+                  (case k
+                    :join-left    (not fits-left)
+                    :join-right   (or fits-left (not fits-right))
+                    :borrow-left  (or fits-left fits-right (not left-fuller))
+                    :borrow-right (or fits-left fits-right last? left-fuller)))]
     [k L]))
 
 (defn- result [disk addr addr' opts before k reads store-reads]
@@ -443,14 +445,17 @@
                    (let [{:keys [left right]} (specs (dec L))
                          need (+ 1 (if left 1 0) (if right 1 0))
                          sub  #(gen-sub disk ctr (dec L) % fill bf)
-                         pads #(vec (repeatedly (- own need) (fn [] (sub fill))))]
+                         npad (- own need)
+                         ;; `:pad` is a side, or the number of padding children on the left
+                         nl   (cond (= pad :left) npad (number? pad) (min npad pad) :else 0)
+                         pads #(vec (repeatedly % (fn [] (sub fill))))]
                      (when (>= own need)
                        ;; in key order: the keys come from one counter
-                       (let [pl (when (= pad :left) (pads))
+                       (let [pl (pads nl)
                              l  (when left (sub left))
                              c  (node (dec L))
                              r  (when (and c right) (sub right))
-                             pr (when (and c (not= pad :left)) (pads))]
+                             pr (when c (pads (- npad nl)))]
                          (when c
                            (gen-branch disk L (vec (concat pl (when l [l]) [c] (when r [r]) pr))))))))))
         root (node H)]
@@ -472,7 +477,12 @@
                                     :join-left   {:own mn :left mn :right nil}
                                     :join-right  {:own mn :left nil :right mn})
                           :else   {:own (inc mn) :left (inc mn) :right (inc mn)})
-                    :pad (cond (<= i L)      (if (= cascade :split-last) :left :right)
+                    :pad (cond (<= i L)      (case cascade
+                                               :split-last :left
+                                               ;; the path child one before the cut, so that
+                                               ;; its two halves fall one on each side
+                                               :split-mid  (- (quot (inc bf) 2) 2)
+                                               :right)
                                (= i (inc L)) pad
                                :else         :right)))))))
 
@@ -486,6 +496,11 @@
   "The first writes of a two-write case: an insert, a delete, a replace."
   [ks]
   [[:add (inc (first ks))] [:del (nth ks (quot (count ks) 2))] [:rep (first ks)]])
+
+(defn- effective?
+  "A write that did nothing must not stand in for an in-place write."
+  [present [op k] delta]
+  (or (not (zero? delta)) (and (= op :rep) (contains? present k))))
 
 (defn- effect [present [op k]]
   (case op
@@ -507,9 +522,9 @@
   (let [bf  (:branching-factor opts)
         mn  (quot bf 2)
         tot (volatile! {:trees 0 :steps 0 :events #{} :transitions #{} :events2 #{} :transitions2 #{}})
-        rec (fn [r op ev tr] (vswap! tot #(-> % (update :steps inc)
-                                              (update ev into (map (fn [e] [op e]) (:events r)))
-                                              (update tr into (:transitions r)))))]
+        rec (fn [r op ev tr eff?] (vswap! tot #(cond-> (update % :steps inc)
+                                                 eff? (-> (update ev into (map (fn [e] [op e]) (:events r)))
+                                                          (update tr into (:transitions r))))))]
     (doseq [specs (shape-cases bf H)]
       (let [disk (atom {})
             g    (gen-spine disk specs mn bf)]
@@ -522,7 +537,7 @@
               (let [keep1 (set (keys @disk))
                     r1    (step disk (:addr g) opts before op1)
                     [present1 delta1] (effect (set (:leaf-keys g)) op1)]
-                (rec r1 (first op1) :events :transitions)
+                (rec r1 (first op1) :events :transitions (effective? (set (:leaf-keys g)) op1 delta1))
                 (check {:specs specs :disk disk :before before :ops [op1] :r r1 :delta delta1})
                 ;; a second write, where the first one left buffered edits to write over
                 (when (and second-step? (buffered? disk (:addr r1)))
@@ -530,7 +545,7 @@
                     (doseq [op2 ops]
                       (let [keep2 (set (keys @disk))
                             r2    (step disk (:addr r1) opts (:shape r1) op2)]
-                        (rec r2 (first op2) :events2 :transitions2)
+                        (rec r2 (first op2) :events2 :transitions2 (effective? present1 op2 (second (effect present1 op2))))
                         (check {:specs specs :disk disk :before (:shape r1) :ops [op1 op2] :r r2
                                 :delta (second (effect present1 op2)) :input-buffered? buffered})
                         (swap! disk select-keys keep2)))))
@@ -544,9 +559,9 @@
    (let [bf  (:branching-factor opts)
          mn  (quot bf 2)
          tot (volatile! {:trees 0 :steps 0 :events #{} :transitions #{} :events2 #{} :transitions2 #{}})
-         rec (fn [r op ev tr] (vswap! tot #(-> % (update :steps inc)
-                                               (update ev into (map (fn [e] [op e]) (:events r)))
-                                               (update tr into (:transitions r)))))]
+         rec (fn [r op ev tr eff?] (vswap! tot #(cond-> (update % :steps inc)
+                                                  eff? (-> (update ev into (map (fn [e] [op e]) (:events r)))
+                                                           (update tr into (:transitions r))))))]
      (loop [cases (shape-cases bf H)]
        (when (seq cases)
          (let [specs (first cases)
@@ -563,7 +578,7 @@
                    (let [op1 (ops1 i)
                          r1  (await (step-async disk (:addr g) opts before op1))
                          [present1 delta1] (effect (set (:leaf-keys g)) op1)]
-                     (rec r1 (first op1) :events :transitions)
+                     (rec r1 (first op1) :events :transitions (effective? (set (:leaf-keys g)) op1 delta1))
                      (check {:specs specs :disk disk :before before :ops [op1] :r r1 :delta delta1})
                      (when (and second-step? (buffered? disk (:addr r1)))
                        (let [keep2    (set (keys @disk))
@@ -572,7 +587,7 @@
                            (when (< j (count ops))
                              (let [op2 (ops j)
                                    r2  (await (step-async disk (:addr r1) opts (:shape r1) op2))]
-                               (rec r2 (first op2) :events2 :transitions2)
+                               (rec r2 (first op2) :events2 :transitions2 (effective? present1 op2 (second (effect present1 op2))))
                                (check {:specs specs :disk disk :before (:shape r1) :ops [op1 op2] :r r2
                                        :delta (second (effect present1 op2)) :input-buffered? buffered})
                                (swap! disk select-keys keep2)

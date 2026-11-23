@@ -84,7 +84,10 @@
                          mid (-> (set/disj mid compare) (set/conj (int -1) compare)))
                 model3 (cond-> model mid (-> (disj mid) (conj (int -1))))
                 addr3  (set/store s3 (storage disk))]
-            (when (some :slots (vals @disk)) (vreset! seen-slots true))
+            (when ((fn buffered? [a]
+                     (let [bl (@disk a)] (or (seq (:slots bl)) (some buffered? (:addresses bl)))))
+                   addr3)
+              (vreset! seen-slots true))
             (doseq [[tag fresh m] [[:memory (fn [] s) model]
                                    [:cold (fn [] (set/restore-by compare addr (storage disk) opts)) model]
                                    [:cold-second-generation
