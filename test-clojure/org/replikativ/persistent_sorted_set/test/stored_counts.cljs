@@ -339,10 +339,44 @@
                       (and (not= k :split) (= L (dec top)) (contains? evs [:collapse])) :collapse
                       :else (get kind (inc L) :absorbed))]))))
 
+(defn- edge
+  "[first? last?]: is the path node at level L its parent's first child, its last?"
+  [before path L]
+  (let [p (path L) top (dec (count (:levels before)))]
+    (if (= L top)
+      [true true]
+      (let [pp    (path (inc L))
+            lens  ((:levels before) (inc L))
+            start (reduce + 0 (take pp lens))]
+        [(= p start) (= p (+ start (dec (lens pp))))]))))
+
+(defn- policy-violations
+  "The rebalance a node chose against the one it must choose: a node left underfull joins
+   its left neighbour if the two fit in one node, else its right one if those fit, else
+   borrows from the fuller of the two, the left one when they are equal. Without this a
+   borrow from the wrong side passes every other check."
+  [bf before path evs]
+  (for [[k L] evs
+        :when (and L (#{:join-left :join-right :borrow-left :borrow-right} k))
+        :let [x  ((:levels before) L)
+              p  (path L)
+              [first? last?] (edge before path L)
+              c  (dec (x p))
+              fits-left  (and (not first?) (<= (+ (x (dec p)) c) bf))
+              fits-right (and (not last?) (<= (+ c (x (inc p))) bf))
+              left-fuller (and (not first?) (or last? (>= (x (dec p)) (x (inc p)))))]
+        :when (case k
+                :join-left    (not fits-left)
+                :join-right   (or fits-left (not fits-right))
+                :borrow-left  (or fits-left fits-right (not left-fuller))
+                :borrow-right (or fits-left fits-right last? left-fuller))]
+    [k L]))
+
 (defn- result [disk addr addr' opts before k reads store-reads]
   (let [after (shape disk addr' opts)
-        evs   (events before after (path-ordinals disk addr opts before k))]
-    {:addr addr' :reads reads :store-reads store-reads :shape after :events evs
+        path  (path-ordinals disk addr opts before k)
+        evs   (events before after path)]
+    {:addr addr' :reads reads :store-reads store-reads :shape after :events evs :path path
      :transitions (transitions before evs) :new-root? (not= addr addr')}))
 
 (defn- step [disk addr opts before [op k]]
@@ -425,7 +459,7 @@
 (defn- shape-cases [bf H]
   (let [mn (quot bf 2) lens (range mn (inc bf)) sibs (cons nil lens)]
     (for [L (range 0 H), own lens, left sibs, right sibs
-          cascade  (if (zero? L) [:none] [:split-first :split-last :join-left :join-right])
+          cascade  (if (zero? L) [:none] [:split-first :split-mid :split-last :join-left :join-right])
           pad      [:right :left]
           root-own (if (= L (dec H)) (range 2 (inc bf)) [(inc mn)])]
       (vec (for [i (range (inc H))]
@@ -434,6 +468,7 @@
                           (< i L) (case cascade
                                     :split-first {:own bf :left nil :right mn}
                                     :split-last  {:own bf :left mn :right nil}
+                                    :split-mid   {:own bf :left mn :right mn}
                                     :join-left   {:own mn :left mn :right nil}
                                     :join-right  {:own mn :left nil :right mn})
                           :else   {:own (inc mn) :left (inc mn) :right (inc mn)})
@@ -471,10 +506,10 @@
   [opts H {:keys [check prepare second-step?]}]
   (let [bf  (:branching-factor opts)
         mn  (quot bf 2)
-        tot (volatile! {:trees 0 :steps 0 :events #{} :transitions #{}})
-        rec (fn [r op] (vswap! tot #(-> % (update :steps inc)
-                                        (update :events into (map (fn [e] [op e]) (:events r)))
-                                        (update :transitions into (:transitions r)))))]
+        tot (volatile! {:trees 0 :steps 0 :events #{} :transitions #{} :events2 #{} :transitions2 #{}})
+        rec (fn [r op ev tr] (vswap! tot #(-> % (update :steps inc)
+                                              (update ev into (map (fn [e] [op e]) (:events r)))
+                                              (update tr into (:transitions r)))))]
     (doseq [specs (shape-cases bf H)]
       (let [disk (atom {})
             g    (gen-spine disk specs mn bf)]
@@ -487,7 +522,7 @@
               (let [keep1 (set (keys @disk))
                     r1    (step disk (:addr g) opts before op1)
                     [present1 delta1] (effect (set (:leaf-keys g)) op1)]
-                (rec r1 (first op1))
+                (rec r1 (first op1) :events :transitions)
                 (check {:specs specs :disk disk :before before :ops [op1] :r r1 :delta delta1})
                 ;; a second write, where the first one left buffered edits to write over
                 (when (and second-step? (buffered? disk (:addr r1)))
@@ -495,7 +530,7 @@
                     (doseq [op2 ops]
                       (let [keep2 (set (keys @disk))
                             r2    (step disk (:addr r1) opts (:shape r1) op2)]
-                        (rec r2 (first op2))
+                        (rec r2 (first op2) :events2 :transitions2)
                         (check {:specs specs :disk disk :before (:shape r1) :ops [op1 op2] :r r2
                                 :delta (second (effect present1 op2)) :input-buffered? buffered})
                         (swap! disk select-keys keep2)))))
@@ -508,10 +543,10 @@
   (async
    (let [bf  (:branching-factor opts)
          mn  (quot bf 2)
-         tot (volatile! {:trees 0 :steps 0 :events #{} :transitions #{}})
-         rec (fn [r op] (vswap! tot #(-> % (update :steps inc)
-                                         (update :events into (map (fn [e] [op e]) (:events r)))
-                                         (update :transitions into (:transitions r)))))]
+         tot (volatile! {:trees 0 :steps 0 :events #{} :transitions #{} :events2 #{} :transitions2 #{}})
+         rec (fn [r op ev tr] (vswap! tot #(-> % (update :steps inc)
+                                               (update ev into (map (fn [e] [op e]) (:events r)))
+                                               (update tr into (:transitions r)))))]
      (loop [cases (shape-cases bf H)]
        (when (seq cases)
          (let [specs (first cases)
@@ -528,7 +563,7 @@
                    (let [op1 (ops1 i)
                          r1  (await (step-async disk (:addr g) opts before op1))
                          [present1 delta1] (effect (set (:leaf-keys g)) op1)]
-                     (rec r1 (first op1))
+                     (rec r1 (first op1) :events :transitions)
                      (check {:specs specs :disk disk :before before :ops [op1] :r r1 :delta delta1})
                      (when (and second-step? (buffered? disk (:addr r1)))
                        (let [keep2    (set (keys @disk))
@@ -537,7 +572,7 @@
                            (when (< j (count ops))
                              (let [op2 (ops j)
                                    r2  (await (step-async disk (:addr r1) opts (:shape r1) op2))]
-                               (rec r2 (first op2))
+                               (rec r2 (first op2) :events2 :transitions2)
                                (check {:specs specs :disk disk :before (:shape r1) :ops [op1 op2] :r r2
                                        :delta (second (effect present1 op2)) :input-buffered? buffered})
                                (swap! disk select-keys keep2)
@@ -570,10 +605,11 @@
   "The path; on a delete the two neighbours of every path node below the root; and for
    every branch that divided, the children of one of the two results."
   [bf levels op evs]
-  (let [divides (count (filter (fn [[k L]] (and L (pos? L) (#{:split :borrow-left :borrow-right} k))) evs))]
+  (let [at-branch (fn [kinds] (count (filter (fn [[k L]] (and L (pos? L) (kinds k))) evs)))]
     (+ levels
        (if (= op :del) (* 2 (dec levels)) 0)
-       (* divides (inc (quot (* 3 bf) 4))))))
+       (* (at-branch #{:split}) (quot (inc bf) 2))
+       (* (at-branch #{:borrow-left :borrow-right}) (inc (quot (* 3 bf) 4))))))
 
 (defn- counted-check [opts]
   (let [bf (:branching-factor opts)]
@@ -587,17 +623,21 @@
                        (= (:content sh) want)
                        (zero? (:misplaced sh)) (zero? (:underfull sh)) (zero? (:overfull sh))
                        (zero? (:mislevelled sh))
-                       ;; a write that changes the set stores a new root
-                       (or (:new-root? r) (zero? delta))
+                       ;; a write that is not a no-op stores a new root
+                       (or (:new-root? r)
+                           (and (zero? delta)
+                                (not (and (= :rep (first op)) (some #{(second op)} (:content before))))))
                        (<= (:reads r) bound)
-                       (or (pos? (:diff-buf-size opts)) (zero? (:store-reads r))))
+                       (or (pos? (:diff-buf-size opts)) (zero? (:store-reads r)))
+                       (empty? (policy-violations bf before (:path r) (:events r))))
           (is false (str "case " (pr-str specs) " ops " (pr-str ops) " events " (pr-str (:events r))
                          ": unknown " (:unknown sh) ", wrong " (:wrong sh) ", elements " (:n sh)
                          " from " (:n before) ", content as expected " (= (:content sh) want)
                          ", misplaced keys " (:misplaced sh) ", underfull " (:underfull sh)
                          ", overfull " (:overfull sh) ", mislevelled " (:mislevelled sh)
                          ", new root " (:new-root? r) ", reads " (:reads r) " (bound " bound
-                         "), store reads " (:store-reads r))))))))
+                         "), store reads " (:store-reads r) ", rebalanced against the policy "
+                         (pr-str (policy-violations bf before (:path r) (:events r))))))))))
 
 (deftest every-single-cold-write-keeps-every-count
   (doseq [[bf H] [[4 3]]]
@@ -633,8 +673,9 @@
           r (every-step opts H {:second-step? true
                                 :check (fn [m] (when (:input-buffered? m) (vswap! seen inc)) (chk m))})]
       (is (pos? @seen) "precondition: some second steps started from buffered edits")
-      (is (= #{} (missing (expected-events H) (:events r))))
-      (is (= #{} (missing (expected-transitions H) (:transitions r)))))))
+      (is (= #{} (missing (expected-events H) (:events2 r)))
+          "the writes over buffered edits took every kind of step at every level")
+      (is (= #{} (missing (expected-transitions H) (:transitions2 r)))))))
 
 (deftest every-single-cold-write-over-an-uncounted-tree
   (testing "no count is ever wrong, and one recount + store leaves none missing and rewrites
@@ -643,10 +684,12 @@
     ;; has its own tests above
     (doseq [dbs [2]]
       (let [opts {:branching-factor 4 :diff-buf-size dbs}
+            real (volatile! 0)
             r (every-step
                opts 2
                {:prepare erase-all!
-                :check (fn [{:keys [specs ops disk r before]}]
+                :check (fn [{:keys [specs ops disk r before delta]}]
+                         (when-not (zero? delta) (vswap! real inc))
                          (let [leaves (leaf-addrs disk)
                                st     #(u/storage (atom {}) disk opts)
                                addr'  (s/store (s/recount (s/restore (:addr r) (st) opts)) (st))
@@ -661,6 +704,7 @@
                                             ": wrong " (:wrong (:shape r)) ", after recount wrong "
                                             (:wrong sh) " unknown " (:unknown sh)
                                             ", content as expected " (= (:content sh) want))))))})]
+        (is (pos? @real) "writes that changed the set were among the steps")
         (is (= #{} (missing (expected-events 2) (:events r))))))))
 
 (deftest every-single-cold-write-on-content-defined-trees
@@ -680,7 +724,8 @@
           (let [keep (set (keys @disk))
                 r    (step disk addr opts before op)
                 sh   (:shape r)]
-            (vswap! seen into (map #(vector (first op) ({:join-left :join :join-right :join} (first %) (first %)))
+            ;; a level also gets shorter when an emptied child is dropped, which is no join
+            (vswap! seen into (map #(vector (first op) ({:join-left :shorter :join-right :shorter} (first %) (first %)))
                                    (:events r)))
             (when-not (and (zero? (:unknown sh)) (zero? (:wrong sh))
                            (= (:content sh) (after-op (:content before) op))
@@ -689,7 +734,7 @@
                              ": unknown " (:unknown sh) ", wrong " (:wrong sh)
                              ", misplaced keys " (:misplaced sh))))
             (swap! disk select-keys keep)))))
-    (is (= #{} (missing #{[:add :split] [:del :join] [:add :in-place] [:del :in-place]} @seen)))))
+    (is (= #{} (missing #{[:add :split] [:del :shorter] [:add :in-place] [:del :in-place]} @seen)))))
 
 ;; ---- the asynchronous arm ----
 ;;
@@ -717,7 +762,7 @@
                                            :check (fn [m] (when (:input-buffered? m) (vswap! seen inc)) (chk m))})
                  (fn [r]
                    (is (pos? @seen) "precondition: some second steps started from buffered edits")
-                   (is (= #{} (missing (expected-events H) (:events r))))
-                   (is (= #{} (missing (expected-transitions H) (:transitions r))))
+                   (is (= #{} (missing (expected-events H) (:events2 r))))
+                   (is (= #{} (missing (expected-transitions H) (:transitions2 r))))
                    (done))
                  (fn [err] (is (nil? err)) (js/console.error err) (done))))))
