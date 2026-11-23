@@ -56,12 +56,38 @@
 
 (defn has-subtree-counts?
   "Whether the ROOT knows its element count, and only that. True means `count` is answered
-   without reading the tree. It does not promise every node below is counted: both halves of
-   a branch that split while its children were on disk stay unknown by design, and a
-   count-slice that fully covers such a node counts it by descending. When false, the set as
-   a whole has no count and count-slice may degrade to O(n)."
+   without reading the tree. It says nothing about the branches below the root: a tree
+   written by an earlier version can hold branches stored without a count (both results of
+   a split or a borrow whose children were on disk), and a count-slice that fully covers
+   one counts it by reading its children. `count-census` answers for the whole tree and
+   `recount` repairs it. When false, the set as a whole has no count and count-slice may
+   degrade to O(n)."
   [^PersistentSortedSet set]
   (.hasSubtreeCounts set))
+
+(defn count-census
+  "`{:branches n :unknown m}`: how many branches the tree has and how many of them are
+   STORED without their element count. A branch without one is correct but expensive: a
+   count-slice that covers it reads its children, on every cold start. Reads every branch
+   and no leaf.
+
+   A count computed in memory does not make a branch known here — what is asked is what a
+   fresh restore would find."
+  [^PersistentSortedSet set]
+  (let [c (.countCensus set)]
+    {:branches (aget c 0) :unknown (aget c 1)}))
+
+(defn recount
+  "`set` with every branch counted and every branch that had no count on disk marked to be
+   written: `store` the result and the counts are durable. Returns `set` itself when there
+   is nothing to do. Content, order and structure are unchanged; not for a transient.
+
+   For trees written before a split or a borrow kept its counts. Writes since keep every
+   count, so one `recount` + `store` is enough. It reads every branch, plus the leaves of
+   each leaf-parent that has no count, and rewrites each branch without a count and every
+   branch above one."
+  [^PersistentSortedSet set]
+  (.recount set))
 
 (defn seek
   "An efficient way to seek to a specific key in a seq (either returned by [[clojure.core.seq]] or a slice.)

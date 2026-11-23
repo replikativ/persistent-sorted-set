@@ -344,6 +344,8 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   private ANode countRoot(ANode root, long totalBefore, int delta) {
     if (root instanceof Branch && totalBefore >= 0 && _settings.leafProcessor() == null) {
       Branch b = (Branch) root;
+      // Not `_countUnstored`: every caller publishes `root` as the set's new root, and a root
+      // is written by the next store.
       if (b._subtreeCount < 0) b._subtreeCount = totalBefore + delta;
     }
     return root;
@@ -390,6 +392,45 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
   public boolean hasSubtreeCounts() {
     ANode root = root();
     return getSubtreeCount(root) >= 0;
+  }
+
+  /**
+   * {branches, branches whose STORED form has no count}. A branch without one is correct but
+   * expensive: a `countSlice` that covers it reads its children, on every cold start. Reads
+   * every branch of the tree and no leaf.
+   *
+   * `hasSubtreeCounts` cannot answer this — it asks the root only, and the root keeps its
+   * count while the nodes below it lose theirs.
+   */
+  public long[] countCensus() {
+    final long[] out = new long[2];
+    final ANode root = root();
+    if (root instanceof Branch) {
+      final Branch b = (Branch) root;
+      b.countCensus(_storage, b._subtreeCount < 0 || b._countUnstored, out);
+    }
+    return out;
+  }
+
+  /**
+   * This set with every branch counted, and every branch that had no count on disk marked to
+   * be written: `store` the result and the counts are durable. Returns `this` when there is
+   * nothing to do. Content, order and structure are unchanged.
+   *
+   * It exists for trees written before a split or a borrow kept its counts (see
+   * Branch.divideCount). Cost: it reads every branch, and the leaves of each leaf-parent that
+   * has no count; it rewrites each branch without one and every branch above such a branch.
+   */
+  public PersistentSortedSet recount() {
+    if (editable()) throw new IllegalStateException("recount: not on a transient; call persistent! first");
+    final ANode root = root();
+    if (!(root instanceof Branch)) return this;
+    final Branch b = (Branch) root;
+    final Branch nb = b.recount(_storage, b._subtreeCount < 0 || b._countUnstored, settings());
+    if (nb == b) return this;
+    if (_storage != null && _address != null) _storage.markFreed(_address);
+    final long c = nb._subtreeCount;
+    return new PersistentSortedSet(_meta, _cmp, null, _storage, nb, (c >= 0) ? (int) c : -1, _settings, _version + 1);
   }
 
   public boolean editable() {

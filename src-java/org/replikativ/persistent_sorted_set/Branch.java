@@ -14,6 +14,16 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // For lazy computation when restored from old storage format.
   public long _subtreeCount;
 
+  // True while `_subtreeCount` is a value this node's STORED form does not carry: it was
+  // restored unknown (-1) and filled in memory by a count. Such a node answers `count` but
+  // its blob still says -1, and nothing writes a clean node — so every later cold restore
+  // starts unknown again. `recount` and `countCensus` treat it as unknown; `store` clears it,
+  // because a node that is written is written with the count it has.
+  //
+  // Without it the damage is invisible to the process that could repair it: one `count`
+  // (the query planner's, a caller's) and every node it walked looks counted.
+  public boolean _countUnstored;
+
   // diff-buf (only used when _settings.diffBufSize() > 0; null/false otherwise, so
   // diffBufSize==0 is byte-identical to baseline — invariant I0).
   //
@@ -391,6 +401,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // the count never changes. For transient nodes it's also safe since
       // add/remove maintain the count incrementally.
       _subtreeCount = computed;
+      _countUnstored = true;
       return (int) computed;
     }
     return (int) _subtreeCount;
@@ -626,6 +637,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           // Cache in child — safe for persistent (immutable count) and transient
           // (add/remove maintain counts; this only fires for unknown/-1 values)
           ((Branch) child)._subtreeCount = childCount;
+          ((Branch) child)._countUnstored = true;
         }
         count += childCount;
       } else {
@@ -633,6 +645,173 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       }
     }
     return count;
+  }
+
+  // ---- counts that need the children: split, borrow, recount ----
+
+  /**
+   * How many of this node's children cannot say their count from memory: not resident, and
+   * with no diff-buf slot carrying it. This is the number of reads `countChildrenReading`
+   * would do.
+   */
+  int childrenToRead() {
+    final NodeState<Address> s = _state;                         // one snapshot
+    final Object[] slots = (s.buf != null) ? s.buf.slots : null;
+    int n = 0;
+    for (int i = 0; i < _len; i++) {
+      ANode child = (s.children != null) ? (ANode) _settings.readReference(s.children[i]) : null;
+      if (child != null) continue;
+      Slot sl = (slots != null) ? (Slot) slots[i] : null;
+      if (sl != null && sl.count >= 0) continue;
+      n++;
+    }
+    return n;
+  }
+
+  /**
+   * The number of elements below this node, as the sum of its children's counts — READING
+   * the children that are not in memory. -1 when a child cannot say (a branch whose own count
+   * is unknown, or a child with neither a node nor an address); it never descends further, so
+   * the cost is bounded by this node's fanout.
+   *
+   * Per child, in this order:
+   *   resident  — its own count (a leaf's length, a branch's `_subtreeCount`);
+   *   a slot    — the slot's count. Under diff-buf the slot is the ONLY right answer for a
+   *               child that is not resident: its durable blob predates the buffered changes,
+   *               so its stored count is stale by exactly those.
+   *   neither   — restore the blob and read it. The node is not kept: this is one number,
+   *               and caching up to a fanout of leaves here would grow the resident set that
+   *               `:ref-type` bounds.
+   */
+  long countChildrenReading(IStorage storage) {
+    final NodeState<Address> s = _state;                         // one snapshot
+    final Object[] slots = (s.buf != null) ? s.buf.slots : null;
+    long total = 0;
+    for (int i = 0; i < _len; i++) {
+      ANode child = (s.children != null) ? (ANode) _settings.readReference(s.children[i]) : null;
+      Slot sl = (slots != null) ? (Slot) slots[i] : null;
+      long c = -1;
+      if (child != null) c = (child instanceof Branch) ? ((Branch) child)._subtreeCount : child._len;
+      if (c < 0 && sl != null) c = sl.count;
+      if (c < 0 && child == null && sl == null) {
+        if (storage == null || s.addresses == null || s.addresses[i] == null) return -1;
+        ANode restored = (ANode) storage.restore(s.addresses[i]);
+        c = (restored instanceof Branch) ? ((Branch) restored)._subtreeCount : restored._len;
+      }
+      if (c < 0) return -1;
+      total += c;
+    }
+    return total;
+  }
+
+  /**
+   * `a` and `b` are two freshly built nodes that together hold `total` elements, and neither
+   * could be counted from memory. Read the children of the one that needs fewer reads and give
+   * the other the remainder.
+   *
+   * This is the one place a write reads beyond its path, and it is the format that makes it
+   * necessary: a branch stores its total and nothing about how the total is spread over its
+   * children, so a node that DIVIDES — a split, a borrow — finds the per-child numbers only in
+   * the children. Leaving both unknown instead (what this did) is durable: the unknown is
+   * serialized, no write heals it, every later write through the node re-stores it unknown,
+   * and a range count that covers it reads its children on every cold start. Measured over 60
+   * cold write generations: 229 of 308 stored branches unknown at bf 16, 51 of 80 at bf 64.
+   *
+   * The price, same runs: 0.3% to 2.2% more restores overall, and at bf 512 up to one fanout
+   * of leaf reads in the single write that splits a leaf-parent — about once per 65,000
+   * inserts below it.
+   */
+  static void divideCount(Branch a, Branch b, long total, IStorage storage) {
+    if (total < 0 || a._subtreeCount >= 0 || b._subtreeCount >= 0) return;
+    final Branch read  = (a.childrenToRead() <= b.childrenToRead()) ? a : b;
+    final Branch other = (read == a) ? b : a;
+    final long c = read.countChildrenReading(storage);
+    if (c < 0) return;
+    read._subtreeCount = c;
+    // A total smaller than one of its parts is a total that was already wrong; do not turn
+    // it into a second wrong number.
+    if (c <= total) other._subtreeCount = total - c;
+  }
+
+  /**
+   * Is child `i`'s count missing from what is STORED? `child` is that child, materialized.
+   *
+   * A child restored through a slot that carries a diff is PROJECTED: it takes its count
+   * from the slot, whatever its own blob says, so it arrives here counted and unflagged.
+   * What is left is a child that is resident with a count it worked out in memory. It is
+   * counted on disk only if this node's slot will hand a restore the same number — a slot
+   * with a count AND a diff; a slot without a diff is not projected, and the child is then
+   * read from its blob as it is.
+   */
+  private boolean childCountUnstored(NodeState<Address> s, int i, Branch child) {
+    if (child._subtreeCount < 0) return true;
+    if (!child._countUnstored) return false;
+    final Object[] slots = (s.buf != null) ? s.buf.slots : null;
+    final Slot sl = (slots != null) ? (Slot) slots[i] : null;
+    return !(sl != null && sl.count >= 0 && sl.diff != null);
+  }
+
+  /**
+   * Walk every branch below this one; `out[0]` += branches seen, `out[1]` += branches whose
+   * stored form has no count. Reads every branch, no leaf.
+   */
+  void countCensus(IStorage storage, boolean selfUnstored, long[] out) {
+    out[0]++;
+    if (selfUnstored) out[1]++;
+    if (_level <= 1) return;
+    for (int i = 0; i < _len; i++) {
+      final NodeState<Address> s = _state;
+      final Branch child = (Branch) child(storage, i);
+      child.countCensus(storage, childCountUnstored(s, i, child), out);
+    }
+  }
+
+  /**
+   * This subtree with every branch counted and every branch that was not counted ON DISK made
+   * dirty, so the next `store` writes it. Returns `this` when nothing below needs it.
+   * `selfUnstored`: this node's own stored form lacks its count (decided by the parent, which
+   * knows about slots).
+   *
+   * A rewritten child is handled as a structural replacement: its address and its slot are
+   * dropped, its old blob is freed, and this node becomes one that must be written — the same
+   * shape a split leaves behind. Nothing about the content changes: same keys, same children,
+   * same measures.
+   */
+  Branch<Key, Address> recount(IStorage storage, boolean selfUnstored, Settings settings) {
+    final NodeState<Address> s0 = _state;                        // one snapshot
+    ANode[] changed = null;
+    if (_level > 1) {
+      for (int i = 0; i < _len; i++) {
+        final Branch child = (Branch) child(storage, i);
+        final Branch nc = child.recount(storage, childCountUnstored(s0, i, child), settings);
+        if (nc != child) {
+          if (changed == null) changed = new ANode[_len];
+          changed[i] = nc;
+        }
+      }
+    }
+    if (changed == null && !selfUnstored) return this;
+
+    final Key[] newKeys = Arrays.copyOfRange(_keys, 0, _len);
+    final Address[] newAddresses = (s0.addresses != null) ? Arrays.copyOfRange(s0.addresses, 0, _len) : null;
+    final Object[] newChildren = (s0.children == null) ? new Object[_keys.length] : Arrays.copyOfRange(s0.children, 0, _len);
+    final Object[] oldSlots = (s0.buf != null) ? s0.buf.slots : null;
+    final Object[] newSlots = (oldSlots != null) ? Arrays.copyOf(oldSlots, _keys.length) : null;
+    if (changed != null) {
+      for (int i = 0; i < _len; i++) {
+        if (changed[i] == null) continue;
+        freeDroppedChild(storage, s0, i);
+        if (newAddresses != null) newAddresses[i] = null;
+        newChildren[i] = changed[i];                              // dirty ⇒ bare
+        if (newSlots != null) newSlots[i] = null;
+      }
+    }
+    final Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, -1, _measure, _projCmp, settings);
+    if (newSlots != null || settings.diffBufSize() > 0) nb.installSlots(newSlots, BUF_WRITE);
+    // The children are counted now (below a leaf-parent they are leaves, which always are),
+    // so this is a sum; it reads the leaves of a leaf-parent that was unknown.
+    nb._subtreeCount = (_subtreeCount >= 0) ? _subtreeCount : nb.countChildrenReading(storage);
+    return nb;
   }
 
   @Override
@@ -1180,7 +1359,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // probe only has for children in memory. Restoring the rest to count them is the
     // whole-subtree walk getSubtreeCount documents, so a half whose children are on disk stays
     // unknown. But the two halves sum to a total this node does know, so one resident half
-    // gives the other for free. Both unknown is the remaining case; the PARENT is unaffected
+    // gives the other for free. Both unknown is the remaining case, settled by divideCount
+    // below once the slots are installed; the PARENT is unaffected
     // either way, because it takes its own count from ownCountAfter, not from these.
     if (ownCountAfter >= 0) {
       if (count1 < 0 && count2 >= 0) count1 = ownCountAfter - count2;
@@ -1220,6 +1400,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       sb1.installSlots(all != null ? Arrays.copyOfRange(all, 0, half1) : null, BUF_WRITE);
       sb2.installSlots(all != null ? Arrays.copyOfRange(all, half1, newLen) : null, BUF_WRITE);
     }
+    // Both halves unknown: neither's children were all in memory. After the slots are in
+    // place, because under diff-buf a slot is where a non-resident child's count lives.
+    divideCount(sb1, sb2, ownCountAfter, storage);
     return new ANode[]{ sb1, sb2 };
   }
 
@@ -1750,7 +1933,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // A borrow REDISTRIBUTES two nodes' elements, minus the one deleted. How they divide
       // needs the moved children's counts, which the probe has only for residents — but the
       // pair's TOTAL is known whenever both sources knew theirs, so one known half gives the
-      // other. Both unknown is what remains on a fully cold pair; the parent keeps its own
+      // other. Both unknown is what remains on a fully cold pair (divideCount, below); the parent keeps its own
       // count by delta regardless. (Not with a leaf processor: one key is not one element.)
       if (unitDelta(_settings, settings) && left._subtreeCount >= 0 && _subtreeCount >= 0) {
         long pair = left._subtreeCount + _subtreeCount - 1;
@@ -1782,6 +1965,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         slotCopyAll(ss, mySlots, idx + 2, _len);
         newCenter.installSlots(nc, BUF_WRITE);
       }
+      // A fully cold pair: read one node's children, the other is the remainder. See divideCount.
+      if (unitDelta(_settings, settings) && left._subtreeCount >= 0 && _subtreeCount >= 0)
+        divideCount(newLeft, newCenter, left._subtreeCount + _subtreeCount - 1, storage);
       return new ANode[] { newLeft, newCenter, right };
     }
 
@@ -1868,6 +2054,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         }
         newRight.installSlots(nr, BUF_WRITE);
       }
+      // A fully cold pair, as in the borrow from left.
+      if (unitDelta(_settings, settings) && right._subtreeCount >= 0 && _subtreeCount >= 0)
+        divideCount(newCenter, newRight, _subtreeCount - 1 + right._subtreeCount, storage);
       return new ANode[] { left, newCenter, newRight };
     }
 
@@ -2868,6 +3057,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (dirty || s0.addresses == null) {
         _state = new NodeState<>(newAddresses, newChildren, s0.buf); // ONE publish
       }
+      _countUnstored = false;   // written with the count it has
       return storage.store(this);
     }
 
@@ -3058,6 +3248,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // settled state, exactly as the old in-place mutation did. children are WRAPPED per
     // `:ref-type`, same as the baseline settle — see the staging comment above.
     _state = new NodeState<>(newAddresses, newChildren, new BufState(newSlots, embedded));
+    _countUnstored = false;   // written with the count it has
     return storage.store(this);
   }
 
