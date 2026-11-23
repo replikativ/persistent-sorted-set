@@ -476,7 +476,7 @@
           last-k (loop [s (set/restore-by compare addr (storage disk) opts), k (dec n)]
                    (let [s' (set/disj s k compare)]
                      (if (< (or (level s') 0) level0) k (recur s' (dec k)))))
-          shared (caching-storage disk)
+          ^IStorage shared (caching-storage disk)
           before (run (set/restore-by compare addr shared opts) last-k)
           ^Branch promoted (.child (root-branch before) shared (int 0))
           _      (is (neg? (.subtreeCount promoted)) "precondition: its blob has no count")
