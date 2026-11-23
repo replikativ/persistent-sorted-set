@@ -7,7 +7,8 @@
 
    Smaller than the JVM run (one branching factor, one height per test) since the code under
    test is a different implementation of the same algorithm, not a different algorithm."
-  (:require [cljs.test :refer-macros [deftest testing is]]
+  (:require [cljs.test :as test :refer-macros [deftest testing is]]
+            [is.simm.partial-cps.async :refer [await] :refer-macros [async]]
             [clojure.edn :as edn]
             [clojure.string :as str]
             [org.replikativ.persistent-sorted-set :as s]
@@ -19,23 +20,46 @@
 
 ;; ---- the oracle: a cold restore, every branch's count against the elements below it ----
 
-(defn- shape [disk addr opts]
+(defn- shape
+  "{:levels {level [node lengths, left to right]} :unknown :wrong :n, and what makes the
+   tree sound beyond its counts: :content (the elements in tree order), :misplaced (branch
+   keys that are not their child's largest key), :underfull / :overfull (nodes other than
+   the root outside [bf/2, bf])."
+  [disk addr opts]
   (let [st   (u/storage (atom {}) disk opts)
         set  (s/restore addr st opts)
         _    (s/count-census set)                       ; loads the root
-        acc  (volatile! {:levels (sorted-map) :unknown 0 :wrong 0})
+        bf   (:branching-factor opts)
+        mn   (quot bf 2)
+        root (.-root set)
+        acc  (volatile! {:levels (sorted-map) :unknown 0 :wrong 0 :misplaced 0 :underfull 0 :overfull 0})
+        out  (volatile! (transient []))
+        ;; returns [elements below, largest key below]
         walk (fn walk [n]
-               (let [len (alength (.-keys n))]
+               (let [ks (.-keys n) len (alength ks)]
+                 (when-not (identical? n root)
+                   (cond (< len mn) (vswap! acc update :underfull inc)
+                         (> len bf) (vswap! acc update :overfull inc)))
                  (if (instance? Branch n)
-                   (let [c (reduce + 0 (map #(walk (branch/child n st % {:sync? true})) (range len)))]
+                   (let [kids (mapv #(walk (branch/child n st % {:sync? true})) (range len))
+                         c    (reduce + 0 (map first kids))]
                      (vswap! acc update-in [:levels (.-level n)] (fnil conj []) len)
+                     (dotimes [i len]
+                       (when-not (= (aget ks i) (second (kids i))) (vswap! acc update :misplaced inc)))
                      (cond (neg? (.-subtree-count n))   (vswap! acc update :unknown inc)
                            (not= c (.-subtree-count n)) (vswap! acc update :wrong inc))
-                     c)
+                     [c (second (peek kids))])
                    (do (vswap! acc update-in [:levels 0] (fnil conj []) len)
-                       len))))
-        total (walk (.-root set))]
-    (assoc @acc :n total)))
+                       (dotimes [i len] (vswap! out conj! (aget ks i)))
+                       [len (when (pos? len) (aget ks (dec len)))]))))
+        total (first (walk root))]
+    (assoc @acc :n total :content (persistent! @out))))
+
+(defn- after-op [content [op k]]
+  (case op
+    :add (vec (into (apply sorted-set content) [k]))
+    :del (vec (remove #(= % k) content))
+    :rep content))
 
 (defn- path-ordinals [disk addr k]
   (let [seen (volatile! {}) out (volatile! {})]
@@ -82,6 +106,23 @@
         after (shape disk addr' opts)]
     {:addr addr' :reads used :shape after
      :events (events before after (path-ordinals disk addr k))}))
+
+(defn- step-async
+  "`step` through the asynchronous arm: async storage, every write and the store awaited."
+  [disk addr opts before [op k]]
+  (async
+   (let [a     {:sync? false}
+         cold  (s/restore addr (u/async-storage (atom {}) disk opts) opts)
+         r0    (:reads @u/*stats)
+         s'    (case op
+                 :add (await (s/conj cold k compare a))
+                 :del (await (s/disj cold k compare a))
+                 :rep (await (s/replace cold k k compare a)))
+         used  (- (:reads @u/*stats) r0)
+         addr' (await (s/store s' (u/async-storage (atom {}) disk opts) a))
+         after (shape disk addr' opts)]
+     {:addr addr' :reads used :shape after
+      :events (events before after (path-ordinals disk addr k))})))
 
 ;; ---- trees written down by shape ----
 
@@ -184,6 +225,47 @@
                 (swap! disk select-keys keep1)))))))
     @tot))
 
+(defn- every-step-async
+  "`every-step` with each write going through `step-async`."
+  [opts H {:keys [check second-step?]}]
+  (async
+   (let [bf  (:branching-factor opts)
+         mn  (quot bf 2)
+         tot (volatile! {:trees 0 :steps 0 :events #{}})
+         rec (fn [r op] (vswap! tot #(-> % (update :steps inc) (update :events into (map (fn [e] [op e]) (:events r))))))]
+     (loop [cases (shape-cases bf H)]
+       (when (seq cases)
+         (let [specs (first cases)
+               disk  (atom {})
+               g     (gen-spine disk specs mn)]
+           (when g
+             (let [before (shape disk (:addr g) opts)
+                   ops    (vec (spine-ops (:leaf-keys g)))
+                   base   (set (keys @disk))]
+               (vswap! tot update :trees inc)
+               (loop [i 0]
+                 (when (< i (count ops))
+                   (let [op1 (ops i)
+                         r1  (await (step-async disk (:addr g) opts before op1))
+                         [present1 delta1] (effect (set (:leaf-keys g)) op1)]
+                     (if-not second-step?
+                       (do (rec r1 (first op1))
+                           (check {:specs specs :disk disk :before before :ops [op1] :r r1 :delta delta1}))
+                       (let [keep2 (set (keys @disk))]
+                         (loop [j 0]
+                           (when (< j (count ops))
+                             (let [op2 (ops j)
+                                   r2  (await (step-async disk (:addr r1) opts (:shape r1) op2))]
+                               (rec r2 (first op2))
+                               (check {:specs specs :disk disk :before (:shape r1) :ops [op1 op2] :r r2
+                                       :delta (second (effect present1 op2))})
+                               (swap! disk select-keys keep2)
+                               (recur (inc j)))))))
+                     (swap! disk select-keys base)
+                     (recur (inc i)))))))
+           (recur (rest cases)))))
+     @tot)))
+
 (defn- expected-events [H]
   (set (concat [[:add [:in-place]] [:del [:in-place]] [:rep [:in-place]]
                 [:add [:grow]] [:del [:collapse]]]
@@ -199,10 +281,15 @@
       (let [sh (:shape r)]
         (when-not (and (zero? (:unknown sh)) (zero? (:wrong sh))
                        (= (:n sh) (+ (:n before) delta))
+                       (= (:content sh) (after-op (:content before) (peek ops)))
+                       (zero? (:misplaced sh)) (zero? (:underfull sh)) (zero? (:overfull sh))
                        (<= (:reads r) bound))
           (is false (str "case " (pr-str specs) " ops " (pr-str ops) " events " (pr-str (:events r))
                          ": unknown " (:unknown sh) ", wrong " (:wrong sh) ", elements " (:n sh)
-                         " from " (:n before) ", reads " (:reads r) " (bound " bound ")")))))))
+                         " from " (:n before) ", content as expected "
+                         (= (:content sh) (after-op (:content before) (peek ops)))
+                         ", misplaced keys " (:misplaced sh) ", underfull " (:underfull sh)
+                         ", overfull " (:overfull sh) ", reads " (:reads r) " (bound " bound ")")))))))
 
 (deftest every-single-cold-write-keeps-every-count
   (let [H 3
@@ -270,3 +357,35 @@
                              ": unknown " (:unknown sh) ", wrong " (:wrong sh))))
             (swap! disk select-keys keep)))))
     (is (= #{} (reduce disj #{[:add :split] [:del :join] [:add :in-place] [:del :in-place]} @seen)))))
+
+;; ---- the asynchronous arm ----
+;;
+;; Every function that reads storage exists twice, once per `:sync?`, and the two are
+;; separate code after macro expansion. Measured before these tests existed, the whole
+;; suite called `conj` asynchronously once, `disj` twice and `replace` never.
+
+(deftest every-single-cold-write-keeps-every-count-async
+  (test/async done
+              (let [H 3 opts {:branching-factor 4 :diff-buf-size 0}]
+                ((every-step-async opts H {:check (counted-check 4 (inc H))})
+                 (fn [r]
+                   (is (= #{} (reduce disj (expected-events H) (:events r)))
+                       "every kind of step was taken at every level")
+                   (is (pos? (:steps r)))
+                   (done))
+                 (fn [err] (is (nil? err)) (js/console.error err) (done))))))
+
+(deftest every-cold-write-over-buffered-edits-keeps-every-count-async
+  (test/async done
+              (let [H 2 opts {:branching-factor 4 :diff-buf-size 2}
+                    seen (volatile! 0)
+                    chk  (counted-check 4 (inc H))]
+                ((every-step-async opts H {:second-step? true
+                                           :check (fn [{:keys [disk] :as m}]
+                                                    (when (some #(seq (:slots (blob disk %))) (keys @disk)) (vswap! seen inc))
+                                                    (chk m))})
+                 (fn [r]
+                   (is (pos? @seen) "precondition: some second steps started from buffered edits")
+                   (is (= #{} (reduce disj (expected-events H) (:events r))))
+                   (done))
+                 (fn [err] (is (nil? err)) (js/console.error err) (done))))))
