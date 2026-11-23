@@ -664,12 +664,15 @@
 ;; cold writes there is nothing to sample: the steps can be listed.
 ;;
 ;; WHAT DECIDES A STEP is local. At each level a write does one of a few things — updates
-;; in place, splits, joins a neighbour, borrows from one — and which one depends on four
-;; facts only: what came up from the child (nothing, a split, a lost child), how full the
-;; node on the path is, and how full its left and right neighbours under the same parent
-;; are. `shape-cases` lists every combination of the three fills (every length a node can
-;; have, and `nil` for no neighbour) at every level, once under a cascade of splits from
-;; below and once under a cascade of joins, with every root size.
+;; in place, splits, joins its left or its right neighbour, borrows from one — and which
+;; one depends on four facts only: what came up from the child (nothing, a split, a child
+;; lost to a join on either side), how full the node on the path is, and how full its left
+;; and right neighbours under the same parent are. `shape-cases` lists every combination of
+;; the three fills (every length a node can have, and `nil` for no neighbour) at every
+;; level, under each of four cascades from below (splits along the first children, splits
+;; along the last, joins to the left, joins to the right), with the path node first or last
+;; among its parent's other children, and with every root size. Neighbouring subtrees are
+;; filled unevenly, so that a count divided by proportion instead of by reading is wrong.
 ;;
 ;; WHY THE TREES ARE BUILT BY SHAPE and not by a history of inserts: measured, every single
 ;; write (5356 of them) from trees built ascending, descending, at random and by deleting a
@@ -677,15 +680,16 @@
 ;; never borrowed from the right. The stored blobs are plain maps, so a tree of any valid
 ;; shape can be written down directly.
 ;;
-;; The oracle is a cold restore: every branch's count against the elements below it. A
+;; The oracle is a cold restore: every branch's count against the elements below it, and
+;; with it what the tree holds, in which order, under which keys, in nodes of which size. A
 ;; classifier reads off what each step did (from the node lengths per level before and
 ;; after, and the path), and each test ends by asserting that every kind of step was seen
-;; at every level — so a change that makes a case unreachable fails here instead of quietly
+;; at every level, and every kind followed at the level above by every kind that can
+;; follow it — so a change that makes a case unreachable fails here instead of quietly
 ;; covering less.
 ;;
-;; Against the code before the fix (origin/main at 136f837), the first test fails on 40
-;; steps at branching factor 4 and on 2612 at 8: every one a branch split or a branch
-;; borrow.
+;; Against the code before the fix (origin/main at 136f837) these fail on every branch
+;; split and every branch borrow.
 ;;
 ;; What is NOT listed here is what depends on memory rather than on the stored tree — a
 ;; count a reader worked out, a transient stored half way, a node two sets share. Those are
@@ -699,20 +703,23 @@
    :unknown branches without a count, :wrong branches whose count is not the number of
    elements below them, :n elements, :content the elements in tree order, :misplaced
    branch keys that are not the largest key of their child, :underfull / :overfull nodes
-   other than the root outside [bf/2, bf]}."
+   outside [bf/2, bf] (the root: a branch of fewer than two children, or more than bf),
+   :mislevelled children that are not one level below their parent}."
   [disk addr opts]
   (let [^IStorage st (storage disk (atom 0))
         s    (set/restore-by compare addr st opts)
         bf   (long (:branching-factor opts))
         mn   (quot bf 2)
         root (.root ^PersistentSortedSet s)
-        acc  (volatile! {:levels (sorted-map) :unknown 0 :wrong 0 :misplaced 0 :underfull 0 :overfull 0})
+        acc  (volatile! {:levels (sorted-map) :unknown 0 :wrong 0 :misplaced 0 :underfull 0
+                         :overfull 0 :mislevelled 0})
         out  (volatile! (transient []))
         fill (fn [^ANode n]
-               (when-not (identical? n root)
-                 (cond (< (.len n) mn) (vswap! acc update :underfull inc)
-                       (> (.len n) bf) (vswap! acc update :overfull inc))))
-        ;; returns [elements below, largest key below]
+               (cond (> (.len n) bf) (vswap! acc update :overfull inc)
+                     (identical? n root) (when (and (instance? Branch n) (< (.len n) 2))
+                                           (vswap! acc update :underfull inc))
+                     (< (.len n) mn) (vswap! acc update :underfull inc)))
+        ;; returns [elements below, largest key below, level]
         walk (fn walk [^ANode n]
                (fill n)
                (if (instance? Branch n)
@@ -722,21 +729,17 @@
                        c    (reduce + 0 (map first kids))]
                    (vswap! acc update-in [:levels (.level br)] (fnil conj []) (.len n))
                    (dotimes [i (.len n)]
-                     (when-not (= (.get ks (int i)) (second (kids i))) (vswap! acc update :misplaced inc)))
+                     (when-not (= (.get ks (int i)) (second (kids i))) (vswap! acc update :misplaced inc))
+                     (when-not (= (nth (kids i) 2) (dec (.level br))) (vswap! acc update :mislevelled inc)))
                    (cond (neg? (.subtreeCount br))     (vswap! acc update :unknown inc)
                          (not= c (.subtreeCount br))   (vswap! acc update :wrong inc))
-                   [c (second (peek kids))])
+                   [c (second (peek kids)) (.level br)])
                  (let [^List ks (.keys n)]
                    (vswap! acc update-in [:levels 0] (fnil conj []) (.len n))
                    (dotimes [i (.len n)] (vswap! out conj! (.get ks (int i))))
-                   [(.len n) (when (pos? (.len n)) (.get ks (int (dec (.len n)))))])))
+                   [(.len n) (when (pos? (.len n)) (.get ks (int (dec (.len n))))) 0])))
         total (first (walk root))]
     (assoc @acc :n total :content (persistent! @out))))
-
-(defn- sound?
-  "The tree holds exactly `expected`, in order, under keys that lead to it."
-  [sh expected]
-  (and (= (:content sh) expected) (zero? (:misplaced sh))))
 
 (defn- after-op
   "The content a tree with `content` holds after `op`."
@@ -747,26 +750,31 @@
     :rep content))
 
 (defn- path-ordinals
-  "Per level, the left-to-right position (within its level) of the node on the path to `k`."
-  [disk addr k]
-  (let [seen (volatile! {}) out (volatile! {})]
-    ((fn walk [a on-path?]
-       (let [bl  (@disk a)
-             L   (or (:level bl) 0)
-             ord (get @seen L 0)]
-         (vswap! seen assoc L (inc ord))
-         (when on-path? (vswap! out assoc L ord))
-         (when-let [as (:addresses bl)]
-           (let [ks (:keys bl)
-                 i  (or (first (keep-indexed (fn [i mk] (when (<= (compare k mk) 0) i)) ks))
-                        (dec (count ks)))]
-             (dotimes [j (count as)] (walk (nth as j) (and on-path? (= i j))))))))
-     addr true)
-    @out))
+  "Per level, the left-to-right position (within its level) of the node on the path to `k`,
+   in the tree a restore finds — under a diff buffer that is not the tree the blobs spell
+   out. `before` is that tree's `shape`."
+  [disk addr opts before k]
+  (let [^IStorage st (storage disk (atom 0))
+        s (set/restore-by compare addr st opts)]
+    (loop [^ANode n (.root ^PersistentSortedSet s), ord 0, out {}]
+      (if (instance? Branch n)
+        (let [^Branch br n
+              L  (.level br)
+              ^List ks (.keys n)
+              i  (or (first (filter #(<= (compare k (.get ks (int %))) 0) (range (.len n))))
+                     (dec (.len n)))]
+          (recur (.child br st (int i))
+                 ;; the nodes left of the child: the children of the nodes left of this one
+                 (+ (long (reduce + 0 (take ord ((:levels before) L)))) (long i))
+                 (assoc out L ord)))
+        (assoc out 0 ord)))))
 
 (defn- events
   "What one step did, read off the two shapes and the path:
-   #{[:grow] [:collapse] [:split L] [:join L] [:borrow-left L] [:borrow-right L] [:in-place]}."
+   #{[:grow] [:collapse] [:split L] [:join-left L] [:join-right L] [:borrow-left L]
+     [:borrow-right L]}, or #{[:in-place]}. A join is to the left when the left neighbour
+   is not what it was; a borrow is from the neighbour that shrank while the path node did
+   not."
   [before after path]
   (let [la (:levels before) lb (:levels after)
         ha (count la) hb (count lb)
@@ -774,21 +782,35 @@
     (cond (> hb ha) (vswap! ev conj [:grow])
           (< hb ha) (vswap! ev conj [:collapse]))
     (doseq [L (range 0 (min ha hb))
-            :let [x (la L) y (lb L) p (path L)]]
+            :let [x (la L) y (lb L) p (long (path L))]]
       (cond (> (count y) (count x)) (vswap! ev conj [:split L])
-            (< (count y) (count x)) (vswap! ev conj [:join L])
+            (< (count y) (count x)) (vswap! ev conj (if (and (pos? p) (not= (get y (dec p)) (x (dec p))))
+                                                      [:join-left L]
+                                                      [:join-right L]))
             :else
-            (do (when (and p (pos? p) (< (y (dec p)) (x (dec p))))
+            (do (when (and (pos? p) (< (y (dec p)) (x (dec p))) (>= (y p) (x p)))
                   (vswap! ev conj [:borrow-left L]))
-                (when (and p (< (inc p) (count x)) (< (y (inc p)) (x (inc p))))
+                (when (and (< (inc p) (count x)) (< (y (inc p)) (x (inc p))) (>= (y p) (x p)))
                   (vswap! ev conj [:borrow-right L])))))
     (if (empty? @ev) #{[:in-place]} @ev)))
+
+(defn- transitions
+  "For every level that changed its parent's length, what the parent did about it:
+   #{[kind L above]}, `above` being the parent's own event, :absorbed when it only updated
+   in place, :grow for a split of the root, :collapse for a root left with one child."
+  [before evs]
+  (let [top  (dec (count (:levels before)))
+        kind (into {} (for [[k L] evs :when L] [L k]))]
+    (set (for [[L k] kind :when (#{:split :join-left :join-right} k)]
+           [k L (cond (and (= k :split) (= L top))                                     :grow
+                      (and (not= k :split) (= L (dec top)) (contains? evs [:collapse])) :collapse
+                      :else (get kind (inc (long L)) :absorbed))]))))
 
 ;; ---- one cold write ----
 
 (defn- step
-  "Restore `addr` cold, do one write, store. {:addr :events :reads :shape}; `:reads` are the
-   restores of the write itself, not of the store."
+  "Restore `addr` cold, do one write, store. `:reads` are the restores of the write itself,
+   `:store-reads` those of the store."
   [disk addr opts before [op k]]
   (let [reads (atom 0)
         cold  (set/restore-by compare addr (storage disk reads) opts)
@@ -798,11 +820,12 @@
                 :del (if tr? (persistent! (disj! (transient cold) k)) (set/disj cold k compare))
                 ;; an equal but distinct key object, so that the replace is a write
                 :rep (set/replace cold k (Integer/valueOf (int k)) compare))
-        used  @reads
+        used  (long @reads)
         addr' (set/store s (storage disk reads))
-        after (shape disk addr' opts)]
-    {:addr addr' :reads used :shape after
-     :events (events before after (path-ordinals disk addr k))}))
+        after (shape disk addr' opts)
+        evs   (events before after (path-ordinals disk addr opts before k))]
+    {:addr addr' :reads used :store-reads (- (long @reads) used) :shape after
+     :events evs :transitions (transitions before evs) :new-root? (not= addr addr')}))
 
 ;; ---- trees written down by shape ----
 
@@ -821,71 +844,107 @@
      :max   (:max (peek kids))}))
 
 (defn- gen-sub
-  "A subtree at `level` whose root has `len` children and everything below `fill`."
+  "A subtree at `level` whose root has `len` children. Below it the nodes alternate between
+   `fill` and `fill` + 1 children, so that neighbouring subtrees hold different numbers of
+   elements."
   [disk ctr level len fill base]
   (if (zero? level)
     (gen-leaf disk ctr len base)
-    (gen-branch disk level (vec (repeatedly len #(gen-sub disk ctr (dec level) fill fill base))) base)))
+    (let [bf (long (:branching-factor base))]
+      (gen-branch disk level
+                  (mapv #(gen-sub disk ctr (dec level) (min bf (+ (long fill) (mod (long %) 2))) fill base)
+                        (range len))
+                  base))))
 
 (defn- gen-spine
-  "`specs` is indexed by level: {:own n :left n|nil :right n|nil} is the node on the path
-   and its two neighbours; the last entry is the root, {:own n}. The other nodes are at
-   minimum fill. Keys are the even numbers, so every odd number is a gap. nil when a level
-   is too small to hold the children the level below asks for."
+  "`specs` is indexed by level: {:own n :left n|nil :right n|nil :pad :left|:right} is the
+   node on the path and its two neighbours; the last entry is the root, {:own n}. A node's
+   other children are padding at minimum fill, laid out on its `:pad` side — so with
+   padding on the right and no left neighbour the path node is its parent's first child,
+   and the padding next to it is a neighbour all the same. Keys are the even numbers, so
+   every odd number is a gap. nil when a level is too small to hold the children the level
+   below asks for."
   [disk specs fill base]
   (let [ctr (volatile! 0) leaf-keys (volatile! nil)
         H    (dec (count specs))
         node (fn node [L]
-               (let [{:keys [own]} (specs L)]
+               (let [{:keys [own pad]} (specs L)]
                  (if (zero? L)
                    (let [l (gen-leaf disk ctr own base)] (vreset! leaf-keys (:keys l)) l)
                    (let [{:keys [left right]} (specs (dec L))
-                         need (+ 1 (if left 1 0) (if right 1 0))]
+                         need (+ 1 (if left 1 0) (if right 1 0))
+                         sub  #(gen-sub disk ctr (dec L) % fill base)
+                         pads #(vec (repeatedly (- own need) (fn [] (sub fill))))]
                      (when (>= own need)
-                       (let [l (when left (gen-sub disk ctr (dec L) left fill base))
-                             c (node (dec L))]
+                       ;; in key order: the keys come from one counter
+                       (let [pl (when (= pad :left) (pads))
+                             l  (when left (sub left))
+                             c  (node (dec L))
+                             r  (when (and c right) (sub right))
+                             pr (when (and c (not= pad :left)) (pads))]
                          (when c
-                           (let [r   (when right (gen-sub disk ctr (dec L) right fill base))
-                                 pad (vec (repeatedly (- own need) #(gen-sub disk ctr (dec L) fill fill base)))]
-                             (gen-branch disk L (vec (concat (when l [l]) [c] (when r [r]) pad)) base)))))))))
+                           (gen-branch disk L (vec (concat pl (when l [l]) [c] (when r [r]) pr)) base))))))))
         root (node H)]
     (when root {:addr (:addr root) :leaf-keys @leaf-keys :n (:count root)})))
 
 (defn- shape-cases
-  "Every (level, fill of the path node, fill of each neighbour or none) under each cascade
-   from below, with every root size where the level under test is the root's child."
+  "Every (level L, fill of the path node, fill of each neighbour or none) under each cascade
+   from below, with the padding of L's parent on either side, and with every root size
+   where L is the root's child."
   [bf H]
   (let [mn (quot bf 2) lens (range mn (inc bf)) sibs (cons nil lens)]
     (for [L (range 0 H), own lens, left sibs, right sibs
-          incoming [:split :underflow]
+          cascade  (if (zero? L) [:none] [:split-first :split-last :join-left :join-right])
+          pad      [:right :left]
           root-own (if (= L (dec H)) (range 2 (inc bf)) [(inc mn)])]
       (vec (for [i (range (inc H))]
-             (cond (= i H) {:own root-own}
-                   (= i L) {:own own :left left :right right}
-                   ;; below: full nodes, so an insert splits all the way up to L …
-                   (< i L) (if (= incoming :split)
-                             {:own bf :left nil :right mn}
-                             ;; … or minimal nodes with a minimal neighbour, so a delete joins
-                             {:own mn :left mn :right nil})
-                   :else   {:own (inc mn) :left (inc mn) :right (inc mn)}))))))
+             (assoc (cond (= i H) {:own root-own}
+                          (= i L) {:own own :left left :right right}
+                          (< i L) (case cascade
+                                    ;; full nodes, so an insert splits all the way up to L:
+                                    ;; along the first children, or along the last
+                                    :split-first {:own bf :left nil :right mn}
+                                    :split-last  {:own bf :left mn :right nil}
+                                    ;; minimal nodes with one minimal neighbour, so a delete
+                                    ;; joins all the way up to L, to that side
+                                    :join-left   {:own mn :left mn :right nil}
+                                    :join-right  {:own mn :left nil :right mn})
+                          :else   {:own (inc mn) :left (inc mn) :right (inc mn)})
+                    ;; `:pad` lays out a node's children: the cascade's levels, then L itself
+                    :pad (cond (<= i L)      (if (= cascade :split-last) :left :right)
+                               (= i (inc L)) pad
+                               :else         :right)))))))
 
 (defn- spine-ops
-  "The writes tried at the path leaf: an insert before, inside and after it; a delete of its
-   first, middle and last key; a replace of its first and last."
+  "The writes tried at the path leaf: an insert before its first key, inside it, and after
+   its last key (which lands in the next leaf where there is one); a delete of its first,
+   middle and last key; a replace of its first and last."
   [ks]
   (let [f (first ks) l (peek ks) m (nth ks (quot (count ks) 2))]
     (distinct [[:add (dec f)] [:add (inc f)] [:add (inc l)]
                [:del f] [:del m] [:del l]
                [:rep f] [:rep l]])))
 
-(defn- base [opts]
-  (cond-> {:branching-factor (:branching-factor opts) :diff-buf-size (:diff-buf-size opts)}))
+(defn- buffering-ops
+  "The first writes of a two-write case: one insert, one delete, one replace — each a kind
+   of edit a diff buffer can be left holding."
+  [ks]
+  [[:add (inc (first ks))] [:del (nth ks (quot (count ks) 2))] [:rep (first ks)]])
+
+(defn- base [opts] {:branching-factor (:branching-factor opts) :diff-buf-size (:diff-buf-size opts)})
 
 (defn- read-bound
-  "The path, the two neighbours of each path node on a delete, and the children of ONE of
-   the two nodes a split or a borrow leaves (at most half of bf + 1 of them)."
-  [bf levels]
-  (+ levels (* 2 (dec levels)) (quot (inc bf) 2) 1))
+  "What one write may read in a tree of `levels` levels, given what it did: its path; on a
+   delete the two neighbours of every path node below the root; and for every branch that
+   divided — a split, a borrow — the children of ONE of the two results, which hold at most
+   three quarters of bf + 1 between a full neighbour and an underfull node. A replace is
+   given one more: the suite runs with -ea, and the assertion that the replaced key has no
+   equal neighbour across the leaf boundary reads the next leaf."
+  [bf levels op evs]
+  (let [divides (count (filter (fn [[k L]] (and L (pos? (long L)) (#{:split :borrow-left :borrow-right} k))) evs))]
+    (+ (long levels)
+       (case op :del (* 2 (dec (long levels))) :rep 1 0)
+       (* divides (inc (quot (* 3 (long bf)) 4))))))
 
 (defn- erase!
   "Take the count from the branches `which` selects: :all, :spine (on the path to `k`) or
@@ -904,6 +963,12 @@
 
 (defn- leaf-addrs [disk] (set (filter #(nil? (:addresses (@disk %))) (keys @disk))))
 
+(defn- buffered?
+  "Does the tree stored at `addr` hold buffered edits?"
+  [disk addr]
+  (let [bl (@disk addr)]
+    (boolean (or (seq (:slots bl)) (some #(buffered? disk %) (:addresses bl))))))
+
 (defn- effect
   "[present' delta]: what `op` does to the set of keys present around the path leaf."
   [present [op k]]
@@ -916,15 +981,17 @@
   (swap! tot (fn [t] (-> t
                          (update :steps inc)
                          (update :max-reads max (:reads r))
-                         (update :events into (map #(vector op %) (:events r)))))))
+                         (update :events into (map #(vector op %) (:events r)))
+                         (update :transitions into (:transitions r))))))
 
 (defn- every-step
   "Run every case of `shape-cases`; `check` is called per step with the case, the step's
-   input and result. Returns {:trees :steps :max-reads :events}."
+   input and result. With `second-step?` the first write is one of `buffering-ops`, and
+   where it leaves buffered edits it is followed by every write, from the tree it stored. Returns {:trees :steps :max-reads :events :transitions}."
   [opts H {:keys [check prepare second-step?]}]
   (let [bf  (:branching-factor opts)
         mn  (quot bf 2)
-        tot (atom {:trees 0 :steps 0 :max-reads 0 :events #{}})]
+        tot (atom {:trees 0 :steps 0 :max-reads 0 :events #{} :transitions #{}})]
     (doseq [specs (shape-cases bf H)]
       (let [disk (atom {})
             g    (gen-spine disk specs mn (base opts))]
@@ -933,22 +1000,22 @@
           (let [before (shape disk (:addr g) opts)
                 ops    (spine-ops (:leaf-keys g))]
             (swap! tot update :trees inc)
-            (doseq [op1 ops]
+            (doseq [op1 (if second-step? (buffering-ops (:leaf-keys g)) ops)]
               (let [keep1 (set (keys @disk))
                     r1    (step disk (:addr g) opts before op1)
                     [present1 delta1] (effect (set (:leaf-keys g)) op1)]
-                (if-not second-step?
-                  (do (record! tot r1 (first op1))
-                      (check {:specs specs :disk disk :g g :before before :ops [op1] :r r1 :delta delta1}))
-                  ;; the second write starts from what the first one stored — under diff-buf
-                  ;; a tree that holds buffered edits
-                  (doseq [op2 ops]
-                    (let [keep2 (set (keys @disk))
-                          r2    (step disk (:addr r1) opts (:shape r1) op2)]
-                      (record! tot r2 (first op2))
-                      (check {:specs specs :disk disk :g g :before (:shape r1) :ops [op1 op2] :r r2
-                              :delta (second (effect present1 op2))})
-                      (swap! disk select-keys keep2))))
+                (record! tot r1 (first op1))
+                (check {:specs specs :disk disk :g g :before before :ops [op1] :r r1 :delta delta1})
+                ;; a second write, where the first one left buffered edits to write over
+                (when (and second-step? (buffered? disk (:addr r1)))
+                  (let [buffered true]
+                    (doseq [op2 ops]
+                      (let [keep2 (set (keys @disk))
+                            r2    (step disk (:addr r1) opts (:shape r1) op2)]
+                        (record! tot r2 (first op2))
+                        (check {:specs specs :disk disk :g g :before (:shape r1) :ops [op1 op2] :r r2
+                                :delta (second (effect present1 op2)) :input-buffered? buffered})
+                        (swap! disk select-keys keep2)))))
                 (swap! disk select-keys keep1)))))))
     @tot))
 
@@ -959,106 +1026,167 @@
                 [:add [:grow]] [:del [:collapse]]]
                (for [L (range 0 (inc H))] [:add [:split L]])
                (for [L (range 0 H)
-                     e [:join :borrow-left :borrow-right]]
+                     e [:join-left :join-right :borrow-left :borrow-right]]
                  [:del [e L]]))))
+
+(defn- expected-transitions
+  "Every kind of length change at every level, followed at the level above by everything
+   that can follow it: a split is absorbed or splits the parent (the root: grows the
+   tree); a lost child is absorbed, or leaves the parent underfull to join either side or
+   borrow from either side (the root: to collapse)."
+  [H]
+  (set (concat (for [L (range 0 H) a [:split :absorbed]] [:split L a])
+               [[:split H :grow]]
+               (for [j [:join-left :join-right]
+                     L (range 0 (dec H))
+                     a [:join-left :join-right :borrow-left :borrow-right :absorbed]]
+                 [j L a])
+               (for [j [:join-left :join-right] a [:collapse :absorbed]] [j (dec H) a]))))
+
+(defn- missing [expected seen] (reduce disj expected seen))
 
 (defn- counted-check
   "A fully counted tree stays fully counted, with no wrong count; it holds exactly the
-   elements it should, in order, under branch keys that lead to them, in nodes that are
-   neither underfull nor overfull; and the write read no more than its bound."
-  [opts H]
-  (let [bound (read-bound (:branching-factor opts) (inc H))]
+   elements it should, in order, under branch keys that lead to them, in nodes of a valid
+   size one level below their parent; a write that changed something stored a new root;
+   and the write read no more than its bound, and the store nothing (without a diff
+   buffer; with one a store may flush)."
+  [opts]
+  (let [bf (:branching-factor opts)]
     (fn [{:keys [specs ops r before delta]}]
-      (let [sh (:shape r)]
+      (let [sh    (:shape r)
+            op    (peek ops)
+            bound (read-bound bf (count (:levels before)) (first op) (:events r))
+            want  (after-op (:content before) op)]
         (when-not (and (zero? (:unknown sh)) (zero? (:wrong sh))
                        (= (:n sh) (+ (:n before) delta))
-                       (sound? sh (after-op (:content before) (peek ops)))
-                       (zero? (:underfull sh)) (zero? (:overfull sh))
-                       (<= (:reads r) bound))
+                       (= (:content sh) want)
+                       (zero? (:misplaced sh)) (zero? (:underfull sh)) (zero? (:overfull sh))
+                       (zero? (:mislevelled sh))
+                       ;; a write that is not a no-op stores a new root
+                       (or (:new-root? r)
+                           (and (zero? delta)
+                                (not (and (= :rep (first op)) (some #{(second op)} (:content before))))))
+                       (<= (:reads r) bound)
+                       (or (pos? (:diff-buf-size opts)) (zero? (:store-reads r))))
           (is false (str "case " (pr-str specs) " ops " (pr-str ops) " events " (pr-str (:events r))
                          ": unknown " (:unknown sh) ", wrong " (:wrong sh) ", elements " (:n sh)
-                         " from " (:n before) ", content as expected "
-                         (= (:content sh) (after-op (:content before) (peek ops)))
+                         " from " (:n before) ", content as expected " (= (:content sh) want)
                          ", misplaced keys " (:misplaced sh) ", underfull " (:underfull sh)
-                         ", overfull " (:overfull sh) ", reads " (:reads r) " (bound " bound ")")))))))
+                         ", overfull " (:overfull sh) ", mislevelled " (:mislevelled sh)
+                         ", new root " (:new-root? r) ", reads " (:reads r) " (bound " bound
+                         "), store reads " (:store-reads r))))))))
 
 ;; ---- Part 1: single cold writes, enumerated ----
 
 (deftest every-single-cold-write-keeps-every-count
-  (doseq [[bf H] [[4 4] [8 3]]
-          transient? [false true]]
+  ;; bf 4 is the smallest there is; 5 splits unevenly; 6 has a borrow of more than one
+  (doseq [[bf H transient?] [[4 4 false] [4 4 true] [5 2 false] [6 3 false]]]
     (testing (str "bf " bf ", " (inc H) " levels, " (if transient? "transient" "persistent"))
       (let [opts {:comparator compare :branching-factor bf :diff-buf-size 0 :transient? transient?}
-            r    (every-step opts H {:check (counted-check opts H)})]
-        (is (= #{} (reduce disj (expected-events H) (:events r)))
+            r    (every-step opts H {:check (counted-check opts)})]
+        (is (= #{} (missing (expected-events H) (:events r)))
             "every kind of step was taken at every level")
+        (is (= #{} (missing (expected-transitions H) (:transitions r)))
+            "and was followed at the level above by everything that can follow it")
         (is (pos? (:steps r)))))))
+
+(deftest every-single-cold-write-on-a-root-that-is-a-leaf
+  (doseq [bf [4 5 8] transient? [false true] size (range 1 (inc bf))]
+    (let [opts   {:comparator compare :branching-factor bf :diff-buf-size 0 :transient? transient?}
+          disk   (atom {})
+          g      (gen-leaf disk (volatile! 0) size (base opts))
+          before (shape disk (:addr g) opts)
+          chk    (counted-check opts)]
+      (doseq [op (spine-ops (:keys g))]
+        (let [r (step disk (:addr g) opts before op)]
+          (chk {:specs [:leaf-root bf size] :ops [op] :r r :before before
+                :delta (second (effect (set (:keys g)) op))})
+          (when (and (= size bf) (= :add (first op)))
+            (is (= #{[:split 0] [:grow]} (:events r)) "a full leaf root splits and grows")))))))
 
 (deftest every-cold-write-over-buffered-edits-keeps-every-count
   (testing "two writes in a row: the second starts from the tree the first one stored, which
             under a diff buffer holds buffered edits"
     (doseq [dbs [1 2 64]]
       (testing (str "diff-buf " dbs)
-        (let [H    3
+        (let [H    2
               opts {:comparator compare :branching-factor 4 :diff-buf-size dbs}
               seen (atom 0)
-              chk  (counted-check opts H)
+              chk  (counted-check opts)
               r    (every-step opts H {:second-step? true
-                                       :check (fn [{:keys [disk] :as m}]
-                                                (when (some :slots (vals @disk)) (swap! seen inc))
+                                       :check (fn [m]
+                                                (when (:input-buffered? m) (swap! seen inc))
                                                 (chk m))})]
           (is (pos? @seen) "precondition: some second steps started from buffered edits")
-          (is (= #{} (reduce disj (expected-events H) (:events r)))))))))
+          (is (= #{} (missing (expected-events H) (:events r))))
+          (is (= #{} (missing (expected-transitions H) (:transitions r)))))))))
 
 (deftest every-single-cold-write-over-an-uncounted-tree
   (testing "a tree written by an earlier version — all of its counts missing, or those on the
-            path, or those off it: a write never stores a WRONG count, and one recount +
-            store leaves none missing and rewrites no leaf"
+            path to the path leaf, or those off it: a write never stores a WRONG count, and
+            one recount + store leaves none missing and rewrites no leaf"
     (doseq [dbs   [0 2]
             which [:all :spine :off-spine]]
       (testing (str "diff-buf " dbs ", " (name which) " uncounted")
         (let [opts {:comparator compare :branching-factor 4 :diff-buf-size dbs}
+              real (atom 0)
               r    (every-step
-                    opts 3
+                    opts 2
                     {:prepare (fn [disk g] (erase! disk (:addr g) which (first (:leaf-keys g))))
                      :check
-                     (fn [{:keys [specs ops disk r]}]
+                     (fn [{:keys [specs ops disk r before delta]}]
                        (let [leaves (leaf-addrs disk)
                              cold   (set/restore-by compare (:addr r) (storage disk (atom 0)) opts)
                              addr'  (set/store (set/recount cold) (storage disk (atom 0)))
-                             sh     (shape disk addr' opts)]
+                             sh     (shape disk addr' opts)
+                             want   (after-op (:content before) (peek ops))]
+                         (when-not (zero? delta) (swap! real inc))
                          (when-not (and (zero? (:wrong (:shape r))) (zero? (:wrong sh))
-                                        (zero? (:unknown sh)) (= (:n sh) (:n (:shape r)))
+                                        (zero? (:unknown sh))
+                                        (= (:content (:shape r)) want) (= (:content sh) want)
+                                        (zero? (:misplaced sh))
                                         (= leaves (leaf-addrs disk)))
                            (is false (str "case " (pr-str specs) " ops " (pr-str ops)
                                           ": wrong after the write " (:wrong (:shape r))
                                           ", after recount wrong " (:wrong sh) " unknown " (:unknown sh)
+                                          ", content as expected " (= (:content sh) want)
                                           ", leaves written by recount "
                                           (count (remove leaves (leaf-addrs disk))))))))})]
-          (is (pos? (:steps r))))))))
+          (is (pos? @real) "writes that changed the set were among the steps")
+          (is (= #{} (missing (expected-events 2) (:events r)))))))))
 
 (deftest every-single-cold-write-with-a-leaf-processor
   (testing "with a processor a write cannot assume it changed the count by one"
-    (let [identity-processor (reify ILeafProcessor
+    (let [calls (atom 0)
+          identity-processor (reify ILeafProcessor
                                (shouldProcess [_ _leaf-size _settings] true)
-                               (processLeaf [_ entries _storage _settings] entries))
+                               (processLeaf [_ entries _storage _settings] (swap! calls inc) entries))
           opts {:comparator compare :branching-factor 4 :diff-buf-size 0
                 :leaf-processor identity-processor}
-          r    (every-step opts 3 {:check (counted-check opts 3)})]
-      (is (= #{} (reduce disj (expected-events 3) (:events r))))))
+          r    (every-step opts 3 {:check (counted-check opts)})]
+      (is (pos? @calls) "the processor ran")
+      (is (= #{} (missing (expected-events 3) (:events r))))
+      (is (= #{} (missing (expected-transitions 3) (:transitions r))))))
   (testing "and one that drops an element from the leaf it touches: no count is wrong or lost"
-    (let [dropping (reify ILeafProcessor
+    (let [deltas   (atom #{})
+          dropping (reify ILeafProcessor
                      (shouldProcess [_ leaf-size _settings] (> (long leaf-size) 5))
                      (processLeaf [_ entries _storage _settings]
                        (let [^List entries entries]
                          (java.util.ArrayList. (.subList entries 0 (dec (.size entries)))))))
           opts {:comparator compare :branching-factor 8 :diff-buf-size 0 :leaf-processor dropping}
           r    (every-step opts 2
-                           {:check (fn [{:keys [specs ops r]}]
+                           {:check (fn [{:keys [specs ops r before]}]
                                      (let [sh (:shape r)]
-                                       (when-not (and (zero? (:unknown sh)) (zero? (:wrong sh)))
+                                       (swap! deltas conj (- (:n sh) (:n before)))
+                                       (when-not (and (zero? (:unknown sh)) (zero? (:wrong sh))
+                                                      (zero? (:misplaced sh)))
                                          (is false (str "case " (pr-str specs) " ops " (pr-str ops)
-                                                        ": unknown " (:unknown sh) ", wrong " (:wrong sh))))))})]
+                                                        ": unknown " (:unknown sh) ", wrong " (:wrong sh)
+                                                        ", misplaced keys " (:misplaced sh))))))})]
+      (is (some #(< (long %) -1) @deltas)
+          "precondition: some writes changed the number of elements by more than one")
       (is (pos? (:steps r))))))
 
 ;; ---- Part 2: content-defined trees ----
@@ -1096,15 +1224,19 @@
               (let [keep (set (keys @disk))
                     r    (step disk addr opts before op)
                     sh   (:shape r)]
-                (swap! seen into (map #(vector (first op) (first %)) (:events r)))
+                (swap! seen into (map #(vector (first op) ({:join-left :join :join-right :join} (first %) (first %)))
+                                      (:events r)))
                 (when-not (and (zero? (:unknown sh)) (zero? (:wrong sh))
-                               (= (:n sh) (+ (:n before) (case (first op) :add 1 :del -1 0))))
+                               (= (:content sh) (after-op (:content before) op))
+                               (zero? (:misplaced sh)) (zero? (:mislevelled sh)))
                   (is false (str n " keys, " (pr-str op) " " (pr-str (:events r))
-                                 ": unknown " (:unknown sh) ", wrong " (:wrong sh))))
+                                 ": unknown " (:unknown sh) ", wrong " (:wrong sh)
+                                 ", content as expected " (= (:content sh) (after-op (:content before) op))
+                                 ", misplaced keys " (:misplaced sh))))
                 (swap! disk select-keys keep)))))
-        (is (= #{} (reduce disj #{[:add :split] [:add :grow] [:del :join] [:del :collapse]
-                                  [:add :in-place] [:del :in-place] [:rep :in-place]}
-                           @seen)))))))
+        (is (= #{} (missing #{[:add :split] [:add :grow] [:del :join] [:del :collapse]
+                              [:add :in-place] [:del :in-place] [:rep :in-place]}
+                            @seen)))))))
 
 ;; ---- Part 3: what depends on memory ----
 ;;
@@ -1132,11 +1264,12 @@
         addr0 (set/store (reduce #(set/conj %1 %2 compare) (set/sorted-set* opts) init) (st))
         _     (when erased?
                 (doseq [[a bl] @disk :when (:addresses bl)] (swap! disk assoc-in [a :subtree-count] -1)))
-        check (fn [s model addr]
+        check (fn [model addr]
                 (let [sh (shape disk addr opts)]
                   (cond (pos? (:wrong sh))                        (str "wrong count: " (:wrong sh))
                         (and (not erased?) (pos? (:unknown sh)))  (str "missing count: " (:unknown sh))
-                        (not= (:n sh) (count model))              (str "elements " (:n sh) " vs " (count model)))))]
+                        (not= (:content sh) (vec model))          (str "content: " (:n sh) " elements vs " (count model))
+                        (pos? (:misplaced sh))                    (str "misplaced keys: " (:misplaced sh)))))]
     (loop [s     (set/restore-by compare addr0 (st) opts)
            model (into (sorted-set) init)
            tr?   false
@@ -1158,7 +1291,7 @@
           (let [census (:unknown (set/count-census s))
                 addr   (set/store s (st))
                 sh     (shape disk addr opts)]
-            (or (check s model addr)
+            (or (check model addr)
                 (when (not= census (:unknown sh))
                   (str "census before the store " census ", stored " (:unknown sh)))
                 (recur (if (= op :cold)
@@ -1168,11 +1301,11 @@
         ;; the end: store, and for a tree that started uncounted, repair it
         (let [s    (if tr? (persistent! s) s)
               addr (set/store s (st))]
-          (or (check s model addr)
+          (or (check model addr)
               (when erased?
                 (let [addr' (set/store (set/recount (set/restore-by compare addr (st) opts)) (st))
                       sh    (shape disk addr' opts)]
-                  (when (or (pos? (:unknown sh)) (pos? (:wrong sh)) (not= (:n sh) (count model)))
+                  (when (or (pos? (:unknown sh)) (pos? (:wrong sh)) (not= (:content sh) (vec model)))
                     (str "after recount: unknown " (:unknown sh) ", wrong " (:wrong sh)))))))))))
 
 (deftest random-sequences-keep-every-count
@@ -1180,7 +1313,7 @@
                          dbs     (gen/elements [0 2 64])
                          erased? gen/boolean
                          init    (gen/vector-distinct (gen/choose 0 400) {:min-elements 0 :max-elements 250})
-                         steps   (gen/vector gen-step 0 150)]
+                         steps   (gen/vector gen-step 20 150)]
                         (nil? (run-sequence {:bf bf :dbs dbs :erased? erased? :init init :steps steps})))
         r (tc/quick-check 150 p :seed 20261123)]
     (is (:pass? r)

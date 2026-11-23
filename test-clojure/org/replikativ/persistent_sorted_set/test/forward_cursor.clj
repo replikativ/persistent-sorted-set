@@ -36,7 +36,7 @@
   "Every seek, every seek after a seek, and a walk with `next` to the end from every
    position. `fresh` gives a set the cursor has not touched."
   [fresh model]
-  (let [probes (range -2 (+ 3 (* 2 (count model))))
+  (let [probes (range -2 (+ 3 (long (or (last model) 0))))
         bad    (volatile! [])]
     (doseq [k1 probes]
       (let [c (cursor (fresh))
@@ -50,14 +50,20 @@
         (let [c (cursor (fresh))]
           (.seekGE c (int k1))
           (let [r (.seekGE c (int k2))]
-            (when (not= r (ge model k2)) (vswap! bad conj [:seek-after-seek k1 k2 r]))))))
+            (when (not= r (ge model k2)) (vswap! bad conj [:seek-after-seek k1 k2 r]))
+            (when (not= (.next c) (second (subseq model >= k2)))
+              (vswap! bad conj [:next-after-seek-after-seek k1 k2]))))))
     @bad))
 
 (deftest forward-cursor-matches-a-sorted-set
-  (doseq [bf [4 8] dbs [0 2]]
+  ;; bf 64 for leaves wide enough that the search inside one is a binary search
+  (doseq [[bf sizes] [[4 (concat (range 0 42) [70 150])]
+                      [8 (concat (range 0 42) [70 150])]
+                      [64 [40 64 65 200]]]
+          dbs [0 2]]
     (testing (str "bf " bf ", diff-buf " dbs)
       (let [seen-slots (volatile! false)]
-        (doseq [size (concat (range 0 42) [70 150])]
+        (doseq [size sizes]
           (let [opts   {:comparator compare :branching-factor bf :diff-buf-size dbs}
                 ks     (map #(int (* 2 %)) (range size))
                 model  (into (sorted-set) ks)
