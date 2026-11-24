@@ -756,36 +756,42 @@
                         (let [idx (inc (.searchLast branch to cmp))]
                           (min (max idx 0) (dec len)))
                         (dec len)))]
-      (cond
-        (> from-idx to-idx)
-        (.identity measure-ops)
+      ;; A child the range covers ENTIRELY is answered from the branch's own record of it,
+      ;; without restoring the child. That is every child strictly between the two
+      ;; boundary ones, and a boundary one too when the range is open on that side -- so
+      ;; only the two boundary paths are read.
+      (letfn [(whole [i]
+                (or (when-let [^objects cm (.ensureChildMeasures branch storage)]
+                      (aget cm (int i)))
+                    (let [^ANode child (.child branch storage (int i))]
+                      (or (.-_measure child)
+                          (.forceComputeMeasure child storage)))))]
+        (cond
+          (> from-idx to-idx)
+          (.identity measure-ops)
 
-        (== from-idx to-idx)
-        (let [child (.child branch storage from-idx)]
-          (measure-slice-node child storage measure-ops from to cmp))
+          (== from-idx to-idx)
+          (if (and (nil? from) (nil? to))
+            (whole from-idx)
+            (measure-slice-node (.child branch storage from-idx) storage measure-ops from to cmp))
 
-        :else
-        (let [first-child (.child branch storage from-idx)
-              first-measure (measure-slice-node first-child storage measure-ops from nil cmp)
-              last-child (.child branch storage to-idx)
-              last-measure (measure-slice-node last-child storage measure-ops nil to cmp)
-              ^objects cm (when (< (inc from-idx) to-idx)
-                            (.ensureChildMeasures branch storage))
-              middle-measure (loop [i (int (inc from-idx))
-                                    acc (.identity measure-ops)]
-                               (if (>= i to-idx)
-                                 acc
-                                 ;; a covered child is answered from the branch's own
-                                 ;; record of it, without restoring the child
-                                 (let [child-measure (or (when cm (aget cm i))
-                                                         (let [^ANode child (.child branch storage i)]
-                                                           (or (.-_measure child)
-                                                               (.forceComputeMeasure child storage))))]
-                                   (recur (inc i)
-                                          (.merge measure-ops acc child-measure)))))]
-          (.merge measure-ops
-                  (.merge measure-ops first-measure middle-measure)
-                  last-measure))))))
+          :else
+          (let [first-measure (if from
+                                (measure-slice-node (.child branch storage from-idx)
+                                                    storage measure-ops from nil cmp)
+                                (whole from-idx))
+                last-measure (if to
+                               (measure-slice-node (.child branch storage to-idx)
+                                                   storage measure-ops nil to cmp)
+                               (whole to-idx))
+                middle-measure (loop [i (int (inc from-idx))
+                                      acc (.identity measure-ops)]
+                                 (if (>= i to-idx)
+                                   acc
+                                   (recur (inc i) (.merge measure-ops acc (whole i)))))]
+            (.merge measure-ops
+                    (.merge measure-ops first-measure middle-measure)
+                    last-measure)))))))
 
 (defn get-nth
   "Find the entry at weighted rank `n`.

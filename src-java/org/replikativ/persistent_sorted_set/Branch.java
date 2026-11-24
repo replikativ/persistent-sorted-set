@@ -2969,7 +2969,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     long entries;
     if (cur == BUF_WRITE || newBE == BUF_WRITE) entries = BUF_WRITE;
     else                                        entries = cur - (prev != null ? slotBE(prev) : 0) + newBE;
-    slots[i] = new Slot(diff, childCount(storage, i), child.measure(), anchor, newBE);
+    // The child's measure as it is NOW, worked out if the child has none cached: this is
+    // what a restore rebuilds the child's place in the parent's record from.
+    slots[i] = new Slot(diff, childCount(storage, i), measureOf(child, storage), anchor, newBE);
     installSlots(slots, entries);               // single publish: slots + total together
   }
 
