@@ -1619,7 +1619,7 @@
                    ;; record of it, without restoring the child: every child strictly
                    ;; between the two boundary ones, and a boundary one too when the range
                    ;; is open on that side. So only the two boundary paths are read.
-                   (let [cm    (await (branch/ensure-child-measures node storage opts))
+                   (let [cm    (await (branch/ensure-child-measures node storage measure-ops opts))
                          whole (fn [i] (when (some? cm) (arrays/aget cm i)))]
                      (cond
                        (> from-idx to-idx)
@@ -1711,7 +1711,7 @@
                                 ;; the record says which child holds the position, so
                                 ;; only that child is restored: one node per level
                                 (let [len (node/len cur-node)
-                                      cm  (await (branch/ensure-child-measures cur-node (.-storage set) opts))
+                                      cm  (await (branch/ensure-child-measures cur-node (.-storage set) measure-ops opts))
                                       hit (when (some? cm)
                                             (loop [i 0
                                                    r rank]

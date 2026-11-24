@@ -103,11 +103,12 @@
   "The array, filled if it is missing by reading THIS node's children once. A child that
    stored no measure of its own is forced, which reads below it. nil only without a
    measure, or when a child cannot produce one."
-  [^Branch node storage {:keys [sync?] :or {sync? true} :as opts}]
+  [^Branch node storage measure-ops {:keys [sync?] :or {sync? true} :as opts}]
+  ;; `measure-ops` is the caller's: a restored node's own settings come from the storage
+  ;; and need not carry the measure the set was opened with.
   (async+sync sync?
               (async
-               (let [cm          (.-_childMeasures node)
-                     measure-ops (:measure (.-settings node))]
+               (let [cm (.-_childMeasures node)]
                  (cond
                    (some? cm)         cm
                    (nil? measure-ops) nil
@@ -878,7 +879,7 @@
                                        new-slots (if (diff-buf? node) -1 0) (.-_projCmp node)
                                        ;; a remeasured child holds the same elements
                                        (.-_childMeasures node) false)
-                           cm (await (ensure-child-measures nb storage opts))
+                           cm (await (ensure-child-measures nb storage measure-ops opts))
                            m  (fold-measures measure-ops cm)]
                        (set! (.-_cmLazy nb) false)       ; this node is written, record and all
                        (when (some? m) (set! (.-_measure nb) m))
@@ -963,7 +964,7 @@
                        (reduce (fn [acc child]
                                  (if (nil? acc)
                                    (reduced nil)
-                                   (let [cs (node/measure child)]
+                                   (let [cs (when (some? child) (node/measure child))]
                                      (if cs (measure/merge-measure measure-ops acc cs) (reduced nil)))))
                                (measure/identity-measure measure-ops) cseg))
                 sc   (try-compute-subtree-count-from-children cseg l)]
@@ -1009,7 +1010,7 @@
                            ;; written replaced by what came back up (one node, or two)
                            cm-ins           (when measure-ops0
                                               (splice-measures measure-ops0
-                                                               (await (ensure-child-measures this storage opts))
+                                                               (await (ensure-child-measures this storage measure-ops0 opts))
                                                                idx (inc idx) nodes nil))]
                        (if bd
                          ;; PROBE FIX: preserve unchanged siblings' durable addresses across the
@@ -1079,7 +1080,7 @@
                                                 (reduce (fn [acc child]
                                                           (if (nil? acc)
                                                             (reduced nil)
-                                                            (let [cs (node/measure child)]
+                                                            (let [cs (when (some? child) (node/measure child))]
                                                               (if cs
                                                                 (measure/merge-measure measure-ops acc cs)
                                                                 (reduced nil)))))
@@ -1089,7 +1090,7 @@
                                                  (reduce (fn [acc child]
                                                            (if (nil? acc)
                                                              (reduced nil)
-                                                             (let [cs (node/measure child)]
+                                                             (let [cs (when (some? child) (node/measure child))]
                                                                (if cs
                                                                  (measure/merge-measure measure-ops acc cs)
                                                                  (reduced nil)))))
@@ -1248,7 +1249,7 @@
                                            (node/try-compute-measure
                                             (Branch. (.-level this) new-keys new-kids new-addrs new-sc nil (.-settings this) nil 0 (.-_projCmp this) nil false)
                                             storage measure-ops {:sync? true}))
-                             cm0    (when measure-ops (await (ensure-child-measures this storage opts)))
+                             cm0    (when measure-ops (await (ensure-child-measures this storage measure-ops opts)))
                              ;; an untouched sibling keeps the entry it had
                              keep   (when cm0
                                       (let [k (arrays/make-array alen)]
@@ -1264,8 +1265,8 @@
                              _      (when (and (some? cm-c)
                                                (< (arrays/alength new-keys)
                                                   (quot (:branching-factor (.-settings this) 32) 2)))
-                                      (when left (await (ensure-child-measures left storage opts)))
-                                      (when right (await (ensure-child-measures right storage opts))))]
+                                      (when left (await (ensure-child-measures left storage measure-ops opts)))
+                                      (when right (await (ensure-child-measures right storage measure-ops opts))))]
                          ;; diff-buf: install the center's slots BEFORE rotate (so a subsequent
                          ;; rotate merge/merge-split with this node's siblings carries them).
                          ;; content-only ⇒ carry source slots + deposit Absent(key) at idx (1-for-1).
@@ -1516,7 +1517,7 @@
                                                   (replace-measure new-branch storage measure-ops))
                                  cm-r           (when measure-ops
                                                   (splice-measures measure-ops
-                                                                   (await (ensure-child-measures this storage opts))
+                                                                   (await (ensure-child-measures this storage measure-ops opts))
                                                                    idx (inc idx) nodes nil))]
                              (install-measures! new-branch measure-ops cm-r new-measure)
                                ;; diff-buf: content-only replace ⇒ carry source slots + deposit Present(new-key).
@@ -1542,7 +1543,7 @@
                                                   (replace-measure new-branch storage measure-ops))
                                  cm-r           (when measure-ops
                                                   (splice-measures measure-ops
-                                                                   (await (ensure-child-measures this storage opts))
+                                                                   (await (ensure-child-measures this storage measure-ops opts))
                                                                    idx (inc idx) nodes nil))]
                              (install-measures! new-branch measure-ops cm-r new-measure)
                                ;; diff-buf: content-only replace ⇒ carry source slots + deposit Present(new-key).
@@ -1911,7 +1912,7 @@
     (async+sync sync?
                 (async
                  (when measure-ops
-                   (let [cm     (await (ensure-child-measures this storage opts))
+                   (let [cm     (await (ensure-child-measures this storage measure-ops opts))
                          result (fold-measures measure-ops cm)]
                      (set! _measure result)
                      result)))))
@@ -1965,7 +1966,7 @@
                  (reduce (fn [acc child]
                            (if (nil? acc)
                              (reduced nil)
-                             (let [cs (node/measure child)]
+                             (let [cs (when (some? child) (node/measure child))]
                                (if cs
                                  (measure/merge-measure measure-ops acc cs)
                                  (reduced nil)))))
@@ -1975,7 +1976,7 @@
                  (reduce (fn [acc child]
                            (if (nil? acc)
                              (reduced nil)
-                             (let [cs (node/measure child)]
+                             (let [cs (when (some? child) (node/measure child))]
                                (if cs
                                  (measure/merge-measure measure-ops acc cs)
                                  (reduced nil)))))
