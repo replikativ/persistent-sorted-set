@@ -148,6 +148,7 @@
                   :addresses     (vec (.-addresses node))
                   :subtree-count (.-subtree-count node)}
            (some? (.-_measure node)) (assoc :measure (.-_measure node))
+           (some? (.-_childMeasures node)) (assoc :child-measures (vec (.-_childMeasures node)))
            slots                     (assoc :slots slots)))
        (cond-> {:keys (vec (.-keys node))}
          (some? (.-_measure node)) (assoc :measure (.-_measure node))))))
@@ -336,6 +337,7 @@
                                           :addresses     (to-array addresses)
                                           :subtree-count subtree-count
                                           :measure       measure
+                                          :child-measures child-measures
                                           :settings      settings})]
                (when slots (attach-slots! node addresses slots))
                node))))

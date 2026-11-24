@@ -1089,6 +1089,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
     final Branch<Key, Address> nb = copyReplacing(storage, s0, changed);
     nb._childMeasures = _childMeasures;   // a recounted child holds the same elements
+    nb._cmLazy = _cmLazy;
     // A count already worked out in memory is used as it is. Otherwise the children are
     // counted now (below a leaf-parent they are leaves, which always are), so this is a sum;
     // it reads the leaves of a leaf-parent that was unknown.
@@ -3258,6 +3259,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         }
       }
       proj._childMeasures = cm;
+      proj._cmLazy = base._cmLazy;
     }
     return proj;
   }
@@ -3324,6 +3326,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
                                                    count, _measure, _projCmp, _settings);
     copy._state = new NodeState<>(addrCopy, childCopy, s.buf);
     copy._childMeasures = _childMeasures;   // same children; the array is never mutated
+    copy._cmLazy = _cmLazy;
     return copy;
   }
 
@@ -3357,6 +3360,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     copy._state = new NodeState<>(addrCopy, childCopy, s.buf);
     copy._lazyCount = _lazyCount;   // a cache of the same content
     copy._childMeasures = _childMeasures;   // likewise; never mutated
+    copy._cmLazy = _cmLazy;
     return copy;
   }
 
