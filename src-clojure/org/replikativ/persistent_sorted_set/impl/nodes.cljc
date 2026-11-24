@@ -136,6 +136,7 @@
                   :addresses     (vec (.addresses b))
                   :subtree-count (.subtreeCount b)}
            (some? (.-_measure b)) (assoc :measure (.-_measure b))
+           (some? (.-_childMeasures b)) (assoc :child-measures (vec (.-_childMeasures b)))
            slots                  (assoc :slots slots)))
        (cond-> {:keys (vec (.keys ^ANode node))}
          (some? (.-_measure ^ANode node)) (assoc :measure (.-_measure ^ANode node))))
@@ -320,11 +321,14 @@
 (defn blob->branch
   "Reconstruct a Branch from its blob, re-attaching diff-buf slots. `ctx` from `reader-context`."
   [ctx blob]
-  (let [{:keys [level keys addresses subtree-count measure slots]} blob
+  (let [{:keys [level keys addresses subtree-count measure child-measures slots]} blob
         settings (blob-settings ctx blob)]
     #?(:clj (let [b (Branch. (int level) ^List keys ^List addresses ^Settings settings)]
               (set! (.-_subtreeCount b) (long (or subtree-count -1)))
               (when (some? measure) (set! (.-_measure ^ANode b) measure))
+              ;; Only an array that fits: one of another length is not this node's.
+              (when (and (some? child-measures) (= (count child-measures) (count keys)))
+                (set! (.-_childMeasures b) (object-array child-measures)))
               (when slots (attach-slots! b addresses slots))
               b)
        :cljs (let [node (branch/from-map {:level         level

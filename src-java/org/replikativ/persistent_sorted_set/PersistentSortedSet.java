@@ -289,8 +289,19 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     // mutated further this txn the first deposit folds its children's values in (poisoning it to
     // BUF_WRITE if a child rebalanced). Do not reuse this for a non-root branch without
     // publishing a diff-buf snapshot.
-    return new Branch(nodes[0].level() + 1, n, keys, null, children,
-                      countKnown ? subtreeCount : -1, measure, _cmp, _settings);
+    Branch root = new Branch(nodes[0].level() + 1, n, keys, null, children,
+                             countKnown ? subtreeCount : -1, measure, _cmp, _settings);
+    IMeasure measureOps = _settings.measure();
+    if (measureOps != null) {
+      // The new root's children are the nodes in hand: record each one's measure.
+      Object[] cm = new Object[n];
+      for (int i = 0; i < n && cm != null; i++) {
+        cm[i] = Branch.measureOf(nodes[i], _storage);
+        if (cm[i] == null) cm = null;
+      }
+      if (cm != null) root._childMeasures = cm;
+    }
+    return root;
   }
 
   /**
@@ -687,13 +698,21 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     while (node instanceof Branch) {
       Branch<Key, Address> branch = (Branch<Key, Address>) node;
       boolean found = false;
+      // Pick the child from the branch's own record of its children's measures, so only
+      // the child that holds the position is restored. Reading each child for its weight
+      // restored every child to the left of it, at every level.
+      final Object[] cm = branch.ensureChildMeasures(_storage);
       for (int i = 0; i < branch._len; i++) {
-        ANode<Key, Address> child = branch.child(_storage, i);
-        Object childMeasure = child._measure;
-        if (childMeasure == null) childMeasure = child.forceComputeMeasure(_storage);
+        Object childMeasure = (cm != null) ? cm[i] : null;
+        ANode<Key, Address> child = null;
+        if (childMeasure == null) {
+          child = branch.child(_storage, i);
+          childMeasure = child._measure;
+          if (childMeasure == null) childMeasure = child.forceComputeMeasure(_storage);
+        }
         long childWeight = measureOps.weight(childMeasure);
         if (rank < childWeight) {
-          node = child;
+          node = (child != null) ? child : branch.child(_storage, i);
           found = true;
           break;
         }

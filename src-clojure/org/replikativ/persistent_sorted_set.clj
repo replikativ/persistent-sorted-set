@@ -363,16 +363,21 @@
                                                                     acc)))
                                                               (.identity measure-ops)
                                                               children))]
-                                  (Branch.
-                                   (int level)
-                                   (int (count children))
-                                   ^objects (arrays/amap #(.maxKey ^ANode %) Object children)
-                                   nil
-                                   children
-                                   (long subtree-count)
-                                   measure
-                                   cmp
-                                   settings)))]
+                                  (let [b (Branch.
+                                           (int level)
+                                           (int (count children))
+                                           ^objects (arrays/amap #(.maxKey ^ANode %) Object children)
+                                           nil
+                                           children
+                                           (long subtree-count)
+                                           measure
+                                           cmp
+                                           settings)]
+                                    ;; each child's measure, kept in the parent (Branch._childMeasures)
+                                    (when (and measure-ops (every? #(some? (.-_measure ^ANode %)) children))
+                                      (set! (.-_childMeasures b)
+                                            (object-array (map #(.-_measure ^ANode %) children))))
+                                    b)))]
      (if (.contentDefined (.boundary settings))
        ;; MST bulk: chunk by boundary level so a freshly-built tree matches an incrementally
        ;; grown one for the same key set (history-independence). key-of = identity for leaf
@@ -550,7 +555,10 @@
                                          (reduce (fn [acc m]
                                                    (if m (.merge measure-ops acc m) acc))
                                                  (.identity measure-ops)
-                                                 (map :measure es))))
+                                                 (map :measure es)))
+                                   ;; each child's measure, kept in the parent (Branch._childMeasures)
+                                   (when (every? #(some? (:measure %)) es)
+                                     (set! (.-_childMeasures b) (object-array (map :measure es)))))
                                  (store-node! b)))
                              (streaming-split entries avg-bf max-bf)))]
      ;; Climb one level at a time. `(next s)` realises only the SECOND entry, so

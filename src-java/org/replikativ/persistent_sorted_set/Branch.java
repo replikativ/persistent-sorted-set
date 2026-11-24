@@ -213,6 +213,176 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       PROJCMP_UPDATER = java.util.concurrent.atomic.AtomicReferenceFieldUpdater.newUpdater(
           Branch.class, Comparator.class, "_projCmp");
 
+
+  // ---------------------------------------------------------------------------------------
+  // Per-child measures.
+  //
+  // `_childMeasures[i]` is the measure of child i's subtree, for i in [0.._len). It exists
+  // only when the set has an IMeasure, and it is what lets this node answer for a child
+  // WITHOUT that child being in memory:
+  //
+  //   - this node's own `_measure` is the fold of the array, so a write below child i only
+  //     needs child i's new measure -- which the child that came back up always carries.
+  //     No subtraction is asked of the measure, so min/max and order-sensitive measures
+  //     work exactly like a sum;
+  //   - `getNth` picks the child holding a position from the array, without restoring the
+  //     children to its left.
+  //
+  // Before it, every arm recomputed `_measure` from the children that happened to be
+  // resident (`tryComputeMeasure`) and stored null when one was not. On a tree that is
+  // mostly on disk that is the normal case, so a replace or a delete erased the measure
+  // from the leaf's parent to the root.
+  //
+  // null means UNKNOWN: a branch stored before the array existed, or built on a path that
+  // could not supply one. Unknown is always safe -- the arms then fall back to
+  // `tryComputeMeasure`, as before -- and `ensureChildMeasures` fills it with one read of
+  // this node's children. A STALE array would be a wrong answer instead, so every writer
+  // either installs the array for the children it leaves behind or clears it: `child(idx,
+  // node)` clears, and the arms install after it.
+  //
+  // The array is never mutated once installed (a fresh one replaces it), which is what
+  // makes the plain volatile publish safe on a shared node: concurrent fills write equal
+  // contents. Its length is exactly the `_len` it was built for.
+  public volatile Object[] _childMeasures;
+
+  /** Fold `cm[0..len)`. null in, or a null entry, gives null. */
+  static Object foldMeasures(IMeasure ops, Object[] cm, int len) {
+    if (ops == null || cm == null) return null;
+    Object result = ops.identity();
+    for (int i = 0; i < len; i++) {
+      if (cm[i] == null) return null;
+      result = ops.merge(result, cm[i]);
+    }
+    return result;
+  }
+
+  /**
+   * The measure of a RESIDENT node, without IO: its cached one, else a leaf's own keys
+   * folded, else a branch's array folded. null when a branch knows neither.
+   */
+  static Object measureOf(ANode n, IStorage storage) {
+    if (n == null) return null;
+    Object m = n._measure;
+    if (m != null) return m;
+    if (n instanceof Leaf) return n.tryComputeMeasure(storage);
+    Branch b = (Branch) n;
+    return foldMeasures(b._settings.measure(), b._childMeasures, b._len);
+  }
+
+  /**
+   * `cm` with the entries [from, to) replaced by the measures of the non-null `nodes`.
+   * `keep[k]`, when non-null, is the entry to use for nodes[k] if that node cannot say
+   * (an untouched sibling). null if `cm` is unknown or a node's measure is.
+   */
+  private static Object[] spliceMeasures(IMeasure ops, Object[] cm, int len, int from, int to,
+                                         ANode[] nodes, Object[] keep, IStorage storage) {
+    if (ops == null || cm == null) return null;
+    int n = 0;
+    for (ANode node : nodes) if (node != null) n++;
+    Object[] out = new Object[len - (to - from) + n];
+    System.arraycopy(cm, 0, out, 0, from);
+    int o = from;
+    for (int k = 0; k < nodes.length; k++) {
+      if (nodes[k] == null) continue;
+      Object m = measureOf(nodes[k], storage);
+      if (m == null && keep != null) m = keep[k];
+      if (m == null) return null;
+      out[o++] = m;
+    }
+    System.arraycopy(cm, to, out, o, len - to);
+    return out;
+  }
+
+  /** a[aFrom..aTo) ++ b[bFrom..bTo); null if either is. */
+  private static Object[] concatMeasures(Object[] a, int aFrom, int aTo, Object[] b, int bFrom, int bTo) {
+    if (a == null || b == null) return null;
+    Object[] out = new Object[(aTo - aFrom) + (bTo - bFrom)];
+    System.arraycopy(a, aFrom, out, 0, aTo - aFrom);
+    System.arraycopy(b, bFrom, out, aTo - aFrom, bTo - bFrom);
+    return out;
+  }
+
+  private static Object[] sliceMeasures(Object[] a, int from, int to) {
+    return (a == null) ? null : Arrays.copyOfRange(a, from, to);
+  }
+
+  /** The measures of children that are all resident (the MST rebuilds), or null. */
+  private static Object[] measuresOfChildren(IMeasure ops, Object[] children, int n, IStorage storage) {
+    if (ops == null) return null;
+    Object[] out = new Object[n];
+    for (int i = 0; i < n; i++) {
+      Object raw = children[i];
+      ANode c = (raw instanceof ANode) ? (ANode) raw
+              : (raw instanceof java.lang.ref.Reference) ? (ANode) ((java.lang.ref.Reference<?>) raw).get() : null;
+      Object m = measureOf(c, storage);
+      if (m == null) return null;
+      out[i] = m;
+    }
+    return out;
+  }
+
+  /**
+   * Install `cm` and the measure it folds to. With `cm` unknown, the measure is `fallback`
+   * (what the arm computed before the array existed) and the array is cleared.
+   */
+  private void installMeasures(IMeasure ops, Object[] cm, Object fallback) {
+    if (ops == null) return;
+    if (cm != null) {
+      assert cm.length == _len : ("child measures " + cm.length + " for len " + _len);
+      Object m = foldMeasures(ops, cm, _len);
+      _childMeasures = (m == null) ? null : cm;
+      _measure = (m == null) ? fallback : m;
+    } else {
+      _childMeasures = null;
+      _measure = fallback;
+    }
+  }
+
+  /** The array if this node has one; never reads. */
+  public Object[] childMeasures() {
+    return _childMeasures;
+  }
+
+  /**
+   * The array, filled if it is missing by reading THIS node's children once -- at most
+   * `_len` nodes, for a child that stored its own measure. A child that did not (a tree
+   * that lost measures before the array existed) is forced, which reads below it. null
+   * only without an IMeasure, or when a child cannot produce a measure at all.
+   */
+  public Object[] ensureChildMeasures(IStorage storage) {
+    Object[] cm = _childMeasures;
+    if (cm != null) return cm;
+    IMeasure ops = _settings.measure();
+    if (ops == null) return null;
+    final int len = _len;
+    Object[] out = new Object[len];
+    for (int i = 0; i < len; i++) {
+      ANode child = child(storage, i);
+      Object m = measureOf(child, storage);
+      if (m == null) m = child.forceComputeMeasure(storage);
+      if (m == null) return null;
+      out[i] = m;
+    }
+    if (len == _len) _childMeasures = out;
+    return out;
+  }
+
+  /** Debug check: an installed array agrees with every resident child that has a measure. */
+  private boolean childMeasuresConsistent() {
+    Object[] cm = _childMeasures;
+    if (cm == null) return true;
+    if (cm.length != _len) return false;
+    Object[] children = _state.children;
+    if (children == null) return true;
+    for (int i = 0; i < _len; i++) {
+      Object raw = children[i];
+      ANode c = (raw instanceof ANode) ? (ANode) raw
+              : (raw instanceof java.lang.ref.Reference) ? (ANode) ((java.lang.ref.Reference<?>) raw).get() : null;
+      if (c != null && c._measure != null && !c._measure.equals(cm[i])) return false;
+    }
+    return true;
+  }
+
   public Branch(int level, int len, Key[] keys, Address[] addresses, Object[] children, Settings settings) {
     this(level, len, keys, addresses, children, -1, settings);
   }
@@ -450,6 +620,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     if (s.children != null || child != null) {
       ensureChildren()[idx] = child;
     }
+    _childMeasures = null;   // stale from here; the caller installs the new array
     return child;
   }
 
@@ -852,6 +1023,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // `recount`: it is the one way a leaf gets rewritten.
     final Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, -1, _measure, _projCmp, _settings);
     if (newSlots != null || _settings.diffBufSize() > 0) nb.installSlots(newSlots, BUF_WRITE);
+    nb._childMeasures = _childMeasures;   // a recounted child holds the same elements
     // A count already worked out in memory is used as it is. Otherwise the children are
     // counted now (below a leaf-parent they are leaves, which always are), so this is a sum;
     // it reads the leaves of a leaf-parent that was unknown.
@@ -893,21 +1065,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     IMeasure measureOps = _settings.measure();
     if (measureOps == null) return null;
 
-    Object result = measureOps.identity();
-    for (int i = 0; i < _len; i++) {
-      ANode child = child(storage, i);
-      Object childMeasure = child.measure();
-      if (childMeasure == null) {
-        // Force computation by recursively computing child measure
-        childMeasure = child.forceComputeMeasure(storage);
-      }
-      if (childMeasure == null) {
-        // Child cannot compute measure - cannot produce accurate branch measure
-        return null;
-      }
-      result = measureOps.merge(result, childMeasure);
-    }
-    _measure = result;
+    // From the array when this node has one -- no child is read. Without one, fill it:
+    // one read of this node's children, deeper only below a child that stored no measure.
+    Object result = foldMeasures(measureOps, ensureChildMeasures(storage), _len);
+    if (result != null) _measure = result;
     return result;
   }
 
@@ -1196,9 +1357,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       // Update measure: recompute from children (child's stats were updated in place), or
       // fold in the one inserted key when a child is not resident (see measureAfterInsert).
       IMeasure measureOps = _settings.measure();
-      if (measureOps != null && _measure != null) {
-        _measure = measureAfterInsert(settings, measureOps, tryComputeMeasure(storage), _measure, key);
-      }
+      final Object[] cmE = (measureOps == null) ? null
+          : spliceMeasures(measureOps, ensureChildMeasures(storage), _len, ins, ins + 1,
+                           new ANode[]{ oldChild }, null, storage);
+      final Object fbE = (cmE == null && measureOps != null && _measure != null)
+          ? measureAfterInsert(settings, measureOps, tryComputeMeasure(storage), _measure, key) : null;
       // The child was mutated IN PLACE, so this node's addresses[ins] — which asserts
       // "that child's whole subtree is already durable" — is now a LIE. store() reads it
       // exactly that way (baseline Pass at :2073 `if (newAddresses[i] == null)`, diff-buf
@@ -1238,6 +1401,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         storage.markFreed(s0.addresses[ins]);
       }
       child(ins, oldChild);  // clears addresses[ins] AND unwraps the child (a dirty child must be bare)
+      installMeasures(measureOps, cmE, fbE);
       if (_settings.diffBufSize() > 0) depositInto(storage, ins, key, key, anchor0); // content-only: Present(key) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
     }
@@ -1282,6 +1446,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
                 ? own - oldChildCount + newChildrenCount : -1);
 
     IMeasure measureOps = _settings.measure();
+    // This node's children with the one written to replaced by what came back for it.
+    final Object[] cmIns = (measureOps == null) ? null
+        : spliceMeasures(measureOps, ensureChildMeasures(storage), _len, ins, ins + 1, nodes, null, storage);
 
     // same len, editable
     if (1 == nodes.length && editable()) {
@@ -1298,9 +1465,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       _lazyCount = -1;   // this node changed in place
       // Update measure: recompute from children, or fold in the one inserted key when a
       // child is not resident (see measureAfterInsert).
-      if (measureOps != null && _measure != null) {
-        _measure = measureAfterInsert(settings, measureOps, tryComputeMeasure(storage), _measure, key);
-      }
+      installMeasures(measureOps, cmIns,
+          (cmIns == null && measureOps != null && _measure != null)
+              ? measureAfterInsert(settings, measureOps, tryComputeMeasure(storage), _measure, key) : null);
       if (_settings.diffBufSize() > 0) depositInto(storage, ins, key, key, anchor0); // content-only: Present(key) / branch marker
       if (ins == _len - 1)
         return new ANode[]{ this }; // last child changed, propagate maxKey update
@@ -1333,9 +1500,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       newChildren[ins] = node;
 
       long newCount = ownCountAfter;
-      Object newMeasure = measureAfterInsert(settings, measureOps,
+      Object newMeasure = (cmIns != null) ? null : measureAfterInsert(settings, measureOps,
           tryComputeMeasureFromChildren(newChildren, _len, storage, measureOps), _measure, key);
       Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, newCount, newMeasure, _projCmp, settings);
+      nb.installMeasures(measureOps, cmIns, newMeasure);
       // The SAME snapshot's {slots, entries} pair — carried together so the successor
       // can never mix a pre-settle total with post-settle slots (or vice versa).
       if (settings.diffBufSize() > 0) nb.carryAndDeposit(storage, s0.buf, ins, key, key, anchor0); // content-only: Present(key) / branch marker
@@ -1385,9 +1553,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       long count = ownCountAfter;
       // Absorb keeps every element this node held and gains the one inserted key, so the
       // insert delta is exact here too when the recompute is unavailable.
-      Object measure = measureAfterInsert(settings, measureOps,
+      Object measure = (cmIns != null) ? null : measureAfterInsert(settings, measureOps,
           tryComputeMeasureFromChildren(allChildren, newLen, storage, measureOps), _measure, key);
       Branch<Key, Address> nb = new Branch(_level, newLen, allKeys, allAddresses, allChildren, count, measure, _projCmp, settings);
+      nb.installMeasures(measureOps, cmIns, measure);
       if (settings.diffBufSize() > 0) {
         // absorbed a child split: structural → written (BUF_WRITE), but it still buffers
         // surviving siblings — carry their slots through the rebuild. nb is unpublished,
@@ -1448,10 +1617,13 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // INTO one of those nodes — `measure-slice`, or `getNth` routing through it. A split is
     // also one insert in every `branchingFactor`, where the arms above ran on every insert,
     // which is why they were the whole cost and this is what is left.
-    Object measure1 = tryComputeMeasureFromChildren(children1, half1, storage, measureOps);
-    Object measure2 = tryComputeMeasureFromChildren(children2, half2, storage, measureOps);
+    final Object[] cm1 = sliceMeasures(cmIns, 0, half1), cm2 = sliceMeasures(cmIns, half1, newLen);
+    Object measure1 = (cm1 != null) ? null : tryComputeMeasureFromChildren(children1, half1, storage, measureOps);
+    Object measure2 = (cm2 != null) ? null : tryComputeMeasureFromChildren(children2, half2, storage, measureOps);
     Branch<Key, Address> sb1 = new Branch(_level, half1, keys1, addresses1, children1, count1, measure1, _projCmp, settings);
     Branch<Key, Address> sb2 = new Branch(_level, half2, keys2, addresses2, children2, count2, measure2, _projCmp, settings);
+    sb1.installMeasures(measureOps, cm1, measure1);
+    sb2.installMeasures(measureOps, cm2, measure2);
     if (settings.diffBufSize() > 0) {
       // split: structural → written (BUF_WRITE), still buffer surviving siblings' slots.
       // sb1/sb2 are unpublished: one consistent publish each.
@@ -1525,9 +1697,15 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       }
       // Update measure: recompute from children (child's stats were updated in place)
       IMeasure measureOps = _settings.measure();
-      if (measureOps != null && _measure != null) {
-        _measure = tryComputeMeasure(storage);
-      }
+      final Object[] cm0e = (measureOps == null) ? null : ensureChildMeasures(storage);
+      final Object[] cmE = (cm0e == null) ? null
+          : spliceMeasures(measureOps, cm0e, _len,
+                           (leftChild != null) ? idx - 1 : idx, idx + 1 + (rightChild != null ? 1 : 0),
+                           new ANode[]{ leftChild, mutatedChild, rightChild },
+                           new Object[]{ leftChild != null ? cm0e[idx - 1] : null, null,
+                                         rightChild != null ? cm0e[idx + 1] : null },
+                           storage);
+      final Object fbE = (cmE == null && measureOps != null && _measure != null) ? tryComputeMeasure(storage) : null;
       // NOTE `key` here is the caller's SEARCH key, not the element the leaf removed.
       // Under a coarse operation comparator those differ, and this is the same shape as
       // the `replace` deposit defect fixed in this cycle: `projectLeaf` replays the diff
@@ -1591,6 +1769,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         storage.markFreed(s0.addresses[idx]);
       }
       child(idx, mutatedChild);  // clears addresses[idx] AND unwraps the child (a dirty child must be bare)
+      installMeasures(measureOps, cmE, fbE);
       if (_settings.diffBufSize() > 0) depositInto(storage, idx, removedKey, Slot.ABSENT, anchor0); // content-only: Absent(removedKey) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
     }
@@ -1618,6 +1797,18 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     }
 
     IMeasure measureOps = _settings.measure();
+    // The children this node keeps after the remove: [0, idx-1) ++ the nodes that came back
+    // ++ [idx+2, _len). `nodes` are in memory by construction; the rest is read from the
+    // array, so nothing is restored for it. A sibling the remove left alone keeps its entry.
+    final Object[] cm0 = (measureOps == null) ? null : ensureChildMeasures(storage);
+    final int cmFrom = (leftChild != null) ? idx - 1 : idx;
+    final int cmTo   = idx + 1 + (rightChild != null ? 1 : 0);
+    final Object[] cmCenter = (cm0 == null) ? null
+        : spliceMeasures(measureOps, cm0, _len, cmFrom, cmTo, nodes,
+                         new Object[]{ (leftChild != null && !leftChanged) ? cm0[idx - 1] : null,
+                                       null,
+                                       (rightChild != null && !rightChanged) ? cm0[idx + 1] : null },
+                         storage);
 
     // nodes[1] always not nil
     int newLen = _len - 1
@@ -1734,9 +1925,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
                         : tryComputeSubtreeCountFromChildren(children, newLen, storage);
         _lazyCount = -1;   // this node changed in place
         // Update measure: recompute from children
-        if (measureOps != null && _measure != null) {
-          _measure = tryComputeMeasure(storage);
-        }
+        installMeasures(measureOps, cmCenter,
+            (cmCenter == null && measureOps != null && _measure != null) ? tryComputeMeasure(storage) : null);
         if (_settings.diffBufSize() > 0) {
           if (!structural) {
             depositInto(storage, idx, removedKey, Slot.ABSENT, anchor0); // content-only: Absent(removedKey) / branch marker
@@ -1789,7 +1979,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       newCenter._subtreeCount = (ownAfter >= 0)
                                 ? ownAfter
                                 : tryComputeSubtreeCountFromChildren(centerChildren, newLen, storage);
-      newCenter._measure = tryComputeMeasureFromChildren(centerChildren, newLen, storage, measureOps);
+      newCenter.installMeasures(measureOps, cmCenter,
+          (cmCenter != null) ? null : tryComputeMeasureFromChildren(centerChildren, newLen, storage, measureOps));
       if (settings.diffBufSize() > 0) {
         if (!leftChanged && !rightChanged && newLen == _len) {
           // content-only: carry the SAME snapshot's {slots, entries} pair aligned and
@@ -1866,7 +2057,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           (left.knownCount() >= 0 && ownAfter >= 0)
           ? left.knownCount() + ownAfter
           : tryComputeSubtreeCountFromChildren(joinChildren, left._len + newLen, storage);
-      join._measure = tryComputeMeasureFromChildren(joinChildren, left._len + newLen, storage, measureOps);
+      {
+        final Object[] lcm = (cmCenter == null) ? null : left.ensureChildMeasures(storage);
+        final Object[] jcm = concatMeasures(lcm, 0, left._len, cmCenter, 0, newLen);
+        join.installMeasures(measureOps, jcm,
+            (jcm != null) ? null : tryComputeMeasureFromChildren(joinChildren, left._len + newLen, storage, measureOps));
+      }
       if (settings.diffBufSize() > 0) {
         // merged with left: structural → written (BUF_WRITE), still buffers surviving
         // siblings. join is unpublished: one consistent publish.
@@ -1926,7 +2122,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           (right.knownCount() >= 0 && ownAfter >= 0)
           ? ownAfter + right.knownCount()
           : tryComputeSubtreeCountFromChildren(joinChildren, newLen + right._len, storage);
-      join._measure = tryComputeMeasureFromChildren(joinChildren, newLen + right._len, storage, measureOps);
+      {
+        final Object[] rcm = (cmCenter == null) ? null : right.ensureChildMeasures(storage);
+        final Object[] jcm = concatMeasures(cmCenter, 0, newLen, rcm, 0, right._len);
+        join.installMeasures(measureOps, jcm,
+            (jcm != null) ? null : tryComputeMeasureFromChildren(joinChildren, newLen + right._len, storage, measureOps));
+      }
       if (settings.diffBufSize() > 0) {
         // merged with right: structural → written (BUF_WRITE), still buffers surviving
         // siblings. join is unpublished: one consistent publish.
@@ -2010,6 +2211,13 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         else if (newCenter._subtreeCount < 0 && newLeft._subtreeCount >= 0) newCenter._subtreeCount = pair - newLeft._subtreeCount;
       }
       newCenter._measure = tryComputeMeasureFromChildren(centerChildren, newCenterLen, storage, measureOps);
+      {
+        final Object[] lcm = (cmCenter == null) ? null : left.ensureChildMeasures(storage);
+        if (lcm != null) {
+          newLeft.installMeasures(measureOps, sliceMeasures(lcm, 0, newLeftLen), newLeft._measure);
+          newCenter.installMeasures(measureOps, concatMeasures(lcm, newLeftLen, left._len, cmCenter, 0, newLen), newCenter._measure);
+        }
+      }
       if (settings.diffBufSize() > 0) {
         // borrowed from left: structural → BUF_WRITE. newLeft/newCenter are unpublished:
         // one consistent {slots, entries} publish each.
@@ -2092,6 +2300,13 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (newRightChildren != null) {
         newRight._subtreeCount = tryComputeSubtreeCountFromChildren(newRightChildren, newRightLen, storage);
         newRight._measure = tryComputeMeasureFromChildren(newRightChildren, newRightLen, storage, measureOps);
+      }
+      {
+        final Object[] rcm = (cmCenter == null) ? null : right.ensureChildMeasures(storage);
+        if (rcm != null) {
+          newCenter.installMeasures(measureOps, concatMeasures(cmCenter, 0, newLen, rcm, 0, rightHead), newCenter._measure);
+          newRight.installMeasures(measureOps, sliceMeasures(rcm, rightHead, right._len), newRight._measure);
+        }
       }
       // Same as the borrow from left: the pair's total is known, so one half gives the other.
       if (right.knownCount() >= 0 && ownAfter >= 0) {
@@ -2196,9 +2411,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     Key[] keys = (Key[]) new Object[n];
     for (int i = 0; i < n; i++) keys[i] = ((ANode<Key, Address>) newChildren[i]).maxKey();
     long count = tryComputeSubtreeCountFromChildren(newChildren, n, storage);
-    Object measure = tryComputeMeasureFromChildren(newChildren, n, storage, measureOps);
+    Object[] cmM = measuresOfChildren(measureOps, newChildren, n, storage);
+    Object measure = (cmM != null) ? null : tryComputeMeasureFromChildren(newChildren, n, storage, measureOps);
     wrapAddressedChildren(newChildren, newAddresses, n, settings);   // AFTER the probes read them
-    return new Branch(_level, n, keys, newAddresses, newChildren, count, measure, _projCmp, settings);
+    Branch<Key, Address> rebuilt = new Branch(_level, n, keys, newAddresses, newChildren, count, measure, _projCmp, settings);
+    rebuilt.installMeasures(measureOps, cmM, measure);
+    return rebuilt;
   }
 
   @Override
@@ -2242,9 +2460,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     Key[] keys = (Key[]) new Object[n];
     for (int i = 0; i < n; i++) keys[i] = ((ANode<Key, Address>) children[i]).maxKey();
     long count = tryComputeSubtreeCountFromChildren(children, n, storage);
-    Object measure = tryComputeMeasureFromChildren(children, n, storage, measureOps);
+    Object[] cmM = measuresOfChildren(measureOps, children, n, storage);
+    Object measure = (cmM != null) ? null : tryComputeMeasureFromChildren(children, n, storage, measureOps);
     wrapAddressedChildren(children, addrs, n, settings);             // AFTER the probes read them
-    return new Branch(_level, n, keys, addrs, children, count, measure, _projCmp, settings);
+    Branch<Key, Address> merged = new Branch(_level, n, keys, addrs, children, count, measure, _projCmp, settings);
+    merged.installMeasures(measureOps, cmM, measure);
+    return merged;
   }
 
   /**
@@ -2413,9 +2634,10 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       ownLazyCount();
       // Try to recompute measure from final state (after child replacement)
       IMeasure measureOps = settings.measure();
-      if (measureOps != null && _measure != null) {
-        _measure = tryComputeMeasure(storage);
-      }
+      final Object[] cmX = (measureOps == null) ? null
+          : spliceMeasures(measureOps, ensureChildMeasures(storage), _len, idx, idx + 1,
+                           new ANode[]{ mutatedChild }, null, storage);
+      final Object fbX = (cmX == null && measureOps != null && _measure != null) ? tryComputeMeasure(storage) : null;
       // The child was mutated IN PLACE, so this node's addresses[idx] — which asserts
       // "that child's whole subtree is already durable" — is now a LIE. store() reads it
       // exactly that way (baseline Pass at :2073 `if (newAddresses[i] == null)`, diff-buf
@@ -2455,6 +2677,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
         storage.markFreed(s0.addresses[idx]);
       }
       child(idx, mutatedChild);  // clears addresses[idx] AND unwraps the child (a dirty child must be bare)
+      installMeasures(measureOps, cmX, fbX);
       if (_settings.diffBufSize() > 0) depositReplace(storage, idx, removedKey, newKey, anchor0); // Absent(removedKey)+Present(newKey) / branch marker
       return PersistentSortedSet.EARLY_EXIT;
     }
@@ -2495,6 +2718,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       ? !java.util.Objects.equals(newMaxKey, _keys[idx])
       : (idx == _len - 1) && separatorMoved(newMaxKey, _keys[idx]);
     IMeasure measureOps = settings.measure();
+    // This node's children with the replaced one's new measure in its place. Nothing here
+    // has been written yet, so the array still describes the children as they were.
+    final Object[] cmR = (measureOps == null) ? null
+        : spliceMeasures(measureOps, ensureChildMeasures(storage), _len, idx, idx + 1,
+                         new ANode[]{ newChild }, null, storage);
 
     // Transient: can modify in place
     if (editable()) {
@@ -2508,9 +2736,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       child(idx, newChild);
       // Note: child(idx, node) also clears the slot's address
       // Try to recompute measure from final state (after child replacement)
-      if (measureOps != null && _measure != null) {
-        _measure = tryComputeMeasure(storage);
-      }
+      installMeasures(measureOps, cmR,
+          (cmR == null && measureOps != null && _measure != null) ? tryComputeMeasure(storage) : null);
       if (_settings.diffBufSize() > 0) depositReplace(storage, idx, removedKey, newKey, anchor0); // Absent(removedKey)+Present(newKey) / branch marker
       if (maxKeyChanged)
         return new ANode[]{this};
@@ -2541,9 +2768,8 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
     // Try to recompute measure from final state (after child replacement) for new branch
     Branch<Key, Address> newBranch = new Branch(_level, _len, newKeys, newAddresses, newChildren, knownCount(), null, _projCmp, settings);
-    if (measureOps != null && _measure != null) {
-      newBranch._measure = newBranch.tryComputeMeasure(storage);
-    }
+    newBranch.installMeasures(measureOps, cmR,
+        (cmR == null && measureOps != null && _measure != null) ? newBranch.tryComputeMeasure(storage) : null);
     // The SAME snapshot's {slots, entries} pair — carried together so the successor
     // can never mix a pre-settle total with post-settle slots (or vice versa).
     if (settings.diffBufSize() > 0) newBranch.carryAndDepositReplace(storage, s0.buf, idx, removedKey, newKey, anchor0); // Absent(removedKey)+Present(newKey)
@@ -2952,6 +3178,20 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     Branch<Key, Address> proj = new Branch<>(base._level, base._len, newKeys, projAddresses,
                                              null, sl.count, sl.measure, _projCmp, base._settings);
     proj.installSlots(slots, BUF_LAZY);
+    // The base's array describes its children as of the base's own blob; the nested diff
+    // carries the current measure of every grandchild that changed since. Any of them
+    // missing leaves the copy without an array, which is the safe direction.
+    Object[] baseCm = base._childMeasures;
+    if (baseCm != null) {
+      Object[] cm = Arrays.copyOf(baseCm, base._len);
+      for (int i = 0; i < base._len && cm != null; i++) {
+        if (slots[i] != null) {
+          Object m = ((Slot) slots[i]).measure;
+          if (m == null) cm = null; else cm[i] = m;
+        }
+      }
+      proj._childMeasures = cm;
+    }
     return proj;
   }
 
@@ -3016,6 +3256,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     final Branch<Key, Address> copy = new Branch<>(_level, _len, Arrays.copyOf(_keys, _keys.length), addrCopy, childCopy,
                                                    count, _measure, _projCmp, _settings);
     copy._state = new NodeState<>(addrCopy, childCopy, s.buf);
+    copy._childMeasures = _childMeasures;   // same children; the array is never mutated
     return copy;
   }
 
@@ -3048,6 +3289,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
                                              _subtreeCount, _measure, projCmp, _settings);
     copy._state = new NodeState<>(addrCopy, childCopy, s.buf);
     copy._lazyCount = _lazyCount;   // a cache of the same content
+    copy._childMeasures = _childMeasures;   // likewise; never mutated
     return copy;
   }
 
@@ -3095,6 +3337,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   @Override
   public Address store(IStorage<Key, Address> storage) {
     assert beginSettle();
+    assert childMeasuresConsistent() : "child measures disagree with a resident child at level " + _level;
     try {
       return storeImpl(storage);
     } finally {
