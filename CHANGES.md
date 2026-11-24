@@ -14,8 +14,9 @@
   A branch now holds an array with the measure of each child, written into its blob as
   `:child-measures`. Its own measure is the fold of that array, so a write below one child
   needs only that child's new measure, which the node that comes back from the write always
-  has. Nothing is asked of a measure beyond `extract` and `merge` — no subtraction — so
-  min/max and order-sensitive measures are kept exactly like a sum. `get-nth` picks the
+  has. A branch asks nothing of a measure beyond `merge` — no subtraction — so min/max and
+  order-sensitive measures are kept exactly like a sum. (A leaf deletion still calls `remove`,
+  with its recompute callback, as before.) `get-nth` picks the
   child from the array, and `measure-slice` answers a fully covered child from it and reads
   only the two boundary paths. Same tree after: 0 stored branches without a measure, a cold
   `measure` reads 1 blob, `get-nth` 3. The price is one measure per child in every branch

@@ -580,7 +580,8 @@
                                  (when measure-ops
                                    (set! (.-_measure ^ANode b)
                                          (reduce (fn [acc m]
-                                                   (if m (.merge measure-ops acc m) acc))
+                                                   ;; `some?`: a measure may be `false`
+                                                   (if (some? m) (.merge measure-ops acc m) acc))
                                                  (.identity measure-ops)
                                                  (map :measure es)))
                                    ;; each child's measure, kept in the parent (Branch._childMeasures)

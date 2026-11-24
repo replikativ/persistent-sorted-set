@@ -312,7 +312,27 @@
       (is (= (:branches (s/measure-census c)) (:unknown (s/measure-census c))))
       (is (= (truth stat-ops all) (s/measure (cold o st addr))))
       (is (= [(nth all 599) 0] (s/get-nth (cold o st addr) 599)))
-      (is (empty? (:wrong (audit (s/replace (cold o st addr) [100 nil] [100 5] cmp) stat-ops)))))))
+      (let [s1 (s/replace (cold o st addr) [100 nil] [100 5] cmp)]
+        (is (empty? (:wrong (audit s1 stat-ops))))
+        (is (some? (.-_childMeasures (root s1)))
+            "and the write replaced it with a record of its own, rather than leaving none")))))
+
+(deftest a-buffered-write-does-not-make-an-older-branch-look-repaired
+  ;; See the JVM twin: under a diff buffer the parent can keep an edit in a slot against the
+  ;; child's OLD blob, so the child in memory holds a record its blob does not.
+  (let [n 3000, bf 8
+        {:keys [st o addr]} (built stat-ops bf 64 nil n)
+        _      (age! st false)
+        census (s/measure-census (cold o st addr))
+        s1     (s/replace (cold o st addr) [2468 nil] [2468 5] cmp)
+        a1     (s/store s1 st)
+        stored (s/measure-census (cold o st a1))]
+    (is (pos? (:unknown stored)) "precondition: the write left older branches behind")
+    (is (= stored (s/measure-census s1)) "the set that was written says what a restore finds")
+    (let [a2 (s/store (s/remeasure s1) st)]
+      (is (= {:branches (:branches census) :unknown 0} (s/measure-census (cold o st a2))))
+      (is (empty? (:wrong (audit (cold o st a2) stat-ops))))
+      (is (zero? (:no-record (audit (cold o st a2) stat-ops)))))))
 
 (deftest the-async-path-keeps-the-record-too
   (async done

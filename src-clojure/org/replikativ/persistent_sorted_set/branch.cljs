@@ -76,8 +76,7 @@
     (let [m (fold-measures measure-ops cm)]
       (if (some? m)
         (do (set! (.-_childMeasures b) cm)
-            (set! (.-_measure b) m)
-            (set! (.-_cmLazy b) false))
+            (set! (.-_measure b) m))
         (do (set! (.-_childMeasures b) nil)
             (set! (.-_measure b) fallback)))))
   b)
@@ -118,15 +117,19 @@
                      (loop [i 0]
                        (if (< i n)
                          (let [c  (await (child node storage i opts))
-                               m0 (node/measure c)
-                               m  (if (some? m0)
-                                    m0
-                                    (await (node/force-compute-measure c storage measure-ops opts)))]
+                               ;; A leaf is folded from its keys, not trusted: before the
+                               ;; record existed a leaf insert here could store a measure
+                               ;; merged in insertion order.
+                               m0 (when-not (instance? Leaf c) (node/measure c))
+                               m  (cond
+                                    (some? m0)         m0
+                                    (instance? Leaf c) (node/try-compute-measure c nil measure-ops {:sync? true})
+                                    :else              (await (node/force-compute-measure c storage measure-ops opts)))]
                            (if (some? m)
                              (do (aset out i m) (recur (inc i)))
                              nil))
-                         (do (set! (.-_cmLazy node) true)
-                             (set! (.-_childMeasures node) out)
+                         (do (set! (.-_childMeasures node) out)
+                             (set! (.-_cmLazy node) true)
                              out)))))))))
 
 (defn- projected-measures
@@ -301,7 +304,12 @@
     (Branch. (.-level base) (arrays/aclone ks) kid-copy addr-copy
              (.-subtree-count base) (.-_measure base) (.-settings base)
              (.-_slots base) (.-_bufEntries base) proj-cmp
-             (.-_childMeasures base) (boolean (.-_cmLazy base)))))
+             ;; Without buffered edits the projection comparator touches nothing and the
+             ;; record stands. With them, a comparator that orders ties differently replays
+             ;; a buffered leaf in another order, and an order-sensitive measure with it:
+             ;; the copy starts unknown and refills.
+             (when (nil? (.-_slots base)) (.-_childMeasures base))
+             (boolean (.-_cmLazy base)))))
 
 (defn stamp-proj-cmp
   "Seed `node`'s projection comparator, or return a COPY when it already carries a different
@@ -952,8 +960,10 @@
             new-sc (if (>= old-sc 0) (inc old-sc) -1)
             m      (when (and measure-ops (some? (.-_measure this)))
                      (measure/merge-measure measure-ops (.-_measure this) (measure/extract measure-ops key)))]
-        (arrays/array (install-measures! (Branch. lvl new-keys new-children new-addrs new-sc m settings nil 0 (.-_projCmp this) nil false)
-                                         measure-ops cm-ins m)))
+        (arrays/array (install-measures! (Branch. lvl new-keys new-children new-addrs new-sc m settings nil 0 (.-_projCmp this) nil (boolean (.-_cmLazy this)))
+                                         ;; unknown rather than `m` when the record cannot be spliced: appending
+                                         ;; the key's measure is right only for a commutative merge
+                                         measure-ops cm-ins nil)))
       (loop [out (transient []), pos 0, ls lens]
         (if (seq ls)
           (let [l    (first ls)
@@ -1049,8 +1059,9 @@
                                  new-measure (when (and measure-ops (some? (.-_measure this)))
                                                (measure/merge-measure measure-ops (.-_measure this) (measure/extract measure-ops key)))
                                  nb (install-measures!
-                                     (Branch. (.-level this) new-keys new-children new-addrs new-sc new-measure (.-settings this) nil 0 (.-_projCmp this) nil false)
-                                     measure-ops cm-ins new-measure)]
+                                     (Branch. (.-level this) new-keys new-children new-addrs new-sc new-measure (.-settings this) nil 0 (.-_projCmp this) nil (boolean (.-_cmLazy this)))
+                                     ;; unknown, not the appended `new-measure`, when the record cannot be spliced
+                                     measure-ops cm-ins nil)]
                            ;; diff-buf: nodes-len==1 ⇒ content-only ⇒ carry the source slots and
                            ;; deposit Present(key) (matches JVM persistent path). nodes-len>=2 ⇒ a child
                            ;; split was absorbed ⇒ structural: mark rebalanced + stitch surviving siblings.
@@ -1258,7 +1269,7 @@
                                         k))
                              cm-c   (splice-measures measure-ops cm0 left-idx right-idx disjoined keep)
                              center (install-measures!
-                                     (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-measure (.-settings this) nil 0 (.-_projCmp this) nil false)
+                                     (Branch. (.-level this) new-keys new-kids new-addrs new-sc new-measure (.-settings this) nil 0 (.-_projCmp this) nil (boolean (.-_cmLazy this)))
                                      measure-ops cm-c new-measure)
                              ;; A join or a borrow combines the records of both nodes, and
                              ;; `merge` / `merge-split` have no storage to fill a missing one.
@@ -1512,7 +1523,7 @@
                                                   na))
                                  _            (aset new-keys idx new-max-key)
                                  _            (aset new-children idx new-node)
-                                 new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil 0 (.-_projCmp this) nil false)
+                                 new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil 0 (.-_projCmp this) nil (boolean (.-_cmLazy this)))
                                  new-measure    (when (and measure-ops (some? (.-_measure this)))
                                                   (replace-measure new-branch storage measure-ops))
                                  cm-r           (when measure-ops
@@ -1538,7 +1549,7 @@
                                                   (aset na idx nil)
                                                   na))
                                  _            (aset new-children idx new-node)
-                                 new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil 0 (.-_projCmp this) nil false)
+                                 new-branch   (Branch. (.-level this) new-keys new-children new-addrs (.-subtree-count this) nil (.-settings this) nil 0 (.-_projCmp this) nil (boolean (.-_cmLazy this)))
                                  new-measure    (when (and measure-ops (some? (.-_measure this)))
                                                   (replace-measure new-branch storage measure-ops))
                                  cm-r           (when measure-ops
@@ -1858,8 +1869,10 @@
 ;;                   nil when unknown (a blob written before the record existed). Never
 ;;                   mutated once installed. See the helpers at the top of this namespace and
 ;;                   JVM `Branch._childMeasures`.
-;;   `_cmLazy`      — true while that array was only filled by a read on a node whose blob
-;;                   has none; `measure-census` and `remeasure` have to know.
+;;   `_cmLazy`      — true while this node's BLOB has no array: filled by a read, or the
+;;                   content-only successor of such a node (it may be buffered in its parent
+;;                   instead of written). Cleared only where the node itself is written.
+;;                   `measure-census` and `remeasure` have to know.
 (deftype Branch [^number level keys ^:mutable children ^:mutable addresses ^:mutable ^number subtree-count ^:mutable _measure settings ^:mutable _slots ^:mutable _bufEntries ^:mutable _projCmp ^:mutable _childMeasures ^:mutable _cmLazy]
   Object
   (toString [_] (pr-str* {:level level :keys (vec keys)}))

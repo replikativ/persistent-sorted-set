@@ -388,4 +388,27 @@
       (is (= (:branches (set/measure-census c)) (:unknown (set/measure-census c))))
       (is (= (truth stat-ops all) (set/measure (cold o st addr))))
       (is (= [(nth all 599) 0] (set/get-nth (cold o st addr) 599)))
-      (is (empty? (:wrong (audit (set/replace (cold o st addr) [100 nil] [100 5] cmp) stat-ops)))))))
+      (let [s1 (set/replace (cold o st addr) [100 nil] [100 5] cmp)]
+        (is (empty? (:wrong (audit s1 stat-ops))))
+        (is (some? (.-_childMeasures ^Branch (.root ^PersistentSortedSet s1)))
+            "and the write replaced it with a record of its own, rather than leaving none")))))
+
+(deftest a-buffered-write-does-not-make-an-older-branch-look-repaired
+  ;; With a diff buffer a write need not rewrite the branch it passes: the parent can keep
+  ;; the edit in a slot against the child's OLD blob. The child in memory then holds a
+  ;; record its blob does not, and a census that believed the memory would report it
+  ;; repaired -- and `remeasure` would skip it for good.
+  (let [n 3000, bf 8
+        {:keys [st o addr]} (built stat-ops bf 64 nil n)
+        _      (age! st false)
+        census (set/measure-census (cold o st addr))
+        s1     (set/replace (cold o st addr) [2468 nil] [2468 5] cmp)
+        a1     (set/store s1 st)
+        stored (set/measure-census (cold o st a1))]
+    (is (pos? (long (:unknown stored))) "precondition: the write left older branches behind")
+    (is (= stored (set/measure-census s1)) "the set that was written says what a restore finds")
+    (let [a2 (set/store (set/remeasure s1) st)
+          c  (cold o st a2)]
+      (is (= {:branches (:branches census) :unknown 0} (set/measure-census (cold o st a2))))
+      (is (empty? (:wrong (audit c stat-ops))))
+      (is (zero? (long (:no-record (audit (cold o st a2) stat-ops))))))))

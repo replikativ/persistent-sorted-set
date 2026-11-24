@@ -245,10 +245,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // contents. Its length is exactly the `_len` it was built for.
   public volatile Object[] _childMeasures;
 
-  // True while the array was only FILLED BY A READ on a node whose blob has none
-  // (`ensureChildMeasures`). Such a node answers from memory but a restore finds nothing,
-  // which is what `measureCensus` and `remeasure` have to know. Cleared when the node is
-  // written, and never set by a write arm: a node a write built is written with its array.
+  // True while this node's BLOB has no array: the array was filled by a read
+  // (`ensureChildMeasures`), or this node is the content-only successor of such a node and
+  // may be buffered in its parent's slot instead of being written. It answers from memory
+  // but a restore finds nothing, which is what `measureCensus` and `remeasure` have to know.
+  // Cleared only where the node itself is written.
   boolean _cmLazy;
 
   /** Fold `cm[0..len)`. null in, or a null entry, gives null. */
@@ -338,7 +339,6 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       Object m = foldMeasures(ops, cm, _len);
       _childMeasures = (m == null) ? null : cm;
       _measure = (m == null) ? fallback : m;
-      _cmLazy = false;
     } else {
       _childMeasures = null;
       _measure = fallback;
@@ -372,7 +372,11 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (m == null) return null;
       out[i] = m;
     }
-    if (len == _len) { _cmLazy = true; _childMeasures = out; }
+    // Array first, flag second. A `store` running between the two either serialised the
+    // array (and the flag then over-reports, which costs one rewrite) or did not (and the
+    // flag is right). The other order let a store clear the flag, write no array, and the
+    // array arrive afterwards looking stored.
+    if (len == _len) { _childMeasures = out; _cmLazy = true; }
     return out;
   }
 
@@ -1570,6 +1574,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           tryComputeMeasureFromChildren(newChildren, _len, storage, measureOps), _measure, key);
       Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, newCount, newMeasure, _projCmp, settings);
       nb.installMeasures(measureOps, cmIns, newMeasure);
+      nb._cmLazy = _cmLazy;   // content-only successor: may be buffered, not written
       // The SAME snapshot's {slots, entries} pair — carried together so the successor
       // can never mix a pre-settle total with post-settle slots (or vice versa).
       if (settings.diffBufSize() > 0) nb.carryAndDeposit(storage, s0.buf, ins, key, key, anchor0); // content-only: Present(key) / branch marker
@@ -1623,6 +1628,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
           tryComputeMeasureFromChildren(allChildren, newLen, storage, measureOps), _measure, key);
       Branch<Key, Address> nb = new Branch(_level, newLen, allKeys, allAddresses, allChildren, count, measure, _projCmp, settings);
       nb.installMeasures(measureOps, cmIns, measure);
+      nb._cmLazy = _cmLazy;
       if (settings.diffBufSize() > 0) {
         // absorbed a child split: structural → written (BUF_WRITE), but it still buffers
         // surviving siblings — carry their slots through the rebuild. nb is unpublished,
@@ -2045,6 +2051,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       newCenter._subtreeCount = (ownAfter >= 0)
                                 ? ownAfter
                                 : tryComputeSubtreeCountFromChildren(centerChildren, newLen, storage);
+      newCenter._cmLazy = _cmLazy;
       newCenter.installMeasures(measureOps, cmCenter,
           (cmCenter != null) ? null : tryComputeMeasureFromChildren(centerChildren, newLen, storage, measureOps));
       if (settings.diffBufSize() > 0) {
@@ -2834,6 +2841,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
 
     // Try to recompute measure from final state (after child replacement) for new branch
     Branch<Key, Address> newBranch = new Branch(_level, _len, newKeys, newAddresses, newChildren, knownCount(), null, _projCmp, settings);
+    newBranch._cmLazy = _cmLazy;
     newBranch.installMeasures(measureOps, cmR,
         (cmR == null && measureOps != null && _measure != null) ? newBranch.tryComputeMeasure(storage) : null);
     // The SAME snapshot's {slots, entries} pair — carried together so the successor
@@ -3359,8 +3367,14 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
                                              _subtreeCount, _measure, projCmp, _settings);
     copy._state = new NodeState<>(addrCopy, childCopy, s.buf);
     copy._lazyCount = _lazyCount;   // a cache of the same content
-    copy._childMeasures = _childMeasures;   // likewise; never mutated
-    copy._cmLazy = _cmLazy;
+    // The array describes the children in THIS comparator's order. Without buffered edits
+    // the projection comparator touches nothing, and the array stands. With them, a
+    // comparator that orders ties differently replays a buffered leaf in another order,
+    // and an order-sensitive measure with it: the copy starts unknown and refills.
+    if (s.buf == null || s.buf.slots == null) {
+      copy._childMeasures = _childMeasures;
+      copy._cmLazy = _cmLazy;
+    }
     return copy;
   }
 
