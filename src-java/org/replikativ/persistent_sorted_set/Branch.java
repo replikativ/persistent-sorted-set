@@ -358,7 +358,9 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     Object[] out = new Object[len];
     for (int i = 0; i < len; i++) {
       ANode child = child(storage, i);
-      Object m = measureOf(child, storage);
+      // Forcing ASSIGNS the child's own measure, as a forced read always has: a leaf
+      // works it out from its keys, a branch from its array.
+      Object m = child._measure;
       if (m == null) m = child.forceComputeMeasure(storage);
       if (m == null) return null;
       out[i] = m;
