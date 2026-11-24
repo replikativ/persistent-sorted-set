@@ -149,9 +149,10 @@
          measure       (when (and measure-ops (every? some? cmeas))
                          (reduce (fn [acc cs] (measure/merge-measure measure-ops acc cs))
                                  (measure/identity-measure measure-ops) cmeas))]
-     (Branch. lvl (arrays/amap node/max-key carr) carr
-              (when addresses-seq (arrays/into-array addresses-seq))
-              subtree-count measure settings nil 0 projcmp))))
+     (branch/with-child-measures!
+       (Branch. lvl (arrays/amap node/max-key carr) carr
+                (when addresses-seq (arrays/into-array addresses-seq))
+                subtree-count measure settings nil 0 projcmp nil false)))))
 
 (defn- mst-children
   "Materialize a branch's children (storage-aware) → (async [children-vec addresses-vec]). Each
@@ -319,7 +320,8 @@
              (when-some [a (.-addresses root)] (.slice a))
              total (.-_measure root) (.-settings root)
              (when-some [sl (.-_slots root)] (.slice sl))
-             (.-_bufEntries root) (.-_projCmp root))
+             (.-_bufEntries root) (.-_projCmp root)
+             (.-_childMeasures root) (boolean (.-_cmLazy root)))
     root))
 
 (defn conjoin
@@ -381,7 +383,8 @@
                             ;; diff-buf: new root on growth — _bufEntries = 0 (no buffered diff; this
                             ;; node is always the root ⇒ always written; if later mutated in a transient
                             ;; batch the first deposit poisons it correctly). Mirrors JVM makeBranchFromChildren.
-                              (BTSet. (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count root-measure (.-settings set) nil 0 (.-comparator set))
+                              (BTSet. (branch/with-child-measures!
+                                        (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count root-measure (.-settings set) nil 0 (.-comparator set) nil false))
                                       new-cnt
                                       (.-comparator set)
                                       (.-meta set)
@@ -516,6 +519,46 @@
                     (let [r (await (branch/count-census root (.-storage set) opts))]
                       {:branches (nth r 0) :unknown (nth r 1)})
                     {:branches 0 :unknown 0}))))))
+
+(defn measure-census
+  "`{:branches n :unknown m}`: how many branches the tree has and how many of them have no
+   STORED record of their children's measures (written before the record existed). Such
+   a branch is correct but expensive: `get-nth` through it, a `measure-slice` that covers
+   it and a write below it read its children. Reads every branch and no leaf."
+  ([^BTSet set] (measure-census set {:sync? true}))
+  ([^BTSet set {:keys [sync?] :or {sync? true} :as opts}]
+   (async+sync sync?
+               (async
+                (let [root (await (-root set opts))]
+                  (if (and (instance? Branch root) (:measure (.-settings set)))
+                    (let [r (await (branch/measure-census root (.-storage set) opts))]
+                      {:branches (nth r 0) :unknown (nth r 1)})
+                    {:branches 0 :unknown 0}))))))
+
+(defn remeasure
+  "`set` with every branch holding its children's measures and every branch that did not
+   hold them on disk marked to be written: `store` the result and the records are
+   durable. Returns `set` itself when there is nothing to do. Content, order, structure
+   and counts are unchanged.
+
+   A tree heals as it is written -- each write stores the record for the branches on its
+   path -- so this is only for getting it over with. It reads every branch, plus the
+   children of each branch without a record."
+  ([^BTSet set] (remeasure set {:sync? true}))
+  ([^BTSet set {:keys [sync?] :or {sync? true} :as opts}]
+   (async+sync sync?
+               (async
+                (let [root (await (-root set opts))]
+                  (if-not (and (instance? Branch root) (:measure (.-settings set)))
+                    set
+                    (let [nr (await (branch/remeasure root (.-storage set) opts))]
+                      (if (identical? nr root)
+                        set
+                        (do
+                          (when (and (.-storage set) (.-address set))
+                            (storage/markFreed (.-storage set) (.-address set)))
+                          (BTSet. nr (.-cnt set) (.-comparator set) (.-meta set)
+                                  UNINITIALIZED_HASH (.-storage set) nil (.-settings set)))))))))))
 
 (defn recount
   "`set` with every branch counted and every branch that had no count marked to be
@@ -1572,37 +1615,45 @@
                                   (let [idx (binary-search-r cmp keys (- len 2) to)]
                                     (min idx (dec len)))
                                   (dec len))]
-                   (cond
-            ;; Empty range
-                     (> from-idx to-idx)
-                     (measure/identity-measure measure-ops)
+                   ;; A child the range covers ENTIRELY is answered from the branch's own
+                   ;; record of it, without restoring the child: every child strictly
+                   ;; between the two boundary ones, and a boundary one too when the range
+                   ;; is open on that side. So only the two boundary paths are read.
+                   (let [cm    (await (branch/ensure-child-measures node storage measure-ops opts))
+                         whole (fn [i] (when (some? cm) (arrays/aget cm i)))]
+                     (cond
+                       (> from-idx to-idx)
+                       (measure/identity-measure measure-ops)
 
-            ;; Same child, recurse into it
-                     (== from-idx to-idx)
-                     (let [child (await (branch/child node storage from-idx opts))]
-                       (await (measure-slice-node child storage measure-ops from to cmp opts)))
+                       (== from-idx to-idx)
+                       (if (and (nil? from) (nil? to) (some? cm))
+                         (whole from-idx)
+                         (let [child (await (branch/child node storage from-idx opts))]
+                           (await (measure-slice-node child storage measure-ops from to cmp opts))))
 
-            ;; Spans multiple children
-                     :else
-                     (let [;; Measure from partial first child
-                           first-child (await (branch/child node storage from-idx opts))
-                           first-measure (await (measure-slice-node first-child storage measure-ops from nil cmp opts))
-                  ;; Measure from partial last child
-                           last-child  (await (branch/child node storage to-idx opts))
-                           last-measure  (await (measure-slice-node last-child storage measure-ops nil to cmp opts))
-                  ;; Measure from fully contained children in between
-                           middle-measure (loop [i (inc from-idx)
-                                                 acc (measure/identity-measure measure-ops)]
-                                            (if (>= i to-idx)
-                                              acc
-                                              (let [child (await (branch/child node storage i opts))
-                                                    child-measure (or (node/measure child)
-                                                                      (await (node/force-compute-measure child storage measure-ops opts)))]
-                                                (recur (inc i)
-                                                       (measure/merge-measure measure-ops acc child-measure)))))]
-                       (measure/merge-measure measure-ops
-                                              (measure/merge-measure measure-ops first-measure middle-measure)
-                                              last-measure))))))))
+                       :else
+                       (let [first-measure (if (and (nil? from) (some? cm))
+                                             (whole from-idx)
+                                             (let [c (await (branch/child node storage from-idx opts))]
+                                               (await (measure-slice-node c storage measure-ops from nil cmp opts))))
+                             last-measure  (if (and (nil? to) (some? cm))
+                                             (whole to-idx)
+                                             (let [c (await (branch/child node storage to-idx opts))]
+                                               (await (measure-slice-node c storage measure-ops nil to cmp opts))))
+                             middle-measure (loop [i (inc from-idx)
+                                                   acc (measure/identity-measure measure-ops)]
+                                              (if (>= i to-idx)
+                                                acc
+                                                (let [m (if (some? cm)
+                                                          (whole i)
+                                                          (let [child (await (branch/child node storage i opts))]
+                                                            (if (some? (node/measure child))
+                                                              (node/measure child)
+                                                              (await (node/force-compute-measure child storage measure-ops opts)))))]
+                                                  (recur (inc i) (measure/merge-measure measure-ops acc m)))))]
+                         (measure/merge-measure measure-ops
+                                                (measure/merge-measure measure-ops first-measure middle-measure)
+                                                last-measure)))))))))
 
 (defn measure-slice
   "Compute measure for elements in the range [from, to] inclusive.
@@ -1648,9 +1699,11 @@
                   (when (nil? measure-ops)
                     (throw (js/Error. "get-nth requires measure to be configured")))
                   (when (pos? (node/len root))
-                    (let [root-measure (or (node/measure root)
-                                           (await (node/force-compute-measure root (.-storage set) measure-ops opts)))]
-                      (when root-measure
+                    (let [m0           (node/measure root)
+                          root-measure (if (some? m0)
+                                         m0
+                                         (await (node/force-compute-measure root (.-storage set) measure-ops opts)))]
+                      (when (some? root-measure)
                         (let [total-weight (measure/weight measure-ops root-measure)]
                           (when (and (>= n 0) (< n total-weight))
                             ;; Navigate tree
@@ -1658,19 +1711,21 @@
                                    rank n]
                               (if (instance? Branch cur-node)
                             ;; Branch: find child by weight
+                                ;; the record says which child holds the position, so
+                                ;; only that child is restored: one node per level
                                 (let [len (node/len cur-node)
-                                      result (loop [i 0
-                                                    r rank]
-                                               (when (< i len)
-                                                 (let [child (await (branch/child cur-node (.-storage set) i opts))
-                                                       child-measure (or (node/measure child)
-                                                                         (await (node/force-compute-measure child (.-storage set) measure-ops opts)))
-                                                       child-weight (measure/weight measure-ops child-measure)]
-                                                   (if (< r child-weight)
-                                                     [child r]
-                                                     (recur (inc i) (- r child-weight))))))]
-                                  (when result
-                                    (recur (nth result 0) (nth result 1))))
+                                      cm  (await (branch/ensure-child-measures cur-node (.-storage set) measure-ops opts))
+                                      hit (when (some? cm)
+                                            (loop [i 0
+                                                   r rank]
+                                              (when (< i len)
+                                                (let [w (measure/weight measure-ops (arrays/aget cm i))]
+                                                  (if (< r w)
+                                                    [i r]
+                                                    (recur (inc i) (- r w)))))))]
+                                  (when hit
+                                    (let [child (await (branch/child cur-node (.-storage set) (nth hit 0) opts))]
+                                      (recur child (nth hit 1)))))
                             ;; Leaf: iterate keys by weight
                                 (let [keys (.-keys cur-node)
                                       len (arrays/alength keys)]
@@ -2367,15 +2422,16 @@
                                                                       (reduced nil)))))
                                                               (measure/identity-measure measure-ops)
                                                               %))]
-                                  (Branch. (inc shift)
-                                           (arrays/amap node/max-key %)
-                                           %
-                                           nil
-                                           subtree-count
-                                           child-measure
+                                  (branch/with-child-measures!
+                                    (Branch. (inc shift)
+                                             (arrays/amap node/max-key %)
+                                             %
+                                             nil
+                                             subtree-count
+                                             child-measure
                                            ;; diff-buf: bulk-built branch — _bufEntries = 0 (no slots,
                                            ;; anchorless ⇒ written wholesale at store). See branch.cljs.
-                                           settings nil 0 cmp))))
+                                             settings nil 0 cmp nil false)))))
          (inc shift))))))
 
 (defn ^BTSet from-sequential [cmp seq opts]
@@ -2455,7 +2511,9 @@
     ;;   whose slots the storage layer will back-fill. We built this one and it
     ;;   has no slots, so it is clean and written wholesale.
     ;; _projCmp = cmp: matches every other bulk-built branch (from-sorted-array-count).
-    (Branch. lvl ks nil as cnt meas settings nil 0 cmp)))
+    ;; the children's measures are in hand (`ms`), so the record costs nothing here
+    (Branch. lvl ks nil as cnt meas settings nil 0 cmp
+             (when (some? meas) (.slice ms 0 n)) false)))
 
 (defn ^BTSet from-sorted-seq
   "Bulk-build a set from a SORTED, DISTINCT seq, storing every node as it fills.

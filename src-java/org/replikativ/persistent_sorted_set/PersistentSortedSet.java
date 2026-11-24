@@ -289,8 +289,19 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     // mutated further this txn the first deposit folds its children's values in (poisoning it to
     // BUF_WRITE if a child rebalanced). Do not reuse this for a non-root branch without
     // publishing a diff-buf snapshot.
-    return new Branch(nodes[0].level() + 1, n, keys, null, children,
-                      countKnown ? subtreeCount : -1, measure, _cmp, _settings);
+    Branch root = new Branch(nodes[0].level() + 1, n, keys, null, children,
+                             countKnown ? subtreeCount : -1, measure, _cmp, _settings);
+    IMeasure measureOps = _settings.measure();
+    if (measureOps != null) {
+      // The new root's children are the nodes in hand: record each one's measure.
+      Object[] cm = new Object[n];
+      for (int i = 0; i < n && cm != null; i++) {
+        cm[i] = Branch.measureOf(nodes[i], _storage);
+        if (cm[i] == null) cm = null;
+      }
+      if (cm != null) root._childMeasures = cm;
+    }
+    return root;
   }
 
   /**
@@ -444,6 +455,35 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     if (_storage != null && _address != null) _storage.markFreed(_address);
     final long c = nb._subtreeCount;
     return new PersistentSortedSet(_meta, _cmp, null, _storage, nb, (c >= 0) ? (int) c : -1, _settings, _version + 1);
+  }
+
+  /**
+   * `{branches, branches stored without their children's measures}`. A branch without them
+   * answers correctly, but a write through it, a positional lookup and a measure over a
+   * range first read its children. Zeros for a set without an IMeasure.
+   */
+  public long[] measureCensus() {
+    final long[] out = new long[2];
+    final ANode root = root();
+    if (_settings.measure() != null && root instanceof Branch) {
+      ((Branch) root).measureCensus(_storage, out);
+    }
+    return out;
+  }
+
+  /**
+   * This set with every branch holding its children's measures, and each one that did not
+   * hold them on disk marked to be written. Returns `this` when there is nothing to do.
+   */
+  public PersistentSortedSet remeasure() {
+    if (editable()) throw new IllegalStateException("remeasure: not on a transient; call persistent! first");
+    final ANode root = root();
+    if (_settings.measure() == null || !(root instanceof Branch)) return this;
+    final Branch b = (Branch) root;
+    final Branch nb = b.remeasure(_storage, settings());
+    if (nb == b) return this;
+    if (_storage != null && _address != null) _storage.markFreed(_address);
+    return new PersistentSortedSet(_meta, _cmp, null, _storage, nb, _count, _settings, _version + 1);
   }
 
   public boolean editable() {
@@ -687,13 +727,21 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     while (node instanceof Branch) {
       Branch<Key, Address> branch = (Branch<Key, Address>) node;
       boolean found = false;
+      // Pick the child from the branch's own record of its children's measures, so only
+      // the child that holds the position is restored. Reading each child for its weight
+      // restored every child to the left of it, at every level.
+      final Object[] cm = branch.ensureChildMeasures(_storage);
       for (int i = 0; i < branch._len; i++) {
-        ANode<Key, Address> child = branch.child(_storage, i);
-        Object childMeasure = child._measure;
-        if (childMeasure == null) childMeasure = child.forceComputeMeasure(_storage);
+        Object childMeasure = (cm != null) ? cm[i] : null;
+        ANode<Key, Address> child = null;
+        if (childMeasure == null) {
+          child = branch.child(_storage, i);
+          childMeasure = child._measure;
+          if (childMeasure == null) childMeasure = child.forceComputeMeasure(_storage);
+        }
         long childWeight = measureOps.weight(childMeasure);
         if (rank < childWeight) {
-          node = child;
+          node = (child != null) ? child : branch.child(_storage, i);
           found = true;
           break;
         }

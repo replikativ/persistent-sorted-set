@@ -46,7 +46,7 @@
      :cljs
      (let [b (branch/->Branch 1 (array 1 2 3) nil nil nil nil
                               {:branching-factor 8 :diff-buf-size 0 :comparator cmp}
-                              nil 0 nil)]
+                              nil 0 nil nil false)]
        (branch/install-slots! b (array {:diff nil :count 1 :measure nil :anchor "anchor-a"}
                                        nil nil)))))
 
@@ -75,7 +75,7 @@
                   :cljs
                   (let [b (branch/->Branch 1 (array 1 2 3) nil nil nil nil
                                            {:branching-factor 8 :diff-buf-size 64 :comparator cmp}
-                                           nil 0 nil)]
+                                           nil 0 nil nil false)]
                     (branch/install-slots!
                      b (array {:diff nil :count 1 :measure nil :anchor "anchor-a"} nil nil))
                     true))

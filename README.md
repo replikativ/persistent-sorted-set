@@ -267,6 +267,29 @@ ClojureScript also supports durable storage. The `IStorage` interface works the 
 `store`/`restore` return promises/async values, so it integrates with IndexedDB, remote storage
 APIs, and other async backends. Async-aware operations take a `:sync?` option.
 
+Every stored branch records the measure of each of its children, and its own measure is the
+fold of that record. A write therefore keeps the aggregate without reading anything beyond
+its path, whatever the measure is (nothing is subtracted, so min/max need no special case),
+`get-nth` reads one node per level, and `measure-slice` reads the two boundary paths. The
+record costs one measure value per child in each branch blob.
+
+A tree written by an earlier version has no records. It answers correctly, reads a branch's
+children the first time the record is needed, and stores the record for every branch a write
+passes, so it repairs itself as it is written. To repair it in one pass:
+
+```clojure
+(set/measure-census s)          ;=> {:branches 1203, :unknown 1203}
+(def s' (set/remeasure s))      ; same elements, same structure
+(set/store s')                  ; writes the branches that had no record
+(set/measure-census s')         ;=> {:branches 1203, :unknown 0}
+```
+
+A measure whose `merge` is not commutative cannot be combined with a diff buffer
+(`:diff-buf-size`); the JVM refuses the pair. See CHANGES.md for why.
+
+A consumer with its own node codec has to carry the blob's `:child-measures` key; see
+[doc/serialization.md](doc/serialization.md).
+
 ## Serialization
 
 For consumers that share a wire format (datahike, yggdrasil, proximum, stratum), the

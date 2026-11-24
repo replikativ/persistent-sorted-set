@@ -133,11 +133,15 @@
                              :else
                              (let [new-keys (util/splice keys idx idx (arrays/array key))
                                    new-leaf (Leaf. new-keys settings nil)]
-                               ;; Update measure incrementally only if we already have measure.
-                               ;; If _measure is nil (e.g. from merge/merge-split), leave nil for lazy recomputation.
+                               ;; Folded from the keys, in key order. This used to append the new
+                               ;; key's measure to the old one -- `merge(old, extract(key))` --
+                               ;; which is the right answer only for a COMMUTATIVE merge: the key
+                               ;; went in at `idx`, not at the end. The protocol here has no way
+                               ;; to say which kind a measure is (the JVM's `commutativeMerge`),
+                               ;; so the fold is the one answer that is right for both, and it
+                               ;; walks an array this arm has just copied anyway.
                                (when (and measure-ops (some? _measure))
-                                 (set! (.-_measure new-leaf)
-                                       (measure/merge-measure measure-ops _measure (measure/extract measure-ops key))))
+                                 (node/try-compute-measure new-leaf nil measure-ops {:sync? true}))
                                (arrays/array new-leaf)))]
       (if sync?
         result

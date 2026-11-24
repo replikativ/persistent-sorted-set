@@ -322,6 +322,25 @@
   ([^BTSet set] (btset/count-census set {:sync? true}))
   ([^BTSet set opts] (btset/count-census set opts)))
 
+(defn measure-census
+  "`{:branches n :unknown m}`: how many branches the tree has and how many of them have no
+   STORED record of their children's measures. A branch without one is correct but
+   expensive: `get-nth` through it, a `measure-slice` that covers it and a write below it
+   read its children. Trees written before 0.5.149 have none. Reads every branch, no leaf."
+  ([^BTSet set] (btset/measure-census set {:sync? true}))
+  ([^BTSet set opts] (btset/measure-census set opts)))
+
+(defn remeasure
+  "`set` with every branch holding its children's measures and every branch that did not
+   hold them on disk marked to be written: `store` the result and the records are durable.
+   Returns `set` itself when there is nothing to do. Content, order, structure and counts
+   are unchanged.
+
+   A tree heals as it is written -- each write stores the record for the branches on its
+   path -- so this is only for getting it over with."
+  ([^BTSet set] (btset/remeasure set {:sync? true}))
+  ([^BTSet set opts] (btset/remeasure set opts)))
+
 (defn recount
   "`set` with every branch counted and every branch that had no count marked to be
    written: `store` the result and the counts are durable. Returns `set` itself when there

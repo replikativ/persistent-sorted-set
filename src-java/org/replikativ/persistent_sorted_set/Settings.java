@@ -88,6 +88,40 @@ public class Settings {
   // and `map->settings` in the Clojure API), and reaching this with a positive budget means
   // someone named one. `PersistentSortedSet.root()` handles the third source separately: it
   // decides from what the subtree actually BUFFERS, not from what it declares.
+  /** A measure whose `merge` is not commutative: the fold depends on element order. */
+  public static boolean orderSensitive(IMeasure measure) {
+    return measure != null && !measure.commutativeMerge();
+  }
+
+  // An ORDER-SENSITIVE measure is not supported together with diff-buffering, and an explicit
+  // request for both is refused.
+  //
+  // A buffered leaf is rebuilt by replaying its diff under the set's projection comparator.
+  // Two sets over one caching storage whose comparators order ties differently rebuild the
+  // same leaf in different orders (`Branch.withProjCmp`), and every aggregate cached above
+  // it -- the leaf's parent's record of its children's measures, the slot's measure, each
+  // ancestor's -- was folded in the other order. A commutative measure does not care: the
+  // elements are the same. An order-sensitive one is then stale, and nothing short of
+  // tracking the comparator with every cached aggregate tells the two apart.
+  //
+  // Same policy as the leafProcessor pairing above: REFUSE an explicit pairing, and let the
+  // callers that only INHERIT a budget (the `pss.diffBufSize` property) pass 0. Checked
+  // only where a caller builds settings (the constructor the Clojure API uses), never where
+  // a restored node's own budget is adopted: a store that already holds buffered edits must
+  // keep opening.
+  private static int diffBufForMeasure(IMeasure measure, int diffBufSize) {
+    if (orderSensitive(measure) && diffBufSize > 0) {
+      throw new IllegalArgumentException(
+        "diff-buf size " + diffBufSize + " was requested together with a measure whose merge "
+        + "is not commutative (IMeasure.commutativeMerge() is false), and the two are not "
+        + "supported together: a buffered leaf is rebuilt in the order of the comparator that "
+        + "reads it, so an aggregate that depends on element order can be stale when two sets "
+        + "share nodes under comparators that order ties differently. Omit :diff-buf-size to "
+        + "run this set unbuffered.");
+    }
+    return diffBufSize;
+  }
+
   private static int diffBufFor(ILeafProcessor leafProcessor, int diffBufSize) {
     if (leafProcessor != null && diffBufSize > 0) {
       throw new IllegalArgumentException(
@@ -134,7 +168,7 @@ public class Settings {
     // `defaultDiffBufSize()` here would hand `diffBufFor` a positive budget nobody asked
     // for and turn the system property into a hard failure for every processor user.
     this(branchingFactor, refType, measure, leafProcessor,
-         (leafProcessor != null) ? 0 : defaultDiffBufSize());
+         (leafProcessor != null || orderSensitive(measure)) ? 0 : defaultDiffBufSize());
   }
 
   /** The smallest branching factor this implementation supports.
@@ -186,7 +220,7 @@ public class Settings {
     _edit = null;
     _measure = measure;
     _leafProcessor = leafProcessor;
-    _diffBufSize = diffBufFor(leafProcessor, diffBufSize < 0 ? 0 : diffBufSize);
+    _diffBufSize = diffBufForMeasure(measure, diffBufFor(leafProcessor, diffBufSize < 0 ? 0 : diffBufSize));
     _boundary = null; // count default; MST configured via withBoundary()
   }
 

@@ -68,14 +68,17 @@ the operating root.** A blob carries plain DATA; it never carries a live object 
 ```
 pss/leaf   → {:keys <elements>                                  :branching-factor n :diff-buf-size d (:ref-type)}
 pss/branch → {:level n :keys <separators> :addresses <addrs>
-              :subtree-count c (:measure m) (:slots <diff-buf>)  :branching-factor n :diff-buf-size d (:ref-type)}
+              :subtree-count c (:measure m) (:child-measures [m ...]) (:slots <diff-buf>)  :branching-factor n :diff-buf-size d (:ref-type)}
 pss/set    → {:meta <root-meta> :address <root-addr> :count n   :branching-factor n :diff-buf-size d (:ref-type)}
 ```
 
 `:ref-type` (`:soft`/`:weak`/`:strong`) is present only when non-default (SOFT omitted). A read-time
 `:ref-type` opt on `read-handlers`/`root-read-handler` overrides the serialized value.
 
-`subtree-count`/`measure` are carried for completeness; `:slots` appears only when diff-buf
+`:child-measures` (only with a measure) holds the measure of each child, parallel to `:keys`.
+It is what lets a write keep the aggregate, and `get-nth` / `measure-slice` route, without
+restoring children; a codec that drops it yields a correct tree whose branches read their
+children to rebuild it. `subtree-count`/`measure` are carried for completeness; `:slots` appears only when diff-buf
 is enabled (`Settings.diffBufSize > 0`), where a leaf child's `:diff` is the comparator-agnostic
 `{:absent [..] :present [..]}` form (`Slot/leafDiffForStorage`) and slots reconstruct into
 `_slots` with `anchor = addresses[idx]` (re-derived, not stored). cljs `keys`/`addresses` are

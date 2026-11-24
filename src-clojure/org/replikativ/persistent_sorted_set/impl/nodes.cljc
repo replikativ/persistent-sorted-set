@@ -96,7 +96,9 @@
 
 (defn node->map
   "Project a PSS node to the map that gets STORED. Leaf → {:keys … (:measure)}; Branch →
-   {:level :keys :addresses :subtree-count (:measure) (:slots)}. Comparator/storage/settings-free;
+   {:level :keys :addresses :subtree-count (:measure) (:child-measures) (:slots)}.
+   `:child-measures` is a vector with the measure of each child, parallel to `:keys`; a
+   reader that drops it gets a correct tree whose branches read their children to rebuild it. Comparator/storage/settings-free;
    element values stay raw. `node->blob` appends :branching-factor/:diff-buf-size/:ref-type so a
    read self-describes.
 
@@ -136,6 +138,7 @@
                   :addresses     (vec (.addresses b))
                   :subtree-count (.subtreeCount b)}
            (some? (.-_measure b)) (assoc :measure (.-_measure b))
+           (some? (.-_childMeasures b)) (assoc :child-measures (vec (.-_childMeasures b)))
            slots                  (assoc :slots slots)))
        (cond-> {:keys (vec (.keys ^ANode node))}
          (some? (.-_measure ^ANode node)) (assoc :measure (.-_measure ^ANode node))))
@@ -147,6 +150,7 @@
                   :addresses     (vec (.-addresses node))
                   :subtree-count (.-subtree-count node)}
            (some? (.-_measure node)) (assoc :measure (.-_measure node))
+           (some? (.-_childMeasures node)) (assoc :child-measures (vec (.-_childMeasures node)))
            slots                     (assoc :slots slots)))
        (cond-> {:keys (vec (.-keys node))}
          (some? (.-_measure node)) (assoc :measure (.-_measure node))))))
@@ -320,11 +324,14 @@
 (defn blob->branch
   "Reconstruct a Branch from its blob, re-attaching diff-buf slots. `ctx` from `reader-context`."
   [ctx blob]
-  (let [{:keys [level keys addresses subtree-count measure slots]} blob
+  (let [{:keys [level keys addresses subtree-count measure child-measures slots]} blob
         settings (blob-settings ctx blob)]
     #?(:clj (let [b (Branch. (int level) ^List keys ^List addresses ^Settings settings)]
               (set! (.-_subtreeCount b) (long (or subtree-count -1)))
               (when (some? measure) (set! (.-_measure ^ANode b) measure))
+              ;; Only an array that fits: one of another length is not this node's.
+              (when (and (some? child-measures) (= (count child-measures) (count keys)))
+                (set! (.-_childMeasures b) (object-array child-measures)))
               (when slots (attach-slots! b addresses slots))
               b)
        :cljs (let [node (branch/from-map {:level         level
@@ -332,6 +339,7 @@
                                           :addresses     (to-array addresses)
                                           :subtree-count subtree-count
                                           :measure       measure
+                                          :child-measures child-measures
                                           :settings      settings})]
                (when slots (attach-slots! node addresses slots))
                node))))

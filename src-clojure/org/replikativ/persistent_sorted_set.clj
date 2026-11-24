@@ -101,6 +101,33 @@
   [^PersistentSortedSet set]
   (.recount set))
 
+(defn measure-census
+  "`{:branches n :unknown m}`: how many branches the tree has and how many of them are
+   STORED without a record of their children's measures. Such a branch answers correctly,
+   but a write through it, `get-nth` and `measure-slice` first read its children (once per
+   process: the record is then kept in memory, and written when the branch next is).
+   Trees written before 0.5.149 have none. Reads every branch and no leaf. Zeros for a set
+   without `:measure`.
+
+   Like `count-census`, the answer is about the tree as it is, or will be, written."
+  [^PersistentSortedSet set]
+  (let [c (.measureCensus set)]
+    {:branches (aget c 0) :unknown (aget c 1)}))
+
+(defn remeasure
+  "`set` with every branch holding its children's measures, and every branch that did not
+   hold them on disk marked to be written: `store` the result and they are durable. Returns
+   `set` itself when there is nothing to do. Content, order and structure are unchanged;
+   not for a transient.
+
+   For trees written before 0.5.149. Writes since keep the record, so one `remeasure` +
+   `store` is enough, and without it a tree recovers branch by branch as it is written and
+   read. It reads every branch, plus the children of each branch without a record -- for a
+   leaf-parent those are its leaves -- and rewrites each such branch and every branch above
+   one. Buffered edits are handled as by `recount`."
+  [^PersistentSortedSet set]
+  (.remeasure set))
+
 (defn seek
   "An efficient way to seek to a specific key in a seq (either returned by [[clojure.core.seq]] or a slice.)
   `(seek (seq set) to)` returns iterator for all Xs where to <= X.
@@ -246,7 +273,10 @@
            ;; `diffBufFor` would refuse the pairing. An EXPLICIT :diff-buf-size is passed
            ;; through unchanged so that refusal fires when it should.
              (int (or (:diff-buf-size m)
-                      (if (:leaf-processor m) 0 (Settings/defaultDiffBufSize)))))
+                      ;; likewise an order-sensitive measure (`Settings/diffBufForMeasure`)
+                      (if (or (:leaf-processor m) (Settings/orderSensitive (:measure m)))
+                        0
+                        (Settings/defaultDiffBufSize)))))
         ;; split-seam: opt into a content-defined boundary (e.g. MST) per store. nil ⇒ the
         ;; default count B-tree (byte-identical baseline). See .internal/SPLIT_SEAM_DESIGN.md.
           s (if boundary (.withBoundary s ^IBoundary boundary) s)]
@@ -363,16 +393,21 @@
                                                                     acc)))
                                                               (.identity measure-ops)
                                                               children))]
-                                  (Branch.
-                                   (int level)
-                                   (int (count children))
-                                   ^objects (arrays/amap #(.maxKey ^ANode %) Object children)
-                                   nil
-                                   children
-                                   (long subtree-count)
-                                   measure
-                                   cmp
-                                   settings)))]
+                                  (let [b (Branch.
+                                           (int level)
+                                           (int (count children))
+                                           ^objects (arrays/amap #(.maxKey ^ANode %) Object children)
+                                           nil
+                                           children
+                                           (long subtree-count)
+                                           measure
+                                           cmp
+                                           settings)]
+                                    ;; each child's measure, kept in the parent (Branch._childMeasures)
+                                    (when (and measure-ops (every? #(some? (.-_measure ^ANode %)) children))
+                                      (set! (.-_childMeasures b)
+                                            (object-array (map #(.-_measure ^ANode %) children))))
+                                    b)))]
      (if (.contentDefined (.boundary settings))
        ;; MST bulk: chunk by boundary level so a freshly-built tree matches an incrementally
        ;; grown one for the same key set (history-independence). key-of = identity for leaf
@@ -548,9 +583,13 @@
                                  (when measure-ops
                                    (set! (.-_measure ^ANode b)
                                          (reduce (fn [acc m]
-                                                   (if m (.merge measure-ops acc m) acc))
+                                                   ;; `some?`: a measure may be `false`
+                                                   (if (some? m) (.merge measure-ops acc m) acc))
                                                  (.identity measure-ops)
-                                                 (map :measure es))))
+                                                 (map :measure es)))
+                                   ;; each child's measure, kept in the parent (Branch._childMeasures)
+                                   (when (every? #(some? (:measure %)) es)
+                                     (set! (.-_childMeasures b) (object-array (map :measure es)))))
                                  (store-node! b)))
                              (streaming-split entries avg-bf max-bf)))]
      ;; Climb one level at a time. `(next s)` realises only the SECOND entry, so
@@ -721,31 +760,45 @@
                         (let [idx (inc (.searchLast branch to cmp))]
                           (min (max idx 0) (dec len)))
                         (dec len)))]
-      (cond
-        (> from-idx to-idx)
-        (.identity measure-ops)
+      ;; A child the range covers ENTIRELY is answered from the branch's own record of it,
+      ;; without restoring the child. That is every child strictly between the two
+      ;; boundary ones, and a boundary one too when the range is open on that side -- so
+      ;; only the two boundary paths are read.
+      (letfn [(whole [i]
+                ;; `some?`, not truthiness: a measure may be `false`
+                (if-some [^objects cm (.ensureChildMeasures branch storage)]
+                  (aget cm (int i))
+                  (let [^ANode child (.child branch storage (int i))]
+                    (if (some? (.-_measure child))
+                      (.-_measure child)
+                      (.forceComputeMeasure child storage)))))]
+        (cond
+          (> from-idx to-idx)
+          (.identity measure-ops)
 
-        (== from-idx to-idx)
-        (let [child (.child branch storage from-idx)]
-          (measure-slice-node child storage measure-ops from to cmp))
+          (== from-idx to-idx)
+          (if (and (nil? from) (nil? to))
+            (whole from-idx)
+            (measure-slice-node (.child branch storage from-idx) storage measure-ops from to cmp))
 
-        :else
-        (let [first-child (.child branch storage from-idx)
-              first-measure (measure-slice-node first-child storage measure-ops from nil cmp)
-              last-child (.child branch storage to-idx)
-              last-measure (measure-slice-node last-child storage measure-ops nil to cmp)
-              middle-measure (loop [i (int (inc from-idx))
-                                    acc (.identity measure-ops)]
-                               (if (>= i to-idx)
-                                 acc
-                                 (let [^ANode child (.child branch storage i)
-                                       child-measure (or (.-_measure child)
-                                                         (.forceComputeMeasure child storage))]
-                                   (recur (inc i)
-                                          (.merge measure-ops acc child-measure)))))]
-          (.merge measure-ops
-                  (.merge measure-ops first-measure middle-measure)
-                  last-measure))))))
+          :else
+          ;; `some?`: `false` is a key like any other, not an open bound
+          (let [first-measure (if (some? from)
+                                (measure-slice-node (.child branch storage from-idx)
+                                                    storage measure-ops from nil cmp)
+                                (whole from-idx))
+                last-measure (if (some? to)
+                               (measure-slice-node (.child branch storage to-idx)
+                                                   storage measure-ops nil to cmp)
+                               (whole to-idx))
+                middle-measure (loop [i (int (inc from-idx))
+                                      acc (.identity measure-ops)]
+                                 (if (>= i to-idx)
+                                   acc
+                                   (recur (inc i) (.merge measure-ops acc (whole i)))))]
+            (.merge measure-ops
+                    (.merge measure-ops first-measure middle-measure)
+                    last-measure)))))))
 
 (defn get-nth
   "Find the entry at weighted rank `n`.

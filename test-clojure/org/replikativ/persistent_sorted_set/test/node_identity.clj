@@ -101,13 +101,17 @@
                 caches recursively; `deeper-levels-strip-too` below pins it.")
         (is (seq (:slots m-cold))
             "precondition: the root actually carries diff-buf slots")
-        (is (not= (slot-measures m-cold) (slot-measures m-warm))
-            "precondition: warmth reaches the slot at all — one deposit saw a
-                cold child measure and the other a populated one. If this ever
-                stops holding, the rest of this test is vacuous.")
-        (is (not= (:slots m-cold) (:slots m-warm))
-            "and node->map, the SERIALIZATION projection, differs — that is
-                allowed; it is why the identity projection has to strip.")
+        ;; This used to assert that the two slots DIFFER -- one deposit saw a child with no
+        ;; cached measure and stored nil, the other saw a populated one -- and that node->map
+        ;; therefore differed, which is why the identity projection has to strip the caches.
+        ;; A deposit now works the child's measure out when it has none cached
+        ;; (Branch.measureOf): a restore rebuilds the child's place in the parent's record
+        ;; of its children's measures from it, and nil there would lose the record. So the
+        ;; slot no longer depends on warmth. The identity assertion below still holds and
+        ;; still matters -- `:measure` and `:child-measures` on the node itself are caches
+        ;; too -- and `deeper-levels-strip-too` covers the nested form.
+        (is (= [[0 true]] (slot-measures m-cold) (slot-measures m-warm))
+            "a slot carries its child's measure whether or not the child had it cached")
         (is (= (nodes/node->identity r-cold) (nodes/node->identity r-warm))
             "THE assertion: same content, same identity, regardless of warmth")
         (is (= (hash (nodes/node->identity r-cold))
