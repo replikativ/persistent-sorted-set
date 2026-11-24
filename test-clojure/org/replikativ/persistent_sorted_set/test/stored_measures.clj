@@ -185,6 +185,8 @@
           dbs  [0 16]
           transient? [false true]
           kind [:conj :disj :replace :mixed]
+          ;; an order-sensitive measure runs unbuffered: the pairing is refused (below)
+          :when (not (and (= ops-name :concat) (pos? (long dbs))))
           :let [n   (if (= bf 64) 3000 400)
                 lbl (str ops-name " bf=" bf " diff-buf=" dbs (when transient? " transient") " " kind)]]
     (let [{:keys [st o addr]} (built ops bf dbs nil n)
@@ -220,6 +222,7 @@
 (deftest a-long-sequence-of-writes-and-restarts
   (doseq [[ops-name ops] [[:stat stat-ops] [:concat concat-ops]]
           bf [4 8], dbs [0 16], seed [1 2 3]
+          :when (not (and (= ops-name :concat) (pos? (long dbs))))
           :let [lbl (str ops-name " bf=" bf " diff-buf=" dbs " seed=" seed)]]
     (let [{:keys [st o addr]} (built ops bf dbs nil 150)
           rnd (Random. (long seed))]
@@ -374,6 +377,20 @@
             (let [c2 (cold o st a1)
                   [_ r] (reading st #(set/get-nth c2 (dec n)))]
               (is (<= (long r) (long h)) (str "get-nth afterwards: " r " reads, height " h)))))))))
+
+(deftest an-order-sensitive-measure-is-not-buffered
+  ;; A buffered leaf is rebuilt in the order of the comparator that reads it, so an
+  ;; aggregate that depends on element order can be stale where two sets share nodes under
+  ;; comparators that order ties differently. See `Settings.diffBufForMeasure`.
+  (testing "asking for both is refused"
+    (is (thrown-with-msg? IllegalArgumentException #"not commutative"
+                          (set/sorted-set* {:comparator cmp :measure concat-ops :diff-buf-size 16}))))
+  (testing "a budget that is only inherited (the suite runs with one) is left off"
+    (let [s (set/sorted-set* {:comparator cmp :measure concat-ops})]
+      (is (zero? (.diffBufSize (.-_settings ^PersistentSortedSet s))))))
+  (testing "a commutative measure buffers as before"
+    (let [s (set/sorted-set* {:comparator cmp :measure stat-ops :diff-buf-size 16})]
+      (is (= 16 (.diffBufSize (.-_settings ^PersistentSortedSet s)))))))
 
 (deftest remeasure-declines-what-it-cannot-do
   (let [{:keys [st o addr]} (built stat-ops 8 0 nil 300)]

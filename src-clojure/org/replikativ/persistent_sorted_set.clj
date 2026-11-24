@@ -273,7 +273,10 @@
            ;; `diffBufFor` would refuse the pairing. An EXPLICIT :diff-buf-size is passed
            ;; through unchanged so that refusal fires when it should.
              (int (or (:diff-buf-size m)
-                      (if (:leaf-processor m) 0 (Settings/defaultDiffBufSize)))))
+                      ;; likewise an order-sensitive measure (`Settings/diffBufForMeasure`)
+                      (if (or (:leaf-processor m) (Settings/orderSensitive (:measure m)))
+                        0
+                        (Settings/defaultDiffBufSize)))))
         ;; split-seam: opt into a content-defined boundary (e.g. MST) per store. nil ⇒ the
         ;; default count B-tree (byte-identical baseline). See .internal/SPLIT_SEAM_DESIGN.md.
           s (if boundary (.withBoundary s ^IBoundary boundary) s)]

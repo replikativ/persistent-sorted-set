@@ -41,6 +41,25 @@
   commutative (there is no `commutativeMerge` on the ClojureScript protocol to gate it); and
   `merge-split` asked a non-resident child for its measure and threw.
 
+  **Limits, stated rather than papered over.**
+
+  - *An order-sensitive measure and a diff buffer are not supported together.* A buffered
+    leaf is rebuilt in the order of the comparator that reads it, so an aggregate that
+    depends on element order can be stale where two sets share nodes under comparators that
+    order ties differently. On the JVM an explicit `:diff-buf-size` with a measure whose
+    `commutativeMerge()` is false is now refused with an `IllegalArgumentException`, and a
+    budget that is only inherited from the `pss.diffBufSize` property is left off. A store
+    that already holds buffered edits still opens. ClojureScript has no `commutativeMerge`
+    to check and does not refuse; the combination is unsupported there. Commutative
+    measures (count, sum, min, max) are unaffected.
+  - *`measure-census` and `remeasure` on an older tree under a diff buffer are best effort.*
+    They are exact for a single line of versions. Where two versions share a branch that one
+    of them has buffered and the other has written, the census of the first can under-report
+    it. Answers are not affected; only the report of what is left to repair.
+  - *A ClojureScript tree written by an earlier version with a non-commutative measure* held
+    wrong leaf measures already (the insert defect above). The lazy fill refolds leaves, but
+    not every path does: rebuild such a tree rather than repairing it.
+
   A slot of the diff buffer now always carries its child's measure, worked out when the
   child had none cached, so a restore can rebuild the parent's array from it.
 

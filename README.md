@@ -284,6 +284,9 @@ passes, so it repairs itself as it is written. To repair it in one pass:
 (set/measure-census s')         ;=> {:branches 1203, :unknown 0}
 ```
 
+A measure whose `merge` is not commutative cannot be combined with a diff buffer
+(`:diff-buf-size`); the JVM refuses the pair. See CHANGES.md for why.
+
 A consumer with its own node codec has to carry the blob's `:child-measures` key; see
 [doc/serialization.md](doc/serialization.md).
 
