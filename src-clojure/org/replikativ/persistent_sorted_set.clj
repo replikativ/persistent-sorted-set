@@ -101,6 +101,33 @@
   [^PersistentSortedSet set]
   (.recount set))
 
+(defn measure-census
+  "`{:branches n :unknown m}`: how many branches the tree has and how many of them are
+   STORED without a record of their children's measures. Such a branch answers correctly,
+   but a write through it, `get-nth` and `measure-slice` first read its children (once per
+   process: the record is then kept in memory, and written when the branch next is).
+   Trees written before 0.5.149 have none. Reads every branch and no leaf. Zeros for a set
+   without `:measure`.
+
+   Like `count-census`, the answer is about the tree as it is, or will be, written."
+  [^PersistentSortedSet set]
+  (let [c (.measureCensus set)]
+    {:branches (aget c 0) :unknown (aget c 1)}))
+
+(defn remeasure
+  "`set` with every branch holding its children's measures, and every branch that did not
+   hold them on disk marked to be written: `store` the result and they are durable. Returns
+   `set` itself when there is nothing to do. Content, order and structure are unchanged;
+   not for a transient.
+
+   For trees written before 0.5.149. Writes since keep the record, so one `remeasure` +
+   `store` is enough, and without it a tree recovers branch by branch as it is written and
+   read. It reads every branch, plus the children of each branch without a record -- for a
+   leaf-parent those are its leaves -- and rewrites each such branch and every branch above
+   one. Buffered edits are handled as by `recount`."
+  [^PersistentSortedSet set]
+  (.remeasure set))
+
 (defn seek
   "An efficient way to seek to a specific key in a seq (either returned by [[clojure.core.seq]] or a slice.)
   `(seek (seq set) to)` returns iterator for all Xs where to <= X.
@@ -742,13 +769,18 @@
               first-measure (measure-slice-node first-child storage measure-ops from nil cmp)
               last-child (.child branch storage to-idx)
               last-measure (measure-slice-node last-child storage measure-ops nil to cmp)
+              ^objects cm (when (< (inc from-idx) to-idx)
+                            (.ensureChildMeasures branch storage))
               middle-measure (loop [i (int (inc from-idx))
                                     acc (.identity measure-ops)]
                                (if (>= i to-idx)
                                  acc
-                                 (let [^ANode child (.child branch storage i)
-                                       child-measure (or (.-_measure child)
-                                                         (.forceComputeMeasure child storage))]
+                                 ;; a covered child is answered from the branch's own
+                                 ;; record of it, without restoring the child
+                                 (let [child-measure (or (when cm (aget cm i))
+                                                         (let [^ANode child (.child branch storage i)]
+                                                           (or (.-_measure child)
+                                                               (.forceComputeMeasure child storage))))]
                                    (recur (inc i)
                                           (.merge measure-ops acc child-measure)))))]
           (.merge measure-ops

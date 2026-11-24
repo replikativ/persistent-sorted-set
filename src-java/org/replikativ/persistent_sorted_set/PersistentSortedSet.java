@@ -457,6 +457,35 @@ public class PersistentSortedSet<Key, Address> extends APersistentSortedSet<Key,
     return new PersistentSortedSet(_meta, _cmp, null, _storage, nb, (c >= 0) ? (int) c : -1, _settings, _version + 1);
   }
 
+  /**
+   * `{branches, branches stored without their children's measures}`. A branch without them
+   * answers correctly, but a write through it, a positional lookup and a measure over a
+   * range first read its children. Zeros for a set without an IMeasure.
+   */
+  public long[] measureCensus() {
+    final long[] out = new long[2];
+    final ANode root = root();
+    if (_settings.measure() != null && root instanceof Branch) {
+      ((Branch) root).measureCensus(_storage, out);
+    }
+    return out;
+  }
+
+  /**
+   * This set with every branch holding its children's measures, and each one that did not
+   * hold them on disk marked to be written. Returns `this` when there is nothing to do.
+   */
+  public PersistentSortedSet remeasure() {
+    if (editable()) throw new IllegalStateException("remeasure: not on a transient; call persistent! first");
+    final ANode root = root();
+    if (_settings.measure() == null || !(root instanceof Branch)) return this;
+    final Branch b = (Branch) root;
+    final Branch nb = b.remeasure(_storage, settings());
+    if (nb == b) return this;
+    if (_storage != null && _address != null) _storage.markFreed(_address);
+    return new PersistentSortedSet(_meta, _cmp, null, _storage, nb, _count, _settings, _version + 1);
+  }
+
   public boolean editable() {
     return _settings.editable();
   }

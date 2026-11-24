@@ -245,6 +245,12 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   // contents. Its length is exactly the `_len` it was built for.
   public volatile Object[] _childMeasures;
 
+  // True while the array was only FILLED BY A READ on a node whose blob has none
+  // (`ensureChildMeasures`). Such a node answers from memory but a restore finds nothing,
+  // which is what `measureCensus` and `remeasure` have to know. Cleared when the node is
+  // written, and never set by a write arm: a node a write built is written with its array.
+  boolean _cmLazy;
+
   /** Fold `cm[0..len)`. null in, or a null entry, gives null. */
   static Object foldMeasures(IMeasure ops, Object[] cm, int len) {
     if (ops == null || cm == null) return null;
@@ -332,6 +338,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       Object m = foldMeasures(ops, cm, _len);
       _childMeasures = (m == null) ? null : cm;
       _measure = (m == null) ? fallback : m;
+      _cmLazy = false;
     } else {
       _childMeasures = null;
       _measure = fallback;
@@ -365,7 +372,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (m == null) return null;
       out[i] = m;
     }
-    if (len == _len) _childMeasures = out;
+    if (len == _len) { _cmLazy = true; _childMeasures = out; }
     return out;
   }
 
@@ -978,6 +985,83 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
   }
 
   /**
+   * A copy of this node with `changed[i]`, where non-null, in place of child i: the shape a
+   * repair (`recount`, `remeasure`) leaves behind. A replaced child is handled as a structural
+   * replacement -- its address and its slot are dropped and its old blob is freed -- so the
+   * copy is one that must be written. Count and child measures are the caller's to set.
+   */
+  private Branch<Key, Address> copyReplacing(IStorage storage, NodeState<Address> s0, ANode[] changed) {
+    final Key[] newKeys = Arrays.copyOfRange(_keys, 0, _len);
+    final Address[] newAddresses = (s0.addresses != null) ? Arrays.copyOfRange(s0.addresses, 0, _len) : null;
+    final Object[] newChildren = (s0.children == null) ? new Object[_keys.length] : Arrays.copyOfRange(s0.children, 0, _len);
+    final Object[] oldSlots = (s0.buf != null) ? s0.buf.slots : null;
+    final Object[] newSlots = (oldSlots != null) ? Arrays.copyOf(oldSlots, _keys.length) : null;
+    if (changed != null) {
+      for (int i = 0; i < _len; i++) {
+        if (changed[i] == null) continue;
+        freeDroppedChild(storage, s0, i);
+        if (newAddresses != null) newAddresses[i] = null;
+        newChildren[i] = changed[i];                              // dirty ⇒ bare
+        if (newSlots != null) newSlots[i] = null;
+      }
+    }
+    // The copy keeps THIS node's settings — its budget, ref-type and the rest — not the
+    // set's: only the count changes, and the slots are carried as they are. A node can hold
+    // more buffered edits than its budget (a join concatenates two nodes' slots; a budget
+    // changed between writes); the store of the copy brings it back within budget by
+    // flushing, exactly as it would after any write through that node. Documented on
+    // `recount`: it is the one way a leaf gets rewritten.
+    final Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, -1, _measure, _projCmp, _settings);
+    if (newSlots != null || _settings.diffBufSize() > 0) nb.installSlots(newSlots, BUF_WRITE);
+    return nb;
+  }
+
+  /**
+   * Walk every branch below this one; `out[0]` += branches seen, `out[1]` += branches whose
+   * STORED form has no record of its children's measures: no array, or one that was only
+   * filled in memory by a read. Reads every branch, no leaf.
+   */
+  void measureCensus(IStorage storage, long[] out) {
+    out[0]++;
+    if (_childMeasures == null || _cmLazy) out[1]++;
+    if (_level <= 1) return;
+    for (int i = 0; i < _len; i++) ((Branch) child(storage, i)).measureCensus(storage, out);
+  }
+
+  /**
+   * This subtree with every branch holding its children's measures and every branch that did
+   * not hold them ON DISK made dirty, so the next `store` writes it. Returns `this` when
+   * nothing below needs it. Reads every branch, and the children of each branch that has no
+   * array -- below a leaf-parent those are leaves.
+   */
+  Branch<Key, Address> remeasure(IStorage storage, Settings settings) {
+    final IMeasure measureOps = _settings.measure();
+    if (measureOps == null) return this;
+    final NodeState<Address> s0 = _state;                        // one snapshot
+    ANode[] changed = null;
+    if (_level > 1) {
+      for (int i = 0; i < _len; i++) {
+        final Branch child = (Branch) child(storage, i);
+        final Branch nc = child.remeasure(storage, settings);
+        if (nc != child) {
+          if (changed == null) changed = new ANode[_len];
+          changed[i] = nc;
+        }
+      }
+    }
+    if (changed == null && _childMeasures != null && !_cmLazy) return this;
+    final Branch<Key, Address> nb = copyReplacing(storage, s0, changed);
+    nb._subtreeCount = _subtreeCount;      // as stored; a count is `recount`'s to repair
+    nb._lazyCount = _lazyCount;
+    nb._childMeasures = _childMeasures;    // a remeasured child holds the same elements
+    final Object[] cm = nb.ensureChildMeasures(storage);
+    nb._cmLazy = false;                    // this node is written, array and all
+    final Object m = foldMeasures(measureOps, cm, nb._len);
+    if (m != null) nb._measure = m;
+    return nb;
+  }
+
+  /**
    * This subtree with every branch counted and every branch that was not counted ON DISK made
    * dirty, so the next `store` writes it. Returns `this` when nothing below needs it.
    *
@@ -1003,28 +1087,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     }
     if (changed == null && _subtreeCount >= 0) return this;
 
-    final Key[] newKeys = Arrays.copyOfRange(_keys, 0, _len);
-    final Address[] newAddresses = (s0.addresses != null) ? Arrays.copyOfRange(s0.addresses, 0, _len) : null;
-    final Object[] newChildren = (s0.children == null) ? new Object[_keys.length] : Arrays.copyOfRange(s0.children, 0, _len);
-    final Object[] oldSlots = (s0.buf != null) ? s0.buf.slots : null;
-    final Object[] newSlots = (oldSlots != null) ? Arrays.copyOf(oldSlots, _keys.length) : null;
-    if (changed != null) {
-      for (int i = 0; i < _len; i++) {
-        if (changed[i] == null) continue;
-        freeDroppedChild(storage, s0, i);
-        if (newAddresses != null) newAddresses[i] = null;
-        newChildren[i] = changed[i];                              // dirty ⇒ bare
-        if (newSlots != null) newSlots[i] = null;
-      }
-    }
-    // The copy keeps THIS node's settings — its budget, ref-type and the rest — not the
-    // set's: only the count changes, and the slots are carried as they are. A node can hold
-    // more buffered edits than its budget (a join concatenates two nodes' slots; a budget
-    // changed between writes); the store of the copy brings it back within budget by
-    // flushing, exactly as it would after any write through that node. Documented on
-    // `recount`: it is the one way a leaf gets rewritten.
-    final Branch<Key, Address> nb = new Branch(_level, _len, newKeys, newAddresses, newChildren, -1, _measure, _projCmp, _settings);
-    if (newSlots != null || _settings.diffBufSize() > 0) nb.installSlots(newSlots, BUF_WRITE);
+    final Branch<Key, Address> nb = copyReplacing(storage, s0, changed);
     nb._childMeasures = _childMeasures;   // a recounted child holds the same elements
     // A count already worked out in memory is used as it is. Otherwise the children are
     // counted now (below a leaf-parent they are leaves, which always are), so this is a sum;
@@ -3401,6 +3464,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
       if (dirty || s0.addresses == null) {
         _state = new NodeState<>(newAddresses, newChildren, s0.buf); // ONE publish
       }
+      _cmLazy = false;   // written with its array
       return storage.store(this);
     }
 
@@ -3591,6 +3655,7 @@ public class Branch<Key, Address> extends ANode<Key, Address> implements ISubtre
     // settled state, exactly as the old in-place mutation did. children are WRAPPED per
     // `:ref-type`, same as the baseline settle — see the staging comment above.
     _state = new NodeState<>(newAddresses, newChildren, new BufState(newSlots, embedded));
+    _cmLazy = false;   // written with its array
     return storage.store(this);
   }
 
