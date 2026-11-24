@@ -1647,8 +1647,9 @@
                                                 (let [m (if (some? cm)
                                                           (whole i)
                                                           (let [child (await (branch/child node storage i opts))]
-                                                            (or (node/measure child)
-                                                                (await (node/force-compute-measure child storage measure-ops opts)))))]
+                                                            (if (some? (node/measure child))
+                                                              (node/measure child)
+                                                              (await (node/force-compute-measure child storage measure-ops opts)))))]
                                                   (recur (inc i) (measure/merge-measure measure-ops acc m)))))]
                          (measure/merge-measure measure-ops
                                                 (measure/merge-measure measure-ops first-measure middle-measure)
@@ -1698,9 +1699,11 @@
                   (when (nil? measure-ops)
                     (throw (js/Error. "get-nth requires measure to be configured")))
                   (when (pos? (node/len root))
-                    (let [root-measure (or (node/measure root)
-                                           (await (node/force-compute-measure root (.-storage set) measure-ops opts)))]
-                      (when root-measure
+                    (let [m0           (node/measure root)
+                          root-measure (if (some? m0)
+                                         m0
+                                         (await (node/force-compute-measure root (.-storage set) measure-ops opts)))]
+                      (when (some? root-measure)
                         (let [total-weight (measure/weight measure-ops root-measure)]
                           (when (and (>= n 0) (< n total-weight))
                             ;; Navigate tree

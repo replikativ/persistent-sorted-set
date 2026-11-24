@@ -779,11 +779,12 @@
             (measure-slice-node (.child branch storage from-idx) storage measure-ops from to cmp))
 
           :else
-          (let [first-measure (if from
+          ;; `some?`: `false` is a key like any other, not an open bound
+          (let [first-measure (if (some? from)
                                 (measure-slice-node (.child branch storage from-idx)
                                                     storage measure-ops from nil cmp)
                                 (whole from-idx))
-                last-measure (if to
+                last-measure (if (some? to)
                                (measure-slice-node (.child branch storage to-idx)
                                                    storage measure-ops nil to cmp)
                                (whole to-idx))

@@ -975,7 +975,7 @@
                                  (if (nil? acc)
                                    (reduced nil)
                                    (let [cs (when (some? child) (node/measure child))]
-                                     (if cs (measure/merge-measure measure-ops acc cs) (reduced nil)))))
+                                     (if (some? cs) (measure/merge-measure measure-ops acc cs) (reduced nil)))))
                                (measure/identity-measure measure-ops) cseg))
                 sc   (try-compute-subtree-count-from-children cseg l)]
             (recur (conj! out (install-measures! (Branch. lvl kseg cseg aseg sc m settings nil 0 (.-_projCmp this) nil false)
@@ -1092,7 +1092,7 @@
                                                           (if (nil? acc)
                                                             (reduced nil)
                                                             (let [cs (when (some? child) (node/measure child))]
-                                                              (if cs
+                                                              (if (some? cs)
                                                                 (measure/merge-measure measure-ops acc cs)
                                                                 (reduced nil)))))
                                                         (measure/identity-measure measure-ops)
@@ -1102,7 +1102,7 @@
                                                            (if (nil? acc)
                                                              (reduced nil)
                                                              (let [cs (when (some? child) (node/measure child))]
-                                                               (if cs
+                                                               (if (some? cs)
                                                                  (measure/merge-measure measure-ops acc cs)
                                                                  (reduced nil)))))
                                                          (measure/identity-measure measure-ops)
@@ -1984,7 +1984,7 @@
                            (if (nil? acc)
                              (reduced nil)
                              (let [cs (when (some? child) (node/measure child))]
-                               (if cs
+                               (if (some? cs)
                                  (measure/merge-measure measure-ops acc cs)
                                  (reduced nil)))))
                          (measure/identity-measure measure-ops)
@@ -1994,7 +1994,7 @@
                            (if (nil? acc)
                              (reduced nil)
                              (let [cs (when (some? child) (node/measure child))]
-                               (if cs
+                               (if (some? cs)
                                  (measure/merge-measure measure-ops acc cs)
                                  (reduced nil)))))
                          (measure/identity-measure measure-ops)
