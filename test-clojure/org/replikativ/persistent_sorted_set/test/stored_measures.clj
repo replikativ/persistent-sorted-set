@@ -278,6 +278,10 @@
         (is (= (truth stat-ops (subvec all 1234 15679)) m))
         (is (<= (long r) (* 2 (long h))) (str r " reads, height " h))))))
 
+;; The WRITE bounds below hold on the old code too: it kept writes cheap by storing the
+;; measure as unknown. What tells the two apart is the oracle above (no stored branch
+;; without a record) and the reader bounds (`get-nth`, `measure-slice`), with the older-tree
+;; test as the control that those can fail.
 (deftest what-a-cold-writer-pays
   (let [n 20000, bf 16
         {:keys [st o addr]} (built stat-ops bf 0 nil n)

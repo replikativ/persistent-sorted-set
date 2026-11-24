@@ -1531,6 +1531,8 @@
                                                                    (await (ensure-child-measures this storage measure-ops opts))
                                                                    idx (inc idx) nodes nil))]
                              (install-measures! new-branch measure-ops cm-r new-measure)
+                             ;; read AFTER the fill above, which is what sets it on `this`
+                             (set! (.-_cmLazy new-branch) (boolean (.-_cmLazy this)))
                                ;; diff-buf: content-only replace ⇒ carry source slots + deposit Present(new-key).
                              (when diff-buf?
                                (set! (.-_bufEntries new-branch) (buf-entries this)) ; carry running total (or -1) onto successor
@@ -1557,6 +1559,8 @@
                                                                    (await (ensure-child-measures this storage measure-ops opts))
                                                                    idx (inc idx) nodes nil))]
                              (install-measures! new-branch measure-ops cm-r new-measure)
+                             ;; read AFTER the fill above, which is what sets it on `this`
+                             (set! (.-_cmLazy new-branch) (boolean (.-_cmLazy this)))
                                ;; diff-buf: content-only replace ⇒ carry source slots + deposit Present(new-key).
                              (when diff-buf?
                                (set! (.-_bufEntries new-branch) (buf-entries this)) ; carry running total (or -1) onto successor

@@ -762,11 +762,13 @@
       ;; boundary ones, and a boundary one too when the range is open on that side -- so
       ;; only the two boundary paths are read.
       (letfn [(whole [i]
-                (or (when-let [^objects cm (.ensureChildMeasures branch storage)]
-                      (aget cm (int i)))
-                    (let [^ANode child (.child branch storage (int i))]
-                      (or (.-_measure child)
-                          (.forceComputeMeasure child storage)))))]
+                ;; `some?`, not truthiness: a measure may be `false`
+                (if-some [^objects cm (.ensureChildMeasures branch storage)]
+                  (aget cm (int i))
+                  (let [^ANode child (.child branch storage (int i))]
+                    (if (some? (.-_measure child))
+                      (.-_measure child)
+                      (.forceComputeMeasure child storage)))))]
         (cond
           (> from-idx to-idx)
           (.identity measure-ops)

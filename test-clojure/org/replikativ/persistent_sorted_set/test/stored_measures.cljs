@@ -213,6 +213,10 @@
 (defn- reading [st f]
   (let [r0 (reads st), v (f)] [v (- (reads st) r0)]))
 
+;; The WRITE bounds below hold on the old code too: it kept writes cheap by storing the
+;; measure as unknown. What tells the two apart is the oracle above (no stored branch
+;; without a record) and the reader bounds (`get-nth`, `measure-slice`), with the older-tree
+;; test as the control that those can fail.
 (deftest what-a-cold-reader-and-writer-pay
   (let [n 6000, bf 8
         {:keys [st o addr]} (built stat-ops bf 0 nil n)
