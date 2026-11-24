@@ -1,5 +1,48 @@
 # Unreleased
 
+- **Every stored branch records its children's measures: a cold write keeps the aggregate,
+  `get-nth` reads one node per level, and `remeasure` repairs old trees.** A branch's measure
+  was recomputed in every write arm from whichever children were in memory, and stored as
+  unknown when one was not. On a tree that is mostly on disk that is the normal case for
+  `replace` and `disj` (the insert-only fold below does not apply to them: a measure is a
+  monoid, and min/max cannot be un-merged). Measured at bf 64, 100 000 elements, `:ref-type
+  :weak`: after 200 scattered `replace`, 100 of 101 stored branches had no measure, and the
+  next cold `measure` read 3173 blobs, 3072 of them leaves. `get-nth` restored every child to
+  the left of its target at every level to add up their weights, and `measure-slice`
+  restored every child a range covered.
+
+  A branch now holds an array with the measure of each child, written into its blob as
+  `:child-measures`. Its own measure is the fold of that array, so a write below one child
+  needs only that child's new measure, which the node that comes back from the write always
+  has. Nothing is asked of a measure beyond `extract` and `merge` — no subtraction — so
+  min/max and order-sensitive measures are kept exactly like a sum. `get-nth` picks the
+  child from the array, and `measure-slice` answers a fully covered child from it and reads
+  only the two boundary paths. Same tree after: 0 stored branches without a measure, a cold
+  `measure` reads 1 blob, `get-nth` 3. The price is one measure per child in every branch
+  blob.
+
+  **Older trees keep working.** A blob without the array restores as "unknown": answers are
+  correct, the node's children are read once when the array is needed, and each write stores
+  the array for the branches on its path, so a tree repairs itself as it is written.
+  `(measure-census s)` reports how many stored branches have none, and
+  `(store (remeasure s))` writes them all in one pass. The array is not part of
+  `node->identity`; it is a cache, like the count and the measure.
+
+  **Consumers with their own node codec** must carry the `:child-measures` key of
+  `impl.nodes/node->blob` (a vector of measure values, one per child) and hand it back to
+  `blob->branch`. A codec that drops it is not incorrect — every restored branch is then
+  "unknown" and pays the reads above. The Fressian, CBOR and Transit modules shipped here
+  write the blob map as it is, so they need a handler for the measure VALUE only, as before.
+
+  **ClojureScript.** Same record, same blob key, same `measure-census` / `remeasure`. Two
+  defects it exposed are fixed with it: a leaf insert appended the new key's measure to the
+  leaf's instead of folding in key order, which is wrong for any measure whose `merge` is not
+  commutative (there is no `commutativeMerge` on the ClojureScript protocol to gate it); and
+  `merge-split` asked a non-resident child for its measure and threw.
+
+  A slot of the diff buffer now always carries its child's measure, worked out when the
+  child had none cached, so a restore can rebuild the parent's array from it.
+
 - **Add cross-platform `walk-delta` for incremental hydration and replication.**
   It uses `diff`'s level-synchronised, diff-buffer-aware paired frontier to
   restore and report only new-side nodes that cannot be pruned as structurally

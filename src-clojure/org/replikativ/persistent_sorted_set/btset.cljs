@@ -150,9 +150,9 @@
                          (reduce (fn [acc cs] (measure/merge-measure measure-ops acc cs))
                                  (measure/identity-measure measure-ops) cmeas))]
      (branch/with-child-measures!
-      (Branch. lvl (arrays/amap node/max-key carr) carr
-               (when addresses-seq (arrays/into-array addresses-seq))
-               subtree-count measure settings nil 0 projcmp nil false)))))
+       (Branch. lvl (arrays/amap node/max-key carr) carr
+                (when addresses-seq (arrays/into-array addresses-seq))
+                subtree-count measure settings nil 0 projcmp nil false)))))
 
 (defn- mst-children
   "Materialize a branch's children (storage-aware) → (async [children-vec addresses-vec]). Each
@@ -384,7 +384,7 @@
                             ;; node is always the root ⇒ always written; if later mutated in a transient
                             ;; batch the first deposit poisons it correctly). Mirrors JVM makeBranchFromChildren.
                               (BTSet. (branch/with-child-measures!
-                                       (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count root-measure (.-settings set) nil 0 (.-comparator set) nil false))
+                                        (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count root-measure (.-settings set) nil 0 (.-comparator set) nil false))
                                       new-cnt
                                       (.-comparator set)
                                       (.-meta set)
@@ -2420,15 +2420,15 @@
                                                               (measure/identity-measure measure-ops)
                                                               %))]
                                   (branch/with-child-measures!
-                                   (Branch. (inc shift)
-                                           (arrays/amap node/max-key %)
-                                           %
-                                           nil
-                                           subtree-count
-                                           child-measure
+                                    (Branch. (inc shift)
+                                             (arrays/amap node/max-key %)
+                                             %
+                                             nil
+                                             subtree-count
+                                             child-measure
                                            ;; diff-buf: bulk-built branch — _bufEntries = 0 (no slots,
                                            ;; anchorless ⇒ written wholesale at store). See branch.cljs.
-                                           settings nil 0 cmp nil false)))))
+                                             settings nil 0 cmp nil false)))))
          (inc shift))))))
 
 (defn ^BTSet from-sequential [cmp seq opts]

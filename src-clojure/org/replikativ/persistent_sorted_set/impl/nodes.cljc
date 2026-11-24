@@ -96,7 +96,9 @@
 
 (defn node->map
   "Project a PSS node to the map that gets STORED. Leaf → {:keys … (:measure)}; Branch →
-   {:level :keys :addresses :subtree-count (:measure) (:slots)}. Comparator/storage/settings-free;
+   {:level :keys :addresses :subtree-count (:measure) (:child-measures) (:slots)}.
+   `:child-measures` is a vector with the measure of each child, parallel to `:keys`; a
+   reader that drops it gets a correct tree whose branches read their children to rebuild it. Comparator/storage/settings-free;
    element values stay raw. `node->blob` appends :branching-factor/:diff-buf-size/:ref-type so a
    read self-describes.
 

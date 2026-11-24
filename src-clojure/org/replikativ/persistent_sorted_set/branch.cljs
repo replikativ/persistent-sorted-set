@@ -1807,7 +1807,7 @@
                          (when slots (aset slots i nil))
                          (recur (next ws)))))
                    (let [a (do (set! (.-_cmLazy this) false)   ; written with its record
-                       (await (storage/store storage this opts)))]
+                               (await (storage/store storage this opts)))]
                      ;; Written ⇒ this node equals its durable object, whose remaining slots are the
                      ;; children we BUFFERED (passthrough + newly buffered); flushed ones were nulled.
                      ;; So the settled total is `embedded`, not 0 (also clears any -1 poison — the new
