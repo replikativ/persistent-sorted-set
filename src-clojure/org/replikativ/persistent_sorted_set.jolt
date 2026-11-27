@@ -1,6 +1,6 @@
 (ns org.replikativ.persistent-sorted-set
   "Count-based B-trees on Jolt."
-  (:refer-clojure :exclude [conj])
+  (:refer-clojure :exclude [conj disj replace])
   (:require [org.replikativ.persistent-sorted-set.branch :as branch]
             [org.replikativ.persistent-sorted-set.impl.delta :as delta]
             [org.replikativ.persistent-sorted-set.impl.storage :as storage]
@@ -58,21 +58,64 @@
     (BTSet. (leaf/empty-leaf settings) (or (:comparator opts) (:cmp opts) compare)
             settings (:meta opts) (:storage opts) nil)))
 
+(defn- synchronous! [opts]
+  (when (false? (:sync? opts))
+    (throw (ex-info "Jolt PSS storage operations require synchronous storage" {}))))
+
+(defn- writable-root [s opts]
+  (synchronous! opts)
+  (let [root (root-node s opts)]
+    (check-settings! (.-settings root))
+    root))
+
+(defn- changed-set [s root]
+  (when (some? (.-address s))
+    (storage/markFreed (.-storage s) (.-address s)))
+  (BTSet. root (.-comparator s) (.-settings root) (meta s) (.-storage s) nil))
+
 (defn conj
   "Insert a non-nil key, optionally overriding the set comparator."
   ([s k] (conj s k (.-comparator s)))
   ([s k cmp]
    (when (nil? k) (throw (ex-info "PersistentSortedSet cannot store nil" {:key k})))
-   (let [root (root-node s)
+   (let [root (writable-root s sync-opts)
          settings (.-settings root)]
-     (check-settings! settings)
      (if-let [roots (node/add root (.-storage s) k cmp sync-opts)]
        (let [new-root (if (= 1 (alength roots))
                         (aget roots 0)
                         (branch/promote-root roots settings (.-comparator s) (inc (count s))))]
-         (when (some? (.-address s))
-           (storage/markFreed (.-storage s) (.-address s)))
-         (BTSet. new-root (.-comparator s) settings (meta s) (.-storage s) nil))
+         (changed-set s new-root))
+       s))))
+
+(defn disj
+  "Remove the element matching key under cmp. Return the original set on a miss."
+  ([s key] (disj s key (.-comparator s) sync-opts))
+  ([s key arg]
+   (if (map? arg) (disj s key (.-comparator s) arg) (disj s key arg sync-opts)))
+  ([s key cmp opts]
+   (let [root (writable-root s opts)
+         backend (.-storage s)]
+     (if-let [roots (node/$remove root backend key nil nil cmp opts)]
+       (let [r (aget roots 0)]
+         (changed-set s (if (and (pos? (node/level r)) (= 1 (node/len r)))
+                          (branch/child r backend 0 opts)
+                          r)))
+       s))))
+
+(defn replace
+  "Replace the unique element matching old-key under cmp. The new key must
+   compare equal at that position. Return the original set on a miss."
+  ([s old-key new-key] (replace s old-key new-key (.-comparator s) sync-opts))
+  ([s old-key new-key arg]
+   (if (map? arg)
+     (replace s old-key new-key (.-comparator s) arg)
+     (replace s old-key new-key arg sync-opts)))
+  ([s old-key new-key cmp opts]
+   (when (nil? new-key)
+     (throw (ex-info "PersistentSortedSet cannot store nil" {:key new-key})))
+   (let [root (writable-root s opts)]
+     (if-let [roots (node/$replace root (.-storage s) old-key new-key cmp opts)]
+       (changed-set s (if (= :early-exit roots) root (aget roots 0)))
        s))))
 
 (defn lookup
@@ -86,10 +129,6 @@
   ([s lo hi cmp]
    (let [xs (entries-from (root-node s) (.-storage s) lo cmp)]
      (seq (if (nil? hi) xs (take-while #(not (pos? (cmp % hi))) xs))))))
-
-(defn- synchronous! [opts]
-  (when (false? (:sync? opts))
-    (throw (ex-info "Jolt PSS storage operations require synchronous storage" {}))))
 
 (defn store
   "Flush a set to its storage and return its root address."

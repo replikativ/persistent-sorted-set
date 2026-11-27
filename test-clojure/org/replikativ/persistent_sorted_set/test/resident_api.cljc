@@ -25,3 +25,16 @@
                               expected))]
           (is (= xs (pss/slice tree lo hi cmp)))))
       (is (= [[0 0]] (vec (pss/slice (second versions) nil nil)))))))
+
+(deftest public-replace-and-disj
+  (let [by-id (fn [a b] (compare (first a) (first b)))
+        entries (mapv #(vector % :original) (range 40))
+        a (reduce #(pss/conj %1 %2 compare) (pss/sorted-set* {:branching-factor 4 :comparator compare}) entries)
+        b (pss/replace a [20 :probe] [20 :changed] by-id)
+        c (pss/disj b [2 :probe] by-id)]
+    (is (= entries (seq a)))
+    (is (= [20 :changed] (pss/lookup b [20 :probe] by-id)))
+    (is (= 39 (count c)))
+    (is (= (remove #(= 2 (first %)) (assoc entries 20 [20 :changed])) (seq c)))
+    (is (identical? c (pss/disj c [2 :probe] by-id)))
+    (is (identical? c (pss/replace c [2 :probe] [2 :missing] by-id)))))

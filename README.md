@@ -16,9 +16,10 @@ storage on any backend, range statistics, and a content-addressed mode for CRDT 
 behavioral difference from `clojure.core/sorted-set` is that it can't store `nil`.
 
 The full API is available on Clojure and ClojureScript. On Jolt, the same
-namespace provides synchronous `sorted-set*`, `conj`, `lookup`, and forward
-`slice` for in-memory sets. These sets also support `seq`, `count`, and
-metadata. [Run the cross-runtime checks](test-jolt/README.md).
+namespace provides synchronous `sorted-set*`, `conj`, `disj`, `replace`, `lookup`,
+and forward `slice` for count-based trees with diff buffering disabled. Use
+`store`, `restore`, and `walk-delta` with synchronous storage. These sets also
+support `seq`, `count`, and metadata. [Run the cross-runtime checks](test-jolt/README.md).
 
 ## Key features
 
