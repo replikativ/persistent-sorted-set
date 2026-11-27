@@ -23,6 +23,6 @@ test-jolt/compare-branches.sh
 (cd test-jolt
  mkdir "$out/jvm" "$out/jolt"
  clojure -M:oracle:cbor -m cbor-cases write "$out/jvm"
- "$JOLT" -M:cbor:cbor-jolt -m cbor-cases read "$out/jvm"
- "$JOLT" -M:cbor:cbor-jolt -m cbor-cases write "$out/jolt"
+ "$JOLT" -M:cbor -m cbor-cases read "$out/jvm"
+ "$JOLT" -M:cbor -m cbor-cases write "$out/jolt"
  clojure -M:oracle:cbor -m cbor-cases read "$out/jolt")

@@ -1,6 +1,4 @@
 {:paths ["." "../src-clojure"]
  :deps {org.replikativ/partial-cps {:mvn/version "0.1.68"}}
- :aliases {:cbor {:extra-deps {org.replikativ/boring {:mvn/version "0.1.32"}}}
-           :cbor-jolt {:override-deps {org.replikativ/boring {:git/url "https://github.com/replikativ/boring.git"
-                                                             :git/sha "84f7c3002ff3af9e4976da2c3ec3b873e7d02216"}}}
+ :aliases {:cbor {:extra-deps {org.replikativ/boring {:mvn/version "0.1.33"}}}
            :oracle {:extra-paths ["../target/classes"]}}}
