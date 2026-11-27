@@ -1,7 +1,9 @@
 (ns org.replikativ.persistent-sorted-set.leaf
-  (:require-macros [org.replikativ.persistent-sorted-set.macros :refer [async+sync]])
-  (:require [is.simm.partial-cps.async :refer [await] :refer-macros [async]]
-            [goog.array :as garr]
+  (:refer-clojure :exclude [await])
+  #?(:cljs (:require-macros [org.replikativ.persistent-sorted-set.macros :refer [async+sync]]))
+  (:require [is.simm.partial-cps.async #?@(:cljs [:refer [await] :refer-macros [async]]
+                                        :clj [:refer [async await]])]
+            #?(:clj [org.replikativ.persistent-sorted-set.macros :refer [async+sync]])
             [org.replikativ.persistent-sorted-set.arrays :as arrays]
             [org.replikativ.persistent-sorted-set.impl.node :as node :refer [INode]]
             [org.replikativ.persistent-sorted-set.impl.measure :as measure]
@@ -9,9 +11,15 @@
             [org.replikativ.persistent-sorted-set.impl.boundary :as b]
             [org.replikativ.persistent-sorted-set.util :as util]))
 
-(deftype Leaf [keys settings ^:mutable _measure]
+(defn- fold-measure [measure-ops keys]
+  (reduce (fn [acc key]
+            (measure/merge-measure measure-ops acc (measure/extract measure-ops key)))
+          (measure/identity-measure measure-ops)
+          keys))
+
+(deftype Leaf [keys settings #?(:cljs ^:mutable _measure :clj ^:unsynchronized-mutable _measure)]
   Object
-  (toString [_] (pr-str* (vec keys)))
+  (toString [_] (#?(:cljs pr-str* :clj pr-str) (vec keys)))
   INode
   (len [_] (arrays/alength keys))
   (level [_] 0)
@@ -19,23 +27,12 @@
   (subtree-count [_] (arrays/alength keys))
   (measure [_] _measure)
   (try-compute-measure [this storage measure-ops {:keys [sync?] :or {sync? true}}]
-    ;; For leaves, try and force are the same - just compute from keys
     (if sync?
       (when measure-ops
-        (let [result (reduce (fn [acc key]
-                               (measure/merge-measure measure-ops acc (measure/extract measure-ops key)))
-                             (measure/identity-measure measure-ops)
-                             keys)]
+        (let [result (fold-measure measure-ops keys)]
           (set! _measure result)
           result))
-      (async
-       (when measure-ops
-         (let [result (reduce (fn [acc key]
-                                (measure/merge-measure measure-ops acc (measure/extract measure-ops key)))
-                              (measure/identity-measure measure-ops)
-                              keys)]
-           (set! _measure result)
-           result)))))
+      (async (node/try-compute-measure this storage measure-ops {:sync? true}))))
   (force-compute-measure [this storage measure-ops opts]
     ;; For leaves, try and force are the same - just compute from keys
     (node/try-compute-measure this storage measure-ops opts))
@@ -59,8 +56,7 @@
     (let [new-leaf (Leaf. (arrays/aconcat keys (.-keys next)) settings nil)
           measure-ops (:measure settings)]
       (when (and measure-ops (some? _measure))
-        (set! (.-_measure new-leaf)
-              (node/try-compute-measure new-leaf nil measure-ops {:sync? true})))
+        (node/try-compute-measure new-leaf nil measure-ops {:sync? true}))
       new-leaf))
   (merge-split [_ next]
     (let [ks (util/merge-n-split keys (.-keys next))
@@ -68,8 +64,8 @@
           l0 (Leaf. (arrays/aget ks 0) settings nil)
           l1 (Leaf. (arrays/aget ks 1) settings nil)]
       (when (and measure-ops (some? _measure))
-        (set! (.-_measure l0) (node/try-compute-measure l0 nil measure-ops {:sync? true}))
-        (set! (.-_measure l1) (node/try-compute-measure l1 nil measure-ops {:sync? true})))
+        (node/try-compute-measure l0 nil measure-ops {:sync? true})
+        (node/try-compute-measure l1 nil measure-ops {:sync? true}))
       (util/return-array l0 l1)))
   (add [this storage key cmp {:keys [sync?] :or {sync? true}}]
     (let [branching-factor (:branching-factor settings)
@@ -95,7 +91,7 @@
                                  (loop [out (transient []), pos 0, ls lens]
                                    (if (seq ls)
                                      (let [l  (first ls)
-                                           lf (Leaf. (.slice all-keys pos (+ pos l)) settings nil)]
+                                           lf (Leaf. (arrays/slice all-keys pos (+ pos l)) settings nil)]
                                        (when (and measure-ops (some? _measure))
                                          (node/try-compute-measure lf nil measure-ops {:sync? true}))
                                        (recur (conj! out lf) (+ pos l) (next ls)))
@@ -122,8 +118,8 @@
                              ;; above already uses.
                              (let [all-keys (util/splice keys idx idx (arrays/array key))
                                    middle   (arrays/half (inc keys-l))
-                                   left-leaf  (Leaf. (.slice all-keys 0 middle) settings nil)
-                                   right-leaf (Leaf. (.slice all-keys middle (inc keys-l)) settings nil)]
+                                   left-leaf  (Leaf. (arrays/slice all-keys 0 middle) settings nil)
+                                   right-leaf (Leaf. (arrays/slice all-keys middle (inc keys-l)) settings nil)]
                                ;; Compute measure for split leaves only if already computed
                                (when (and measure-ops (some? _measure))
                                  (node/try-compute-measure left-leaf nil measure-ops {:sync? true})
@@ -148,7 +144,7 @@
         (async result))))
   ($contains? [this storage key cmp {:keys [sync?] :or {sync? true}}]
     (async+sync sync?
-                (async (<= 0 ^number (garr/binarySearch keys key cmp)))))
+                (async (<= 0 (util/lookup-exact cmp keys key)))))
   ($count [this storage {:keys [sync?] :or {sync? true}}]
     (if sync?
       (alength keys)
@@ -156,7 +152,7 @@
   (lookup [this storage key cmp {:keys [sync?] :or {sync? true}}]
     (async+sync sync?
                 (async
-                 (let [idx (garr/binarySearch keys key cmp)]
+                 (let [idx (util/lookup-exact cmp keys key)]
                    (when (<= 0 idx)
                      (arrays/aget keys idx))))))
   ;; `removed-out`, when given, is a 1-element array this fills with the element
@@ -165,7 +161,7 @@
   ($remove [this storage key left right cmp {:keys [sync? removed-out] :or {sync? true}}]
     (let [root? (and (nil? left) (nil? right))
           measure-ops (:measure settings)
-          idx   (garr/binarySearch keys key cmp)]
+          idx   (util/lookup-exact cmp keys key)]
       (async+sync sync?
                   (async
                    (when (<= 0 idx)
@@ -183,12 +179,10 @@
                            removed-element (arrays/aget keys idx)
                            _ (when removed-out (aset removed-out 0 removed-element))
                            new-keys (util/splice keys idx (inc idx) (arrays/array))
-                           new-leaf (Leaf. new-keys settings nil)]
-                       ;; Update measure only if already computed
-                       (when (and measure-ops (some? _measure))
-                         (set! (.-_measure new-leaf)
-                               (measure/remove-measure measure-ops _measure removed-element
-                                                       #(node/try-compute-measure new-leaf storage measure-ops {:sync? true}))))
+                           new-measure (when (and measure-ops (some? _measure))
+                                         (measure/remove-measure measure-ops _measure removed-element
+                                                                 #(fold-measure measure-ops new-keys)))
+                           new-leaf (Leaf. new-keys settings new-measure)]
                        (util/rotate new-leaf root? left right settings)))))))
   ;; `removed-out`, when given, is a 1-element array this fills with the element
   ;; ACTUALLY removed. A diff-buf parent needs it to deposit Absent(<what the leaf
@@ -200,7 +194,7 @@
     (assert (== 0 (cmp old-key new-key)) "old-key and new-key must compare as equal (cmp must return 0)")
     (async+sync sync?
                 (async
-                 (let [idx (garr/binarySearch keys old-key cmp)]
+                 (let [idx (util/lookup-exact cmp keys old-key)]
                    (when (<= 0 idx)
                      ;; PRECONDITION, checked only when assertions are live (release
                      ;; builds elide it): `replace` writes new-key into the OLD
@@ -225,9 +219,7 @@
                            measure-ops (:measure settings)]
                        ;; Eagerly maintain measure: compute from new leaf (which has replacement done)
                        (when (and measure-ops (some? _measure))
-                         (set! (.-_measure new-leaf)
-                               ;; Compute from new-leaf which has new-key instead of old-key
-                               (node/try-compute-measure new-leaf storage measure-ops {:sync? true})))
+                         (node/try-compute-measure new-leaf storage measure-ops {:sync? true}))
                        (arrays/array new-leaf)))))))
   (store [this storage {:keys [sync?] :or {sync? true} :as opts}]
     (async+sync sync?

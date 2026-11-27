@@ -9,25 +9,23 @@
    only *gates* the MST path on `content-boundary`. MST itself is unambiguous (the cut is at the
    boundary key's position), so it is identical across platforms. See SPLIT_SEAM_DESIGN.md.")
 
-#?(:cljs
-   (defprotocol PBoundary
-     "CLJS parallel of the Java IBoundary seam (MST only — count stays inline)."
-     (-split-on-insert [_ run len ins level]
-       "MST: O(1) split decision after a single key was inserted at `ins` (run[ins] is the new
-        key). Returns [len-a len-b] if it must split, else nil. Only the inserted key — or the
-        displaced old max when appended — can be a new boundary.")
-     (-key-level [_ key]
-       "The level a key rises to (0 ⇒ leaf-only).")
-     (-content-defined? [_] "true for MST.")
-     (-descriptor [_] "Serializable descriptor {:type … …} for self-describing restore.")))
+(defprotocol PBoundary
+  "CLJS parallel of the Java IBoundary seam (MST only — count stays inline)."
+  (-split-on-insert [_ run len ins level]
+    "MST: O(1) split decision after a single key was inserted at `ins` (run[ins] is the new
+     key). Returns [len-a len-b] if it must split, else nil. Only the inserted key — or the
+     displaced old max when appended — can be a new boundary.")
+  (-key-level [_ key]
+    "The level a key rises to (0 ⇒ leaf-only).")
+  (-content-defined? [_] "true for MST.")
+  (-descriptor [_] "Serializable descriptor {:type … …} for self-describing restore."))
 
-#?(:cljs
-   (defn content-boundary
-     "The settings' boundary iff it is content-defined (MST), else nil ⇒ use the inline count
-      path. The cljs gate that mirrors the JVM `boundary().contentDefined()` branch."
-     [settings]
-     (when-let [b (:boundary settings)]
-       (when (-content-defined? b) b))))
+(defn content-boundary
+  "The settings' boundary iff it is content-defined (MST), else nil ⇒ use the inline count
+   path. The cljs gate that mirrors the JVM `boundary().contentDefined()` branch."
+  [settings]
+  (when-let [b (:boundary settings)]
+    (when (-content-defined? b) b)))
 
 ;; ---- internal descriptor → boundary resolution (NO consumer interaction) ------------------
 ;; The descriptor→strategy mapping lives in the optional `boundary` ns (which carries hasch). We

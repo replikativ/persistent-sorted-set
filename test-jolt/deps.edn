@@ -1,0 +1,3 @@
+{:paths ["." "../src-clojure"]
+ :deps {is.simm/partial-cps {:mvn/version "0.1.59"}}
+ :aliases {:oracle {:extra-deps {org.replikativ/persistent-sorted-set {:mvn/version "0.5.144"}}}}}

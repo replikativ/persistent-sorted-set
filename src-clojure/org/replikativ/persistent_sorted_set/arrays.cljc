@@ -68,6 +68,10 @@
   #?(:clj  (Arrays/copyOf ^{:tag "[[Ljava.lang.Object;"} from (alength from))
      :cljs (.slice from 0)))
 
+(defn slice [arr start end]
+  #?(:cljs (.slice arr start end)
+     :clj (Arrays/copyOfRange ^objects arr (int start) (int end))))
+
 (defn aconcat [a b]
   #?(:cljs (.concat a b)
      :clj  (let [al  (alength a)

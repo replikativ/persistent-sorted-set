@@ -152,13 +152,17 @@
       (let [nodes (node/merge-split node right)]
         (return-array left (arrays/aget nodes 0) (arrays/aget nodes 1))))))
 
-(defn lookup-exact [cmp arr key]
-  (let [arr-l (arrays/alength arr)
-        idx   (binary-search-l cmp arr (dec arr-l) key)]
-    (if (and (< idx arr-l)
-             (== 0 (cmp (arrays/aget arr idx) key)))
-      idx
-      -1)))
+(defn lookup-exact
+  "First equal slot, or -1. Leaf lookup comparators receive the probe first."
+  [cmp arr key]
+  (loop [lo 0, hi (arrays/alength arr), found -1]
+    (if (< lo hi)
+      (let [mid (arrays/half (+ lo hi))
+            order (cmp key (arrays/aget arr mid))]
+        (if (pos? order)
+          (recur (inc mid) hi found)
+          (recur lo mid (if (zero? order) mid found))))
+      found)))
 
 (defn merge-n-split [a1 a2]
   (let [a1-l    (arrays/alength a1)
