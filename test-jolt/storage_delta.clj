@@ -47,6 +47,12 @@
     (is (= (range 80) (seq x)))
     (is (= (range 81) (seq y)))
     (is (= 81 (count y)))
+    (let [old (s/restore ra storage)
+          new (s/restore rb storage)]
+      (reset! reads [])
+      (is (= [79 78 77] (vec (s/rslice old nil 77))))
+      (is (< 0 (count @reads) (count previous)))
+      (is (= [80 79 78 77] (vec (s/rslice new nil 77)))))
     (is (= [77 78 79 80] (vec (s/slice y 77 nil))))
     (is (thrown? Throwable (s/walk-delta x y storage identity {:sync? false})))))
 

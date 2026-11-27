@@ -131,6 +131,30 @@
    (let [xs (entries-from (root-node s) (.-storage s) lo cmp)]
      (seq (if (nil? hi) xs (take-while #(not (pos? (cmp % hi))) xs))))))
 
+(defn- entries-backward [n storage from cmp]
+  (lazy-seq
+   (let [keys (.-keys n)
+         size (node/len n)
+         end (if (nil? from) size (util/binary-search-r cmp keys (dec size) from))]
+     (if (zero? (node/level n))
+       (map #(aget keys %) (range (dec end) -1 -1))
+       ;; Branch keys are child maxima. The first child whose maximum exceeds
+       ;; from may still contain matching entries, including comparator ties.
+       (letfn [(siblings [idx bound]
+                 (lazy-seq
+                  (when (>= idx 0)
+                    (lazy-cat (entries-backward (branch/child n storage idx sync-opts)
+                                                storage bound cmp)
+                              (siblings (dec idx) nil)))))]
+         (siblings (min end (dec size)) from))))))
+
+(defn rslice
+  "Return a descending seq from hi through lo, inclusive. A nil bound is open."
+  ([s hi lo] (rslice s hi lo (.-comparator s)))
+  ([s hi lo cmp]
+   (let [xs (entries-backward (root-node s) (.-storage s) hi cmp)]
+     (seq (if (nil? lo) xs (take-while #(not (neg? (cmp % lo))) xs))))))
+
 (defn store
   "Flush a set to its storage and return its root address."
   ([s] (store s (.-storage s) sync-opts))

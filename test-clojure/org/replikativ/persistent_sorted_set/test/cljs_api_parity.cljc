@@ -223,3 +223,17 @@
                    (set/replace s 2 nil))
           "a nil replacement must be refused")
       (is (= [1 2 3] (elems s)) "and the set is untouched"))))
+
+(deftest reverse-slice-across-stored-versions
+  (let [backend (storage)
+        initial (reduce #(set/conj %1 %2 compare)
+                        (set/sorted-set* {:branching-factor 8 :diff-buf-size 0
+                                          :storage backend :comparator compare})
+                        (range 80))
+        old-root (set/store initial backend)
+        new-root (set/store (set/disj initial 42 compare) backend)]
+    (doseq [[root expected] [[old-root (range 54 29 -1)]
+                             [new-root (remove #{42} (range 54 29 -1))]]]
+      (let [s (set/restore root backend)]
+        (is (= expected (set/rslice s 54 30)))
+        (is (= (reverse expected) (set/slice s 30 54)))))))

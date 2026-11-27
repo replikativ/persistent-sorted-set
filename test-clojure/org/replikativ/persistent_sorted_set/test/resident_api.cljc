@@ -38,3 +38,17 @@
     (is (= (remove #(= 2 (first %)) (assoc entries 20 [20 :changed])) (seq c)))
     (is (identical? c (pss/disj c [2 :probe] by-id)))
     (is (identical? c (pss/replace c [2 :probe] [2 :missing] by-id)))))
+
+(deftest multi-leaf-reverse-slice
+  (let [items (mapv #(vector (quot % 8) %) (range 80))
+        old (reduce #(pss/conj %1 %2 compare)
+                    (pss/sorted-set* {:branching-factor 4 :comparator compare}) items)
+        current (pss/disj old [5 42] compare)
+        by-group #(compare (first %1) (first %2))]
+    (doseq [[tree values] [[old items] [current (remove #{[5 42]} items)]]
+            [lo hi] [[nil nil] [[3] [6]] [[5] [5]] [nil [0]] [[9] nil]
+                     [[11] nil] [nil [-1]]]]
+      (let [expected (filter #(and (or (nil? lo) (not (neg? (by-group % lo))))
+                                   (or (nil? hi) (not (pos? (by-group % hi))))) values)]
+        (is (= (seq expected) (pss/slice tree lo hi by-group)))
+        (is (= (seq (reverse expected)) (pss/rslice tree hi lo by-group)))))))

@@ -35,7 +35,7 @@
 
 (defn rslice
   "A reverse iterator for part of the set with provided boundaries.
-   `(rslice set from to)` returns backwards iterator for all Xs where from <= X <= to.
+   `(rslice set from to)` returns backwards iterator for all Xs where to <= X <= from.
    `(rslice set from nil)` returns backwards iterator for all Xs where X <= from.
    Optionally pass in comparator that will override the one that set uses. Supports efficient [[clojure.core/rseq]]."
   ([^PersistentSortedSet set from to]

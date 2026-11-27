@@ -19,7 +19,9 @@
           (recur l (dec m))))
       l)))
 
-(defn- binary-search-r [cmp arr r k]
+(defn binary-search-r
+  "First index strictly greater than k under cmp, or r+1."
+  [cmp arr r k]
   (loop [l 0
          r (long r)]
     (if (<= l r)
