@@ -1,14 +1,16 @@
 (ns org.replikativ.persistent-sorted-set
-  "Resident count-based B-trees on Jolt."
+  "Count-based B-trees on Jolt."
   (:refer-clojure :exclude [conj])
   (:require [org.replikativ.persistent-sorted-set.branch :as branch]
+            [org.replikativ.persistent-sorted-set.impl.delta :as delta]
+            [org.replikativ.persistent-sorted-set.impl.storage :as storage]
             [org.replikativ.persistent-sorted-set.impl.node :as node]
             [org.replikativ.persistent-sorted-set.leaf :as leaf]
             [org.replikativ.persistent-sorted-set.util :as util]))
 
 (def ^:private sync-opts {:sync? true})
 
-(defn- entries-from [n from cmp]
+(defn- entries-from [n storage from cmp]
   (lazy-seq
    (let [keys (.-keys n)
          size (node/len n)
@@ -17,50 +19,109 @@
        (if (zero? (node/level n))
          (map #(aget keys %) (range i size))
          (mapcat (fn [idx]
-                   (entries-from (branch/child n nil idx sync-opts)
+                   (entries-from (branch/child n storage idx sync-opts) storage
                                  (when (= idx i) from) cmp))
                  (range i size)))))))
 
-(deftype BTSet [root comparator settings metadata]
+(declare root-node)
+
+(deftype BTSet [^:unsynchronized-mutable root comparator settings metadata
+                ^:unsynchronized-mutable storage ^:unsynchronized-mutable address]
   clojure.lang.Counted
-  (count [_] (node/subtree-count root))
+  (count [s] (node/$count (root-node s) storage sync-opts))
   clojure.lang.Seqable
-  (seq [_] (seq (entries-from root nil comparator)))
+  (seq [s] (seq (entries-from (root-node s) storage nil comparator)))
   clojure.lang.IMeta
   (meta [_] metadata)
   clojure.lang.IObj
-  (withMeta [_ m] (BTSet. root comparator settings m)))
+  (withMeta [_ m] (BTSet. root comparator settings m storage address)))
+
+(defn- root-node
+  ([s] (root-node s sync-opts))
+  ([s opts]
+   (or (.-root s)
+       (let [n (storage/restore (.-storage s) (.-address s) opts)
+             root (if (pos? (node/level n)) (branch/stamp-proj-cmp n (.-comparator s)) n)]
+         (set! (.-root s) root)
+         root))))
+
+(defn- check-settings! [settings]
+  (when (or (:boundary settings) (pos? (or (:diff-buf-size settings) 0)))
+    (throw (ex-info "Jolt supports count-based trees with diff buffering disabled" {}))))
 
 (defn sorted-set*
-  "Create a resident sorted set with an optional comparator, branching factor,
+  "Create a sorted set with an optional comparator, branching factor,
    measure and metadata."
   [opts]
   (let [settings (node/node-settings opts)]
-    (when (or (:storage opts) (:boundary opts) (pos? (:diff-buf-size settings)))
-      (throw (ex-info "Jolt supports resident count-based sets with diff buffering disabled" {})))
+    (check-settings! settings)
     (BTSet. (leaf/empty-leaf settings) (or (:comparator opts) (:cmp opts) compare)
-            settings (:meta opts))))
+            settings (:meta opts) (:storage opts) nil)))
 
 (defn conj
   "Insert a non-nil key, optionally overriding the set comparator."
   ([s k] (conj s k (.-comparator s)))
   ([s k cmp]
    (when (nil? k) (throw (ex-info "PersistentSortedSet cannot store nil" {:key k})))
-   (if-let [roots (node/add (.-root s) nil k cmp sync-opts)]
-     (BTSet. (if (= 1 (alength roots))
-               (aget roots 0)
-               (branch/promote-root roots (.-settings s) (.-comparator s) (inc (count s))))
-             (.-comparator s) (.-settings s) (meta s))
-     s)))
+   (let [root (root-node s)
+         settings (.-settings root)]
+     (check-settings! settings)
+     (if-let [roots (node/add root (.-storage s) k cmp sync-opts)]
+       (let [new-root (if (= 1 (alength roots))
+                        (aget roots 0)
+                        (branch/promote-root roots settings (.-comparator s) (inc (count s))))]
+         (when (some? (.-address s))
+           (storage/markFreed (.-storage s) (.-address s)))
+         (BTSet. new-root (.-comparator s) settings (meta s) (.-storage s) nil))
+       s))))
 
 (defn lookup
   "Return the stored element equal to k under cmp, or nil."
   ([s k] (lookup s k (.-comparator s)))
-  ([s k cmp] (node/lookup (.-root s) nil k cmp sync-opts)))
+  ([s k cmp] (node/lookup (root-node s) (.-storage s) k cmp sync-opts)))
 
 (defn slice
   "Return a forward seq from lo through hi, inclusive. A nil bound is open."
   ([s lo hi] (slice s lo hi (.-comparator s)))
   ([s lo hi cmp]
-   (let [xs (entries-from (.-root s) lo cmp)]
+   (let [xs (entries-from (root-node s) (.-storage s) lo cmp)]
      (seq (if (nil? hi) xs (take-while #(not (pos? (cmp % hi))) xs))))))
+
+(defn- synchronous! [opts]
+  (when (false? (:sync? opts))
+    (throw (ex-info "Jolt PSS storage operations require synchronous storage" {}))))
+
+(defn store
+  "Flush a set to its storage and return its root address."
+  ([s] (store s (.-storage s) sync-opts))
+  ([s arg] (if (satisfies? storage/IStorage arg)
+             (store s arg sync-opts)
+             (store s (.-storage s) arg)))
+  ([s backend opts]
+   (synchronous! opts)
+   (assert (satisfies? storage/IStorage backend))
+   (when (and (.-storage s) (not (identical? backend (.-storage s))))
+     (throw (ex-info "The set belongs to another storage" {})))
+   (set! (.-storage s) backend)
+   (or (.-address s)
+       (let [address (node/store (root-node s) backend opts)]
+         (set! (.-address s) address)
+         address))))
+
+(defn restore
+  "Open a stored set by root address without reading it until needed."
+  ([address backend] (restore address backend {}))
+  ([address-or-info backend opts]
+   (let [info (if (map? address-or-info) address-or-info {:root-address address-or-info})
+         settings (node/node-settings (merge info opts))]
+     (assert (some? (:root-address info)))
+     (BTSet. nil (or (:comparator info) (:comparator opts) (:cmp opts) compare)
+             settings (or (:meta info) (:meta opts)) backend (:root-address info)))))
+
+(defn walk-delta
+  "Visit stored addresses introduced by b, skipping subtrees shared with a."
+  ([a b on-address] (walk-delta a b (.-storage b) on-address sync-opts))
+  ([a b backend on-address] (walk-delta a b backend on-address sync-opts))
+  ([a b backend on-address opts]
+   (synchronous! opts)
+   (delta/walk-delta root-node a b backend on-address opts)))

@@ -14,9 +14,9 @@ fi
 
 export JOLT
 clojure -T:build java
-"$JOLT" -Sdeps '{:paths ["src-clojure" "test-clojure"]}' -e "
-(require 'clojure.test 'org.replikativ.persistent-sorted-set.test.resident-api)
-(let [r (clojure.test/run-tests 'org.replikativ.persistent-sorted-set.test.resident-api)]
+"$JOLT" -Sdeps '{:paths ["src-clojure" "test-clojure" "test-jolt"]}' -e "
+(require 'clojure.test 'storage-delta 'org.replikativ.persistent-sorted-set.test.resident-api)
+(let [r (clojure.test/run-tests 'storage-delta 'org.replikativ.persistent-sorted-set.test.resident-api)]
   (assert (and (pos? (:test r)) (zero? (+ (:fail r) (:error r))))))"
 test-jolt/compare-leaves.sh
 test-jolt/compare-branches.sh
