@@ -1,0 +1,66 @@
+(ns org.replikativ.persistent-sorted-set
+  "Resident count-based B-trees on Jolt."
+  (:refer-clojure :exclude [conj])
+  (:require [org.replikativ.persistent-sorted-set.branch :as branch]
+            [org.replikativ.persistent-sorted-set.impl.node :as node]
+            [org.replikativ.persistent-sorted-set.leaf :as leaf]
+            [org.replikativ.persistent-sorted-set.util :as util]))
+
+(def ^:private sync-opts {:sync? true})
+
+(defn- entries-from [n from cmp]
+  (lazy-seq
+   (let [keys (.-keys n)
+         size (node/len n)
+         i (if (nil? from) 0 (util/binary-search-l cmp keys (dec size) from))]
+     (when (< i size)
+       (if (zero? (node/level n))
+         (map #(aget keys %) (range i size))
+         (mapcat (fn [idx]
+                   (entries-from (branch/child n nil idx sync-opts)
+                                 (when (= idx i) from) cmp))
+                 (range i size)))))))
+
+(deftype BTSet [root comparator settings metadata]
+  clojure.lang.Counted
+  (count [_] (node/subtree-count root))
+  clojure.lang.Seqable
+  (seq [_] (seq (entries-from root nil comparator)))
+  clojure.lang.IMeta
+  (meta [_] metadata)
+  clojure.lang.IObj
+  (withMeta [_ m] (BTSet. root comparator settings m)))
+
+(defn sorted-set*
+  "Create a resident sorted set with an optional comparator, branching factor,
+   measure and metadata."
+  [opts]
+  (let [settings (node/node-settings opts)]
+    (when (or (:storage opts) (:boundary opts) (pos? (:diff-buf-size settings)))
+      (throw (ex-info "Jolt supports resident count-based sets with diff buffering disabled" {})))
+    (BTSet. (leaf/empty-leaf settings) (or (:comparator opts) (:cmp opts) compare)
+            settings (:meta opts))))
+
+(defn conj
+  "Insert a non-nil key, optionally overriding the set comparator."
+  ([s k] (conj s k (.-comparator s)))
+  ([s k cmp]
+   (when (nil? k) (throw (ex-info "PersistentSortedSet cannot store nil" {:key k})))
+   (if-let [roots (node/add (.-root s) nil k cmp sync-opts)]
+     (BTSet. (if (= 1 (alength roots))
+               (aget roots 0)
+               (branch/promote-root roots (.-settings s) (.-comparator s) (inc (count s))))
+             (.-comparator s) (.-settings s) (meta s))
+     s)))
+
+(defn lookup
+  "Return the stored element equal to k under cmp, or nil."
+  ([s k] (lookup s k (.-comparator s)))
+  ([s k cmp] (node/lookup (.-root s) nil k cmp sync-opts)))
+
+(defn slice
+  "Return a forward seq from lo through hi, inclusive. A nil bound is open."
+  ([s lo hi] (slice s lo hi (.-comparator s)))
+  ([s lo hi cmp]
+   (let [xs (entries-from (.-root s) lo cmp)]
+     (seq (if (nil? hi) xs (take-while #(not (pos? (cmp % hi))) xs))))))

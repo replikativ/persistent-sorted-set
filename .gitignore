@@ -28,3 +28,6 @@ node_modules
 .settings/
 # Stray shadow-cljs/compiled output at repo root (real source is src-clojure/)
 /org/
+
+# Local Jolt dependency cache
+.jolt/

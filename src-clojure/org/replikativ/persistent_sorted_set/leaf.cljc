@@ -2,7 +2,7 @@
   (:refer-clojure :exclude [await])
   #?(:cljs (:require-macros [org.replikativ.persistent-sorted-set.macros :refer [async+sync]]))
   (:require [is.simm.partial-cps.async #?@(:cljs [:refer [await] :refer-macros [async]]
-                                        :clj [:refer [async await]])]
+                                           :clj [:refer [async await]])]
             #?(:clj [org.replikativ.persistent-sorted-set.macros :refer [async+sync]])
             [org.replikativ.persistent-sorted-set.arrays :as arrays]
             [org.replikativ.persistent-sorted-set.impl.node :as node :refer [INode]]
@@ -227,3 +227,23 @@
                  (await (storage/store storage this opts)))))
   (walk-addresses [this storage on-address {:keys [sync?] :or {sync? true}}]
     (when-not sync? (async))))
+
+(defn empty-leaf
+  "The empty root leaf, carrying the measure IDENTITY when a measure is configured.
+
+   Every measure-maintenance site in leaf.cljs and branch.cljs is guarded on the SOURCE
+   node already having a measure — correct for maintenance, but it means nothing ever
+   BOOTSTRAPS one. The empty leaf was built with nil, so on the incremental path no node
+   ever acquired a measure at all, and the library's own `diagnostics/validate-measures-known`
+   failed on ClojureScript for every conj-built set (measured: 12 / 129 / 5 / 56 violations at
+   bf 8 n 40 / bf 8 n 400 / bf 16 n 40 / bf 16 n 400 — leaves as well as branches). It also
+   made cljs internally inconsistent, since the bulk builders compute eagerly, so bulk and
+   incremental builds of the SAME set produced different `:measure` in their blobs.
+
+   Seeding the identity here is enough: from a non-nil measure the existing incremental
+   maintenance carries it through every add, split, merge and borrow, so the whole tree
+   bootstraps from the empty set outward. The identity is what an empty leaf's measure IS,
+   so this is also the correct value rather than a convenient one."
+  [settings]
+  (let [measure-ops (:measure settings)]
+    (Leaf. (arrays/make-array 0) settings (when measure-ops (measure/identity-measure measure-ops)))))

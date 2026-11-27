@@ -15,7 +15,10 @@ standard set API it adds efficient slicing, transients, custom comparators, lazy
 storage on any backend, range statistics, and a content-addressed mode for CRDT sync. The only
 behavioral difference from `clojure.core/sorted-set` is that it can't store `nil`.
 
-Implementations are provided for both Clojure and ClojureScript.
+The full API is available on Clojure and ClojureScript. On Jolt, the same
+namespace provides synchronous `sorted-set*`, `conj`, `lookup`, and forward
+`slice` for in-memory sets. These sets also support `seq`, `count`, and
+metadata. [Run the cross-runtime checks](test-jolt/README.md).
 
 ## Key features
 

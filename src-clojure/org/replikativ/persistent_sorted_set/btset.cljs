@@ -2073,26 +2073,6 @@
 
 #!------------------------------------------------------------------------------
 
-(defn- empty-leaf
-  "The empty root leaf, carrying the measure IDENTITY when a measure is configured.
-
-   Every measure-maintenance site in leaf.cljs and branch.cljs is guarded on the SOURCE
-   node already having a measure — correct for maintenance, but it means nothing ever
-   BOOTSTRAPS one. The empty leaf was built with nil, so on the incremental path no node
-   ever acquired a measure at all, and the library's own `diagnostics/validate-measures-known`
-   failed on ClojureScript for every conj-built set (measured: 12 / 129 / 5 / 56 violations at
-   bf 8 n 40 / bf 8 n 400 / bf 16 n 40 / bf 16 n 400 — leaves as well as branches). It also
-   made cljs internally inconsistent, since the bulk builders compute eagerly, so bulk and
-   incremental builds of the SAME set produced different `:measure` in their blobs.
-
-   Seeding the identity here is enough: from a non-nil measure the existing incremental
-   maintenance carries it through every add, split, merge and borrow, so the whole tree
-   bootstraps from the empty set outward. The identity is what an empty leaf's measure IS,
-   so this is also the correct value rather than a convenient one."
-  [settings]
-  (let [measure-ops (:measure settings)]
-    (Leaf. (arrays/array) settings (when measure-ops (measure/identity-measure measure-ops)))))
-
 (deftype BTSet [^:mutable root cnt comparator meta ^:mutable _hash storage ^:mutable address ^:mutable settings]
   Object
   (toString [this] (pr-str* this))
@@ -2113,7 +2093,7 @@
   ;; the same failure shape: a crash on the next write, well away from the `empty` that
   ;; caused it. The ADDRESS is still dropped, correctly: an empty set shares no nodes with
   ;; the one it came from, so it has nothing durable to point at until it is stored.
-  (-empty [_] (BTSet. (empty-leaf settings) 0 comparator meta UNINITIALIZED_HASH storage nil settings))
+  (-empty [_] (BTSet. (leaf/empty-leaf settings) 0 comparator meta UNINITIALIZED_HASH storage nil settings))
 
   IEquiv
   (-equiv [this other]
@@ -2291,32 +2271,9 @@
 ;;
 ;; A non-positive or absent value means UNSET and takes the default, matching the
 ;; JVM where `Settings()` delegates with 0. Only an explicit 1, 2 or 3 is refused.
-(def ^:const MIN-BRANCHING-FACTOR 4)
-(def ^:const DEFAULT-BRANCHING-FACTOR 512)
-
-(defn check-branching-factor
-  "Normalize an unset branching factor to the default and refuse an unsupported one."
-  [bf]
-  (let [bf (if (or (nil? bf) (not (pos? bf))) DEFAULT-BRANCHING-FACTOR bf)]
-    (when (< bf MIN-BRANCHING-FACTOR)
-      (throw (ex-info (str "branching-factor " bf " is not supported: the minimum is "
-                           MIN-BRANCHING-FACTOR ". Below it the minimum fill (bf >>> 1) is 1, "
-                           "so a branch of length 1 is considered full, its only child has no "
-                           "sibling to rebalance with, and a removal leaves a length-0 leaf. "
-                           "Measured: this yields nil elements and a count that disagrees with "
-                           "seq in ClojureScript, and throws ArrayIndexOutOfBoundsException on "
-                           "the JVM. Omit :branching-factor for the default of "
-                           DEFAULT-BRANCHING-FACTOR ".")
-                      {:branching-factor bf :min MIN-BRANCHING-FACTOR})))
-    bf))
-
-(defn- node-settings
-  "The settings a node carries, normalized and validated exactly as the JVM's
-   `Settings` constructor does."
-  [opts]
-  (-> (select-keys opts [:branching-factor :measure :boundary :diff-buf-size])
-      (update :branching-factor check-branching-factor)
-      (update :diff-buf-size (fn [d] (if (or (nil? d) (neg? d)) 0 d)))))
+(def ^:const MIN-BRANCHING-FACTOR node/MIN-BRANCHING-FACTOR)
+(def ^:const DEFAULT-BRANCHING-FACTOR node/DEFAULT-BRANCHING-FACTOR)
+(def check-branching-factor node/check-branching-factor)
 
 (defn ^BTSet from-sorted-array
   "Build from the first `len` elements of `arr`.
@@ -2340,7 +2297,7 @@
                    (throw (ex-info "from-sorted-array: len out of range"
                                    {:len len :array-length full})))
         arr      (if (< len full) (.slice arr 0 len) arr)
-        settings (node-settings opts)
+        settings (node/node-settings opts)
         measure-ops (:measure settings)
         storage  (:storage opts)
         bd       (b/content-boundary settings)]
@@ -2352,7 +2309,7 @@
                          (mst-partition bd arr identity 1))]
         (loop [nodes leaves, lvl 1]
           (case (count nodes)
-            0 (BTSet. (empty-leaf settings) 0 cmp (:meta opts) UNINITIALIZED_HASH storage nil settings)
+            0 (BTSet. (leaf/empty-leaf settings) 0 cmp (:meta opts) UNINITIALIZED_HASH storage nil settings)
             1 (BTSet. (first nodes) (arrays/alength arr) cmp (:meta opts) UNINITIALIZED_HASH storage nil settings)
             (recur (mapv #(mst-build-branch lvl (array-seq %) settings cmp)
                          (mst-partition bd (arrays/into-array nodes) node/max-key (inc lvl)))
@@ -2527,7 +2484,7 @@
    Input MUST be sorted and distinct under `cmp`; this is checked, because the
    alternative is a silently corrupt tree."
   [cmp xs {:keys [sync? storage flush-fn] :or {sync? true} :as opts}]
-  (let [settings    (node-settings opts)
+  (let [settings    (node/node-settings opts)
         measure-ops (:measure settings)
         max-bf      (max-len settings)
         avg-bf      (avg-len settings)
@@ -2637,8 +2594,8 @@
    - :measure  Measure implementation (IMeasure protocol)
    - :meta     Metadata"
   [opts]
-  (let [settings (node-settings opts)]
-    (BTSet. (empty-leaf settings) 0 (or (:comparator opts) (:cmp opts) compare)
+  (let [settings (node/node-settings opts)]
+    (BTSet. (leaf/empty-leaf settings) 0 (or (:comparator opts) (:cmp opts) compare)
             (:meta opts) UNINITIALIZED_HASH (:storage opts) nil settings)))
 
 (defn ^BTSet sorted-set-by
