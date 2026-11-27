@@ -1,3 +1,5 @@
 Run `test-jolt/compare-leaves.sh` with `clojure` and `jolt` on PATH. Set `JOLT` to select a particular executable. The JVM run uses the Java Leaf from the released 0.5.144 jar. Jolt loads the shared leaf from this checkout.
 
 Each case inserts into a leaf, checks that its source still has the same keys and cached measure, and reports the resulting leaves in order. The script compares the two runtimes' reports. Cases include ascending and descending comparators, odd and even branching factors, duplicate inserts, and warm and cold measures. The ordered measure exposes an insertion folded at the wrong position.
+
+Run `test-jolt/compare-branches.sh` to exercise insertion through root splits. The JVM oracle uses the public sorted set from 0.5.144. Jolt uses shared resident nodes and the same root promotion function as the ClojureScript sorted set. The test compares every retained root after all insertions, including separators, counts, ordered measures and lookup results. It uses branching factor four and disables diff buffering.

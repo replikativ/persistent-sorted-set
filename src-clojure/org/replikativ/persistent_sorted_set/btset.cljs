@@ -363,35 +363,9 @@
                             (BTSet. (with-root-count (mst-grow-root bd roots (.-settings set) (.-comparator set)) root-total)
                                     new-cnt (.-comparator set) (.-meta set)
                                     UNINITIALIZED_HASH (.-storage set) nil (.-settings set))
-                            (let [child0 (arrays/aget roots 0)
-                                  lvl    (inc (node/level child0))
-                                ;; Compute subtree count; propagate -1 (unknown) if any child is unknown
-                                  child-counts (map node/subtree-count roots)
-                                  subtree-count (if (every? #(>= % 0) child-counts)
-                                                  (reduce + 0 child-counts)
-                                                  root-total)
-                                ;; Compute measure from children if measure-ops available
-                                  measure-ops (:measure (.-settings set))
-                                ;; Only compute root-measure when all children have measure;
-                                ;; otherwise keep nil to allow lazy recomputation
-                                  child-measure (when measure-ops (map node/measure roots))
-                                  root-measure (when (and measure-ops (every? some? child-measure))
-                                                 (reduce (fn [acc cs]
-                                                           (measure/merge-measure measure-ops acc cs))
-                                                         (measure/identity-measure measure-ops)
-                                                         child-measure))]
-                            ;; diff-buf: new root on growth — _bufEntries = 0 (no buffered diff; this
-                            ;; node is always the root ⇒ always written; if later mutated in a transient
-                            ;; batch the first deposit poisons it correctly). Mirrors JVM makeBranchFromChildren.
-                              (BTSet. (branch/with-child-measures!
-                                        (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count root-measure (.-settings set) nil 0 (.-comparator set) nil false))
-                                      new-cnt
-                                      (.-comparator set)
-                                      (.-meta set)
-                                      UNINITIALIZED_HASH
-                                      (.-storage set)
-                                      nil
-                                      (.-settings set)))))))))))))
+                            (BTSet. (branch/promote-root roots (.-settings set) (.-comparator set) root-total)
+                                    new-cnt (.-comparator set) (.-meta set)
+                                    UNINITIALIZED_HASH (.-storage set) nil (.-settings set))))))))))))
 
 (defn $replace
   ([^BTSet set old-key new-key]
