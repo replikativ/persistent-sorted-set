@@ -611,39 +611,27 @@
 (defn child
   [^Branch node storage idx {:keys [sync?] :or {sync? true} :as opts}]
   (assert (and (some? idx) (number? idx)))
-  (assert (or (and (some? (read-field node :children))
-                   (some? (aget (read-field node :children) idx)))
-              (and (some? (read-field node :addresses))
-                   (some? (aget (read-field node :addresses) idx)))))
   (async+sync sync?
               (async
-               (let [*child (atom nil)]
-                 (when (some? (read-field node :children))
-                   (reset! *child (aget (read-field node :children) idx)))
-                 (if (nil? @*child)
-                   (let [addr (aget (read-field node :addresses) idx)
-                         _    (assert (some? addr) "expected address to restore child")
-                         _    (assert (some? storage) "expected storage")
-                         base0 (await (storage/restore storage addr opts))
-                         ;; diff-buf: propagate the set's projection comparator down to the
-                         ;; restored branch (the storage layer has no comparator), so a
-                         ;; leaf-parent projects its buffered leaves with the set's own
-                         ;; comparator — independent of the op that drove this descent.
-                         ;; SEED it when the node carries none; COPY when it carries a
-                         ;; different one, because `base0` is the object the storage returned
-                         ;; and a caching storage shares it by address across sets. Writing
-                         ;; unconditionally is what let one set's comparator decide another
-                         ;; set's leaf order — see `with-proj-cmp`.
-                         base (stamp-proj-cmp base0 (read-field node :_projCmp))
-                         ;; diff-buf: project this parent's buffered diff onto the freshly
-                         ;; loaded child (leaf: rebuild keys; branch: install nested _slots).
-                         c    (project-child node storage idx base)]
-                     (reset! *child c)
-                     (aset (ensure-children node) idx c))
-                   (when (and (some? (read-field node :addresses)) (some? (aget (read-field node :addresses) idx)))
+               (let [cached (when-some [children (read-field node :children)]
+                              (arrays/aget children idx))
+                     addr (when-some [addresses (read-field node :addresses)]
+                            (arrays/aget addresses idx))]
+                 (if (some? cached)
+                   (do
+                     (when (some? addr)
+                       (assert (some? storage) "expected storage")
+                       (storage/accessed storage addr))
+                     cached)
+                   (do
+                     (assert (some? addr) "expected address to restore child")
                      (assert (some? storage) "expected storage")
-                     (storage/accessed storage (aget (read-field node :addresses) idx))))
-                 @*child))))
+                     (let [restored (await (storage/restore storage addr opts))
+                           ;; Storage can share a node across sets with different comparators.
+                           base (stamp-proj-cmp restored (read-field node :_projCmp))
+                           child (project-child node storage idx base)]
+                       (arrays/aset (ensure-children node) idx child)
+                       child)))))))
 
 (defn address
   ([^Branch this idx]
@@ -717,7 +705,7 @@
     (loop [i 0, cnt 0]
       (if (>= i len)
         cnt
-        (let [child (aget children i)]
+        (let [child (arrays/aget children i)]
           (if (nil? child)
             -1
             (let [cc (node/subtree-count child)]
@@ -1236,7 +1224,7 @@
                      (let [branching-factor (:branching-factor (.-settings this))
                            bd               (b/content-boundary (.-settings this))
                            children         (ensure-children this)
-                           new-keys         (util/check-n-splice cmp keys idx (inc idx) (arrays/amap node/max-key nodes))
+                           new-keys         (util/splice-max-keys keys idx (inc idx) nodes)
                            new-children     (util/splice children idx (inc idx) nodes)
                            nodes-len        (arrays/alength nodes)
                            measure-ops0     (:measure (.-settings this))
@@ -1434,8 +1422,7 @@
                              content-only? (and (== alen (- right-idx left-idx))
                                                 (or (nil? left-child)  left-unchanged)
                                                 (or (nil? right-child) right-unchanged))
-                             new-keys  (util/check-n-splice cmp keys left-idx right-idx
-                                                            (arrays/amap node/max-key disjoined))
+                             new-keys  (util/splice-max-keys keys left-idx right-idx disjoined)
                              new-kids  (util/splice children left-idx right-idx disjoined)
                              new-addrs (when addrs
                                          (let [repl  (arrays/make-array alen)
@@ -1497,9 +1484,10 @@
                                      measure-ops cm-c new-measure)
                              ;; A join or a borrow combines the records of both nodes, and
                              ;; `merge` / `merge-split` have no storage to fill a missing one.
-                             _      (when (and (some? cm-c)
-                                               (< (arrays/alength new-keys)
-                                                  (quot (:branching-factor (.-settings this) 32) 2)))
+                             underfull? (and (or left right)
+                                             (< (arrays/alength new-keys)
+                                                (quot (:branching-factor (.-settings this) 32) 2)))
+                             _      (when (and (some? cm-c) underfull?)
                                       (when left (await (ensure-child-measures left storage measure-ops opts)))
                                       (when right (await (ensure-child-measures right storage measure-ops opts))))]
                          ;; diff-buf: install the center's slots BEFORE rotate (so a subsequent
@@ -1529,35 +1517,18 @@
                                                 left
                                                 right
                                                 (.-settings this))]
-                           ;; A BORROW redistributes two nodes' elements between two new
-                           ;; ones, and `merge-split` (no storage, synchronous) counts them
-                           ;; from resident children only. The pair's total is known whenever
-                           ;; both sources knew theirs; settle the halves here, where storage
-                           ;; is. A join has a nil in the triple and sums; nothing to do.
-                           (let [n     (arrays/alength res)
-                                 has?  (fn [x] (loop [i 0] (cond (>= i n) false
-                                                                 (identical? x (arrays/aget res i)) true
-                                                                 :else (recur (inc i)))))
-                                 fresh (loop [i 0, acc []]
-                                         (if (>= i n)
-                                           acc
-                                           (let [x (arrays/aget res i)]
-                                             (recur (inc i)
-                                                    (if (or (identical? x left) (identical? x right) (identical? x center))
-                                                      acc
-                                                      (conj acc x))))))]
-                             ;; `rotate` drops nils, so the arms are told apart by identity:
-                             ;; two nodes that are none of left/center/right are a borrow's
-                             ;; two halves, and the sibling that is gone is the one they
-                             ;; were made from.
-                             (when (== 2 (count fresh))
-                               (let [sibling (cond (and (some? left) (not (has? left))) left
-                                                   (and (some? right) (not (has? right))) right)]
-                                 (when sibling
-                                   (await (divide-count! (nth fresh 0) (nth fresh 1)
-                                                         (if (and (>= (read-field sibling :subtree-count) 0) (>= new-sc 0))
-                                                           (+ (read-field sibling :subtree-count) new-sc) -1)
-                                                         storage opts))))))
+                           ;; A join drops one node. A borrow preserves arity and replaces
+                           ;; two adjacent nodes. Settle their counts while storage is available.
+                           (when (and underfull?
+                                      (= (arrays/alength res) (if (and left right) 3 2)))
+                             (let [kept-left? (and left (identical? left (arrays/aget res 0)))
+                                   start (if kept-left? 1 0)
+                                   sibling (if (and left (not kept-left?)) left right)
+                                   sibling-count (read-field sibling :subtree-count)]
+                               (await (divide-count! (arrays/aget res start) (arrays/aget res (inc start))
+                                                     (if (and (>= sibling-count 0) (>= new-sc 0))
+                                                       (+ sibling-count new-sc) -1)
+                                                     storage opts))))
                            res)))))))))
 
 (defn- replace-measure
@@ -1583,7 +1554,7 @@
   (let [children (read-field this :children)
         n        (arrays/alength (.-keys this))
         resident (fn [i] (when (and children (<= 0 i) (< i n)) (aget children i)))
-        ks       (.-keys child)
+        ks       (leaf/key-array child)
         j        (util/binary-search cmp ks old-key)]
     (if (neg? j)
       true
@@ -1591,7 +1562,7 @@
             right (when (== j (dec (arrays/alength ks))) (resident (inc idx)))
             eq?   (fn [node pick]
                     (when node
-                      (let [nks (.-keys node)
+                      (let [nks (leaf/key-array node)
                             len (arrays/alength nks)]
                         (when (pos? len)
                           (== 0 (cmp (arrays/aget nks (pick len)) old-key))))))]
@@ -1675,121 +1646,39 @@
                              new-max-key   (node/max-key new-node)
                              children      (ensure-children this)
                              addrs         (read-field this :addresses)
-                             ;; split-seam (MST): the separator keys[idx] must equal the child's max for
-                             ;; canonical content-addressing, so ANY value change (even at the same
-                             ;; comparator position, and for a non-rightmost child) must rebuild keys[idx]
-                             ;; and propagate up the spine. Count mode is routing-only (by cmp), so its
-                             ;; original last-child/cmp test is preserved byte-for-byte. Mirrors JVM
-                             ;; Branch.replace, which always writes _keys[idx] = newMaxKey.
-                             ;; VALUE equality, and for EVERY child — not `cmp`, and not only
-                             ;; the last one.
-                             ;;
-                             ;; Asking the OPERATION comparator whether the max moved is wrong
-                             ;; whenever that comparator is coarser than the one routing uses:
-                             ;; datahike's value-changing upsert searches [e a _ _], so `cmp`
-                             ;; returns 0 for a datom whose v changed, this arm took the
-                             ;; "reuse keys array" branch, and `keys[idx]` kept naming the OLD
-                             ;; element while the child held the new one. A later descent
-                             ;; comparing the new element against that stale separator routes
-                             ;; past the child that holds it.
-                             ;;
-                             ;; The JVM writes `_keys[idx] = newMaxKey` UNCONDITIONALLY and its
-                             ;; persistent path always returns the successor, so only its
-                             ;; transient path was affected. ClojureScript gated the keys
-                             ;; rebuild on this flag too, which is why its default (persistent)
-                             ;; path was. Testing the value for every child makes the rebuild
-                             ;; and the propagation match the JVM persistent path exactly.
-                             ;;
-                             ;; `not=` (Clojure `=`, i.e. -equiv) rather than identity: a Datom
-                             ;; implements equiv but not reference equality, so this propagates
-                             ;; exactly when the element really changed.
-                             ;; Mirrors the JVM's `separatorMoved` (Branch.java:1596). VALUE
-                             ;; equality alone is not enough: it answers "is this the same
-                             ;; element?", and the question here is "does the separator still
-                             ;; sit where the SET's comparator puts it?". Those come apart for
-                             ;; any type whose `=` is COARSER than the set comparator —
-                             ;; datahike's Datom, whose `equiv-datom` compares e/a/v while
-                             ;; `cmp-datoms-eavt` orders by e/a/v/tx. `not=` then says
-                             ;; "unchanged", the separator is left naming the OLD element, and
-                             ;; a later descent comparing the new element against that stale
-                             ;; separator routes past the child that holds it.
-                             ;;
-                             ;; Measured with an element type whose `=` ignores a field the set
-                             ;; orders by, value-changing upsert over the whole set, elements
-                             ;; that `seq` still lists but `lookup` cannot find:
-                             ;;
-                             ;;     bf  4 n   40   JVM 0   cljs 19
-                             ;;     bf  8 n  400   JVM 0   cljs 99
-                             ;;     bf 16 n 3000   JVM 0   cljs 374
-                             ;;
-                             ;; A control with plain vectors (exact `=`) is 0 on both, so the
-                             ;; probe is sound. This was fixed on the JVM and not ported here.
-                             max-key-changed
-                             (let [old-sep (arrays/aget keys idx)
-                                   pcmp    (read-field this :_projCmp)]
-                               (or (not= new-max-key old-sep)
-                                   (nil? pcmp)
-                                   (not (zero? (pcmp new-max-key old-sep)))))]
-                         (if max-key-changed
-                           ;; maxKey changed - update keys array
-                           ;; Clone arrays. There is no in-place arm: see
-                           ;; .internal/transient-support-cljs.md — cljs has no node
-                           ;; ownership, so mutating `this` would edit a node other
-                           ;; versions share.
-                           (let [new-keys     (arrays/aclone keys)
-                                 new-children (arrays/aclone children)
-                                 new-addrs    (when addrs
-                                                (let [na (arrays/aclone addrs)]
-                                                    ;; Mark old child address as freed before clearing (deferred under diff-buf)
-                                                  (when (and (not diff-buf?) storage (aget addrs idx))
-                                                    (storage/markFreed storage (aget addrs idx)))
-                                                  (aset na idx nil)
-                                                  na))
-                                 _            (aset new-keys idx new-max-key)
-                                 _            (aset new-children idx new-node)
-                                 new-branch   (->Branch (.-level this) new-keys new-children new-addrs (read-field this :subtree-count) nil (.-settings this) nil 0 (read-field this :_projCmp) nil (boolean (read-field this :_cmLazy)))
-                                 new-measure    (when (and measure-ops (some? (read-field this :_measure)))
-                                                  (replace-measure new-branch storage measure-ops))
-                                 cm-r           (when measure-ops
-                                                  (splice-measures measure-ops
-                                                                   (await (ensure-child-measures this storage measure-ops opts))
-                                                                   idx (inc idx) nodes nil))]
-                             (install-measures! new-branch measure-ops cm-r new-measure)
-                             ;; read AFTER the fill above, which is what sets it on `this`
-                             (write-field! new-branch :_cmLazy (boolean (read-field this :_cmLazy)))
-                               ;; diff-buf: content-only replace ⇒ carry source slots + deposit Present(new-key).
-                             (when diff-buf?
-                               (write-field! new-branch :_bufEntries (buf-entries this)) ; carry running total (or -1) onto successor
-                               (await (carry-and-deposit-replace new-branch storage (read-field this :_slots) idx removed-key new-key anchor0 opts)))
-                             (arrays/array new-branch))
-                           ;; maxKey unchanged - reuse keys array
-                           ;; Clone ALL arrays — sharing any of them would let a future
-                           ;; in-place path corrupt the original.
-                           (let [new-keys     (arrays/aclone keys)
-                                 new-children (arrays/aclone children)
-                                 new-addrs    (when addrs
-                                                (let [na (arrays/aclone addrs)]
-                                                    ;; Mark old child address as freed before clearing (deferred under diff-buf)
-                                                  (when (and (not diff-buf?) storage (aget addrs idx))
-                                                    (storage/markFreed storage (aget addrs idx)))
-                                                  (aset na idx nil)
-                                                  na))
-                                 _            (aset new-children idx new-node)
-                                 new-branch   (->Branch (.-level this) new-keys new-children new-addrs (read-field this :subtree-count) nil (.-settings this) nil 0 (read-field this :_projCmp) nil (boolean (read-field this :_cmLazy)))
-                                 new-measure    (when (and measure-ops (some? (read-field this :_measure)))
-                                                  (replace-measure new-branch storage measure-ops))
-                                 cm-r           (when measure-ops
-                                                  (splice-measures measure-ops
-                                                                   (await (ensure-child-measures this storage measure-ops opts))
-                                                                   idx (inc idx) nodes nil))]
-                             (install-measures! new-branch measure-ops cm-r new-measure)
-                             ;; read AFTER the fill above, which is what sets it on `this`
-                             (write-field! new-branch :_cmLazy (boolean (read-field this :_cmLazy)))
-                               ;; diff-buf: content-only replace ⇒ carry source slots + deposit Present(new-key).
-                             (when diff-buf?
-                               (write-field! new-branch :_bufEntries (buf-entries this)) ; carry running total (or -1) onto successor
-                               (await (carry-and-deposit-replace new-branch storage (read-field this :_slots) idx removed-key new-key anchor0 opts)))
-                             (arrays/array new-branch)))))))))))
+                             ;; A coarse operation comparator cannot tell whether the stored
+                             ;; separator moved (e.g. Datoms equal by e/a/v but ordered by tx).
+                             old-sep       (arrays/aget keys idx)
+                             pcmp          (read-field this :_projCmp)
+                             new-keys      (arrays/aclone keys)
+                             new-children  (arrays/aclone children)
+                             new-addrs     (when addrs
+                                             (let [na (arrays/aclone addrs)]
+                                               (when (and (not diff-buf?) storage (arrays/aget addrs idx))
+                                                 (storage/markFreed storage (arrays/aget addrs idx)))
+                                               (arrays/aset na idx nil)
+                                               na))
+                             _             (when (and (not (identical? new-max-key old-sep))
+                                                      (or (not= new-max-key old-sep) (nil? pcmp)
+                                                          (not (zero? (pcmp new-max-key old-sep)))))
+                                             (arrays/aset new-keys idx new-max-key))
+                             _             (arrays/aset new-children idx new-node)
+                             new-branch    (->Branch (.-level this) new-keys new-children new-addrs
+                                                     (read-field this :subtree-count) nil settings nil 0 pcmp
+                                                     nil (boolean (read-field this :_cmLazy)))
+                             new-measure   (when (and measure-ops (some? (read-field this :_measure)))
+                                             (replace-measure new-branch storage measure-ops))
+                             cm-r          (when measure-ops
+                                             (splice-measures measure-ops
+                                                              (await (ensure-child-measures this storage measure-ops opts))
+                                                              idx (inc idx) nodes nil))]
+                         (install-measures! new-branch measure-ops cm-r new-measure)
+                         ;; A cold fill above may have changed this flag.
+                         (write-field! new-branch :_cmLazy (boolean (read-field this :_cmLazy)))
+                         (when diff-buf?
+                           (write-field! new-branch :_bufEntries (buf-entries this))
+                           (await (carry-and-deposit-replace new-branch storage (read-field this :_slots) idx removed-key new-key anchor0 opts)))
+                         (arrays/array new-branch)))))))))
 
 ;; ---- diff-buf store-side helpers (mirror JVM Branch) ----
 

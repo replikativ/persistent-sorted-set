@@ -44,8 +44,27 @@
     (arrays/acopy arr splice-to cut-to new-arr l1xs)
     new-arr))
 
-(defn splice [arr splice-from splice-to xs]
-  (cut-n-splice arr 0 (arrays/alength arr) splice-from splice-to xs))
+(defn- splice-gap [arr from to width]
+  (let [len (arrays/alength arr)]
+    (if (= width (- to from))
+      (arrays/aclone arr)
+      (let [out (arrays/make-array (+ (- len (- to from)) width))]
+        (arrays/acopy arr 0 from out 0)
+        (arrays/acopy arr to len out (+ from width))
+        out))))
+
+(defn splice [arr from to xs]
+  (let [width (arrays/alength xs)
+        out (splice-gap arr from to width)]
+    (arrays/acopy xs 0 width out from)
+    out))
+
+(defn splice-max-keys [keys from to nodes]
+  (let [width (arrays/alength nodes)
+        out (splice-gap keys from to width)]
+    (dotimes [i width]
+      (arrays/aset out (+ from i) (node/max-key (arrays/aget nodes i))))
+    out))
 
 (defn- ^boolean eq-arr [cmp a1 a1-from a1-to a2 a2-from a2-to]
   (let [len (- a1-to a1-from)]
