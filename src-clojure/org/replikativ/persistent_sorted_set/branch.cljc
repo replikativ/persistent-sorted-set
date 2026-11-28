@@ -236,7 +236,6 @@
   (walk-addresses [this storage on-address opts]
     (walk-addresses this storage on-address opts)))
 
-
 ;; ---------------------------------------------------------------------------
 ;; The record of the children's measures (mirrors JVM Branch._childMeasures).
 ;;
@@ -1523,8 +1522,8 @@
                                                      (and (= ci (dec right-idx)) right-unchanged))
                                          (free-dropped-child this storage ci)))))
                                  (write-field! center :_slots
-                                       (remove-stitch-slots this left-idx right-idx alen left-child right-child
-                                                            left-unchanged right-unchanged (arrays/alength new-kids))))))
+                                               (remove-stitch-slots this left-idx right-idx alen left-child right-child
+                                                                    left-unchanged right-unchanged (arrays/alength new-kids))))))
                          (let [res (util/rotate center
                                                 (and (nil? left) (nil? right))
                                                 left
