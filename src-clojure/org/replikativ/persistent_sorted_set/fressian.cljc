@@ -59,13 +59,11 @@
    transit handler modules. Three copies of that logic would reintroduce precisely the drift this
    namespace was written to prevent. The names below are re-exported so existing consumers are
    unaffected."
-  (:require [org.replikativ.persistent-sorted-set.impl.nodes :as nodes])
-  #?(:cljs (:require [fress.api :as fress]
-                     [org.replikativ.persistent-sorted-set.leaf :refer [Leaf]]
-                     [org.replikativ.persistent-sorted-set.branch :refer [Branch]]
-                     [org.replikativ.persistent-sorted-set.btset :refer [BTSet]]))
-  #?(:clj (:import [org.replikativ.persistent_sorted_set Leaf Branch PersistentSortedSet]
-                   [org.fressian.handlers WriteHandler ReadHandler])))
+  #?(:cljs (:require-macros [org.replikativ.persistent-sorted-set.impl.tree-macros :refer [if-java-tree]]))
+  (:require [org.replikativ.persistent-sorted-set.impl.nodes :as nodes]
+            #?(:clj [org.replikativ.persistent-sorted-set.impl.tree-macros :refer [if-java-tree]])
+            #?@(:jolt [[fress.api :as fress]] :cljs [[fress.api :as fress]]))
+  #?@(:jolt [] :clj [(:import [org.fressian.handlers WriteHandler ReadHandler])]))
 
 ;; ---------------------------------------------------------------------------
 ;; Re-exports. These were this namespace's public API before the shared core was
@@ -117,12 +115,12 @@
 (def write-handlers
   "Fressian write handlers for PSS nodes. JVM: {Class {tag WriteHandler}}; cljs: {Type fn}. Each
    emits `node->blob` — the content projection PLUS the node's own settings, so reads self-describe."
-  #?(:clj
-     {Leaf   {nodes/leaf-tag   (reify WriteHandler (write [_ w leaf] (.writeTag w nodes/leaf-tag 1)   (.writeObject w (nodes/node->blob leaf))))}
-      Branch {nodes/branch-tag (reify WriteHandler (write [_ w node] (.writeTag w nodes/branch-tag 1) (.writeObject w (nodes/node->blob node))))}}
-     :cljs
-     {Leaf   (fn [w leaf] (fress/write-tag w nodes/leaf-tag 1)   (fress/write-object w (nodes/node->blob leaf)))
-      Branch (fn [w node] (fress/write-tag w nodes/branch-tag 1) (fress/write-object w (nodes/node->blob node)))}))
+  (if-java-tree
+   {nodes/leaf-type   {nodes/leaf-tag   (reify WriteHandler (write [_ w leaf] (.writeTag w nodes/leaf-tag 1)   (.writeObject w (nodes/node->blob leaf))))}
+    nodes/branch-type {nodes/branch-tag (reify WriteHandler (write [_ w node] (.writeTag w nodes/branch-tag 1) (.writeObject w (nodes/node->blob node))))}}
+
+   {nodes/leaf-type   (fn [w leaf] (fress/write-tag w nodes/leaf-tag 1)   (fress/write-object w (nodes/node->blob leaf)))
+    nodes/branch-type (fn [w node] (fress/write-tag w nodes/branch-tag 1) (fress/write-object w (nodes/node->blob node)))}))
 
 (defn read-handlers
   "Fressian read handlers for PSS nodes. Each node's `Settings` are reconstructed from its blob's
@@ -132,14 +130,14 @@
    Returns {tag handler}. Comparator-free (the comparator lives on the root)."
   [opts]
   (let [ctx (nodes/reader-context opts)]
-    #?(:clj
-       {nodes/leaf-tag
-        (reify ReadHandler (read [_ rdr _tag _n] (nodes/blob->leaf ctx (.readObject rdr))))
-        nodes/branch-tag
-        (reify ReadHandler (read [_ rdr _tag _n] (nodes/blob->branch ctx (.readObject rdr))))}
-       :cljs
-       {nodes/leaf-tag   (fn [rdr _tag _n] (nodes/blob->leaf ctx (fress/read-object rdr)))
-        nodes/branch-tag (fn [rdr _tag _n] (nodes/blob->branch ctx (fress/read-object rdr)))})))
+    (if-java-tree
+     {nodes/leaf-tag
+      (reify ReadHandler (read [_ rdr _tag _n] (nodes/blob->leaf ctx (.readObject rdr))))
+      nodes/branch-tag
+      (reify ReadHandler (read [_ rdr _tag _n] (nodes/blob->branch ctx (.readObject rdr))))}
+
+     {nodes/leaf-tag   (fn [rdr _tag _n] (nodes/blob->leaf ctx (fress/read-object rdr)))
+      nodes/branch-tag (fn [rdr _tag _n] (nodes/blob->branch ctx (fress/read-object rdr)))})))
 
 ;; ---------------------------------------------------------------------------
 ;; ROOT handlers.
@@ -150,21 +148,22 @@
    under `pss/set`. `:meta` carries whatever ids the consumer stamped (`:pss/storage-id` etc.). The set
    MUST be flushed (root address realized) first — `nodes/root->blob` throws otherwise."
   []
-  #?(:clj
-     (reify WriteHandler
-       (write [_ w pset]
-         (.writeTag w nodes/set-tag 1)
-         (.writeObject w (nodes/root->blob pset))))
-     :cljs
-     (fn [w pset]
-       (fress/write-tag w nodes/set-tag 1)
-       (fress/write-object w (nodes/root->blob pset)))))
+  (if-java-tree
+   (reify WriteHandler
+     (write [_ w pset]
+       (.writeTag w nodes/set-tag 1)
+       (.writeObject w (nodes/root->blob pset))))
+
+   (fn [w pset]
+     (fress/write-tag w nodes/set-tag 1)
+     (fress/write-object w (nodes/root->blob pset)))))
 
 (def root-write-handlers
   "Pre-keyed root write handler, shaped like `write-handlers` so a cljc consumer merges it WITHOUT
-   importing the root type. JVM: {PersistentSortedSet {tag WriteHandler}}; cljs: {BTSet fn}."
-  #?(:clj  {PersistentSortedSet {nodes/set-tag (root-write-handler)}}
-     :cljs {BTSet (root-write-handler)}))
+   importing the root type. JVM: {nodes/root-type {tag WriteHandler}}; cljs: {nodes/root-type fn}."
+  (if-java-tree
+   {nodes/root-type {nodes/set-tag (root-write-handler)}}
+   {nodes/root-type (root-write-handler)}))
 
 (defn root-read-handler
   "Canonical read handler for a PSS root. Reconstructs a lazy root from
@@ -178,8 +177,9 @@
   ([] (root-read-handler {}))
   ([opts]
    (let [ctx (nodes/reader-context opts)]
-     #?(:clj  (reify ReadHandler (read [_ rdr _tag _n] (nodes/blob->root ctx (.readObject rdr))))
-        :cljs (fn [rdr _tag _n] (nodes/blob->root ctx (fress/read-object rdr)))))))
+     (if-java-tree
+      (reify ReadHandler (read [_ rdr _tag _n] (nodes/blob->root ctx (.readObject rdr))))
+      (fn [rdr _tag _n] (nodes/blob->root ctx (fress/read-object rdr)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Bundle builders — assemble a consumer's full canonical handler maps in one call.

@@ -1,0 +1,191 @@
+(ns org.replikativ.persistent-sorted-set
+  "Count-based B-trees on Jolt."
+  (:refer-clojure :exclude [conj disj replace])
+  (:require [org.replikativ.persistent-sorted-set.branch :as branch]
+            [org.replikativ.persistent-sorted-set.impl.delta :as delta]
+            [org.replikativ.persistent-sorted-set.impl.storage :as storage]
+            [org.replikativ.persistent-sorted-set.impl.node :as node]
+            [org.replikativ.persistent-sorted-set.leaf :as leaf]
+            [org.replikativ.persistent-sorted-set.util :as util]))
+
+(def ^:private sync-opts {:sync? true})
+
+(defn- entries-from [n storage from cmp]
+  (lazy-seq
+   (let [keys (.-keys n)
+         size (node/len n)
+         i (if (nil? from) 0 (util/binary-search-l cmp keys (dec size) from))]
+     (when (< i size)
+       (if (zero? (node/level n))
+         (map #(aget keys %) (range i size))
+         (mapcat (fn [idx]
+                   (entries-from (branch/child n storage idx sync-opts) storage
+                                 (when (= idx i) from) cmp))
+                 (range i size)))))))
+
+(declare root-node)
+
+(deftype BTSet [^:unsynchronized-mutable root comparator settings metadata
+                ^:unsynchronized-mutable storage ^:unsynchronized-mutable address cnt]
+  clojure.lang.Counted
+  (count [s] (if (neg? cnt) (node/$count (root-node s) storage sync-opts) cnt))
+  clojure.lang.Seqable
+  (seq [s] (seq (entries-from (root-node s) storage nil comparator)))
+  clojure.lang.IMeta
+  (meta [_] metadata)
+  clojure.lang.IObj
+  (withMeta [_ m] (BTSet. root comparator settings m storage address cnt)))
+
+(defn- root-node
+  ([s] (root-node s sync-opts))
+  ([s opts]
+   (or (.-root s)
+       (let [n (storage/restore (.-storage s) (.-address s) opts)
+             root (if (pos? (node/level n)) (branch/stamp-proj-cmp n (.-comparator s)) n)]
+         (set! (.-root s) root)
+         root))))
+
+(defn- check-settings! [settings]
+  (when (or (:boundary settings) (pos? (or (:diff-buf-size settings) 0)))
+    (throw (ex-info "Jolt supports count-based trees with diff buffering disabled" {}))))
+
+(defn sorted-set*
+  "Create a sorted set with an optional comparator, branching factor,
+   measure and metadata."
+  [opts]
+  (let [settings (node/node-settings opts)]
+    (check-settings! settings)
+    (BTSet. (leaf/empty-leaf settings) (or (:comparator opts) (:cmp opts) compare)
+            settings (:meta opts) (:storage opts) nil 0)))
+
+(defn- synchronous! [opts]
+  (when (false? (:sync? opts))
+    (throw (ex-info "Jolt PSS storage operations require synchronous storage" {}))))
+
+(defn- writable-root [s opts]
+  (synchronous! opts)
+  (let [root (root-node s opts)]
+    (check-settings! (.-settings root))
+    root))
+
+(defn- changed-set [s root delta]
+  (when (some? (.-address s))
+    (storage/markFreed (.-storage s) (.-address s)))
+  (BTSet. root (.-comparator s) (.-settings root) (meta s) (.-storage s) nil
+          (if (neg? (.-cnt s)) -1 (+ (.-cnt s) delta))))
+
+(defn conj
+  "Insert a non-nil key, optionally overriding the set comparator."
+  ([s k] (conj s k (.-comparator s)))
+  ([s k cmp]
+   (when (nil? k) (throw (ex-info "PersistentSortedSet cannot store nil" {:key k})))
+   (let [root (writable-root s sync-opts)
+         settings (.-settings root)]
+     (if-let [roots (node/add root (.-storage s) k cmp sync-opts)]
+       (let [new-root (if (= 1 (alength roots))
+                        (aget roots 0)
+                        (branch/promote-root roots settings (.-comparator s) (inc (count s))))]
+         (changed-set s new-root 1))
+       s))))
+
+(defn disj
+  "Remove the element matching key under cmp. Return the original set on a miss."
+  ([s key] (disj s key (.-comparator s) sync-opts))
+  ([s key arg]
+   (if (map? arg) (disj s key (.-comparator s) arg) (disj s key arg sync-opts)))
+  ([s key cmp opts]
+   (let [root (writable-root s opts)
+         backend (.-storage s)]
+     (if-let [roots (node/$remove root backend key nil nil cmp opts)]
+       (let [r (aget roots 0)]
+         (changed-set s (if (and (pos? (node/level r)) (= 1 (node/len r)))
+                          (branch/child r backend 0 opts)
+                          r) -1))
+       s))))
+
+(defn replace
+  "Replace the unique element matching old-key under cmp. The new key must
+   compare equal at that position. Return the original set on a miss."
+  ([s old-key new-key] (replace s old-key new-key (.-comparator s) sync-opts))
+  ([s old-key new-key arg]
+   (if (map? arg)
+     (replace s old-key new-key (.-comparator s) arg)
+     (replace s old-key new-key arg sync-opts)))
+  ([s old-key new-key cmp opts]
+   (when (nil? new-key)
+     (throw (ex-info "PersistentSortedSet cannot store nil" {:key new-key})))
+   (let [root (writable-root s opts)]
+     (if-let [roots (node/$replace root (.-storage s) old-key new-key cmp opts)]
+       (changed-set s (if (= :early-exit roots) root (aget roots 0)) 0)
+       s))))
+
+(defn lookup
+  "Return the stored element equal to k under cmp, or nil."
+  ([s k] (lookup s k (.-comparator s)))
+  ([s k cmp] (node/lookup (root-node s) (.-storage s) k cmp sync-opts)))
+
+(defn slice
+  "Return a forward seq from lo through hi, inclusive. A nil bound is open."
+  ([s lo hi] (slice s lo hi (.-comparator s)))
+  ([s lo hi cmp]
+   (let [xs (entries-from (root-node s) (.-storage s) lo cmp)]
+     (seq (if (nil? hi) xs (take-while #(not (pos? (cmp % hi))) xs))))))
+
+(defn- entries-backward [n storage from cmp]
+  (lazy-seq
+   (let [keys (.-keys n)
+         size (node/len n)
+         end (if (nil? from) size (util/binary-search-r cmp keys (dec size) from))]
+     (if (zero? (node/level n))
+       (map #(aget keys %) (range (dec end) -1 -1))
+       ;; Branch keys are child maxima. The first child whose maximum exceeds
+       ;; from may still contain matching entries, including comparator ties.
+       (letfn [(siblings [idx bound]
+                 (lazy-seq
+                  (when (>= idx 0)
+                    (lazy-cat (entries-backward (branch/child n storage idx sync-opts)
+                                                storage bound cmp)
+                              (siblings (dec idx) nil)))))]
+         (siblings (min end (dec size)) from))))))
+
+(defn rslice
+  "Return a descending seq from hi through lo, inclusive. A nil bound is open."
+  ([s hi lo] (rslice s hi lo (.-comparator s)))
+  ([s hi lo cmp]
+   (let [xs (entries-backward (root-node s) (.-storage s) hi cmp)]
+     (seq (if (nil? lo) xs (take-while #(not (neg? (cmp % lo))) xs))))))
+
+(defn store
+  "Flush a set to its storage and return its root address."
+  ([s] (store s (.-storage s) sync-opts))
+  ([s arg] (if (satisfies? storage/IStorage arg)
+             (store s arg sync-opts)
+             (store s (.-storage s) arg)))
+  ([s backend opts]
+   (synchronous! opts)
+   (assert (satisfies? storage/IStorage backend))
+   (when (and (.-storage s) (not (identical? backend (.-storage s))))
+     (throw (ex-info "The set belongs to another storage" {})))
+   (set! (.-storage s) backend)
+   (or (.-address s)
+       (let [address (node/store (root-node s) backend opts)]
+         (set! (.-address s) address)
+         address))))
+
+(defn restore
+  "Open a stored set by root address without reading it until needed."
+  ([address backend] (restore address backend {}))
+  ([address-or-info backend opts]
+   (let [info (if (map? address-or-info) address-or-info {:root-address address-or-info})
+         settings (node/node-settings (merge info opts))]
+     (assert (some? (:root-address info)))
+     (BTSet. nil (or (:comparator info) (:comparator opts) (:cmp opts) compare)
+             settings (or (:meta info) (:meta opts)) backend (:root-address info) -1))))
+
+(defn walk-delta
+  "Visit stored addresses introduced by b, skipping subtrees shared with a."
+  ([a b on-address] (walk-delta a b (.-storage b) on-address sync-opts))
+  ([a b backend on-address] (walk-delta a b backend on-address sync-opts))
+  ([a b backend on-address opts]
+   (synchronous! opts)
+   (delta/walk-delta root-node a b backend on-address opts)))

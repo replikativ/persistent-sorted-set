@@ -40,6 +40,8 @@
               (list 'js* "(~{}[~{}] = ~{})" arr i v)
               `(clojure.lang.RT/aset ~(vary-meta arr assoc :tag "[[Ljava.lang.Object;") (int ~i) ~v))))
 
+#?(:clj (def ^:no-doc empty-object-array (object-array 0)))
+
 #?(:clj
    (defmacro array [& args]
      (if-cljs &env
@@ -49,7 +51,7 @@
               (let [len (count args)
                     arr (with-meta (gensym "arr") {:tag "[Ljava.lang.Object;"})]
                 (if (zero? len)
-                  'clojure.lang.RT/EMPTY_ARRAY
+                  `empty-object-array
                   `(let [~arr (object-array ~len)]
                      (doto ~arr
                        ~@(map #(list 'aset % (nth args %)) (range len)))))))))
@@ -67,6 +69,13 @@
 (defn aclone [from]
   #?(:clj  (Arrays/copyOf ^{:tag "[[Ljava.lang.Object;"} from (alength from))
      :cljs (.slice from 0)))
+
+(defn slice
+  ([arr start] #?(:cljs (.slice arr start)
+                  :clj (slice arr start (alength arr))))
+  ([arr start end]
+   #?(:cljs (.slice arr start end)
+      :clj (Arrays/copyOfRange ^objects arr (int start) (int end)))))
 
 (defn aconcat [a b]
   #?(:cljs (.concat a b)

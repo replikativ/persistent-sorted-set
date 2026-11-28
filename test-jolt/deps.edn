@@ -1,0 +1,4 @@
+{:paths ["." "../src-clojure"]
+ :deps {org.replikativ/partial-cps {:mvn/version "0.1.68"}}
+ :aliases {:cbor {:extra-deps {org.replikativ/boring {:mvn/version "0.1.33"}}}
+           :oracle {:extra-paths ["../target/classes"]}}}

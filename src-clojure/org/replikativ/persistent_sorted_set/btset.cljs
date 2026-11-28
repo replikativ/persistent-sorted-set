@@ -7,6 +7,7 @@
             [org.replikativ.persistent-sorted-set.branch :as branch :refer [Branch]]
             [org.replikativ.persistent-sorted-set.leaf :as leaf :refer [Leaf]]
             [org.replikativ.persistent-sorted-set.impl.node :as node]
+            [org.replikativ.persistent-sorted-set.impl.delta :as delta]
             [org.replikativ.persistent-sorted-set.impl.measure :as measure]
             [org.replikativ.persistent-sorted-set.impl.storage :as storage]
             [org.replikativ.persistent-sorted-set.impl.boundary :as b]
@@ -363,35 +364,9 @@
                             (BTSet. (with-root-count (mst-grow-root bd roots (.-settings set) (.-comparator set)) root-total)
                                     new-cnt (.-comparator set) (.-meta set)
                                     UNINITIALIZED_HASH (.-storage set) nil (.-settings set))
-                            (let [child0 (arrays/aget roots 0)
-                                  lvl    (inc (node/level child0))
-                                ;; Compute subtree count; propagate -1 (unknown) if any child is unknown
-                                  child-counts (map node/subtree-count roots)
-                                  subtree-count (if (every? #(>= % 0) child-counts)
-                                                  (reduce + 0 child-counts)
-                                                  root-total)
-                                ;; Compute measure from children if measure-ops available
-                                  measure-ops (:measure (.-settings set))
-                                ;; Only compute root-measure when all children have measure;
-                                ;; otherwise keep nil to allow lazy recomputation
-                                  child-measure (when measure-ops (map node/measure roots))
-                                  root-measure (when (and measure-ops (every? some? child-measure))
-                                                 (reduce (fn [acc cs]
-                                                           (measure/merge-measure measure-ops acc cs))
-                                                         (measure/identity-measure measure-ops)
-                                                         child-measure))]
-                            ;; diff-buf: new root on growth — _bufEntries = 0 (no buffered diff; this
-                            ;; node is always the root ⇒ always written; if later mutated in a transient
-                            ;; batch the first deposit poisons it correctly). Mirrors JVM makeBranchFromChildren.
-                              (BTSet. (branch/with-child-measures!
-                                        (Branch. lvl (arrays/amap node/max-key roots) roots nil subtree-count root-measure (.-settings set) nil 0 (.-comparator set) nil false))
-                                      new-cnt
-                                      (.-comparator set)
-                                      (.-meta set)
-                                      UNINITIALIZED_HASH
-                                      (.-storage set)
-                                      nil
-                                      (.-settings set)))))))))))))
+                            (BTSet. (branch/promote-root roots (.-settings set) (.-comparator set) root-total)
+                                    new-cnt (.-comparator set) (.-meta set)
+                                    UNINITIALIZED_HASH (.-storage set) nil (.-settings set))))))))))))
 
 (defn $replace
   ([^BTSet set old-key new-key]
@@ -636,48 +611,6 @@
 ;; tree — measured on the JVM at 3-4 node reads for a two-element delta whether
 ;; the set holds a thousand elements or a hundred thousand.
 
-(defn- diff-child-refs
-  "Frontier entries for every child of `branches` (already materialized). Pure."
-  [branches]
-  (into []
-        (mapcat (fn [[node]]
-                  (let [^Branch b node
-                        addrs (.-addresses b)
-                        ;; diff-buf: a branch buffers a child's changes in its OWN
-                        ;; slots and leaves the child's ADDRESS untouched, so for a
-                        ;; buffered child an address match no longer proves the
-                        ;; subtrees are equal. The guard is per CHILD: a nil slot
-                        ;; means that child has no buffered diff. A non-nil slot is
-                        ;; unprunable whatever its shape — for a BRANCH child :diff
-                        ;; is nil and the real diff lives in the subtree, so a nil
-                        ;; :diff does not mean no change.
-                        slots (.-_slots b)]
-                    (map (fn [i]
-                           [nil b i
-                            (when addrs (arrays/aget addrs i))
-                            (or (nil? slots) (nil? (arrays/aget slots i)))])
-                         (range (arrays/alength (.-keys b)))))))
-        branches))
-
-(defn- diff-prune
-  "Drop from each frontier the entries the other side holds at the same address —
-   identical subtrees, which cannot contain a difference. Pure, no IO."
-  [fa fb]
-  (let [addrs   (fn [f] (into #{} (keep (fn [[_ _ _ addr prunable?]]
-                                          (when (and (some? addr) prunable?) addr)))
-                              f))
-        sa      (addrs fa)
-        sb      (addrs fb)
-        shared? (fn [other] (fn [[_ _ _ addr prunable?]]
-                              (and (some? addr) prunable? (contains? other addr))))]
-    ;; an entry the OTHER side marked unprunable never entered its address set, so
-    ;; neither side prunes against a buffered branch.
-    [(into [] (remove (shared? sb)) fa)
-     (into [] (remove (shared? sa)) fb)]))
-
-(defn- diff-level [node]
-  (if (instance? Branch node) (.-level ^Branch node) 0))
-
 (defn- diff-sorted
   "Elements of `xs` absent from `ys`. Both ascending under `cmp`; O(n+m), no IO."
   [cmp xs ys]
@@ -711,7 +644,7 @@
                                 (conj nodes (assoc ref 0 (await (branch/child parent storage idx opts)))))))
                      (if (zero? level)
                        [[] (reduce (fn [c [nd]] (reduce conj c (.-keys nd))) cand nodes)]
-                       [(diff-child-refs nodes) cand])))))))
+                       [(delta/child-refs nodes) cand])))))))
 
 (defn diff
   "Keys added and removed between two sets that SHARE STRUCTURE. See the JVM
@@ -732,8 +665,8 @@
                          ;; comparator that diff-buf needs on descent
                          root-a (await (-root a opts))
                          root-b (await (-root b opts))]
-                     (loop [fa [[root-a nil nil addr-a true]] la (diff-level root-a)
-                            fb [[root-b nil nil addr-b true]] lb (diff-level root-b)
+                     (loop [fa [[root-a nil nil addr-a true]] la (node/level root-a)
+                            fb [[root-b nil nil addr-b true]] lb (node/level root-b)
                             ca [] cb []]
                        (let [la (if (seq fa) la -1)
                              lb (if (seq fb) lb -1)]
@@ -743,7 +676,7 @@
                            ;; and a shared node keeps its level, so pruning across
                            ;; unequal levels would find nothing. Walk the deeper
                            ;; side down until they meet.
-                           (let [[fa fb]   (if (== la lb) (diff-prune fa fb) [fa fb])
+                           (let [[fa fb]   (if (== la lb) (delta/prune fa fb) [fa fb])
                                  la        (if (seq fa) la -1)
                                  lb        (if (seq fb) lb -1)
                                  down-a?   (and (>= la 0) (>= la lb))
@@ -758,68 +691,8 @@
                                     fb' (if down-b? (dec lb) lb)
                                     ca' cb')))))))))))
 
-(defn- walk-delta-descend
-  "Materialize one frontier and return its children without retaining keys.
-   `on-address` is nil on the old side and observational on the new side."
-  [storage refs level on-address {:keys [sync?] :or {sync? true} :as opts}]
-  (async+sync sync?
-              (async
-               (let [n (count refs)
-                     nodes
-                     (loop [i 0 nodes []]
-                       (if (< i n)
-                         (let [[nd parent idx :as ref] (nth refs i)]
-                           (if (some? nd)
-                             (recur (inc i) (conj nodes ref))
-                             (recur (inc i)
-                                    (conj nodes
-                                          (assoc ref 0
-                                                 (await (branch/child parent storage idx opts)))))))
-                         nodes))]
-                 (when on-address
-                   (doseq [[_ _ _ address] nodes]
-                     (when (some? address)
-                       (on-address address))))
-                 (if (zero? level) [] (diff-child-refs nodes))))))
-
-(defn walk-delta
-  "Restore and visit the stored nodes in `b` that cannot be pruned as subtrees
-   shared with `a`.
-
-   Uses the same paired-frontier and diff-buffer-aware pruning rules as `diff`,
-   but does not retain or compare elements. `on-address` observes successfully
-   materialized new-side addresses; its return value is ignored so callback return
-   values cannot accidentally prune an incomplete hydration. Old-side restores
-   are not reported.
-
-   Returns nil when synchronous, or a continuation yielding nil under
-   `{:sync? false}`."
-  [^BTSet a ^BTSet b storage on-address {:keys [sync?] :or {sync? true} :as opts}]
-  (async+sync sync?
-              (async
-               (let [addr-a (.-address a)
-                     addr-b (.-address b)]
-                 (when-not (and (some? addr-a) (= addr-a addr-b))
-                   (let [root-a (await (-root a opts))
-                         root-b (await (-root b opts))]
-                     (loop [fa [[root-a nil nil addr-a true]] la (diff-level root-a)
-                            fb [[root-b nil nil addr-b true]] lb (diff-level root-b)]
-                       (let [la (if (seq fa) la -1)
-                             lb (if (seq fb) lb -1)]
-                         (when-not (and (neg? la) (neg? lb))
-                           (let [[fa fb] (if (== la lb) (diff-prune fa fb) [fa fb])
-                                 la      (if (seq fa) la -1)
-                                 lb      (if (seq fb) lb -1)
-                                 down-a? (and (>= la 0) (>= la lb))
-                                 down-b? (and (>= lb 0) (>= lb la))
-                                 fa'     (if down-a?
-                                           (await (walk-delta-descend storage fa la nil opts))
-                                           fa)
-                                 fb'     (if down-b?
-                                           (await (walk-delta-descend storage fb lb on-address opts))
-                                           fb)]
-                             (recur fa' (if down-a? (dec la) la)
-                                    fb' (if down-b? (dec lb) lb))))))))))))
+(defn walk-delta [a b storage on-address opts]
+  (delta/walk-delta -root a b storage on-address opts))
 
 (defn lookup
   [^BTSet set key cmp {:keys [sync?] :or {sync? true} :as opts}]
@@ -2099,26 +1972,6 @@
 
 #!------------------------------------------------------------------------------
 
-(defn- empty-leaf
-  "The empty root leaf, carrying the measure IDENTITY when a measure is configured.
-
-   Every measure-maintenance site in leaf.cljs and branch.cljs is guarded on the SOURCE
-   node already having a measure — correct for maintenance, but it means nothing ever
-   BOOTSTRAPS one. The empty leaf was built with nil, so on the incremental path no node
-   ever acquired a measure at all, and the library's own `diagnostics/validate-measures-known`
-   failed on ClojureScript for every conj-built set (measured: 12 / 129 / 5 / 56 violations at
-   bf 8 n 40 / bf 8 n 400 / bf 16 n 40 / bf 16 n 400 — leaves as well as branches). It also
-   made cljs internally inconsistent, since the bulk builders compute eagerly, so bulk and
-   incremental builds of the SAME set produced different `:measure` in their blobs.
-
-   Seeding the identity here is enough: from a non-nil measure the existing incremental
-   maintenance carries it through every add, split, merge and borrow, so the whole tree
-   bootstraps from the empty set outward. The identity is what an empty leaf's measure IS,
-   so this is also the correct value rather than a convenient one."
-  [settings]
-  (let [measure-ops (:measure settings)]
-    (Leaf. (arrays/array) settings (when measure-ops (measure/identity-measure measure-ops)))))
-
 (deftype BTSet [^:mutable root cnt comparator meta ^:mutable _hash storage ^:mutable address ^:mutable settings]
   Object
   (toString [this] (pr-str* this))
@@ -2139,7 +1992,7 @@
   ;; the same failure shape: a crash on the next write, well away from the `empty` that
   ;; caused it. The ADDRESS is still dropped, correctly: an empty set shares no nodes with
   ;; the one it came from, so it has nothing durable to point at until it is stored.
-  (-empty [_] (BTSet. (empty-leaf settings) 0 comparator meta UNINITIALIZED_HASH storage nil settings))
+  (-empty [_] (BTSet. (leaf/empty-leaf settings) 0 comparator meta UNINITIALIZED_HASH storage nil settings))
 
   IEquiv
   (-equiv [this other]
@@ -2317,32 +2170,9 @@
 ;;
 ;; A non-positive or absent value means UNSET and takes the default, matching the
 ;; JVM where `Settings()` delegates with 0. Only an explicit 1, 2 or 3 is refused.
-(def ^:const MIN-BRANCHING-FACTOR 4)
-(def ^:const DEFAULT-BRANCHING-FACTOR 512)
-
-(defn check-branching-factor
-  "Normalize an unset branching factor to the default and refuse an unsupported one."
-  [bf]
-  (let [bf (if (or (nil? bf) (not (pos? bf))) DEFAULT-BRANCHING-FACTOR bf)]
-    (when (< bf MIN-BRANCHING-FACTOR)
-      (throw (ex-info (str "branching-factor " bf " is not supported: the minimum is "
-                           MIN-BRANCHING-FACTOR ". Below it the minimum fill (bf >>> 1) is 1, "
-                           "so a branch of length 1 is considered full, its only child has no "
-                           "sibling to rebalance with, and a removal leaves a length-0 leaf. "
-                           "Measured: this yields nil elements and a count that disagrees with "
-                           "seq in ClojureScript, and throws ArrayIndexOutOfBoundsException on "
-                           "the JVM. Omit :branching-factor for the default of "
-                           DEFAULT-BRANCHING-FACTOR ".")
-                      {:branching-factor bf :min MIN-BRANCHING-FACTOR})))
-    bf))
-
-(defn- node-settings
-  "The settings a node carries, normalized and validated exactly as the JVM's
-   `Settings` constructor does."
-  [opts]
-  (-> (select-keys opts [:branching-factor :measure :boundary :diff-buf-size])
-      (update :branching-factor check-branching-factor)
-      (update :diff-buf-size (fn [d] (if (or (nil? d) (neg? d)) 0 d)))))
+(def ^:const MIN-BRANCHING-FACTOR node/MIN-BRANCHING-FACTOR)
+(def ^:const DEFAULT-BRANCHING-FACTOR node/DEFAULT-BRANCHING-FACTOR)
+(def check-branching-factor node/check-branching-factor)
 
 (defn ^BTSet from-sorted-array
   "Build from the first `len` elements of `arr`.
@@ -2366,7 +2196,7 @@
                    (throw (ex-info "from-sorted-array: len out of range"
                                    {:len len :array-length full})))
         arr      (if (< len full) (.slice arr 0 len) arr)
-        settings (node-settings opts)
+        settings (node/node-settings opts)
         measure-ops (:measure settings)
         storage  (:storage opts)
         bd       (b/content-boundary settings)]
@@ -2378,7 +2208,7 @@
                          (mst-partition bd arr identity 1))]
         (loop [nodes leaves, lvl 1]
           (case (count nodes)
-            0 (BTSet. (empty-leaf settings) 0 cmp (:meta opts) UNINITIALIZED_HASH storage nil settings)
+            0 (BTSet. (leaf/empty-leaf settings) 0 cmp (:meta opts) UNINITIALIZED_HASH storage nil settings)
             1 (BTSet. (first nodes) (arrays/alength arr) cmp (:meta opts) UNINITIALIZED_HASH storage nil settings)
             (recur (mapv #(mst-build-branch lvl (array-seq %) settings cmp)
                          (mst-partition bd (arrays/into-array nodes) node/max-key (inc lvl)))
@@ -2553,7 +2383,7 @@
    Input MUST be sorted and distinct under `cmp`; this is checked, because the
    alternative is a silently corrupt tree."
   [cmp xs {:keys [sync? storage flush-fn] :or {sync? true} :as opts}]
-  (let [settings    (node-settings opts)
+  (let [settings    (node/node-settings opts)
         measure-ops (:measure settings)
         max-bf      (max-len settings)
         avg-bf      (avg-len settings)
@@ -2663,8 +2493,8 @@
    - :measure  Measure implementation (IMeasure protocol)
    - :meta     Metadata"
   [opts]
-  (let [settings (node-settings opts)]
-    (BTSet. (empty-leaf settings) 0 (or (:comparator opts) (:cmp opts) compare)
+  (let [settings (node/node-settings opts)]
+    (BTSet. (leaf/empty-leaf settings) 0 (or (:comparator opts) (:cmp opts) compare)
             (:meta opts) UNINITIALIZED_HASH (:storage opts) nil settings)))
 
 (defn ^BTSet sorted-set-by

@@ -26,15 +26,20 @@
    node from the blob plus the consumer's measure-ops. See `fressian.cljc`'s
    docstring for the full rationale — it is the reference explanation and is
    not repeated here."
-  #?(:clj (:require [org.replikativ.persistent-sorted-set.impl.boundary :as bnd]))
-  #?(:cljs (:require [org.replikativ.persistent-sorted-set.impl.node :as node]
-                     [org.replikativ.persistent-sorted-set.impl.boundary :as bnd]
-                     [org.replikativ.persistent-sorted-set.leaf :refer [Leaf]]
-                     [org.replikativ.persistent-sorted-set.branch :refer [Branch] :as branch]
-                     [org.replikativ.persistent-sorted-set.btset :refer [BTSet]]))
-  #?(:clj (:import [org.replikativ.persistent_sorted_set ANode Leaf Branch Settings Slot
-                    IMeasure IBoundary RefType PersistentSortedSet]
-                   [java.util List])))
+  #?(:cljs (:require-macros [org.replikativ.persistent-sorted-set.impl.tree-macros :refer [if-java-tree]]))
+  (:require [org.replikativ.persistent-sorted-set.impl.boundary :as bnd]
+            #?(:clj [org.replikativ.persistent-sorted-set.impl.tree-macros :refer [if-java-tree]])
+            #?@(:jolt [[org.replikativ.persistent-sorted-set :as pss]
+                       [org.replikativ.persistent-sorted-set.impl.node :as node]
+                       [org.replikativ.persistent-sorted-set.leaf :as leaf]
+                       [org.replikativ.persistent-sorted-set.branch :as branch]]
+                :cljs [[org.replikativ.persistent-sorted-set.impl.node :as node]
+                       [org.replikativ.persistent-sorted-set.leaf :as leaf :refer [Leaf]]
+                       [org.replikativ.persistent-sorted-set.branch :refer [Branch] :as branch]
+                       [org.replikativ.persistent-sorted-set.btset :refer [BTSet]]]))
+  #?@(:jolt [] :clj [(:import [org.replikativ.persistent_sorted_set ANode Leaf Branch Settings Slot
+                               IMeasure IBoundary RefType PersistentSortedSet]
+                              [java.util List])]))
 
 ;; Tag NAMES, shared across formats. Fressian and transit use them literally;
 ;; boring uses them as tag-27 type names. Keeping one set of names means a
@@ -43,51 +48,56 @@
 (def ^:const branch-tag "pss/branch")
 (def ^:const set-tag "pss/set")
 
+(def leaf-type #?(:jolt org.replikativ.persistent_sorted_set.leaf.Leaf :default Leaf))
+(def branch-type #?(:jolt org.replikativ.persistent_sorted_set.branch.Branch :default Branch))
+(def root-type #?(:jolt org.replikativ.persistent_sorted_set.BTSet :cljs BTSet :clj PersistentSortedSet))
+
 ;; ---------------------------------------------------------------------------
 ;; Settings (de)construction. A Settings splits into DATA and FUNCTIONS:
 ;;   DATA (serialized):    branching-factor, diff-buf-size, ref-type (an enum).
 ;;   FUNCTIONS (never):    measure-ops (IMeasure), leaf-processor, comparator.
 ;; ---------------------------------------------------------------------------
 
-#?(:clj (defn ref-type->kw [^RefType rt] (when rt (keyword (.toLowerCase (.name rt))))))
-#?(:clj (defn kw->ref-type ^RefType [kw]
-          (case kw :strong RefType/STRONG :soft RefType/SOFT :weak RefType/WEAK nil)))
+#?(:jolt nil :clj (defn ref-type->kw [^RefType rt] (when rt (keyword (.toLowerCase (.name rt))))))
+#?(:jolt nil :clj (defn kw->ref-type ^RefType [kw]
+                    (case kw :strong RefType/STRONG :soft RefType/SOFT :weak RefType/WEAK nil)))
 
-#?(:clj
-   (defn settings-for ^Settings [bf dbs ^IMeasure measure ref-type bdesc]
+(if-java-tree
+ (defn settings-for ^Settings [bf dbs ^IMeasure measure ref-type bdesc]
      ;; ref-type nil ⇒ Settings normalizes to SOFT. `measure` is the IMeasure OPS the consumer
      ;; supplied (never serialized); leaf-processor stays nil — it's the operating root's, threaded.
      ;; bdesc (a serialized boundary descriptor, nil for count) is resolved INTERNALLY.
-     (let [s (Settings. (int bf) (kw->ref-type ref-type) measure nil (int dbs))]
-       (if bdesc (.withBoundary s ^IBoundary (bnd/resolve-boundary bdesc)) s)))
-   :cljs
-   (defn settings-for [bf dbs measure ref-type bdesc]
+   (let [s (Settings. (int bf) (kw->ref-type ref-type) measure nil (int dbs))]
+     (if bdesc (.withBoundary s ^IBoundary (bnd/resolve-boundary bdesc)) s)))
+
+ (defn settings-for [bf dbs measure ref-type bdesc]
      ;; cljs has no soft/weak refs, so ref-type is inert here — but CARRY it so it round-trips
      ;; losslessly through a cljs relay (deserialize → re-serialize) back to a JVM reader.
-     (cond-> {:branching-factor bf :diff-buf-size dbs :measure measure}
-       ref-type (assoc :ref-type ref-type)
-       bdesc    (assoc :boundary (bnd/resolve-boundary bdesc)))))
+   (cond-> {:branching-factor bf :diff-buf-size dbs :measure measure}
+     ref-type (assoc :ref-type ref-type)
+     bdesc    (assoc :boundary (bnd/resolve-boundary bdesc)))))
 
 (defn node-config
   "A node's SERIALIZABLE settings — branching-factor + diff-buf-size + (non-default) ref-type. These
    ride in the blob (self-describing) but NOT in `node->map` (the content hash), so addresses are
    unchanged. ref-type is omitted when SOFT (the default), so common-case blobs are byte-unchanged."
   [node]
-  #?(:clj  (let [^Settings s (.-_settings ^ANode node)
-                 rt (.refType s)
-                 bdesc (.descriptor (.boundary s))]   ; nil for count, {:type :mst :lzpl n} for MST
-             (cond-> {:branching-factor (.branchingFactor s) :diff-buf-size (.diffBufSize s)}
-               (and rt (not= rt RefType/SOFT)) (assoc :ref-type (ref-type->kw rt))
-               bdesc (assoc :boundary bdesc)))
-     :cljs (let [s (.-settings node)
-                 bdesc (when-let [bd (:boundary s)] (bnd/-descriptor bd))]
+  (if-java-tree
+   (let [^Settings s (.-_settings ^ANode node)
+         rt (.refType s)
+         bdesc (.descriptor (.boundary s))]   ; nil for count, {:type :mst :lzpl n} for MST
+     (cond-> {:branching-factor (.branchingFactor s) :diff-buf-size (.diffBufSize s)}
+       (and rt (not= rt RefType/SOFT)) (assoc :ref-type (ref-type->kw rt))
+       bdesc (assoc :boundary bdesc)))
+   (let [s (.-settings node)
+         bdesc (when-let [bd (:boundary s)] (bnd/-descriptor bd))]
              ;; `(or … 0)`: the cljs settings map simply lacks the key when no diff-buf was
              ;; configured, so this emitted nil where the JVM -- whose Settings.diffBufSize is
              ;; an int -- emits 0. Same logical node, two different blobs, and a decode+encode
              ;; on cljs was not idempotent (nil in, 0 back out, because the reader defaults it).
-             (cond-> {:branching-factor (:branching-factor s) :diff-buf-size (or (:diff-buf-size s) 0)}
-               (:ref-type s) (assoc :ref-type (:ref-type s))
-               bdesc (assoc :boundary bdesc)))))
+     (cond-> {:branching-factor (:branching-factor s) :diff-buf-size (or (:diff-buf-size s) 0)}
+       (:ref-type s) (assoc :ref-type (:ref-type s))
+       bdesc (assoc :boundary bdesc)))))
 
 ;; ---------------------------------------------------------------------------
 ;; node->map — the CONTENT projection (for content-addressing). Branching-factor/diff-buf are
@@ -127,33 +137,33 @@
    element vector for a Leaf; stratum hashes the address vector and the leaf's chunk keys.
    `node->identity` is that subset, named."
   [node]
-  #?(:clj
+  (if-java-tree
      ;; `vec` the keys/addresses: the raw trimmed Java List isn't hash-coercible (hasch) and differs
      ;; from the cljs vector form — a Clojure vector is both, and every format reads either back as a vector.
-     (if (instance? Branch node)
-       (let [^Branch b node
-             slots (.slotsForStorage b)]
-         (cond-> {:level         (.level b)
-                  :keys          (vec (.keys b))
-                  :addresses     (vec (.addresses b))
-                  :subtree-count (.subtreeCount b)}
-           (some? (.-_measure b)) (assoc :measure (.-_measure b))
-           (some? (.-_childMeasures b)) (assoc :child-measures (vec (.-_childMeasures b)))
-           slots                  (assoc :slots slots)))
-       (cond-> {:keys (vec (.keys ^ANode node))}
-         (some? (.-_measure ^ANode node)) (assoc :measure (.-_measure ^ANode node))))
-     :cljs
-     (if (instance? Branch node)
-       (let [slots (branch/slots-for-storage node)]
-         (cond-> {:level         (node/level node)
-                  :keys          (vec (.-keys node))
-                  :addresses     (vec (.-addresses node))
-                  :subtree-count (.-subtree-count node)}
-           (some? (.-_measure node)) (assoc :measure (.-_measure node))
-           (some? (.-_childMeasures node)) (assoc :child-measures (vec (.-_childMeasures node)))
-           slots                     (assoc :slots slots)))
-       (cond-> {:keys (vec (.-keys node))}
-         (some? (.-_measure node)) (assoc :measure (.-_measure node))))))
+   (if (instance? Branch node)
+     (let [^Branch b node
+           slots (.slotsForStorage b)]
+       (cond-> {:level         (.level b)
+                :keys          (vec (.keys b))
+                :addresses     (vec (.addresses b))
+                :subtree-count (.subtreeCount b)}
+         (some? (.-_measure b)) (assoc :measure (.-_measure b))
+         (some? (.-_childMeasures b)) (assoc :child-measures (vec (.-_childMeasures b)))
+         slots                  (assoc :slots slots)))
+     (cond-> {:keys (vec (.keys ^ANode node))}
+       (some? (.-_measure ^ANode node)) (assoc :measure (.-_measure ^ANode node))))
+
+   (if (instance? branch-type node)
+     (let [slots (branch/slots-for-storage node)]
+       (cond-> {:level         (node/level node)
+                :keys          (vec (.-keys node))
+                :addresses     (vec (.-addresses node))
+                :subtree-count (.-subtree-count node)}
+         (some? (.-_measure node)) (assoc :measure (.-_measure node))
+         (some? (.-_childMeasures node)) (assoc :child-measures (vec (.-_childMeasures node)))
+         slots                     (assoc :slots slots)))
+     (cond-> {:keys (vec (.-keys node))}
+       (some? (.-_measure node)) (assoc :measure (.-_measure node))))))
 
 (defn- nested-slot-map?
   "Is this `:diff` a NESTED slot map (index -> entry) rather than a leaf diff?
@@ -248,39 +258,39 @@
 (defn branch?
   "Does this node serialize as a branch? Format modules need this to pick a tag."
   [node]
-  (instance? Branch node))
+  (instance? branch-type node))
 
 ;; ---------------------------------------------------------------------------
 ;; Reconstruction: blob → Leaf / Branch / root.
 ;; ---------------------------------------------------------------------------
 
-#?(:clj
-   (defn- attach-slots!
-     "Rebuild a restored Branch's slots from the stored {idx -> entry} map.
+(if-java-tree
+ (defn- attach-slots!
+   "Rebuild a restored Branch's slots from the stored {idx -> entry} map.
       anchor = addresses[idx] (re-derived, not stored — matches the reference codec).
       Installed via Branch.installSlots — ONE volatile publish of the {slots, entries}
       snapshot (entries BUF_LAZY: derived from the slots on first read)."
-     [^Branch b ^List addresses slots]
-     (let [arr (object-array (alength (.-_keys b)))]
-       (doseq [[idx entry] slots]
-         (aset arr (int idx)
-               (Slot. (:diff entry) (long (:count entry)) (:measure entry)
-                      (nth addresses (int idx)))))
-       (.installSlots b arr Branch/BUF_LAZY)))
-   :cljs
-   (defn- attach-slots!
-     [node addresses slots]
-     (let [arr (make-array (count addresses))
-           av  (vec addresses)]
-       (doseq [[idx entry] slots]
-         (aset arr (int idx) {:diff    (:diff entry)
-                              :count   (:count entry)
-                              :measure (:measure entry)
-                              :anchor  (nth av (int idx))}))
+   [^Branch b ^List addresses slots]
+   (let [arr (object-array (alength (.-_keys b)))]
+     (doseq [[idx entry] slots]
+       (aset arr (int idx)
+             (Slot. (:diff entry) (long (:count entry)) (:measure entry)
+                    (nth addresses (int idx)))))
+     (.installSlots b arr Branch/BUF_LAZY)))
+
+ (defn- attach-slots!
+   [node addresses slots]
+   (let [arr (#?(:jolt object-array :default make-array) (count addresses))
+         av  (vec addresses)]
+     (doseq [[idx entry] slots]
+       (aset arr (int idx) {:diff    (:diff entry)
+                            :count   (:count entry)
+                            :measure (:measure entry)
+                            :anchor  (nth av (int idx))}))
        ;; via install-slots!, not a direct field write: it carries the incoherent-budget
        ;; refusal (slots handed to a node whose settings say buffering is off), which the
        ;; JVM has always had at Branch.installSlots and cljs silently accepted.
-       (branch/install-slots! node arr))))
+     (branch/install-slots! node arr))))
 
 (defn reader-context
   "Bundle the read-side knobs once, so each format module builds it in one call and the
@@ -316,33 +326,33 @@
   [ctx blob]
   (let [{:keys [keys measure]} blob
         settings (blob-settings ctx blob)]
-    #?(:clj (let [l (Leaf. ^List keys ^Settings settings)]
-              (when (some? measure) (set! (.-_measure ^ANode l) measure))
-              l)
-       :cljs (Leaf. (to-array keys) settings measure))))
+    (if-java-tree (let [l (Leaf. ^List keys ^Settings settings)]
+                    (when (some? measure) (set! (.-_measure ^ANode l) measure))
+                    l)
+                  (leaf/->Leaf (to-array keys) settings measure))))
 
 (defn blob->branch
   "Reconstruct a Branch from its blob, re-attaching diff-buf slots. `ctx` from `reader-context`."
   [ctx blob]
   (let [{:keys [level keys addresses subtree-count measure child-measures slots]} blob
         settings (blob-settings ctx blob)]
-    #?(:clj (let [b (Branch. (int level) ^List keys ^List addresses ^Settings settings)]
-              (set! (.-_subtreeCount b) (long (or subtree-count -1)))
-              (when (some? measure) (set! (.-_measure ^ANode b) measure))
+    (if-java-tree (let [b (Branch. (int level) ^List keys ^List addresses ^Settings settings)]
+                    (set! (.-_subtreeCount b) (long (or subtree-count -1)))
+                    (when (some? measure) (set! (.-_measure ^ANode b) measure))
               ;; Only an array that fits: one of another length is not this node's.
-              (when (and (some? child-measures) (= (count child-measures) (count keys)))
-                (set! (.-_childMeasures b) (object-array child-measures)))
-              (when slots (attach-slots! b addresses slots))
-              b)
-       :cljs (let [node (branch/from-map {:level         level
-                                          :keys          (to-array keys)
-                                          :addresses     (to-array addresses)
-                                          :subtree-count subtree-count
-                                          :measure       measure
-                                          :child-measures child-measures
-                                          :settings      settings})]
-               (when slots (attach-slots! node addresses slots))
-               node))))
+                    (when (and (some? child-measures) (= (count child-measures) (count keys)))
+                      (set! (.-_childMeasures b) (object-array child-measures)))
+                    (when slots (attach-slots! b addresses slots))
+                    b)
+                  (let [node (branch/from-map {:level         level
+                                               :keys          (to-array keys)
+                                               :addresses     (to-array addresses)
+                                               :subtree-count subtree-count
+                                               :measure       measure
+                                               :child-measures child-measures
+                                               :settings      settings})]
+                    (when slots (attach-slots! node addresses slots))
+                    node))))
 
 ;; ---------------------------------------------------------------------------
 ;; Root projection.
@@ -358,36 +368,36 @@
    children — but serialization must work on a storage-DETACHED root. The read ctor treats -1 as
    compute-lazily-on-demand, so the count comes back right on the reader."
   [pset]
-  #?(:clj
-     (do
-       (when (nil? (.-_address ^PersistentSortedSet pset))
-         (throw (ex-info "PSS root must be flushed before serialization" {:type :must-be-flushed})))
-       (let [^Settings s (.-_settings ^PersistentSortedSet pset)
-             rt (.refType s)
-             bdesc (.descriptor (.boundary s))]
-         (cond-> {:meta             (meta pset)
-                  :address          (.-_address ^PersistentSortedSet pset)
-                  :count            (.-_count ^PersistentSortedSet pset)
-                  :branching-factor (.branchingFactor s)
-                  :diff-buf-size    (.diffBufSize s)}
-           (and rt (not= rt RefType/SOFT)) (assoc :ref-type (ref-type->kw rt))
-           bdesc (assoc :boundary bdesc))))
-     :cljs
-     (do
-       (when (nil? (.-address pset))
-         (throw (ex-info "PSS root must be flushed before serialization" {:type :must-be-flushed})))
-       (let [s (.-settings pset)
-             bdesc (when-let [bd (:boundary s)] (bnd/-descriptor bd))]
-         (cond-> {:meta             (meta pset)
-                  :address          (.-address pset)
-                  :count            (.-cnt pset)
-                  :branching-factor (:branching-factor s)
+  (if-java-tree
+   (do
+     (when (nil? (.-_address ^PersistentSortedSet pset))
+       (throw (ex-info "PSS root must be flushed before serialization" {:type :must-be-flushed})))
+     (let [^Settings s (.-_settings ^PersistentSortedSet pset)
+           rt (.refType s)
+           bdesc (.descriptor (.boundary s))]
+       (cond-> {:meta             (meta pset)
+                :address          (.-_address ^PersistentSortedSet pset)
+                :count            (.-_count ^PersistentSortedSet pset)
+                :branching-factor (.branchingFactor s)
+                :diff-buf-size    (.diffBufSize s)}
+         (and rt (not= rt RefType/SOFT)) (assoc :ref-type (ref-type->kw rt))
+         bdesc (assoc :boundary bdesc))))
+
+   (do
+     (when (nil? (.-address pset))
+       (throw (ex-info "PSS root must be flushed before serialization" {:type :must-be-flushed})))
+     (let [s (.-settings pset)
+           bdesc (when-let [bd (:boundary s)] (bnd/-descriptor bd))]
+       (cond-> {:meta             (meta pset)
+                :address          (.-address pset)
+                :count            (.-cnt pset)
+                :branching-factor (:branching-factor s)
                   ;; `(or … 0)` for the same reason as in `node-config` — match the JVM,
                   ;; which writes an int here, so a root relayed through a cljs peer keeps
                   ;; the bytes it arrived with.
-                  :diff-buf-size    (or (:diff-buf-size s) 0)}
-           (:ref-type s) (assoc :ref-type (:ref-type s))
-           bdesc (assoc :boundary bdesc))))))
+                :diff-buf-size    (or (:diff-buf-size s) 0)}
+         (:ref-type s) (assoc :ref-type (:ref-type s))
+         bdesc (assoc :boundary bdesc))))))
 
 (defn blob->root
   "Reconstruct a lazy PSS root, resolving storage/comparator/measure per read from the root's
@@ -399,7 +409,8 @@
                                (resolve-measure meta)
                                (or ref-type (:ref-type blob))
                                (:boundary blob))]
-    #?(:clj (PersistentSortedSet. meta (resolve-cmp meta) address (resolve-storage meta)
+    #?(:jolt (pss/->BTSet nil (or (resolve-cmp meta) compare) settings meta (resolve-storage meta) address count)
+       :clj (PersistentSortedSet. meta (resolve-cmp meta) address (resolve-storage meta)
                                   nil (int count) settings 0)
        ;; BTSet deftype: [root cnt comparator meta _hash storage address settings]
        :cljs (BTSet. nil count (resolve-cmp meta) meta nil (resolve-storage meta) address settings))))

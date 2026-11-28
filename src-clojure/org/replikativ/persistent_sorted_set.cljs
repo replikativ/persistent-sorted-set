@@ -250,7 +250,7 @@
 
 (defn rslice
   "A reverse iterator for part of the set with provided boundaries.
-   `(rslice set from to)` returns backwards iterator for all Xs where from <= X <= to.
+   `(rslice set from to)` returns backwards iterator for all Xs where to <= X <= from.
    Optionally pass in comparator that will override the one that set uses. Supports efficient [[clojure.core/rseq]]."
   ([^BTSet set key]
    (btset/rslice set key key (.-comparator set) {:sync? true}))

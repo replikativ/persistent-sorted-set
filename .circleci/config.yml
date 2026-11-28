@@ -3,9 +3,17 @@ version: 2.1
 orbs:
   tools: replikativ/clj-tools@0
 
+jobs:
+  test-jolt:
+    executor: tools/clojurecli
+    steps:
+      - checkout
+      - run: test-jolt/check.sh
+
 workflows:
   build-test-and-deploy:
     jobs:
+      - test-jolt
       - tools/setup:
           context: docker-deploy
           setup_cljs: true
@@ -34,6 +42,7 @@ workflows:
             branches:
               only: main
           requires:
+            - test-jolt
             - tools/unittest
             - tools/cljstest
       - tools/release:

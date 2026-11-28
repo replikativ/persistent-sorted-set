@@ -19,7 +19,9 @@
           (recur l (dec m))))
       l)))
 
-(defn- binary-search-r [cmp arr r k]
+(defn binary-search-r
+  "First index strictly greater than k under cmp, or r+1."
+  [cmp arr r k]
   (loop [l 0
          r (long r)]
     (if (<= l r)
@@ -152,13 +154,20 @@
       (let [nodes (node/merge-split node right)]
         (return-array left (arrays/aget nodes 0) (arrays/aget nodes 1))))))
 
+(defn binary-search
+  "First equal slot, or the bitwise complement of the insertion point. Leaf lookup comparators receive the probe first."
+  [cmp arr key]
+  (loop [lo 0, hi (arrays/alength arr), found -1]
+    (if (< lo hi)
+      (let [mid (arrays/half (+ lo hi))
+            order (cmp key (arrays/aget arr mid))]
+        (if (pos? order)
+          (recur (inc mid) hi found)
+          (recur lo mid (if (zero? order) mid found))))
+      (if (neg? found) (bit-not lo) found))))
+
 (defn lookup-exact [cmp arr key]
-  (let [arr-l (arrays/alength arr)
-        idx   (binary-search-l cmp arr (dec arr-l) key)]
-    (if (and (< idx arr-l)
-             (== 0 (cmp (arrays/aget arr idx) key)))
-      idx
-      -1)))
+  (max -1 (binary-search cmp arr key)))
 
 (defn merge-n-split [a1 a2]
   (let [a1-l    (arrays/alength a1)

@@ -56,11 +56,7 @@
    registered on the same registry — `:keys`, slot values and slot `:diff`s
    recurse through them exactly as under Fressian."
   (:require [boring.core :as boring]
-            [org.replikativ.persistent-sorted-set.impl.nodes :as nodes])
-  #?(:cljs (:require [org.replikativ.persistent-sorted-set.leaf :refer [Leaf]]
-                     [org.replikativ.persistent-sorted-set.branch :refer [Branch]]
-                     [org.replikativ.persistent-sorted-set.btset :refer [BTSet]]))
-  #?(:clj (:import [org.replikativ.persistent_sorted_set Leaf Branch PersistentSortedSet])))
+            [org.replikativ.persistent-sorted-set.impl.nodes :as nodes]))
 
 (def ^:const leaf-tag   nodes/leaf-tag)
 (def ^:const branch-tag nodes/branch-tag)
@@ -87,11 +83,11 @@
   [reg]
   (-> reg
       (boring/register-tag generic-object-tag
-                           #?(:clj Leaf :cljs Leaf)
+                           nodes/leaf-type
                            (fn [leaf] (tagged leaf-tag (nodes/node->blob leaf)))
                            nil)
       (boring/register-tag generic-object-tag
-                           #?(:clj Branch :cljs Branch)
+                           nodes/branch-type
                            (fn [node] (tagged branch-tag (nodes/node->blob node)))
                            nil)))
 
@@ -107,7 +103,7 @@
    this handler."
   [reg]
   (boring/register-tag reg generic-object-tag
-                       #?(:clj PersistentSortedSet :cljs BTSet)
+                       nodes/root-type
                        (fn [pset] (tagged set-tag (nodes/root->blob pset)))
                        nil))
 
