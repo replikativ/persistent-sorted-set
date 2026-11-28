@@ -36,14 +36,15 @@
 (defn- effective-bf
   "The branching factor a constructed set actually carries."
   [opts]
-  #?(:clj  (.branchingFactor
+  #?(:jolt (:branching-factor (.-settings (s/sorted-set* (assoc opts :comparator compare))))
+     :clj  (.branchingFactor
             (.-_settings ^org.replikativ.persistent_sorted_set.PersistentSortedSet
              (s/sorted-set* (assoc opts :comparator compare))))
      :cljs (:branching-factor (.-settings (s/sorted-set* (assoc opts :comparator compare))))))
 
 (defn- refused? [opts]
   (try (effective-bf opts) false
-       (catch #?(:clj IllegalArgumentException :cljs :default) _ true)))
+       (catch #?(:jolt clojure.lang.ExceptionInfo :clj IllegalArgumentException :cljs :default) _ true)))
 
 (deftest branching-factors-below-four-are-refused
   (testing "1, 2 and 3 cannot form a working B-tree — refuse them where the set is
@@ -71,7 +72,7 @@
   (testing "the refusal has to happen before any elements go in, so the caller
             never holds a set that will corrupt later"
     (doseq [bf [2 3]]
-      (is (thrown? #?(:clj IllegalArgumentException :cljs :default)
+      (is (thrown? #?(:jolt clojure.lang.ExceptionInfo :clj IllegalArgumentException :cljs :default)
                    (reduce #(s/conj %1 %2 compare)
                            (s/sorted-set* {:comparator compare :branching-factor bf})
                            (range 40)))
