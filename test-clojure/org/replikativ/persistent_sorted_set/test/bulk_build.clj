@@ -12,7 +12,9 @@
    live heap MID-BUILD — measuring after the build returns sees only the residue and
    misses retention entirely, which is how the first version of it passed against an
    implementation that OOM'd at -Xmx128m."
-  (:require [clojure.test :refer [deftest testing is]]
+  (:require [org.replikativ.persistent-sorted-set.test.bulk-cases :as cases]
+            [org.replikativ.persistent-sorted-set.impl.bulk :as bulk]
+            [clojure.test :refer [deftest testing is]]
             [org.replikativ.persistent-sorted-set :as set])
   (:import [org.replikativ.persistent_sorted_set IStorage ANode Branch PersistentSortedSet]))
 
@@ -49,53 +51,10 @@
        :children (mapv #(shape (.child b storage %) storage) (range n))})
     {:level 0 :len (.len node)}))
 
-(defn- built-both-ways
-  "[array-built streaming-built storage] for the same elements and settings."
-  [xs opts]
-  (let [{:keys [storage] :as st} (mk-storage)
-        arr (set/from-sorted-array compare (to-array xs) (count xs) opts)
-        seqd (set/from-sorted-seq compare xs (assoc opts :storage storage))]
-    [arr seqd st]))
+(deftest array-and-streaming-builders-agree
+  (cases/check-builders #(:storage (mk-storage))
+                        (fn [s storage] (shape (.root ^PersistentSortedSet s) storage))))
 
-;; ---------------------------------------------------------------------------
-;; equivalence with the in-memory builder
-
-(deftest same-tree-as-from-sorted-array
-  (testing "identical contents AND identical structure across the lengths where
-            `split`'s three cases meet — the cut rule changes at 2*avg and at max,
-            so those boundaries are where a streaming reimplementation would drift"
-    (doseq [bf [4 8 16 32]
-            n [0 1 2 3 7 15 16 17 31 32 33 47 48 63 64 65 100 257 1000 5000]]
-      (let [xs (vec (range n))
-            opts {:branching-factor bf}
-            [arr seqd {:keys [storage]}] (built-both-ways xs opts)]
-        (is (= (vec arr) (vec seqd))
-            (str "contents differ at bf=" bf " n=" n))
-        (when (pos? n)
-          (is (= (shape (.root ^PersistentSortedSet arr) nil)
-                 (shape (.root ^PersistentSortedSet seqd) storage))
-              (str "SHAPE differs at bf=" bf " n=" n
-                   " — same elements, different tree")))))))
-
-(deftest same-tree-for-non-contiguous-keys
-  (testing "the equivalence is about the cut rule, not about the keys being ints
-            that happen to be dense"
-    (doseq [n [50 200 777]]
-      (let [xs (vec (sort (map #(* % 37) (range n))))
-            opts {:branching-factor 16}
-            [arr seqd {:keys [storage]}] (built-both-ways xs opts)]
-        (is (= (vec arr) (vec seqd)))
-        (is (= (shape (.root ^PersistentSortedSet arr) nil)
-               (shape (.root ^PersistentSortedSet seqd) storage)))))))
-
-(deftest string-keys-round-trip
-  (testing "a non-numeric comparator"
-    (let [xs (vec (sort (map #(format "k%05d" %) (range 500))))
-          {:keys [storage]} (mk-storage)
-          s (set/from-sorted-seq compare xs {:storage storage :branching-factor 16})]
-      (is (= xs (vec s))))))
-
-;; ---------------------------------------------------------------------------
 ;; the property that justifies the function existing
 
 (deftest streaming-split-does-not-retain-its-input
@@ -110,7 +69,7 @@
             Measured before the fix: live heap at mid-stream grew 2.7x from 250k
             to 2M elements, and a 4M build died under -Xmx128m. After: 0.99x, and
             the same build completes. A type check has none of that noise."
-    (let [chunks (take 5 (#'set/streaming-split (range 10000) 12 16))]
+    (let [chunks (take 5 (bulk/streaming-split (range 10000) 12 16))]
       (is (seq chunks))
       (doseq [c chunks]
         (is (instance? clojure.lang.PersistentVector c)

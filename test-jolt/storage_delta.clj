@@ -1,28 +1,10 @@
 (ns storage-delta
   (:require [clojure.test :refer [deftest is]]
             [org.replikativ.persistent-sorted-set :as s]
-            [org.replikativ.persistent-sorted-set.branch :as branch]
-            [org.replikativ.persistent-sorted-set.impl.storage :as storage]
-            [org.replikativ.persistent-sorted-set.impl.node :as node]
-            [org.replikativ.persistent-sorted-set.leaf :as leaf]))
-
-(defn- backend [disk reads]
-  (reify storage/IStorage
-    (store [_ n _]
-      (let [address (inc (count @disk))]
-        (swap! disk assoc address
-               {:level (node/level n) :keys (vec (seq (.-keys n))) :settings (.-settings n)
-                :subtree-count (node/subtree-count n)
-                :addresses (when (pos? (node/level n)) (vec (seq (.-addresses n))))})
-        address))
-    (restore [_ address opts]
-      (swap! reads conj [address opts])
-      (let [{:keys [level keys addresses settings] :as m} (@disk address)]
-        (if (zero? level)
-          (leaf/->Leaf (to-array keys) settings nil)
-          (branch/from-map (assoc m :keys (to-array keys) :addresses (to-array addresses))))))
-    (accessed [_ _])
-    (markFreed [_ _])))
+            [org.replikativ.persistent-sorted-set.test.bulk-cases :as cases]
+            [org.replikativ.persistent-sorted-set.test.portable-storage :refer [backend tree-shape]]
+            [org.replikativ.persistent-sorted-set.arrays :as arrays]
+            [org.replikativ.persistent-sorted-set.impl.measure :as measure]))
 
 (deftest cold-delta
   (let [disk (atom {}) reads (atom []) storage (backend disk reads)
@@ -78,3 +60,123 @@
     (is (= 63 (count restored)))
     (is (empty? (seq (open (s/store empty-set)))))
     (is (zero? (count empty-set)))))
+
+(deftest weighted-cold-rank
+  (let [reads (atom [])
+        backend (backend (atom {}) reads)
+        ops (reify measure/IMeasure
+              (identity-measure [_] 0)
+              (extract [_ k] (mod k 4))
+              (merge-measure [_ a b] (+ a b))
+              (remove-measure [_ m k _] (- m (mod k 4)))
+              (weight [_ m] m))
+        settings {:branching-factor 4 :storage backend :measure ops}
+        a (reduce s/conj (s/sorted-set* settings) (range 64))
+        b (s/disj a 31)]
+    (doseq [[tree keys] [[a (range 64)] [b (remove #{31} (range 64))]
+                         [(s/from-sorted-array compare (to-array (range 64)) 64 settings) (range 64)]
+                         [(s/from-sorted-seq compare (range 64) settings) (range 64)]]]
+      (let [address (s/store tree)
+            open #(s/restore address backend settings)
+            expected (vec (mapcat (fn [k] (map #(vector k %) (range (mod k 4)))) keys))]
+        (reset! reads [])
+        (is (= (nth expected 45) (s/get-nth (open) 45)))
+        (is (<= 2 (count @reads) 6))
+        (let [cold (open)]
+          (is (= expected (mapv #(s/get-nth cold %) (range (count expected)))))
+          (is (nil? (s/get-nth cold -1)))
+          (is (nil? (s/get-nth cold (count expected)))))))))
+
+(deftest retained-addresses
+  (let [disk (atom {}) reads (atom []) storage (backend disk reads)
+        open #(s/restore % storage)
+        opts {:sync? true :await-read-through? true}
+        original (reduce s/conj (s/sorted-set* {:branching-factor 4 :storage storage}) (range 80))
+        old (s/store original)
+        edited (reduce s/disj (open old) (range 24 52))
+        walk (fn [tree descend?]
+               (let [seen (atom [])]
+                 (is (nil? (s/walk-addresses tree #(do (swap! seen conj %) (descend? %)) opts)))
+                 @seen))
+        ;; The backend records child addresses before either root is walked.
+        reachable (fn [root] (tree-seq #(seq (:addresses (@disk %))) #(:addresses (@disk %)) root))
+        stored-before (set (walk edited (constantly true)))
+        new (s/store edited)
+        before (set (reachable old))
+        after (set (reachable new))
+        skipped (first (:addresses (@disk old)))]
+    (is (seq stored-before))
+    (is (= (set (filter before after)) stored-before))
+    (is (some #(not (after %)) before))
+    (doseq [r [old new]]
+      (is (= (frequencies (reachable r)) (frequencies (walk (open r) (constantly true))))))
+    (reset! reads [])
+    (is (nil? (s/walk-addresses (open old) #(do (is (= old %)) false))))
+    (is (empty? @reads))
+    (is (seq (:addresses (@disk skipped))))
+    (let [descendants (set (rest (reachable skipped)))]
+      (is (= (frequencies (remove descendants (reachable old)))
+             (frequencies (walk (open old) #(not= skipped %)))))
+      (is (not-any? #(= skipped (first %)) @reads))
+      (is (every? #(= opts (second %)) @reads)))
+    (is (thrown? Throwable (s/walk-addresses (open old) identity {:sync? false})))))
+
+(deftest diff-of-retained-roots
+  (let [disk (atom {}) reads (atom []) storage (backend disk reads)
+        opts {:sync? true :await-read-through? true}
+        open #(s/restore % storage)
+        a (s/store (reduce s/conj (s/sorted-set* {:branching-factor 4 :storage storage})
+                           (range 0 256 2)))
+        b (s/store (-> (open a) (s/disj 100) (s/conj 101)))
+        reachable #(tree-seq (fn [k] (seq (:addresses (@disk k))))
+                             (fn [k] (:addresses (@disk k))) %)
+        old (set (reachable a))
+        new (set (reachable b))
+        changed (concat (remove old new) (remove new old))]
+    (reset! reads [])
+    (is (= {:added [] :removed []} (s/diff (open a) (open a))))
+    (is (empty? @reads))
+    (is (= {:added [101] :removed [100]} (s/diff (open a) (open b) storage opts)))
+    (is (= (frequencies changed) (frequencies (map first @reads))))
+    (is (< (count @reads) (count old)))
+    (is (every? #(= opts (second %)) @reads))
+    (is (= {:added [100] :removed [101]} (s/diff (open b) (open a) storage)))
+    (is (thrown? Throwable (s/diff (open a) (open b) storage {:sync? false})))))
+
+(deftest bulk-build
+  (let [disk (atom {}) reads (atom []) st (backend disk reads)
+        consumed (atom 0) flushes (atom [])
+        opts {:branching-factor 4 :storage st :meta {:index :bulk}
+              :flush-fn #(delay (swap! flushes conj @consumed))}
+        ks (map (fn [i] (swap! consumed inc) i) (range 200))
+        streamed (s/from-sorted-seq compare ks opts)
+        writes (count @disk)
+        arr (to-array (concat (range 200) [nil -1]))
+        resident (s/from-sorted-array compare arr 200 opts)]
+    (is (= 200 (count streamed) (count resident)))
+    (is (= (:meta opts) (meta streamed) (meta resident)))
+    (is (= writes (count @flushes)))
+    (is (< 0 (first @flushes) 200))
+    (is (empty? @reads))
+    (is (= (range 200) (seq (s/restore (s/store streamed) st))))
+    (is (= writes (count @disk)))
+    (is (= (range 200) (seq (s/restore (s/store resident) st))))
+    (is (= writes (count @flushes)))
+    (let [unsorted (to-array [2 3 1])
+          cmp #(compare %2 %1)]
+      (is (identical? unsorted (arrays/asort unsorted cmp)))
+      (is (= [3 2 1] (seq (s/from-sorted-array cmp unsorted)))))
+    (is (= [1 2] (seq (s/from-sorted-array compare (to-array [1 2])))))
+    (is (empty? (seq (s/from-sorted-array compare arr 0))))
+    (is (empty? (seq (s/from-sorted-seq compare [] opts))))
+    (doseq [xs [[nil] [1 1] [2 1]]]
+      (is (thrown? Throwable (s/from-sorted-seq compare xs opts)))
+      (is (thrown? Throwable (s/from-sorted-array compare (to-array xs)))))
+    (doseq [len [-1 203]]
+      (is (thrown? Throwable (s/from-sorted-array compare arr len))))
+    (is (thrown? Throwable (s/from-sorted-seq compare [] {})))
+    (is (thrown? Throwable (s/from-sorted-seq compare [] (assoc opts :sync? false))))
+    (is (thrown? Throwable (s/from-sorted-seq compare [1] (assoc opts :flush-fn #(throw (ex-info "flush" {}))))))))
+
+(deftest array-and-streaming-builders-agree
+  (cases/check-builders #(backend (atom {}) (atom [])) tree-shape))

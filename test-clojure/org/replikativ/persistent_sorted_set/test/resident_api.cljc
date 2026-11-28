@@ -52,3 +52,31 @@
                                    (or (nil? hi) (not (pos? (by-group % hi))))) values)]
         (is (= (seq expected) (pss/slice tree lo hi by-group)))
         (is (= (seq (reverse expected)) (pss/rslice tree hi lo by-group)))))))
+
+(defn check-retained-versions
+  "Run the same mixed updates on a public set or directly on the portable nodes."
+  [empty-tree insert remove-key slice rslice lookup]
+  (doseq [seed [13 47 101]]
+    (let [states (reductions
+                  (fn [[tree model] x]
+                    (let [k (mod (quot x 4) 127)]
+                      (if (odd? x)
+                        [(insert tree k) (conj model k)]
+                        [(remove-key tree k) (disj model k)])))
+                  [empty-tree #{}]
+                  (take 256 (iterate #(mod (+ (* 137 %) 187) 4093) seed)))
+          ;; Finish all writes before inspecting old roots.
+          retained (vec (take-nth 16 states))]
+      (doseq [[tree model] retained]
+        (let [expected (sort (filter #(<= 21 % 89) model))]
+          (is (= (seq (sort model)) (slice tree nil nil)))
+          (is (= (seq expected) (slice tree 21 89)))
+          (is (= (seq (reverse expected)) (rslice tree 89 21)))
+          (is (= (get model 42) (lookup tree 42))))))))
+
+(deftest mixed-updates-keep-older-versions
+  (check-retained-versions
+   (pss/sorted-set* {:branching-factor 4 :diff-buf-size 0 :comparator compare})
+   #(pss/conj %1 %2 compare) #(pss/disj %1 %2 compare)
+   #(pss/slice %1 %2 %3 compare) #(pss/rslice %1 %2 %3 compare)
+   #(pss/lookup %1 %2 compare)))

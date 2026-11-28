@@ -590,106 +590,8 @@
                                              on-address
                                              opts))))))
 
-;; ---- diff -------------------------------------------------------------------
-;; Mirrors the JVM frontier walk in persistent_sorted_set.clj: same pruning rule,
-;; same candidate differencing, so a diff computed here agrees with one computed
-;; there on the same pair of trees.
-;;
-;; A frontier entry names a node WITHOUT loading it:
-;;
-;;     [node parent idx addr prunable?]
-;;
-;; `node` is nil until materialized, `addr` is the stored address (nil for a node
-;; never stored), and `prunable?` says whether that address can be trusted to
-;; stand for the contents.
-;;
-;; Each round intersects the two frontiers' addresses, drops what both sides
-;; hold, and loads only the remainder. The addresses come from the parents, which
-;; are already loaded, so pruning itself costs no IO. That shape matters more
-;; here than on the JVM: every load is an async round trip, so the count of them
-;; is what the caller feels, and it is bounded by the CHANGE rather than by the
-;; tree — measured on the JVM at 3-4 node reads for a two-element delta whether
-;; the set holds a thousand elements or a hundred thousand.
-
-(defn- diff-sorted
-  "Elements of `xs` absent from `ys`. Both ascending under `cmp`; O(n+m), no IO."
-  [cmp xs ys]
-  (loop [xs (seq xs) ys (seq ys) out (transient [])]
-    (cond
-      (nil? xs) (persistent! out)
-      (nil? ys) (persistent! (reduce conj! out xs))
-      :else     (let [c (cmp (first xs) (first ys))]
-                  (cond
-                    (neg? c) (recur (next xs) ys (conj! out (first xs)))
-                    (pos? c) (recur xs (next ys) out)
-                    :else    (recur (next xs) (next ys) out))))))
-
-(defn- diff-descend
-  "One level down. At level 0 the entries are leaves and contribute their keys to
-   `cand`; above it they contribute their children to the next frontier.
-
-   Loads are sequential rather than overlapped: a frontier holds only the nodes
-   that actually changed, so there is little to overlap, and issuing a whole
-   frontier at once would make fan-out unbounded on a large delta."
-  [storage refs level cand {:keys [sync?] :or {sync? true} :as opts}]
-  (async+sync sync?
-              (async
-               (let [n (count refs)]
-                 (loop [i 0 nodes []]
-                   (if (< i n)
-                     (let [[node parent idx :as ref] (nth refs i)]
-                       (if (some? node)
-                         (recur (inc i) (conj nodes ref))
-                         (recur (inc i)
-                                (conj nodes (assoc ref 0 (await (branch/child parent storage idx opts)))))))
-                     (if (zero? level)
-                       [[] (reduce (fn [c [nd]] (reduce conj c (.-keys nd))) cand nodes)]
-                       [(delta/child-refs nodes) cand])))))))
-
-(defn diff
-  "Keys added and removed between two sets that SHARE STRUCTURE. See the JVM
-   `org.replikativ.persistent-sorted-set/diff` for the full contract; this is the
-   same algorithm with the loads awaited.
-
-   Returns `{:added [...] :removed [...]}`, or a continuation yielding it when
-   `{:sync? false}`."
-  [^BTSet a ^BTSet b storage {:keys [sync?] :or {sync? true} :as opts}]
-  (async+sync sync?
-              (async
-               (let [addr-a (.-address a)
-                     addr-b (.-address b)]
-                 (if (and (some? addr-a) (= addr-a addr-b))
-                   {:added [] :removed []}          ; same root: zero reads
-                   (let [cmp    (.-comparator b)
-                         ;; roots go through -root, which stamps the projection
-                         ;; comparator that diff-buf needs on descent
-                         root-a (await (-root a opts))
-                         root-b (await (-root b opts))]
-                     (loop [fa [[root-a nil nil addr-a true]] la (node/level root-a)
-                            fb [[root-b nil nil addr-b true]] lb (node/level root-b)
-                            ca [] cb []]
-                       (let [la (if (seq fa) la -1)
-                             lb (if (seq fb) lb -1)]
-                         (if (and (neg? la) (neg? lb))
-                           {:added (diff-sorted cmp cb ca) :removed (diff-sorted cmp ca cb)}
-                           ;; addresses only mean the same thing at the same level,
-                           ;; and a shared node keeps its level, so pruning across
-                           ;; unequal levels would find nothing. Walk the deeper
-                           ;; side down until they meet.
-                           (let [[fa fb]   (if (== la lb) (delta/prune fa fb) [fa fb])
-                                 la        (if (seq fa) la -1)
-                                 lb        (if (seq fb) lb -1)
-                                 down-a?   (and (>= la 0) (>= la lb))
-                                 down-b?   (and (>= lb 0) (>= lb la))
-                                 [fa' ca'] (if down-a?
-                                             (await (diff-descend storage fa la ca opts))
-                                             [fa ca])
-                                 [fb' cb'] (if down-b?
-                                             (await (diff-descend storage fb lb cb opts))
-                                             [fb cb])]
-                             (recur fa' (if down-a? (dec la) la)
-                                    fb' (if down-b? (dec lb) lb)
-                                    ca' cb')))))))))))
+(defn diff [a b storage opts]
+  (delta/diff -root a b storage opts))
 
 (defn walk-delta [a b storage on-address opts]
   (delta/walk-delta -root a b storage on-address opts))
@@ -1567,50 +1469,8 @@
   ([^BTSet set n {:keys [sync?] :or {sync? true} :as opts}]
    (async+sync sync?
                (async
-                (let [root (await (-root set opts))
-                      measure-ops (:measure (.-settings set))]
-                  (when (nil? measure-ops)
-                    (throw (js/Error. "get-nth requires measure to be configured")))
-                  (when (pos? (node/len root))
-                    (let [m0           (node/measure root)
-                          root-measure (if (some? m0)
-                                         m0
-                                         (await (node/force-compute-measure root (.-storage set) measure-ops opts)))]
-                      (when (some? root-measure)
-                        (let [total-weight (measure/weight measure-ops root-measure)]
-                          (when (and (>= n 0) (< n total-weight))
-                            ;; Navigate tree
-                            (loop [cur-node root
-                                   rank n]
-                              (if (instance? Branch cur-node)
-                            ;; Branch: find child by weight
-                                ;; the record says which child holds the position, so
-                                ;; only that child is restored: one node per level
-                                (let [len (node/len cur-node)
-                                      cm  (await (branch/ensure-child-measures cur-node (.-storage set) measure-ops opts))
-                                      hit (when (some? cm)
-                                            (loop [i 0
-                                                   r rank]
-                                              (when (< i len)
-                                                (let [w (measure/weight measure-ops (arrays/aget cm i))]
-                                                  (if (< r w)
-                                                    [i r]
-                                                    (recur (inc i) (- r w)))))))]
-                                  (when hit
-                                    (let [child (await (branch/child cur-node (.-storage set) (nth hit 0) opts))]
-                                      (recur child (nth hit 1)))))
-                            ;; Leaf: iterate keys by weight
-                                (let [keys (.-keys cur-node)
-                                      len (arrays/alength keys)]
-                                  (loop [i 0
-                                         r rank]
-                                    (when (< i len)
-                                      (let [key (arrays/aget keys i)
-                                            key-measure (measure/extract measure-ops key)
-                                            key-weight (measure/weight measure-ops key-measure)]
-                                        (if (< r key-weight)
-                                          [key r]
-                                          (recur (inc i) (- r key-weight)))))))))))))))))))
+                (let [root (await (-root set opts))]
+                  (await (branch/weighted-entry root (.-storage set) (:measure (.-settings set)) n opts)))))))
 
 (defn equivalent?
   [^BTSet set other {:keys [sync?] :or {sync? true} :as opts}]

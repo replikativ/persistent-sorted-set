@@ -49,6 +49,16 @@
         path (str dir "/root")
         values (range 60)]
     (case mode
+      "bulk"
+      (let [build-opts {:branching-factor 4 :diff-buf-size 0 :storage backend :meta m}
+            ks (reverse values)]
+        (doseq [[suffix build] [["stream" #(pss/from-sorted-seq cmp ks build-opts)]
+                                ["array" #(pss/from-sorted-array cmp (to-array (concat ks [nil])) 60 build-opts)]]]
+          (let [s (build)
+                addr (pss/store s backend)
+                reopened (pss/restore addr backend (assoc build-opts :comparator cmp))]
+            (assert (= ks (seq reopened)))
+            (write-bytes (str path "-" suffix) (boring/encode s registry)))))
       "write"
       (let [s (reduce #(pss/conj %1 %2 cmp)
                       (pss/sorted-set* {:branching-factor 4 :diff-buf-size 0

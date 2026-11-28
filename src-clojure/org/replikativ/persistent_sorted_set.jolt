@@ -2,26 +2,15 @@
   "Count-based B-trees on Jolt."
   (:refer-clojure :exclude [conj disj replace])
   (:require [org.replikativ.persistent-sorted-set.branch :as branch]
+            [org.replikativ.persistent-sorted-set.impl.bulk :as bulk]
+            [org.replikativ.persistent-sorted-set.impl.measure :as measure]
             [org.replikativ.persistent-sorted-set.impl.delta :as delta]
             [org.replikativ.persistent-sorted-set.impl.storage :as storage]
             [org.replikativ.persistent-sorted-set.impl.node :as node]
             [org.replikativ.persistent-sorted-set.leaf :as leaf]
-            [org.replikativ.persistent-sorted-set.util :as util]))
+            [org.replikativ.persistent-sorted-set.impl.range :as ranges]))
 
 (def ^:private sync-opts {:sync? true})
-
-(defn- entries-from [n storage from cmp]
-  (lazy-seq
-   (let [keys (.-keys n)
-         size (node/len n)
-         i (if (nil? from) 0 (util/binary-search-l cmp keys (dec size) from))]
-     (when (< i size)
-       (if (zero? (node/level n))
-         (map #(aget keys %) (range i size))
-         (mapcat (fn [idx]
-                   (entries-from (branch/child n storage idx sync-opts) storage
-                                 (when (= idx i) from) cmp))
-                 (range i size)))))))
 
 (declare root-node)
 
@@ -30,7 +19,7 @@
   clojure.lang.Counted
   (count [s] (if (neg? cnt) (node/$count (root-node s) storage sync-opts) cnt))
   clojure.lang.Seqable
-  (seq [s] (seq (entries-from (root-node s) storage nil comparator)))
+  (seq [s] (ranges/slice (root-node s) storage nil nil comparator))
   clojure.lang.IMeta
   (meta [_] metadata)
   clojure.lang.IObj
@@ -61,6 +50,72 @@
 (defn- synchronous! [opts]
   (when (false? (:sync? opts))
     (throw (ex-info "Jolt PSS storage operations require synchronous storage" {}))))
+
+(defn- checked-keys [cmp prev xs]
+  (lazy-seq
+   (when-let [s (seq xs)]
+     (let [k (first s)]
+       (when (nil? k)
+         (throw (ex-info "PersistentSortedSet cannot store nil" {:type :pss/nil-key})))
+       (when (and (some? prev) (not (pos? (cmp k prev))))
+         (throw (ex-info "Bulk build requires strictly ascending, distinct input"
+                         {:type :pss/unsorted :prev prev :next k})))
+       (cons k (checked-keys cmp k (rest s)))))))
+
+(defn- build-sorted [cmp xs opts stream?]
+  (synchronous! opts)
+  (let [settings (node/node-settings opts)
+        _ (check-settings! settings)
+        backend (:storage opts)
+        ops (:measure settings)
+        max-bf (:branching-factor settings)
+        avg (quot (+ max-bf (quot max-bf 2)) 2)
+        entry (fn [n]
+                (if stream?
+                  (let [address (node/store n backend opts)]
+                    (when-let [flush! (:flush-fn opts)]
+                      (let [r (flush!)]
+                        (when (instance? clojure.lang.IDeref r) @r)))
+                    {:address address :key (node/max-key n) :count (node/subtree-count n)
+                     :measure (node/measure n)})
+                  n))
+        make-leaf (fn [ks]
+                    (let [n (leaf/->Leaf (to-array ks) settings nil)]
+                      (when ops (node/try-compute-measure n nil ops sync-opts))
+                      (entry n)))
+        make-branch (fn [level children]
+                      (if stream?
+                        (let [ms (when ops (mapv :measure children))
+                              total (when (and ops (every? some? ms))
+                                      (reduce #(measure/merge-measure ops %1 %2)
+                                              (measure/identity-measure ops) ms))]
+                          (entry (branch/->Branch level (to-array (map :key children))
+                                                 nil (to-array (map :address children))
+                                                 (reduce + 0 (map :count children)) total settings
+                                                 nil 0 cmp (when (some? total) (to-array ms)) false)))
+                        (branch/promote-root (to-array children) settings cmp -1)))]
+    (if-let [root (bulk/build-levels (checked-keys cmp nil xs) avg max-bf make-leaf make-branch)]
+      (if stream?
+        (BTSet. nil cmp settings (:meta opts) backend (:address root) (:count root))
+        (BTSet. root cmp settings (:meta opts) backend nil (node/subtree-count root)))
+      (BTSet. (leaf/empty-leaf settings) cmp settings (:meta opts) backend nil 0))))
+
+(defn from-sorted-array
+  "Build a resident set from the first len sorted, distinct array elements."
+  ([cmp arr] (from-sorted-array cmp arr (alength arr)))
+  ([cmp arr len] (from-sorted-array cmp arr len {}))
+  ([cmp arr len opts]
+   (when-not (and (integer? len) (<= 0 len (alength arr)))
+     (throw (ex-info "from-sorted-array: len out of range" {:len len :array-length (alength arr)})))
+   (build-sorted cmp (map #(aget arr %) (range len)) opts false)))
+
+(defn from-sorted-seq
+  "Build a sorted, distinct stream into synchronous :storage. Call :flush-fn
+   after each node and return a set that loads its stored root on demand."
+  [cmp xs opts]
+  (when-not (:storage opts)
+    (throw (ex-info "from-sorted-seq requires :storage" {:type :pss/requires-storage})))
+  (build-sorted cmp xs opts true))
 
 (defn- writable-root [s opts]
   (synchronous! opts)
@@ -128,32 +183,20 @@
   "Return a forward seq from lo through hi, inclusive. A nil bound is open."
   ([s lo hi] (slice s lo hi (.-comparator s)))
   ([s lo hi cmp]
-   (let [xs (entries-from (root-node s) (.-storage s) lo cmp)]
-     (seq (if (nil? hi) xs (take-while #(not (pos? (cmp % hi))) xs))))))
-
-(defn- entries-backward [n storage from cmp]
-  (lazy-seq
-   (let [keys (.-keys n)
-         size (node/len n)
-         end (if (nil? from) size (util/binary-search-r cmp keys (dec size) from))]
-     (if (zero? (node/level n))
-       (map #(aget keys %) (range (dec end) -1 -1))
-       ;; Branch keys are child maxima. The first child whose maximum exceeds
-       ;; from may still contain matching entries, including comparator ties.
-       (letfn [(siblings [idx bound]
-                 (lazy-seq
-                  (when (>= idx 0)
-                    (lazy-cat (entries-backward (branch/child n storage idx sync-opts)
-                                                storage bound cmp)
-                              (siblings (dec idx) nil)))))]
-         (siblings (min end (dec size)) from))))))
+   (ranges/slice (root-node s) (.-storage s) lo hi cmp)))
 
 (defn rslice
   "Return a descending seq from hi through lo, inclusive. A nil bound is open."
   ([s hi lo] (rslice s hi lo (.-comparator s)))
   ([s hi lo cmp]
-   (let [xs (entries-backward (root-node s) (.-storage s) hi cmp)]
-     (seq (if (nil? lo) xs (take-while #(not (neg? (cmp % lo))) xs))))))
+   (ranges/rslice (root-node s) (.-storage s) hi lo cmp)))
+
+(defn get-nth
+  "Return [entry local-offset] at weighted rank n, or nil outside the set."
+  ([s n] (get-nth s n sync-opts))
+  ([s n opts]
+   (synchronous! opts)
+   (branch/weighted-entry (root-node s opts) (.-storage s) (:measure (.-settings s)) n opts)))
 
 (defn store
   "Flush a set to its storage and return its root address."
@@ -181,6 +224,25 @@
      (assert (some? (:root-address info)))
      (BTSet. nil (or (:comparator info) (:comparator opts) (:cmp opts) compare)
              settings (or (:meta info) (:meta opts)) backend (:root-address info) -1))))
+
+(defn walk-addresses
+  "Visit the stored addresses reachable from this set. Return truthy from
+   on-address to descend, or falsey to skip that address's subtree."
+  ([s on-address] (walk-addresses s on-address sync-opts))
+  ([s on-address opts]
+   (synchronous! opts)
+   (let [address (.-address s)]
+     (when (or (nil? address) (on-address address))
+       (node/walk-addresses (root-node s opts) (.-storage s) on-address opts)))))
+
+(defn diff
+  "Return {:added [...] :removed [...]} in comparator order. Stored versions
+   in the same storage skip subtrees with shared addresses."
+  ([a b] (diff a b (.-storage b) sync-opts))
+  ([a b storage] (diff a b storage sync-opts))
+  ([a b storage opts]
+   (synchronous! opts)
+   (delta/diff root-node a b storage opts)))
 
 (defn walk-delta
   "Visit stored addresses introduced by b, skipping subtrees shared with a."

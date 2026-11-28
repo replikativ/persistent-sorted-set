@@ -3,7 +3,8 @@
  org.replikativ.persistent-sorted-set
   (:refer-clojure :exclude [conj disj sorted-set sorted-set-by replace])
   (:require
-   [org.replikativ.persistent-sorted-set.arrays :as arrays])
+   [org.replikativ.persistent-sorted-set.arrays :as arrays]
+   [org.replikativ.persistent-sorted-set.impl.bulk :as bulk])
   (:import
    [clojure.lang RT]
    [java.lang.ref SoftReference]
@@ -429,53 +430,6 @@
            1 (PersistentSortedSet. (:meta opts) cmp nil storage (first nodes) len settings 0)
            (recur (inc level) (mapv #(->Branch level %) (split nodes (count nodes) Object avg-branching-factor max-branching-factor)))))))))
 
-(defn- streaming-split
-  "Lazy seq of vectors, reproducing `split`'s distribution over a SEQ rather than
-   an indexed collection, buffering at most `(* 2 avg)` elements.
-
-   `split` needs the remaining count to choose a cut, which looks like it needs
-   the whole collection — but its rule only ever asks whether at least `2*avg`
-   remain, so a `2*avg` lookahead answers it exactly. That is what makes a
-   streaming build possible at all, and it is why the output is IDENTICAL to
-   `from-sorted-array`'s rather than merely similar: same cuts, same tree.
-
-   The three cases are `split`'s, in order:
-     >= 2*avg remaining  take exactly avg
-     <= max remaining    take all of it as the last node
-     otherwise           halve it, so the last two nodes are both >= min"
-  [coll avg max]
-  ;; avg >= 2 or the build never terminates: with avg = 1 every branch gets one
-  ;; child, so a level with k nodes produces k nodes again and the tree grows
-  ;; upward forever. avg = (min+max)/2 with min = bf>>>1, so this means bf >= 3.
-  ;; Checked rather than left to hang — bf=2 spun until OOM.
-  (assert (>= avg 2)
-          (str "branching-factor must be >= 4 for a streaming build (got avg fanout "
-               avg "); a fanout of 1 never reduces the level count"))
-  (let [need (* 2 avg)
-        fill (fn [buf s]
-               (loop [buf buf s s]
-                 (if (or (nil? s) (>= (count buf) need))
-                   [buf s]
-                   (recur (clojure.core/conj buf (first s)) (next s)))))]
-    ((fn step [buf s]
-       (lazy-seq
-        (let [[buf s] (fill buf s)
-              n (count buf)]
-          (cond
-            (zero? n) nil
-            ;; `(into [] (subvec ...))` and NOT the bare subvec: a SubVector shares
-            ;; its base, and `conj` on one does `base.assocN(end, o)` — so the base
-            ;; grows without bound and every element ever consumed stays reachable.
-            ;; That silently makes this O(n), which is the one thing the function
-            ;; exists not to be. Measured: 4M elements OOM'd at -Xmx128m before
-            ;; this copy, and complete comfortably after it.
-            (>= n need) (cons (into [] (subvec buf 0 avg))
-                              (step (into [] (subvec buf avg)) s))
-            (<= n max) (list buf)
-            :else (let [h (quot n 2)]
-                    (list (into [] (subvec buf 0 h)) (into [] (subvec buf h))))))))
-     [] (seq coll))))
-
 (defn from-sorted-seq
   "Bulk-build a set from a SORTED, DISTINCT seq, flushing every node to `:storage`
    as it is filled. Returns the set; its root address is `(store set)`.
@@ -564,54 +518,35 @@
                                    (.subtreeCount ^ISubtreeCount node)
                                    (.count node nil))
                           :measure (.-_measure node)}))
-         leaves (map (fn [ks]
-                       (let [^objects arr (to-array ks)
-                             ^Leaf leaf (Leaf. (alength arr) arr settings)]
-                         (when measure-ops
-                           (set! (.-_measure ^ANode leaf) (.tryComputeMeasure leaf nil)))
-                         (store-node! leaf)))
-                     (streaming-split (checked ::none xs) avg-bf max-bf))
+         make-leaf (fn [ks]
+                     (let [^objects arr (to-array ks)
+                           ^Leaf leaf (Leaf. (alength arr) arr settings)]
+                       (when measure-ops
+                         (set! (.-_measure ^ANode leaf) (.tryComputeMeasure leaf nil)))
+                       (store-node! leaf)))
          ;; ---- level n>0: branches over the level below ----
-         branch-level (fn [level entries]
-                        (map (fn [es]
-                               (let [n (count es)
-                                     ^objects keys (to-array (map :key es))
-                                     ^objects addrs (to-array (map :address es))
-                                     cnt (reduce + 0 (map :count es))
-                                     ^Branch b (Branch. (int level) (int n) keys addrs nil
-                                                        (long cnt) settings)]
-                                 (when measure-ops
-                                   (set! (.-_measure ^ANode b)
-                                         (reduce (fn [acc m]
-                                                   ;; `some?`: a measure may be `false`
-                                                   (if (some? m) (.merge measure-ops acc m) acc))
-                                                 (.identity measure-ops)
-                                                 (map :measure es)))
-                                   ;; each child's measure, kept in the parent (Branch._childMeasures)
-                                   (when (every? #(some? (:measure %)) es)
-                                     (set! (.-_childMeasures b) (object-array (map :measure es)))))
-                                 (store-node! b)))
-                             (streaming-split entries avg-bf max-bf)))]
-     ;; Climb one level at a time. `(next s)` realises only the SECOND entry, so
-     ;; the check for "is this level the root" costs two nodes, not a level.
-     (loop [level 1
-            entries leaves]
-       (let [s (seq entries)]
-         (cond
-           (nil? s)
-           ;; `(:meta opts)`, not `{}`: `sorted-set*` and the ClojureScript
-           ;; `from-sorted-seq` both honour it, and this silently dropped it —
-           ;; measured, JVM `(meta (from-sorted-seq … {:meta {:x 1}}))` was `{}`
-           ;; against `{:x 1}` from `sorted-set*` and from cljs.
-           (PersistentSortedSet. (:meta opts) cmp storage settings)
-
-           (nil? (next s))
-           (let [{:keys [address count]} (first s)]
-             ;; root is referenced by address and loaded on demand, like a restore
-             (PersistentSortedSet. (:meta opts) cmp address storage nil (int count) settings 0))
-
-           :else
-           (recur (inc level) (branch-level level s))))))))
+         make-branch (fn [level es]
+                       (let [n (count es)
+                             ^objects keys (to-array (map :key es))
+                             ^objects addrs (to-array (map :address es))
+                             cnt (reduce + 0 (map :count es))
+                             ^Branch b (Branch. (int level) (int n) keys addrs nil
+                                                (long cnt) settings)]
+                         (when measure-ops
+                           (set! (.-_measure ^ANode b)
+                                 (reduce (fn [acc m]
+                                           ;; `some?`: a measure may be `false`
+                                           (if (some? m) (.merge measure-ops acc m) acc))
+                                         (.identity measure-ops)
+                                         (map :measure es)))
+                           ;; each child's measure, kept in the parent (Branch._childMeasures)
+                           (when (every? #(some? (:measure %)) es)
+                             (set! (.-_childMeasures b) (object-array (map :measure es)))))
+                         (store-node! b)))
+         root (bulk/build-levels (checked ::none xs) avg-bf max-bf make-leaf make-branch)]
+     (if root
+       (PersistentSortedSet. (:meta opts) cmp (:address root) storage nil (int (:count root)) settings 0)
+       (PersistentSortedSet. (:meta opts) cmp storage settings)))))
 
 (defn from-sequential
   "Create a set with custom comparator and a collection of keys. Useful when you don’t want to call [[clojure.core/apply]] on [[sorted-set-by]]."

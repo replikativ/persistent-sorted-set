@@ -214,7 +214,7 @@
                                   " use disj+conj instead."))
                      (when removed-out (aset removed-out 0 (arrays/aget keys idx)))
                      (let [new-keys (arrays/aclone keys)
-                           _        (aset new-keys idx new-key)
+                           _        (arrays/aset new-keys idx new-key)
                            new-leaf (Leaf. new-keys settings nil)
                            measure-ops (:measure settings)]
                        ;; Eagerly maintain measure: compute from new leaf (which has replacement done)
@@ -227,6 +227,9 @@
                  (await (storage/store storage this opts)))))
   (walk-addresses [this storage on-address {:keys [sync?] :or {sync? true}}]
     (when-not sync? (async))))
+
+(defn key-array [^Leaf leaf]
+  (.-keys leaf))
 
 (defn empty-leaf
   "The empty root leaf, carrying the measure IDENTITY when a measure is configured.
