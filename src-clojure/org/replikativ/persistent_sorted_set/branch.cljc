@@ -21,8 +21,8 @@
 #?(:jolt nil
    :clj
    (definterface BranchState
-     (children []) (children [v])
-     (addresses []) (addresses [v])
+     (^"[Ljava.lang.Object;" children []) (children [v])
+     (^"[Ljava.lang.Object;" addresses []) (addresses [v])
      (subtreeCount []) (subtreeCount [v])
      (nodeMeasure []) (nodeMeasure [v])
      (slots []) (slots [v])
@@ -56,7 +56,7 @@
          #?(:cljs [^number level keys ^:mutable children ^:mutable addresses ^:mutable ^number subtree-count
                    ^:mutable _measure settings ^:mutable _slots ^:mutable _bufEntries ^:mutable _projCmp
                    ^:mutable _childMeasures ^:mutable _cmLazy]
-            :clj [level keys ^:unsynchronized-mutable children ^:unsynchronized-mutable addresses
+            :clj [level ^objects keys ^:unsynchronized-mutable children ^:unsynchronized-mutable addresses
                   ^:unsynchronized-mutable subtree-count ^:unsynchronized-mutable _measure settings
                   ^:unsynchronized-mutable _slots ^:unsynchronized-mutable _bufEntries
                   ^:unsynchronized-mutable _projCmp ^:unsynchronized-mutable _childMeasures
@@ -705,7 +705,7 @@
     (async+sync sync?
                 (async
                  (let [ins (if (<= 0 idx) idx (dec (- idx)))]
-                   (when (< ins (alength (.-keys node)))
+                   (when (< ins (node/len node))
                      (let [c (await (child node storage ins opts))]
                        (await (node/lookup c storage key cmp opts)))))))))
 
