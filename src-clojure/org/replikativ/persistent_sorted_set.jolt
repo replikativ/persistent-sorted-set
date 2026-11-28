@@ -17,7 +17,7 @@
   clojure.lang.Counted
   (count [s] (if (neg? cnt) (node/$count (root-node s) storage sync-opts) cnt))
   clojure.lang.Seqable
-  (seq [s] (seq (ranges/slice (root-node s) storage nil nil comparator)))
+  (seq [s] (ranges/slice (root-node s) storage nil nil comparator))
   clojure.lang.IMeta
   (meta [_] metadata)
   clojure.lang.IObj

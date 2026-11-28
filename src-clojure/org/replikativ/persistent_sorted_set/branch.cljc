@@ -2111,16 +2111,18 @@
                      (loop [cur root rank n]
                        (if (instance? Branch cur)
                          (when-some [ms (await (ensure-child-measures cur storage measure-ops opts))]
-                           (let [hit (loop [i 0 r rank]
-                                       (when (< i (node/len cur))
+                           (let [len (node/len cur)
+                                 hit (loop [i 0 r rank]
+                                       (when (< i len)
                                          (let [w (measure/weight measure-ops (arrays/aget ms i))]
                                            (if (< r w) [i r] (recur (inc i) (- r w))))))]
                              (when hit
-                               (let [next-node (await (child cur storage (first hit) opts))]
-                                 (recur next-node (second hit))))))
-                         (let [keys (.-keys cur)]
+                               (let [next-node (await (child cur storage (nth hit 0) opts))]
+                                 (recur next-node (nth hit 1))))))
+                         (let [keys (.-keys cur)
+                               len (arrays/alength keys)]
                            (loop [i 0 r rank]
-                             (when (< i (arrays/alength keys))
+                             (when (< i len)
                                (let [key (arrays/aget keys i)
                                      w (measure/weight measure-ops (measure/extract measure-ops key))]
                                  (if (< r w) [key r] (recur (inc i) (- r w)))))))))))))))

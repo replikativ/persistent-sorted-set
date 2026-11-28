@@ -37,8 +37,8 @@
 
 (defn slice [root storage lo hi cmp]
   (let [xs (entries-from root storage lo cmp)]
-     (seq (if (nil? hi) xs (take-while #(not (pos? (cmp % hi))) xs)))))
+    (seq (if (nil? hi) xs (take-while #(not (pos? (cmp % hi))) xs)))))
 
 (defn rslice [root storage hi lo cmp]
   (let [xs (entries-backward root storage hi cmp)]
-     (seq (if (nil? lo) xs (take-while #(not (neg? (cmp % lo))) xs)))))
+    (seq (if (nil? lo) xs (take-while #(not (neg? (cmp % lo))) xs)))))
