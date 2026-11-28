@@ -82,3 +82,37 @@
           (is (= expected (mapv #(s/get-nth cold %) (range (count expected)))))
           (is (nil? (s/get-nth cold -1)))
           (is (nil? (s/get-nth cold (count expected)))))))))
+
+(deftest retained-addresses
+  (let [disk (atom {}) reads (atom []) storage (backend disk reads)
+        open #(s/restore % storage)
+        opts {:sync? true :await-read-through? true}
+        original (reduce s/conj (s/sorted-set* {:branching-factor 4 :storage storage}) (range 80))
+        old (s/store original)
+        edited (reduce s/disj (open old) (range 24 52))
+        walk (fn [tree descend?]
+               (let [seen (atom [])]
+                 (is (nil? (s/walk-addresses tree #(do (swap! seen conj %) (descend? %)) opts)))
+                 @seen))
+        ;; The backend records child addresses before either root is walked.
+        reachable (fn [root] (tree-seq #(seq (:addresses (@disk %))) #(:addresses (@disk %)) root))
+        stored-before (set (walk edited (constantly true)))
+        new (s/store edited)
+        before (set (reachable old))
+        after (set (reachable new))
+        skipped (first (:addresses (@disk old)))]
+    (is (seq stored-before))
+    (is (= (set (filter before after)) stored-before))
+    (is (some #(not (after %)) before))
+    (doseq [r [old new]]
+      (is (= (frequencies (reachable r)) (frequencies (walk (open r) (constantly true))))))
+    (reset! reads [])
+    (is (nil? (s/walk-addresses (open old) #(do (is (= old %)) false))))
+    (is (empty? @reads))
+    (is (seq (:addresses (@disk skipped))))
+    (let [descendants (set (rest (reachable skipped)))]
+      (is (= (frequencies (remove descendants (reachable old)))
+             (frequencies (walk (open old) #(not= skipped %)))))
+      (is (not-any? #(= skipped (first %)) @reads))
+      (is (every? #(= opts (second %)) @reads)))
+    (is (thrown? Throwable (s/walk-addresses (open old) identity {:sync? false})))))

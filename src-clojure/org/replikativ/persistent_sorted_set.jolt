@@ -157,6 +157,16 @@
      (BTSet. nil (or (:comparator info) (:comparator opts) (:cmp opts) compare)
              settings (or (:meta info) (:meta opts)) backend (:root-address info) -1))))
 
+(defn walk-addresses
+  "Visit the stored addresses reachable from this set. Return truthy from
+   on-address to descend, or falsey to skip that address's subtree."
+  ([s on-address] (walk-addresses s on-address sync-opts))
+  ([s on-address opts]
+   (synchronous! opts)
+   (let [address (.-address s)]
+     (when (or (nil? address) (on-address address))
+       (node/walk-addresses (root-node s opts) (.-storage s) on-address opts)))))
+
 (defn walk-delta
   "Visit stored addresses introduced by b, skipping subtrees shared with a."
   ([a b on-address] (walk-delta a b (.-storage b) on-address sync-opts))
