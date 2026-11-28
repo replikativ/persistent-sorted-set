@@ -67,7 +67,7 @@
                    (System/arraycopy ~from ~from-start ~to ~to-start l#))))))
 
 (defn aclone [from]
-  #?(:clj  (Arrays/copyOf ^{:tag "[Ljava.lang.Object;"} from (alength from))
+  #?(:clj  (clojure.core/aclone ^objects from)
      :cljs (.slice from 0)))
 
 (defn slice
