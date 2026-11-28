@@ -2,6 +2,8 @@
   "Count-based B-trees on Jolt."
   (:refer-clojure :exclude [conj disj replace])
   (:require [org.replikativ.persistent-sorted-set.branch :as branch]
+            [org.replikativ.persistent-sorted-set.impl.bulk :as bulk]
+            [org.replikativ.persistent-sorted-set.impl.measure :as measure]
             [org.replikativ.persistent-sorted-set.impl.delta :as delta]
             [org.replikativ.persistent-sorted-set.impl.storage :as storage]
             [org.replikativ.persistent-sorted-set.impl.node :as node]
@@ -48,6 +50,72 @@
 (defn- synchronous! [opts]
   (when (false? (:sync? opts))
     (throw (ex-info "Jolt PSS storage operations require synchronous storage" {}))))
+
+(defn- checked-keys [cmp prev xs]
+  (lazy-seq
+   (when-let [s (seq xs)]
+     (let [k (first s)]
+       (when (nil? k)
+         (throw (ex-info "PersistentSortedSet cannot store nil" {:type :pss/nil-key})))
+       (when (and (some? prev) (not (pos? (cmp k prev))))
+         (throw (ex-info "Bulk build requires strictly ascending, distinct input"
+                         {:type :pss/unsorted :prev prev :next k})))
+       (cons k (checked-keys cmp k (rest s)))))))
+
+(defn- build-sorted [cmp xs opts stream?]
+  (synchronous! opts)
+  (let [settings (node/node-settings opts)
+        _ (check-settings! settings)
+        backend (:storage opts)
+        ops (:measure settings)
+        max-bf (:branching-factor settings)
+        avg (quot (+ max-bf (quot max-bf 2)) 2)
+        entry (fn [n]
+                (if stream?
+                  (let [address (node/store n backend opts)]
+                    (when-let [flush! (:flush-fn opts)]
+                      (let [r (flush!)]
+                        (when (instance? clojure.lang.IDeref r) @r)))
+                    {:address address :key (node/max-key n) :count (node/subtree-count n)
+                     :measure (node/measure n)})
+                  n))
+        make-leaf (fn [ks]
+                    (let [n (leaf/->Leaf (to-array ks) settings nil)]
+                      (when ops (node/try-compute-measure n nil ops sync-opts))
+                      (entry n)))
+        make-branch (fn [level children]
+                      (if stream?
+                        (let [ms (when ops (mapv :measure children))
+                              total (when (and ops (every? some? ms))
+                                      (reduce #(measure/merge-measure ops %1 %2)
+                                              (measure/identity-measure ops) ms))]
+                          (entry (branch/->Branch level (to-array (map :key children))
+                                                 nil (to-array (map :address children))
+                                                 (reduce + 0 (map :count children)) total settings
+                                                 nil 0 cmp (when (some? total) (to-array ms)) false)))
+                        (branch/promote-root (to-array children) settings cmp -1)))]
+    (if-let [root (bulk/build-levels (checked-keys cmp nil xs) avg max-bf make-leaf make-branch)]
+      (if stream?
+        (BTSet. nil cmp settings (:meta opts) backend (:address root) (:count root))
+        (BTSet. root cmp settings (:meta opts) backend nil (node/subtree-count root)))
+      (BTSet. (leaf/empty-leaf settings) cmp settings (:meta opts) backend nil 0))))
+
+(defn from-sorted-array
+  "Build a resident set from the first len sorted, distinct array elements."
+  ([cmp arr] (from-sorted-array cmp arr (alength arr)))
+  ([cmp arr len] (from-sorted-array cmp arr len {}))
+  ([cmp arr len opts]
+   (when-not (and (integer? len) (<= 0 len (alength arr)))
+     (throw (ex-info "from-sorted-array: len out of range" {:len len :array-length (alength arr)})))
+   (build-sorted cmp (map #(aget arr %) (range len)) opts false)))
+
+(defn from-sorted-seq
+  "Build a sorted, distinct stream into synchronous :storage. Call :flush-fn
+   after each node and return a set that loads its stored root on demand."
+  [cmp xs opts]
+  (when-not (:storage opts)
+    (throw (ex-info "from-sorted-seq requires :storage" {:type :pss/requires-storage})))
+  (build-sorted cmp xs opts true))
 
 (defn- writable-root [s opts]
   (synchronous! opts)

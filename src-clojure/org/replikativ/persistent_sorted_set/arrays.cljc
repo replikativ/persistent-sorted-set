@@ -99,7 +99,8 @@
         res))))
 
 (defn asort [arr cmp]
-  #?(:cljs (.sort arr cmp)
+  #?(:jolt (doto arr (Arrays/sort cmp))
+     :cljs (.sort arr cmp)
      :clj  (doto arr (Arrays/parallelSort cmp))))
 
 #?(:cljs

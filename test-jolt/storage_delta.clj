@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [org.replikativ.persistent-sorted-set :as s]
             [org.replikativ.persistent-sorted-set.test.portable-storage :refer [backend]]
+            [org.replikativ.persistent-sorted-set.arrays :as arrays]
             [org.replikativ.persistent-sorted-set.impl.measure :as measure]))
 
 (deftest cold-delta
@@ -71,7 +72,9 @@
         settings {:branching-factor 4 :storage backend :measure ops}
         a (reduce s/conj (s/sorted-set* settings) (range 64))
         b (s/disj a 31)]
-    (doseq [[tree keys] [[a (range 64)] [b (remove #{31} (range 64))]]]
+    (doseq [[tree keys] [[a (range 64)] [b (remove #{31} (range 64))]
+                         [(s/from-sorted-array compare (to-array (range 64)) 64 settings) (range 64)]
+                         [(s/from-sorted-seq compare (range 64) settings) (range 64)]]]
       (let [address (s/store tree)
             open #(s/restore address backend settings)
             expected (vec (mapcat (fn [k] (map #(vector k %) (range (mod k 4)))) keys))]
@@ -138,3 +141,38 @@
     (is (every? #(= opts (second %)) @reads))
     (is (= {:added [100] :removed [101]} (s/diff (open b) (open a) storage)))
     (is (thrown? Throwable (s/diff (open a) (open b) storage {:sync? false})))))
+
+(deftest bulk-build
+  (let [disk (atom {}) reads (atom []) st (backend disk reads)
+        consumed (atom 0) flushes (atom [])
+        opts {:branching-factor 4 :storage st :meta {:index :bulk}
+              :flush-fn #(delay (swap! flushes conj @consumed))}
+        ks (map (fn [i] (swap! consumed inc) i) (range 200))
+        streamed (s/from-sorted-seq compare ks opts)
+        writes (count @disk)
+        arr (to-array (concat (range 200) [nil -1]))
+        resident (s/from-sorted-array compare arr 200 opts)]
+    (is (= 200 (count streamed) (count resident)))
+    (is (= (:meta opts) (meta streamed) (meta resident)))
+    (is (= writes (count @flushes)))
+    (is (< 0 (first @flushes) 200))
+    (is (empty? @reads))
+    (is (= (range 200) (seq (s/restore (s/store streamed) st))))
+    (is (= writes (count @disk)))
+    (is (= (range 200) (seq (s/restore (s/store resident) st))))
+    (is (= writes (count @flushes)))
+    (let [unsorted (to-array [2 3 1])
+          cmp #(compare %2 %1)]
+      (is (identical? unsorted (arrays/asort unsorted cmp)))
+      (is (= [3 2 1] (seq (s/from-sorted-array cmp unsorted)))))
+    (is (= [1 2] (seq (s/from-sorted-array compare (to-array [1 2])))))
+    (is (empty? (seq (s/from-sorted-array compare arr 0))))
+    (is (empty? (seq (s/from-sorted-seq compare [] opts))))
+    (doseq [xs [[nil] [1 1] [2 1]]]
+      (is (thrown? Throwable (s/from-sorted-seq compare xs opts)))
+      (is (thrown? Throwable (s/from-sorted-array compare (to-array xs)))))
+    (doseq [len [-1 203]]
+      (is (thrown? Throwable (s/from-sorted-array compare arr len))))
+    (is (thrown? Throwable (s/from-sorted-seq compare [] {})))
+    (is (thrown? Throwable (s/from-sorted-seq compare [] (assoc opts :sync? false))))
+    (is (thrown? Throwable (s/from-sorted-seq compare [1] (assoc opts :flush-fn #(throw (ex-info "flush" {}))))))))

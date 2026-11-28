@@ -12,7 +12,8 @@
    live heap MID-BUILD — measuring after the build returns sees only the residue and
    misses retention entirely, which is how the first version of it passed against an
    implementation that OOM'd at -Xmx128m."
-  (:require [clojure.test :refer [deftest testing is]]
+  (:require [org.replikativ.persistent-sorted-set.impl.bulk :as bulk]
+            [clojure.test :refer [deftest testing is]]
             [org.replikativ.persistent-sorted-set :as set])
   (:import [org.replikativ.persistent_sorted_set IStorage ANode Branch PersistentSortedSet]))
 
@@ -110,7 +111,7 @@
             Measured before the fix: live heap at mid-stream grew 2.7x from 250k
             to 2M elements, and a 4M build died under -Xmx128m. After: 0.99x, and
             the same build completes. A type check has none of that noise."
-    (let [chunks (take 5 (#'set/streaming-split (range 10000) 12 16))]
+    (let [chunks (take 5 (bulk/streaming-split (range 10000) 12 16))]
       (is (seq chunks))
       (doseq [c chunks]
         (is (instance? clojure.lang.PersistentVector c)
