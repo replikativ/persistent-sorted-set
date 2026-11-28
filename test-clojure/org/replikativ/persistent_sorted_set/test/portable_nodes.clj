@@ -10,6 +10,7 @@
             [org.replikativ.persistent-sorted-set.impl.storage :as storage]
             [org.replikativ.persistent-sorted-set.leaf :as leaf]
             [org.replikativ.persistent-sorted-set.test.portable-storage :refer [backend]]
+            [org.replikativ.persistent-sorted-set.test.resident-api :as resident]
             [org.replikativ.persistent-sorted-set.test.stored-measures :as stored])
   (:import [org.replikativ.persistent_sorted_set IMeasure]))
 
@@ -84,3 +85,10 @@
         (doseq [[lo hi] [[nil nil] [[2] [6]] [[4] [4]] [nil [0]] [[9] nil]]]
           (is (= (java/slice java-tree lo hi by-group) (ranges/slice root store lo hi by-group)))
           (is (= (java/rslice java-tree hi lo by-group) (ranges/rslice root store hi lo by-group))))))))
+
+(deftest mixed-updates-on-portable-nodes
+  (resident/check-retained-versions
+   (leaf/empty-leaf {:branching-factor 4 :diff-buf-size 0})
+   insert remove-key
+   #(ranges/slice %1 nil %2 %3 compare) #(ranges/rslice %1 nil %2 %3 compare)
+   #(node/lookup %1 nil %2 compare opts)))

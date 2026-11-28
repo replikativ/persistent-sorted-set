@@ -1,7 +1,8 @@
 (ns storage-delta
   (:require [clojure.test :refer [deftest is]]
             [org.replikativ.persistent-sorted-set :as s]
-            [org.replikativ.persistent-sorted-set.test.portable-storage :refer [backend]]
+            [org.replikativ.persistent-sorted-set.test.bulk-cases :as cases]
+            [org.replikativ.persistent-sorted-set.test.portable-storage :refer [backend tree-shape]]
             [org.replikativ.persistent-sorted-set.arrays :as arrays]
             [org.replikativ.persistent-sorted-set.impl.measure :as measure]))
 
@@ -176,3 +177,6 @@
     (is (thrown? Throwable (s/from-sorted-seq compare [] {})))
     (is (thrown? Throwable (s/from-sorted-seq compare [] (assoc opts :sync? false))))
     (is (thrown? Throwable (s/from-sorted-seq compare [1] (assoc opts :flush-fn #(throw (ex-info "flush" {}))))))))
+
+(deftest array-and-streaming-builders-agree
+  (cases/check-builders #(backend (atom {}) (atom [])) tree-shape))

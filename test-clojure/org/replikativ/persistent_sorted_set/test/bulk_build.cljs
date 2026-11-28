@@ -17,12 +17,13 @@
    Heap sampling is deliberately absent. The JVM suite samples live memory
    mid-build; on Node there is no equivalent worth trusting, and the write-order
    test is a stronger assertion anyway because it is deterministic."
-  (:require [cljs.test :refer-macros [deftest testing is]]
+  (:require [org.replikativ.persistent-sorted-set.test.bulk-cases :as cases]
+            [cljs.test :refer-macros [deftest testing is]]
             [is.simm.partial-cps.async :refer-macros [async]]
             [org.replikativ.persistent-sorted-set :as set]
-            [org.replikativ.persistent-sorted-set.impl.storage :as storage :refer [IStorage]]
+            [org.replikativ.persistent-sorted-set.impl.storage :refer [IStorage]]
             [org.replikativ.persistent-sorted-set.impl.node :as node]
-            [org.replikativ.persistent-sorted-set.branch :refer [Branch]]))
+            [org.replikativ.persistent-sorted-set.test.portable-storage :as portable]))
 
 ;; ---------------------------------------------------------------------------
 
@@ -49,70 +50,9 @@
                 (isFreed [_ _] false)
                 (freedInfo [_ _] nil))}))
 
-(defn- shape
-  "Level and fanout of every node, recursively — TREE STRUCTURE, not contents.
-   `child` resolves a branch's i-th child, which differs between a resident tree
-   and an address-only one."
-  [node child]
-  (if (instance? Branch node)
-    {:level (node/level node)
-     :len (alength (.-keys node))
-     :children (mapv #(shape (child node %) child) (range (alength (.-keys node))))}
-    {:level 0 :len (alength (.-keys node))}))
+(deftest array-and-streaming-builders-agree
+  (cases/check-builders #(:storage (recording-storage)) portable/tree-shape))
 
-(defn- resident-child [node i] (aget (.-children node) i))
-
-(defn- stored-child [storage]
-  (fn [node i] (storage/restore storage (aget (.-addresses node) i) {:sync? true})))
-
-(defn- root-of
-  "The root node of an address-rooted set, restored."
-  [s storage]
-  (or (.-root s) (storage/restore storage (.-address s) {:sync? true})))
-
-;; ---------------------------------------------------------------------------
-;; equivalence with the in-memory builder
-
-(deftest same-tree-as-from-sorted-array
-  (testing "identical contents AND identical structure across the lengths where
-            the cut rule's three cases meet — it changes at 2*avg and at max, so
-            those boundaries are where a streaming reimplementation would drift"
-    (doseq [bf [4 8 16 32]
-            n [0 1 2 3 7 15 16 17 31 32 33 47 48 63 64 65 100 257 1000 5000]]
-      (let [xs (vec (range n))
-            opts {:branching-factor bf}
-            {:keys [storage]} (recording-storage)
-            arr (set/from-sorted-array compare (to-array xs) (count xs) opts)
-            seqd (set/from-sorted-seq compare xs (assoc opts :storage storage))]
-        (is (= (vec arr) (vec seqd))
-            (str "contents differ at bf=" bf " n=" n))
-        (when (pos? n)
-          (is (= (shape (.-root arr) resident-child)
-                 (shape (root-of seqd storage) (stored-child storage)))
-              (str "SHAPE differs at bf=" bf " n=" n
-                   " — same elements, different tree")))))))
-
-(deftest same-tree-for-non-contiguous-keys
-  (testing "the equivalence is about the cut rule, not about the keys being ints
-            that happen to be dense"
-    (doseq [n [50 200 777]]
-      (let [xs (vec (sort (map #(* % 37) (range n))))
-            opts {:branching-factor 16}
-            {:keys [storage]} (recording-storage)
-            arr (set/from-sorted-array compare (to-array xs) (count xs) opts)
-            seqd (set/from-sorted-seq compare xs (assoc opts :storage storage))]
-        (is (= (vec arr) (vec seqd)))
-        (is (= (shape (.-root arr) resident-child)
-               (shape (root-of seqd storage) (stored-child storage))))))))
-
-(deftest string-keys-round-trip
-  (testing "a non-numeric comparator"
-    (let [xs (vec (sort (map #(str "k" %) (range 500))))
-          {:keys [storage]} (recording-storage)
-          s (set/from-sorted-seq compare xs {:storage storage :branching-factor 16})]
-      (is (= xs (vec s))))))
-
-;; ---------------------------------------------------------------------------
 ;; the property that justifies the function existing
 
 (deftest nodes-are-written-mid-stream

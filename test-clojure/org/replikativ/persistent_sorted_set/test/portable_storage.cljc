@@ -26,3 +26,13 @@
           (branch/from-map (assoc m :keys (to-array keys) :addresses (to-array addresses))))))
     (accessed [_ _])
     (markFreed [_ _])))
+
+(defn tree-shape [s backend]
+  (let [opts {:sync? true}
+        root (or (.-root s) (storage/restore backend (.-address s) opts))]
+    (letfn [(walk [n]
+              (let [level (node/level n)
+                    len (node/len n)]
+                (cond-> {:level level :len len}
+                  (pos? level) (assoc :children (mapv #(walk (branch/child n backend % opts)) (range len))))))]
+      (walk root))))
