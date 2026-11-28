@@ -1,28 +1,8 @@
 (ns storage-delta
   (:require [clojure.test :refer [deftest is]]
             [org.replikativ.persistent-sorted-set :as s]
-            [org.replikativ.persistent-sorted-set.branch :as branch]
-            [org.replikativ.persistent-sorted-set.impl.storage :as storage]
-            [org.replikativ.persistent-sorted-set.impl.node :as node]
-            [org.replikativ.persistent-sorted-set.leaf :as leaf]))
-
-(defn- backend [disk reads]
-  (reify storage/IStorage
-    (store [_ n _]
-      (let [address (inc (count @disk))]
-        (swap! disk assoc address
-               {:level (node/level n) :keys (vec (seq (.-keys n))) :settings (.-settings n)
-                :subtree-count (node/subtree-count n)
-                :addresses (when (pos? (node/level n)) (vec (seq (.-addresses n))))})
-        address))
-    (restore [_ address opts]
-      (swap! reads conj [address opts])
-      (let [{:keys [level keys addresses settings] :as m} (@disk address)]
-        (if (zero? level)
-          (leaf/->Leaf (to-array keys) settings nil)
-          (branch/from-map (assoc m :keys (to-array keys) :addresses (to-array addresses))))))
-    (accessed [_ _])
-    (markFreed [_ _])))
+            [org.replikativ.persistent-sorted-set.test.portable-storage :refer [backend]]
+            [org.replikativ.persistent-sorted-set.impl.measure :as measure]))
 
 (deftest cold-delta
   (let [disk (atom {}) reads (atom []) storage (backend disk reads)
@@ -78,3 +58,27 @@
     (is (= 63 (count restored)))
     (is (empty? (seq (open (s/store empty-set)))))
     (is (zero? (count empty-set)))))
+
+(deftest weighted-cold-rank
+  (let [reads (atom [])
+        backend (backend (atom {}) reads)
+        ops (reify measure/IMeasure
+              (identity-measure [_] 0)
+              (extract [_ k] (mod k 4))
+              (merge-measure [_ a b] (+ a b))
+              (remove-measure [_ m k _] (- m (mod k 4)))
+              (weight [_ m] m))
+        settings {:branching-factor 4 :storage backend :measure ops}
+        a (reduce s/conj (s/sorted-set* settings) (range 64))
+        b (s/disj a 31)]
+    (doseq [[tree keys] [[a (range 64)] [b (remove #{31} (range 64))]]]
+      (let [address (s/store tree)
+            open #(s/restore address backend settings)
+            expected (vec (mapcat (fn [k] (map #(vector k %) (range (mod k 4)))) keys))]
+        (reset! reads [])
+        (is (= (nth expected 45) (s/get-nth (open) 45)))
+        (is (<= 2 (count @reads) 6))
+        (let [cold (open)]
+          (is (= expected (mapv #(s/get-nth cold %) (range (count expected)))))
+          (is (nil? (s/get-nth cold -1)))
+          (is (nil? (s/get-nth cold (count expected)))))))))

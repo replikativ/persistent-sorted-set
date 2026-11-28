@@ -1567,50 +1567,8 @@
   ([^BTSet set n {:keys [sync?] :or {sync? true} :as opts}]
    (async+sync sync?
                (async
-                (let [root (await (-root set opts))
-                      measure-ops (:measure (.-settings set))]
-                  (when (nil? measure-ops)
-                    (throw (js/Error. "get-nth requires measure to be configured")))
-                  (when (pos? (node/len root))
-                    (let [m0           (node/measure root)
-                          root-measure (if (some? m0)
-                                         m0
-                                         (await (node/force-compute-measure root (.-storage set) measure-ops opts)))]
-                      (when (some? root-measure)
-                        (let [total-weight (measure/weight measure-ops root-measure)]
-                          (when (and (>= n 0) (< n total-weight))
-                            ;; Navigate tree
-                            (loop [cur-node root
-                                   rank n]
-                              (if (instance? Branch cur-node)
-                            ;; Branch: find child by weight
-                                ;; the record says which child holds the position, so
-                                ;; only that child is restored: one node per level
-                                (let [len (node/len cur-node)
-                                      cm  (await (branch/ensure-child-measures cur-node (.-storage set) measure-ops opts))
-                                      hit (when (some? cm)
-                                            (loop [i 0
-                                                   r rank]
-                                              (when (< i len)
-                                                (let [w (measure/weight measure-ops (arrays/aget cm i))]
-                                                  (if (< r w)
-                                                    [i r]
-                                                    (recur (inc i) (- r w)))))))]
-                                  (when hit
-                                    (let [child (await (branch/child cur-node (.-storage set) (nth hit 0) opts))]
-                                      (recur child (nth hit 1)))))
-                            ;; Leaf: iterate keys by weight
-                                (let [keys (.-keys cur-node)
-                                      len (arrays/alength keys)]
-                                  (loop [i 0
-                                         r rank]
-                                    (when (< i len)
-                                      (let [key (arrays/aget keys i)
-                                            key-measure (measure/extract measure-ops key)
-                                            key-weight (measure/weight measure-ops key-measure)]
-                                        (if (< r key-weight)
-                                          [key r]
-                                          (recur (inc i) (- r key-weight)))))))))))))))))))
+                (let [root (await (-root set opts))]
+                  (await (branch/weighted-entry root (.-storage set) (:measure (.-settings set)) n opts)))))))
 
 (defn equivalent?
   [^BTSet set other {:keys [sync?] :or {sync? true} :as opts}]

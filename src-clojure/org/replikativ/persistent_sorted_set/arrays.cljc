@@ -18,27 +18,27 @@
    (defn ^array into-array [aseq]
      (reduce (fn [a x] (.push a x) a) (js/Array.) aseq))
    :clj
-   (defn into-array ^{:tag "[[Ljava.lang.Object;"} [aseq]
+   (defn into-array ^{:tag "[Ljava.lang.Object;"} [aseq]
      (clojure.core/into-array java.lang.Object aseq)))
 
 #?(:clj
    (defmacro aget [arr i]
      (if-cljs &env
               (list 'js* "(~{}[~{}])" arr i)
-              `(clojure.lang.RT/aget ~(vary-meta arr assoc :tag "[[Ljava.lang.Object;") (int ~i)))))
+              `(clojure.lang.RT/aget ~(vary-meta arr assoc :tag "[Ljava.lang.Object;") (int ~i)))))
 
 #?(:clj
    (defmacro alength [arr]
      (if-cljs &env
               (-> (list 'js* "~{}.length" arr)
                   (vary-meta assoc :tag 'number))
-              `(clojure.lang.RT/alength ~(vary-meta arr assoc :tag "[[Ljava.lang.Object;")))))
+              `(clojure.lang.RT/alength ~(vary-meta arr assoc :tag "[Ljava.lang.Object;")))))
 
 #?(:clj
    (defmacro aset [arr i v]
      (if-cljs &env
               (list 'js* "(~{}[~{}] = ~{})" arr i v)
-              `(clojure.lang.RT/aset ~(vary-meta arr assoc :tag "[[Ljava.lang.Object;") (int ~i) ~v))))
+              `(clojure.lang.RT/aset ~(vary-meta arr assoc :tag "[Ljava.lang.Object;") (int ~i) ~v))))
 
 #?(:clj (def ^:no-doc empty-object-array (object-array 0)))
 
@@ -67,7 +67,7 @@
                    (System/arraycopy ~from ~from-start ~to ~to-start l#))))))
 
 (defn aclone [from]
-  #?(:clj  (Arrays/copyOf ^{:tag "[[Ljava.lang.Object;"} from (alength from))
+  #?(:clj  (Arrays/copyOf ^{:tag "[Ljava.lang.Object;"} from (alength from))
      :cljs (.slice from 0)))
 
 (defn slice
@@ -81,8 +81,8 @@
   #?(:cljs (.concat a b)
      :clj  (let [al  (alength a)
                  bl  (alength b)
-                 res (Arrays/copyOf ^{:tag "[[Ljava.lang.Object;"} a (+ al bl))]
-             (System/arraycopy ^{:tag "[[Ljava.lang.Object;"} b 0 res al bl)
+                 res (Arrays/copyOf ^{:tag "[Ljava.lang.Object;"} a (+ al bl))]
+             (System/arraycopy ^{:tag "[Ljava.lang.Object;"} b 0 res al bl)
              res)))
 
 #?(:cljs

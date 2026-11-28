@@ -6,22 +6,9 @@
             [org.replikativ.persistent-sorted-set.impl.storage :as storage]
             [org.replikativ.persistent-sorted-set.impl.node :as node]
             [org.replikativ.persistent-sorted-set.leaf :as leaf]
-            [org.replikativ.persistent-sorted-set.util :as util]))
+            [org.replikativ.persistent-sorted-set.impl.range :as ranges]))
 
 (def ^:private sync-opts {:sync? true})
-
-(defn- entries-from [n storage from cmp]
-  (lazy-seq
-   (let [keys (.-keys n)
-         size (node/len n)
-         i (if (nil? from) 0 (util/binary-search-l cmp keys (dec size) from))]
-     (when (< i size)
-       (if (zero? (node/level n))
-         (map #(aget keys %) (range i size))
-         (mapcat (fn [idx]
-                   (entries-from (branch/child n storage idx sync-opts) storage
-                                 (when (= idx i) from) cmp))
-                 (range i size)))))))
 
 (declare root-node)
 
@@ -30,7 +17,7 @@
   clojure.lang.Counted
   (count [s] (if (neg? cnt) (node/$count (root-node s) storage sync-opts) cnt))
   clojure.lang.Seqable
-  (seq [s] (seq (entries-from (root-node s) storage nil comparator)))
+  (seq [s] (seq (ranges/slice (root-node s) storage nil nil comparator)))
   clojure.lang.IMeta
   (meta [_] metadata)
   clojure.lang.IObj
@@ -128,32 +115,20 @@
   "Return a forward seq from lo through hi, inclusive. A nil bound is open."
   ([s lo hi] (slice s lo hi (.-comparator s)))
   ([s lo hi cmp]
-   (let [xs (entries-from (root-node s) (.-storage s) lo cmp)]
-     (seq (if (nil? hi) xs (take-while #(not (pos? (cmp % hi))) xs))))))
-
-(defn- entries-backward [n storage from cmp]
-  (lazy-seq
-   (let [keys (.-keys n)
-         size (node/len n)
-         end (if (nil? from) size (util/binary-search-r cmp keys (dec size) from))]
-     (if (zero? (node/level n))
-       (map #(aget keys %) (range (dec end) -1 -1))
-       ;; Branch keys are child maxima. The first child whose maximum exceeds
-       ;; from may still contain matching entries, including comparator ties.
-       (letfn [(siblings [idx bound]
-                 (lazy-seq
-                  (when (>= idx 0)
-                    (lazy-cat (entries-backward (branch/child n storage idx sync-opts)
-                                                storage bound cmp)
-                              (siblings (dec idx) nil)))))]
-         (siblings (min end (dec size)) from))))))
+   (ranges/slice (root-node s) (.-storage s) lo hi cmp)))
 
 (defn rslice
   "Return a descending seq from hi through lo, inclusive. A nil bound is open."
   ([s hi lo] (rslice s hi lo (.-comparator s)))
   ([s hi lo cmp]
-   (let [xs (entries-backward (root-node s) (.-storage s) hi cmp)]
-     (seq (if (nil? lo) xs (take-while #(not (neg? (cmp % lo))) xs))))))
+   (ranges/rslice (root-node s) (.-storage s) hi lo cmp)))
+
+(defn get-nth
+  "Return [entry local-offset] at weighted rank n, or nil outside the set."
+  ([s n] (get-nth s n sync-opts))
+  ([s n opts]
+   (synchronous! opts)
+   (branch/weighted-entry (root-node s opts) (.-storage s) (:measure (.-settings s)) n opts)))
 
 (defn store
   "Flush a set to its storage and return its root address."
