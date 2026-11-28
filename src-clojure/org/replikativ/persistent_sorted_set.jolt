@@ -167,6 +167,15 @@
      (when (or (nil? address) (on-address address))
        (node/walk-addresses (root-node s opts) (.-storage s) on-address opts)))))
 
+(defn diff
+  "Return {:added [...] :removed [...]} in comparator order. Stored versions
+   in the same storage skip subtrees with shared addresses."
+  ([a b] (diff a b (.-storage b) sync-opts))
+  ([a b storage] (diff a b storage sync-opts))
+  ([a b storage opts]
+   (synchronous! opts)
+   (delta/diff root-node a b storage opts)))
+
 (defn walk-delta
   "Visit stored addresses introduced by b, skipping subtrees shared with a."
   ([a b on-address] (walk-delta a b (.-storage b) on-address sync-opts))

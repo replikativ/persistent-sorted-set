@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [org.replikativ.persistent-sorted-set :as java]
             [org.replikativ.persistent-sorted-set.branch :as branch]
+            [org.replikativ.persistent-sorted-set.impl.delta :as delta]
             [org.replikativ.persistent-sorted-set.impl.measure :as m]
             [org.replikativ.persistent-sorted-set.impl.node :as node]
             [org.replikativ.persistent-sorted-set.impl.range :as ranges]
@@ -11,6 +12,8 @@
             [org.replikativ.persistent-sorted-set.test.portable-storage :refer [backend]]
             [org.replikativ.persistent-sorted-set.test.stored-measures :as stored])
   (:import [org.replikativ.persistent_sorted_set IMeasure]))
+
+(defrecord StoredRoot [address comparator])
 
 (def opts {:sync? true})
 (defn- weight-of [[_ i]] (mod i 4))
@@ -63,6 +66,12 @@
         versions [[java-root portable-root]
                   [(reduce disj java-root removed) (reduce remove-key portable-root removed)]]
         saved (mapv (fn [[j p]] [(java/store j java-store) (node/store p store opts)]) versions)]
+    (let [[[ja pa] [jb pb]] saved
+          java-open #(java/restore-by compare % java-store java-settings)
+          root-of (fn [tree opts] (storage/restore store (:address tree) opts))]
+      (doseq [[from to p q] [[ja jb pa pb] [jb ja pb pa]]]
+        (is (= (java/diff (java-open from) (java-open to))
+               (delta/diff root-of (->StoredRoot p compare) (->StoredRoot q compare) store opts)))))
     (doseq [[java-address address] saved]
       (let [java-tree (java/restore-by compare java-address java-store java-settings)
             root (storage/restore store address opts)

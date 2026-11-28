@@ -116,3 +116,25 @@
       (is (not-any? #(= skipped (first %)) @reads))
       (is (every? #(= opts (second %)) @reads)))
     (is (thrown? Throwable (s/walk-addresses (open old) identity {:sync? false})))))
+
+(deftest diff-of-retained-roots
+  (let [disk (atom {}) reads (atom []) storage (backend disk reads)
+        opts {:sync? true :await-read-through? true}
+        open #(s/restore % storage)
+        a (s/store (reduce s/conj (s/sorted-set* {:branching-factor 4 :storage storage})
+                           (range 0 256 2)))
+        b (s/store (-> (open a) (s/disj 100) (s/conj 101)))
+        reachable #(tree-seq (fn [k] (seq (:addresses (@disk k))))
+                             (fn [k] (:addresses (@disk k))) %)
+        old (set (reachable a))
+        new (set (reachable b))
+        changed (concat (remove old new) (remove new old))]
+    (reset! reads [])
+    (is (= {:added [] :removed []} (s/diff (open a) (open a))))
+    (is (empty? @reads))
+    (is (= {:added [101] :removed [100]} (s/diff (open a) (open b) storage opts)))
+    (is (= (frequencies changed) (frequencies (map first @reads))))
+    (is (< (count @reads) (count old)))
+    (is (every? #(= opts (second %)) @reads))
+    (is (= {:added [100] :removed [101]} (s/diff (open b) (open a) storage)))
+    (is (thrown? Throwable (s/diff (open a) (open b) storage {:sync? false})))))
