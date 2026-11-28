@@ -25,20 +25,20 @@
    (defmacro aget [arr i]
      (if-cljs &env
               (list 'js* "(~{}[~{}])" arr i)
-              `(clojure.lang.RT/aget ~(vary-meta arr assoc :tag "[Ljava.lang.Object;") (int ~i)))))
+              `(clojure.core/aget ~(vary-meta arr assoc :tag "[Ljava.lang.Object;") ~i))))
 
 #?(:clj
    (defmacro alength [arr]
      (if-cljs &env
               (-> (list 'js* "~{}.length" arr)
                   (vary-meta assoc :tag 'number))
-              `(clojure.lang.RT/alength ~(vary-meta arr assoc :tag "[Ljava.lang.Object;")))))
+              `(clojure.core/alength ~(vary-meta arr assoc :tag "[Ljava.lang.Object;")))))
 
 #?(:clj
    (defmacro aset [arr i v]
      (if-cljs &env
               (list 'js* "(~{}[~{}] = ~{})" arr i v)
-              `(clojure.lang.RT/aset ~(vary-meta arr assoc :tag "[Ljava.lang.Object;") (int ~i) ~v))))
+              `(clojure.core/aset ~(vary-meta arr assoc :tag "[Ljava.lang.Object;") ~i ~v))))
 
 #?(:clj (def ^:no-doc empty-object-array (object-array 0)))
 
